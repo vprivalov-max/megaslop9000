@@ -6947,12 +6947,14 @@ def timeline_render_delete(sid, name):
 
 
 if __name__ == '__main__':
-    # Startup recovery — cleans stranded "submitting" chunks from prior crash/restart.
-    # Runs in main process only (skip the debug-reloader child).
-    if os.environ.get('WERKZEUG_RUN_MAIN') == 'true' or not os.environ.get('FLASK_DEBUG'):
+    # Dev mode entrypoint. In production we run under gunicorn (see Dockerfile),
+    # which hits the `else` branch below.
+    debug = os.environ.get('FLASK_DEBUG', '1').lower() not in ('', '0', 'false', 'no')
+    port = int(os.environ.get('PORT', '8080'))
+    if not debug or os.environ.get('WERKZEUG_RUN_MAIN') == 'true':
         _recover_inflight_chunks()
-    print('Series Writer запущен → http://localhost:8080')
-    app.run(debug=True, port=8080, host='0.0.0.0', threaded=True)
+    print(f'Series Writer запущен → http://localhost:{port}  (debug={debug})')
+    app.run(debug=debug, port=port, host='0.0.0.0', threaded=True)
 else:
-    # When running under gunicorn / WSGI (production), invoke recovery on import.
+    # Production: gunicorn imports this module. Run recovery once on boot.
     _recover_inflight_chunks()
