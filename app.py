@@ -3,14 +3,23 @@ import os
 import re
 import uuid
 import random
+import secrets
 import shutil
 import datetime
 import time
 import subprocess
 import requests
 from pathlib import Path
-from flask import Flask, request, jsonify, render_template, send_from_directory
+from functools import wraps
+from urllib.parse import urlencode
+from flask import (Flask, request, jsonify, render_template, send_from_directory,
+                   session, redirect, url_for, abort)
 from werkzeug.utils import secure_filename
+try:
+    from authlib.integrations.flask_client import OAuth
+    _AUTHLIB_AVAILABLE = True
+except ImportError:
+    _AUTHLIB_AVAILABLE = False
 
 
 _TRANSLIT = {
@@ -60,6 +69,151 @@ def _load_anthropic_key():
 
 ANTHROPIC_KEY = _load_anthropic_key()
 ALLOWED_EXTENSIONS = {'jpg', 'jpeg', 'png', 'webp'}
+
+
+# ── Auth (Google OAuth, restricted to a single Workspace domain) ─────────────
+#
+# Modes:
+#   • Production: set GOOGLE_CLIENT_ID + GOOGLE_CLIENT_SECRET env vars.
+#     OAuth flow runs, only @AUTH_ALLOWED_DOMAIN emails get in.
+#   • Dev (default for local): no env vars set → DEV_BYPASS auto-logs in
+#     as DEV_USER_EMAIL so existing local workflow keeps working.
+
+AUTH_ALLOWED_DOMAIN = os.environ.get('AUTH_ALLOWED_DOMAIN', 'gamegears.online').lower()
+DEV_USER_EMAIL      = os.environ.get('DEV_USER_EMAIL', 'local@dev').lower()
+GOOGLE_CLIENT_ID    = os.environ.get('GOOGLE_CLIENT_ID', '').strip()
+GOOGLE_CLIENT_SECRET= os.environ.get('GOOGLE_CLIENT_SECRET', '').strip()
+AUTH_ENABLED        = bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and _AUTHLIB_AVAILABLE)
+
+# Persist Flask session secret across restarts so users don't get logged out
+# every time we redeploy. Stored in a gitignored file.
+def _get_or_create_secret():
+    env_secret = os.environ.get('FLASK_SECRET_KEY', '').strip()
+    if env_secret:
+        return env_secret
+    fp = BASE / '.flask_secret'
+    if fp.exists():
+        try:
+            return fp.read_text().strip()
+        except Exception:
+            pass
+    s = secrets.token_hex(32)
+    try:
+        fp.write_text(s)
+        try: fp.chmod(0o600)
+        except Exception: pass
+    except Exception:
+        pass
+    return s
+
+app.config['SECRET_KEY'] = _get_or_create_secret()
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE='Lax',
+    # Set SECURE on production via env (Caddy terminates TLS)
+    SESSION_COOKIE_SECURE=bool(os.environ.get('SESSION_COOKIE_SECURE')),
+    PERMANENT_SESSION_LIFETIME=datetime.timedelta(days=14),
+)
+
+oauth = None
+if AUTH_ENABLED:
+    oauth = OAuth(app)
+    oauth.register(
+        name='google',
+        client_id=GOOGLE_CLIENT_ID,
+        client_secret=GOOGLE_CLIENT_SECRET,
+        server_metadata_url='https://accounts.google.com/.well-known/openid-configuration',
+        client_kwargs={'scope': 'openid email profile'},
+    )
+
+def current_user_email():
+    """Returns the logged-in user's email, or None if not authenticated."""
+    if not AUTH_ENABLED:
+        return DEV_USER_EMAIL
+    return (session.get('user') or {}).get('email')
+
+def _is_path_allowed(path):
+    """Paths that bypass the auth gate."""
+    if path.startswith('/static/'):
+        return True
+    return path in ('/login', '/auth/google', '/auth/google/callback', '/auth/logout', '/healthz')
+
+@app.before_request
+def _require_auth():
+    if not AUTH_ENABLED:
+        return None  # dev bypass
+    if _is_path_allowed(request.path):
+        return None
+    if current_user_email():
+        return None
+    # Browser request → redirect to login. API call (XHR/fetch) → 401 JSON.
+    if request.path.startswith('/api/') or request.headers.get('X-Requested-With') == 'XMLHttpRequest':
+        return jsonify({'error': 'auth_required'}), 401
+    return redirect(url_for('login'))
+
+@app.route('/login')
+def login():
+    if not AUTH_ENABLED:
+        return redirect('/')
+    if current_user_email():
+        return redirect('/')
+    return render_template('login.html', domain=AUTH_ALLOWED_DOMAIN)
+
+@app.route('/auth/google')
+def auth_google_start():
+    if not AUTH_ENABLED:
+        return redirect('/')
+    redirect_uri = url_for('auth_google_callback', _external=True)
+    # `hd` hint restricts the chooser to a single Workspace domain.
+    return oauth.google.authorize_redirect(redirect_uri, hd=AUTH_ALLOWED_DOMAIN)
+
+@app.route('/auth/google/callback')
+def auth_google_callback():
+    if not AUTH_ENABLED:
+        return redirect('/')
+    try:
+        token = oauth.google.authorize_access_token()
+    except Exception as e:
+        return render_template('login.html', domain=AUTH_ALLOWED_DOMAIN,
+                               error=f'OAuth error: {e}'), 400
+    info = token.get('userinfo') or {}
+    email = (info.get('email') or '').lower().strip()
+    domain = email.rsplit('@', 1)[-1] if '@' in email else ''
+    if not info.get('email_verified') or domain != AUTH_ALLOWED_DOMAIN:
+        return render_template('login.html', domain=AUTH_ALLOWED_DOMAIN,
+                               error=f'Доступ только для @{AUTH_ALLOWED_DOMAIN}. Вошли как: {email or "?"}'), 403
+    session.permanent = True
+    session['user'] = {
+        'email': email,
+        'name': info.get('name') or email.split('@')[0],
+        'picture': info.get('picture') or '',
+    }
+    return redirect('/')
+
+@app.route('/auth/logout', methods=['GET', 'POST'])
+def auth_logout():
+    session.pop('user', None)
+    if AUTH_ENABLED:
+        return redirect(url_for('login'))
+    return redirect('/')
+
+@app.route('/api/me')
+def api_me():
+    email = current_user_email()
+    if not email:
+        return jsonify({'email': None}), 401
+    info = (session.get('user') or {}) if AUTH_ENABLED else {'email': email, 'name': 'Local Dev'}
+    return jsonify({
+        'email': email,
+        'name': info.get('name') or email.split('@')[0],
+        'picture': info.get('picture') or '',
+        'auth_enabled': AUTH_ENABLED,
+        'domain': AUTH_ALLOWED_DOMAIN,
+    })
+
+@app.route('/healthz')
+def healthz():
+    return {'ok': True, 'auth': AUTH_ENABLED}
 
 
 # ── Config ──────────────────────────────────────────────────────────────────

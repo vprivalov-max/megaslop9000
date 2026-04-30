@@ -178,6 +178,17 @@ document.addEventListener('DOMContentLoaded', () => {
   if (c) c.addEventListener('click', () => Tasks.clearFinished());
   // Tick durations every 2s while anything is running
   setInterval(() => { if (Tasks._items.some(x => x.status === 'running')) Tasks._render(); }, 2000);
+  // Load current user info → header pill
+  fetch('/api/me').then(r => r.ok ? r.json() : null).then(me => {
+    if (!me || !me.email) return;
+    const pill = document.getElementById('user-pill');
+    const lbl = document.getElementById('user-pill-email');
+    if (pill && lbl) {
+      lbl.textContent = me.email;
+      pill.title = me.name ? `${me.name} · ${me.email}` : me.email;
+      pill.classList.remove('hidden');
+    }
+  }).catch(() => {});
 });
 
 // ── Navigation ────────────────────────────────────────────────────────────────

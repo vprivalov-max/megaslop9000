@@ -80,6 +80,11 @@ button { cursor: pointer; transition: all 0.15s; }
   font-size: 1.1rem; padding: 4px 8px; border-radius: var(--radius-sm);
 }
 .btn-icon:hover { color: var(--text); background: var(--surface3); }
+.user-pill { display: inline-flex; align-items: center; gap: 6px; padding: 3px 8px 3px 10px;
+             background: var(--surface3); border-radius: 999px; font-size: 12px; color: var(--muted); }
+.user-pill-logout { color: var(--muted); text-decoration: none; padding: 0 4px; border-radius: 50%;
+                    transition: background .15s; }
+.user-pill-logout:hover { background: rgba(255,80,80,0.15); color: #ff8a8a; }
 .btn-danger {
   background: none; color: var(--danger); border: 1px solid var(--danger);
   padding: 5px 12px; border-radius: var(--radius-sm); font-size: 0.85rem;

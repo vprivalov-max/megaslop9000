@@ -25,6 +25,7 @@ env/
 config.json
 .env
 .env.*
+.flask_secret
 
 # Temp ffmpeg artifacts
 *.tmp.mp4
