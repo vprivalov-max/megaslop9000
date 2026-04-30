@@ -8,6 +8,7 @@ import shutil
 import datetime
 import time
 import subprocess
+import threading
 import requests
 from pathlib import Path
 from functools import wraps
@@ -93,6 +94,20 @@ for _name, _val in (('ANTHROPIC_API_KEY', ANTHROPIC_KEY),
                     ('RETELLER_API_KEY',  RETELLER_KEY)):
     if not _val:
         print(f'[config] WARNING {_name} is not set — related features will fail')
+
+# ── Render queue ─────────────────────────────────────────────────────────────
+# Cap concurrent ffmpeg renders so N users don't all pin the CPU at once.
+# Each render takes 5–30s of pure CPU; serializing past 2 prevents stalls and
+# OOM. Configurable via env.
+_RENDER_CONCURRENCY = max(1, int(os.environ.get('RENDER_CONCURRENCY', '2')))
+RENDER_SEMAPHORE = threading.BoundedSemaphore(_RENDER_CONCURRENCY)
+
+def _render_queue_depth():
+    """Approximate number of waiters. Bounded semaphores don't expose this
+    directly, so we just report whether the queue is saturated."""
+    # _value is the number of free slots (CPython internal).
+    free = getattr(RENDER_SEMAPHORE, '_value', _RENDER_CONCURRENCY)
+    return {'concurrency': _RENDER_CONCURRENCY, 'free': free, 'busy': _RENDER_CONCURRENCY - free}
 ALLOWED_EXTENSIONS = {'jpg', 'jpeg', 'png', 'webp'}
 
 
@@ -6811,16 +6826,23 @@ def timeline_render(sid):
                '-pix_fmt', 'yuv420p',
                '-c:a', 'aac', '-b:a', '128k', str(out_path)]
 
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-    except subprocess.TimeoutExpired:
-        return jsonify({'error': 'ffmpeg timeout (>10 min)'}), 500
-    if proc.returncode != 0:
-        return jsonify({
-            'error': 'ffmpeg failed',
-            'stderr': proc.stderr[-2000:],
-            'cmd': ' '.join(cmd[:8]) + ' ...',
-        }), 500
+    # Acquire the global render slot. If both slots are busy this blocks until
+    # one frees, naturally queueing concurrent renders.
+    queue_wait_start = time.time()
+    with RENDER_SEMAPHORE:
+        queue_waited = time.time() - queue_wait_start
+        if queue_waited > 0.5:
+            print(f'[render] {sid} waited {queue_waited:.1f}s in queue')
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        except subprocess.TimeoutExpired:
+            return jsonify({'error': 'ffmpeg timeout (>10 min)'}), 500
+        if proc.returncode != 0:
+            return jsonify({
+                'error': 'ffmpeg failed',
+                'stderr': proc.stderr[-2000:],
+                'cmd': ' '.join(cmd[:8]) + ' ...',
+            }), 500
     try:
         if not needs_trim and not needs_crop:
             list_file.unlink(missing_ok=True)
