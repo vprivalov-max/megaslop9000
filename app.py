@@ -50,8 +50,12 @@ app = Flask(__name__, static_folder='static', template_folder='templates')
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB
 
 BASE = Path(__file__).parent
-PROJECTS = BASE / 'projects'
-PROJECTS.mkdir(exist_ok=True)
+# DATA_ROOT holds per-user subfolders: <DATA_ROOT>/<email>/projects/<sid>/...
+# Override via env (DATA_ROOT=/var/lib/series-writer on the server).
+DATA_ROOT = Path(os.environ.get('DATA_ROOT') or (BASE / 'data')).resolve()
+DATA_ROOT.mkdir(parents=True, exist_ok=True)
+# Legacy path — used to one-time-migrate existing single-user data
+LEGACY_PROJECTS = BASE / 'projects'
 CONFIG_FILE = BASE / 'config.json'
 RETELLER_API   = 'https://reteller.ai/api/v1'
 AVAI_API       = 'https://avai-gen.com/api/public/generate'
@@ -383,7 +387,35 @@ def allowed_file(filename):
 
 # ── Storage helpers ──────────────────────────────────────────────────────────
 
-def series_path(sid):   return PROJECTS / sid
+def _safe_email_dir(email):
+    """Map an email to a safe folder name. user@gamegears.online → user_at_gamegears_online."""
+    return re.sub(r'[^a-z0-9]+', '_', (email or '').lower()).strip('_') or 'anon'
+
+def user_root():
+    """Returns Path to current user's project root: <DATA_ROOT>/<email-slug>/projects/.
+    Creates it on first call. Performs a one-time migration from legacy
+    single-user `projects/` for the dev user."""
+    email = current_user_email() or DEV_USER_EMAIL
+    udir = DATA_ROOT / _safe_email_dir(email) / 'projects'
+    udir.mkdir(parents=True, exist_ok=True)
+    # Idempotent migration from legacy single-user `projects/` for the dev user.
+    # For each non-hidden entry in legacy: if missing in user dir, move it over.
+    # Hidden/macOS metadata (._foo, .DS_Store) is ignored so it doesn't block the migration.
+    if email == DEV_USER_EMAIL and LEGACY_PROJECTS.exists():
+        try:
+            for entry in LEGACY_PROJECTS.iterdir():
+                if entry.name.startswith('.') or entry.name.startswith('._'):
+                    continue
+                target = udir / entry.name
+                if target.exists():
+                    continue
+                shutil.move(str(entry), str(target))
+                print(f'[migrate] {entry.name} → {udir.name}/')
+        except Exception as e:
+            print(f'[migrate] WARNING failed: {e}')
+    return udir
+
+def series_path(sid):   return user_root() / sid
 def series_file(sid):   return series_path(sid) / 'series.json'
 def episodes_dir(sid):  return series_path(sid) / 'episodes'
 def assets_dir(sid):    return series_path(sid) / 'assets'
@@ -629,9 +661,10 @@ def list_series():
     # ?archived=1 → only archived projects. Default → only non-archived.
     want_archived = request.args.get('archived') in ('1', 'true', 'yes')
     result = []
-    if not PROJECTS.exists():
+    root = user_root()
+    if not root.exists():
         return jsonify([])
-    for d in sorted(PROJECTS.iterdir()):
+    for d in sorted(root.iterdir()):
         sf = d / 'series.json'
         if sf.exists():
             s = json.loads(sf.read_text())
@@ -1035,7 +1068,7 @@ def toggle_pin(sid):
 def create_series():
     data = request.json
     slug = slugify(data.get('title', ''))
-    sid = slug if slug and not (PROJECTS / slug).exists() else f"{slug}-{str(uuid.uuid4())[:6]}"
+    sid = slug if slug and not (user_root() / slug).exists() else f"{slug}-{str(uuid.uuid4())[:6]}"
     series_data = {
         'id': sid,
         'title': data['title'],
