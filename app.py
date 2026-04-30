@@ -59,19 +59,40 @@ LEGACY_PROJECTS = BASE / 'projects'
 CONFIG_FILE = BASE / 'config.json'
 RETELLER_API   = 'https://reteller.ai/api/v1'
 AVAI_API       = 'https://avai-gen.com/api/public/generate'
-AVAI_KEY       = 'avai_529fd7c24d1e183486d24dc00fb0f851'
-def _load_anthropic_key():
-    """Read Anthropic API key from config.json or env. Config takes priority."""
+
+def _read_config_field(field):
+    """Read a key from config.json (legacy single-user dev fallback)."""
     try:
         if CONFIG_FILE.exists():
             cfg = json.loads(CONFIG_FILE.read_text())
-            k = (cfg.get('anthropic_key') or '').strip()
-            if k: return k
+            return (cfg.get(field) or '').strip()
     except Exception:
         pass
-    return os.environ.get('ANTHROPIC_API_KEY', '').strip()
+    return ''
 
-ANTHROPIC_KEY = _load_anthropic_key()
+def _load_secret(env_name, config_field=None):
+    """Resolve a secret in this order: env var → config.json field → empty.
+    Env wins so production deploys never accidentally fall back to a checked-in
+    legacy config (config.json is gitignored, but exists locally)."""
+    val = (os.environ.get(env_name) or '').strip()
+    if val:
+        return val
+    if config_field:
+        return _read_config_field(config_field)
+    return ''
+
+# All secrets are loaded once at startup. Env vars are the canonical source for
+# production; config.json is a dev-only convenience fallback.
+ANTHROPIC_KEY = _load_secret('ANTHROPIC_API_KEY', 'anthropic_key')
+AVAI_KEY      = _load_secret('AVAI_API_KEY',      'avai_key')
+RETELLER_KEY  = _load_secret('RETELLER_API_KEY',  'reteller_key')
+
+# Warn loudly at startup if anything is missing — easier than debugging 401s later.
+for _name, _val in (('ANTHROPIC_API_KEY', ANTHROPIC_KEY),
+                    ('AVAI_API_KEY',      AVAI_KEY),
+                    ('RETELLER_API_KEY',  RETELLER_KEY)):
+    if not _val:
+        print(f'[config] WARNING {_name} is not set — related features will fail')
 ALLOWED_EXTENSIONS = {'jpg', 'jpeg', 'png', 'webp'}
 
 
@@ -316,8 +337,7 @@ def save_config(cfg):
     CONFIG_FILE.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
 
 def rtl_headers():
-    key = load_config().get('reteller_key', '')
-    return {'Authorization': f'Bearer {key}'}
+    return {'Authorization': f'Bearer {RETELLER_KEY}'}
 
 def _avai_call(provider: str, prompt: str, reference_url: str = None, aspect_ratio: str = '9:16') -> str:
     """One AVAI call with the given provider. Returns image URL or raises."""

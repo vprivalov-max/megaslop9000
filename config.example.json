@@ -1,4 +1,6 @@
 {
-  "reteller_key": "rtl_sk_...",
-  "anthropic_key": "sk-ant-api03-..."
+  "_comment": "DEV-ONLY fallback. In production set env vars instead: ANTHROPIC_API_KEY, AVAI_API_KEY, RETELLER_API_KEY",
+  "anthropic_key": "sk-ant-api03-...",
+  "avai_key": "avai_...",
+  "reteller_key": "rtl_sk_..."
 }
