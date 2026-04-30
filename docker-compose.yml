@@ -1,0 +1,42 @@
+# Production compose for series.gamegears.online
+#
+# Usage on the server:
+#   cp .env.example .env  &&  edit values
+#   docker compose up -d --build
+#
+# Caddy terminates TLS automatically via Let's Encrypt.
+# All persistent state lives in named volumes — surviving container rebuilds.
+
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - DATA_ROOT=/data
+      - PORT=8080
+      - SESSION_COOKIE_SECURE=1
+      - FLASK_DEBUG=0
+    volumes:
+      - app_data:/data
+    expose:
+      - "8080"
+    # No public port — Caddy proxies. Health-check inside container.
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - app
+
+volumes:
+  app_data:
+  caddy_data:
+  caddy_config:

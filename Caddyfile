@@ -1,0 +1,27 @@
+# Caddy 2 config for series.gamegears.online.
+# Replace the hostname below to match your real domain. Caddy will fetch a
+# Let's Encrypt cert automatically on first request.
+
+series.gamegears.online {
+    encode gzip zstd
+
+    # Larger uploads for image refs (50 MB).
+    request_body {
+        max_size 100MB
+    }
+
+    # Long-running renders need long proxy timeouts.
+    reverse_proxy app:8080 {
+        transport http {
+            response_header_timeout 600s
+            read_timeout 600s
+        }
+    }
+
+    # Tighten security headers.
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options nosniff
+        Referrer-Policy strict-origin-when-cross-origin
+    }
+}
