@@ -1,0 +1,31 @@
+# Project data — never commit user content
+projects/
+*.tar.gz
+*-backup-*
+
+# macOS metadata
+.DS_Store
+._*
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+venv/
+.venv/
+env/
+*.log
+
+# Editors / tools
+.idea/
+.vscode/
+.claude/
+
+# Local secrets — config.json contains API keys
+config.json
+.env
+.env.*
+
+# Temp ffmpeg artifacts
+*.tmp.mp4
+concat_*.txt

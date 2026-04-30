@@ -1,0 +1,1059 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Series Writer</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<!-- ── TOP NAV ── -->
+<nav id="topnav">
+  <div class="nav-left">
+    <button class="nav-logo" onclick="navigate('projects')">Series Writer</button>
+    <div id="breadcrumb" class="breadcrumb"></div>
+  </div>
+  <div class="nav-right">
+    <span id="balance-badge" class="badge"></span>
+    <button class="btn-icon" onclick="openSettings()" title="Настройки">⚙</button>
+  </div>
+</nav>
+
+<!-- ══════════════════════════════════════════════════════ -->
+<!-- VIEW: PROJECTS LIST                                    -->
+<!-- ══════════════════════════════════════════════════════ -->
+<div id="view-projects" class="view">
+  <div class="page-header">
+    <h1>Мои сериалы</h1>
+    <div class="page-header-actions">
+      <button class="dropzone-btn" id="dz-archive" onclick="openArchiveModal()" title="Архив (перетащи сериал сюда, чтобы скрыть)">
+        <span class="dz-icon">📦</span>
+        <span class="dz-label">Архив</span>
+      </button>
+      <button class="dropzone-btn dropzone-trash" id="dz-trash" title="Корзина (перетащи сюда, чтобы удалить навсегда)">
+        <span class="dz-icon">🗑️</span>
+        <span class="dz-label">Корзина</span>
+      </button>
+      <button class="btn-primary" onclick="openCreateSeries()">+ Новый сериал</button>
+    </div>
+  </div>
+  <div class="projects-filterbar" id="projects-filterbar">
+    <div class="filter-group">
+      <span class="filter-label">Цвет:</span>
+      <button class="color-filter-btn active" data-color="" onclick="setColorFilter('')" title="Все">∗</button>
+      <button class="color-filter-btn swatch-red"    data-color="red"    onclick="setColorFilter('red')"    title="Красный"></button>
+      <button class="color-filter-btn swatch-orange" data-color="orange" onclick="setColorFilter('orange')" title="Оранжевый"></button>
+      <button class="color-filter-btn swatch-yellow" data-color="yellow" onclick="setColorFilter('yellow')" title="Жёлтый"></button>
+      <button class="color-filter-btn swatch-green"  data-color="green"  onclick="setColorFilter('green')"  title="Зелёный"></button>
+      <button class="color-filter-btn swatch-teal"   data-color="teal"   onclick="setColorFilter('teal')"   title="Бирюза"></button>
+      <button class="color-filter-btn swatch-blue"   data-color="blue"   onclick="setColorFilter('blue')"   title="Синий"></button>
+      <button class="color-filter-btn swatch-purple" data-color="purple" onclick="setColorFilter('purple')" title="Фиолетовый"></button>
+      <button class="color-filter-btn swatch-pink"   data-color="pink"   onclick="setColorFilter('pink')"   title="Розовый"></button>
+      <button class="color-filter-btn swatch-gray"   data-color="gray"   onclick="setColorFilter('gray')"   title="Серый"></button>
+    </div>
+    <div class="filter-group">
+      <button class="star-filter-btn" id="star-filter-btn" onclick="toggleStarFilter()" title="Только избранные">☆ Только избранные</button>
+    </div>
+  </div>
+  <div id="projects-grid" class="projects-grid"></div>
+  <div id="projects-empty" class="empty-state hidden">
+    <p>Ещё нет ни одного проекта.<br>Создай первый сериал!</p>
+  </div>
+</div>
+
+<!-- Archive modal -->
+<div id="modal-archive" class="modal hidden">
+  <div class="modal-box modal-wide">
+    <div class="modal-header">
+      <h2>📦 Архив сериалов</h2>
+      <button class="btn-icon" onclick="closeModal('modal-archive')">✕</button>
+    </div>
+    <div class="modal-body">
+      <p class="muted" style="margin-bottom:14px">Здесь хранятся скрытые сериалы. Нажми «Вернуть», чтобы достать обратно в основной список, или «Удалить навсегда» чтобы стереть с диска.</p>
+      <div id="archive-list" class="archive-list"></div>
+      <div id="archive-empty" class="empty-state hidden"><p>Архив пуст.</p></div>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════ -->
+<!-- VIEW: SERIES (episodes + sidebar)                     -->
+<!-- ══════════════════════════════════════════════════════ -->
+<div id="view-series" class="view hidden">
+  <div class="series-layout">
+
+    <!-- Sidebar -->
+    <aside id="series-sidebar">
+      <div class="sidebar-section">
+        <h3>Библия сериала</h3>
+        <div id="bible-content" class="bible-content"></div>
+        <button class="btn-ghost btn-sm" onclick="openBibleEditor()">Редактировать</button>
+      </div>
+
+      <div class="sidebar-section">
+        <div class="section-header">
+          <h3>Персонажи</h3>
+          <button class="btn-icon" onclick="openAddCharacter()" title="Добавить персонажа">+</button>
+        </div>
+        <div id="characters-list" class="characters-list"></div>
+      </div>
+
+      <div class="sidebar-section">
+        <div class="section-header">
+          <h3>Локации</h3>
+          <button class="btn-icon" onclick="openAddLocation()" title="Добавить локацию">+</button>
+        </div>
+        <div id="locations-list" class="characters-list"></div>
+      </div>
+
+      <div class="sidebar-section">
+        <h3>Стиль</h3>
+        <div id="style-section" class="style-section"></div>
+        <button class="btn-ghost btn-sm" onclick="openStyleEditor()">Редактировать стиль</button>
+      </div>
+    </aside>
+
+    <!-- Main content -->
+    <main class="series-main">
+      <div class="series-toolbar">
+        <h2 id="series-title-display"></h2>
+        <div class="toolbar-actions">
+          <button class="btn-ghost" onclick="openCheckpointModal()" title="Закрепить ключевое событие на конкретной серии">🎯 Контрольная точка</button>
+          <button class="btn-ghost" onclick="openFinaleModal()" title="Указать финальную серию и финальные события">🏁 Финал</button>
+          <label class="video-provider-toggle" title="Где генерим видео">
+            <span>Видео:</span>
+            <select id="video-provider-select" onchange="setVideoProvider(this.value)">
+              <option value="reteller">Reteller</option>
+              <option value="seedance">Seedance</option>
+            </select>
+          </label>
+          <button class="btn-secondary reteller-only" onclick="openReteller()">🎬 Отправить в Reteller</button>
+          <button class="btn-ghost" onclick="renameOutFiles()" title="Переименовать файлы в папке OUT по студийным требованиям">📁 Переименовать OUT</button>
+          <button class="btn-ghost seedance-only" onclick="openMontage()" title="Склеить сгенерированные ролики в одно видео">🎬 Монтаж</button>
+          <button class="btn-primary" onclick="openCreateEpisode()">+ Эпизод</button>
+        </div>
+      </div>
+
+      <div id="landmarks-panel"></div>
+      <div id="pipeline-section"></div>
+
+      <div id="episodes-list" class="episodes-list"></div>
+      <div id="episodes-empty" class="empty-state hidden">
+        <p>Нет эпизодов. Создай первый!</p>
+      </div>
+    </main>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════ -->
+<!-- VIEW: MONTAGE (one timeline per series)              -->
+<!-- ══════════════════════════════════════════════════════ -->
+<div id="view-montage" class="view hidden">
+  <div class="montage-layout">
+    <div class="montage-toolbar">
+      <button class="btn-ghost" onclick="closeMontage()">← Назад к сериалу</button>
+      <h2 id="montage-title">🎬 Монтаж</h2>
+      <div class="montage-actions">
+        <span id="mt-summary" class="muted"></span>
+        <button class="btn-ghost" onclick="mtUndo()" id="mt-undo-btn" title="Отменить (⌘Z)" disabled>↶ Отменить</button>
+        <button class="btn-ghost" onclick="mtRedo()" id="mt-redo-btn" title="Вернуть (⌘⇧Z)" disabled>↷ Вернуть</button>
+        <button class="btn-primary" onclick="mtRender()" id="mt-render-btn">▶ Собрать MP4</button>
+      </div>
+    </div>
+
+    <div class="montage-body">
+      <aside class="montage-library">
+        <h3>Библиотека клипов</h3>
+        <div class="muted" style="font-size:12px;margin-bottom:8px">Только готовые Seedance-ролики из всех эпизодов</div>
+        <div id="mt-library" class="mt-library"></div>
+      </aside>
+
+      <main class="montage-main">
+        <div class="mt-preview-wrap">
+          <div class="mt-preview-frame">
+            <video id="mt-preview" class="mt-preview" preload="metadata" playsinline></video>
+          </div>
+          <div class="mt-preview-controls">
+            <button class="btn-ghost" onclick="mtTogglePlay()" id="mt-playbtn">▶</button>
+            <span id="mt-time" class="muted">0.0с / 0.0с</span>
+            <div style="display:flex;gap:6px">
+              <button class="btn-ghost" onclick="mtStepFrame(-1)" title="−1 кадр">⏪</button>
+              <button class="btn-ghost" onclick="mtStepFrame(1)" title="+1 кадр">⏩</button>
+            </div>
+            <button class="btn-ghost" onclick="mtCutAtPlayhead()" title="Разрезать клип в позиции playhead">✂ Разрезать</button>
+            <button class="btn-ghost" onclick="mtSeekToStart()" title="В начало">⏮</button>
+          </div>
+        </div>
+
+        <h3>Таймлайн <span class="muted" style="font-weight:normal;font-size:12px">· тяни клипы для перестановки · перетаскивай линию для скраба</span></h3>
+        <div class="mt-timeline-toolbar">
+          <span class="muted">Масштаб:</span>
+          <button class="btn-ghost" onclick="mtZoom(-1)" title="Уменьшить">−</button>
+          <span id="mt-zoom-val" class="mt-zoom-val">30 px/s</span>
+          <button class="btn-ghost" onclick="mtZoom(1)" title="Увеличить">+</button>
+          <button class="btn-ghost" onclick="mtZoomFit()" title="Вписать в ширину">Fit</button>
+          <span class="muted" style="margin-left:8px;font-size:11px">⌘+колесо — зум</span>
+        </div>
+        <div id="mt-timeline-wrap" class="mt-timeline-wrap">
+          <div id="mt-timeline" class="mt-timeline"></div>
+          <div id="mt-playhead" class="mt-playhead hidden"></div>
+        </div>
+        <div id="mt-empty" class="muted hidden" style="padding:24px;text-align:center">
+          Таймлайн пустой. Жми ➕ на любом сгенерированном видео в эпизодах, или перетащи из библиотеки слева.
+        </div>
+
+        <div class="mt-renders-section">
+          <h3>Готовые сборки</h3>
+          <div id="mt-renders" class="mt-renders"></div>
+        </div>
+      </main>
+    </div>
+  </div>
+</div>
+
+<!-- Crop modal -->
+<div id="crop-modal" class="crop-modal hidden">
+  <div class="crop-dialog">
+    <div class="crop-header">
+      <h3>✂ Crop &amp; Position</h3>
+      <span class="muted" id="crop-info"></span>
+      <button class="btn-ghost" onclick="cropClose()" style="margin-left:auto">✕</button>
+    </div>
+    <div class="crop-body">
+      <div class="crop-stage" id="crop-stage">
+        <video id="crop-source" preload="metadata" muted playsinline></video>
+        <div class="crop-rect" id="crop-rect">
+          <div class="crop-handle nw"></div><div class="crop-handle ne"></div>
+          <div class="crop-handle sw"></div><div class="crop-handle se"></div>
+        </div>
+        <div class="crop-shade" id="crop-shade"></div>
+      </div>
+      <div class="crop-side">
+        <div class="muted">Тяни рамку — позиция · углы — масштаб (соотношение зафиксировано под выходной кадр)</div>
+        <div id="crop-readout" class="crop-readout"></div>
+        <div class="crop-actions">
+          <button class="btn-ghost" onclick="cropReset()">Сбросить</button>
+          <button class="btn-ghost" onclick="cropClear()">Убрать crop</button>
+          <button class="btn-primary" onclick="cropSave()">Сохранить</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════ -->
+<!-- VIEW: EPISODE EDITOR                                  -->
+<!-- ══════════════════════════════════════════════════════ -->
+<div id="view-episode" class="view hidden">
+  <div class="episode-layout">
+    <div class="episode-editor">
+      <div class="editor-toolbar">
+        <div class="editor-meta">
+          <span id="ep-number-badge" class="ep-badge"></span>
+          <input id="ep-title-input" class="ep-title-input" type="text" placeholder="Название эпизода">
+        </div>
+        <div class="editor-actions">
+          <span id="ep-status-badge" class="status-badge"></span>
+          <label class="ep-ready-label" title="Отметить серию как готовую — попадёт в счётчик готовых на странице проектов">
+            <input type="checkbox" id="ep-ready-toggle" onchange="onReadyToggle()"> Готово
+          </label>
+          <button class="btn-ghost" onclick="goBackToSeries()">← Назад</button>
+          <button class="btn-primary" onclick="saveEpisode()">Сохранить</button>
+        </div>
+      </div>
+
+      <div class="editor-body">
+        <div class="field-group">
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
+            <label style="margin:0">Синопсис</label>
+            <button class="btn-ghost btn-sm" onclick="translateField('ep-synopsis','Синопсис')">🌐 Перевести</button>
+          </div>
+          <textarea id="ep-synopsis" class="synopsis-area" placeholder="Краткое содержание эпизода..."></textarea>
+        </div>
+
+        <div class="field-group">
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
+            <label style="margin:0">Сценарий</label>
+            <div style="display:flex;gap:6px;align-items:center">
+              <button class="btn-ghost btn-sm" id="ep-history-btn" onclick="openScriptHistory()" title="Предыдущие версии сценария (после регенерации или Доктора)">↩ История</button>
+              <button class="btn-ghost btn-sm" id="ep-doctor-btn" onclick="doctorScript()" title="Найти и исправить логические дыры в сценарии (статус персонажей, мотивации, enabling conditions)">🩺 Доктор сценария</button>
+              <button class="btn-ghost btn-sm" id="ep-extract-chars-btn" onclick="extractCharsFromScript()" title="Найти персонажей и локации в сценарии, добавить новые в сериал и пересверить активных в этой сцене">🤖 Извлечь персонажей и локации</button>
+              <button class="ep-script-btn ready" id="ep-gen-script-btn" onclick="generateEpisodeScript()">⚡ Сгенерировать</button>
+            </div>
+          </div>
+          <textarea id="ep-script" class="script-area" placeholder="Screenplay / Script..."></textarea>
+          <div class="char-counter" style="display:flex;justify-content:space-between">
+            <span id="ep-script-gen-status" style="font-size:0.78rem;color:var(--warning)"></span>
+            <span><span id="script-char-count">0</span> символов</span>
+          </div>
+
+          <!-- Inline logic-check panel (appears after script gen if violations found) -->
+          <div id="ep-logic-panel" class="logic-panel hidden">
+            <div class="logic-panel-header">
+              <div>
+                <span class="logic-panel-title">🩺 Проверка логики: <span id="ep-logic-count">0</span> замечаний</span>
+                <div class="logic-panel-sub">Сценарий проверен с учётом предыдущей серии. Отметь те пункты, которые хочешь починить — или нажми «Игнорировать всё», чтобы сразу перейти к Reteller-промпту.</div>
+              </div>
+              <div class="logic-panel-actions">
+                <button class="btn-ghost btn-sm" id="ep-logic-toggle-all" type="button" onclick="toggleAllLogicViolations()">Выделить всё</button>
+                <button class="btn-sm btn-accent" id="ep-logic-fix-btn" type="button" onclick="fixSelectedLogicIssues()">🩹 Лечить выбранное</button>
+                <button class="btn-ghost btn-sm" id="ep-logic-skip-btn" type="button" onclick="skipLogicAndContinue()">Игнорировать всё → Reteller</button>
+              </div>
+            </div>
+            <div id="ep-logic-list" class="logic-violation-list"></div>
+          </div>
+        </div>
+
+        <div class="field-group">
+          <label>Заметки</label>
+          <textarea id="ep-notes" class="notes-area" placeholder="Режиссёрские заметки, идеи..."></textarea>
+        </div>
+
+        <!-- ── SEEDANCE PANEL — visible only in seedance-mode ───────────── -->
+        <div class="field-group seedance-only" id="seedance-panel">
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
+            <label style="margin:0">🎬 Seedance — генерация видео</label>
+            <span id="sd-poll-status" style="font-size:0.78rem;color:var(--muted)"></span>
+          </div>
+
+          <div class="sd-composer">
+            <textarea id="sd-chunk-text" class="notes-area" style="min-height:90px"
+              placeholder="Вставь сюда кусок сценария (5-15 сек экранного времени)..."></textarea>
+
+            <div class="sd-row">
+              <button class="btn-sm btn-accent" onclick="sdCompose()">⚙ Скомпоновать (LLM)</button>
+              <span id="sd-compose-status" style="font-size:0.78rem;color:var(--muted)"></span>
+            </div>
+
+            <textarea id="sd-prompt" class="notes-area" style="min-height:70px;font-family:monospace;font-size:0.8rem"
+              placeholder="Motion prompt (англ) — упомяни референсы как @Image1, @Image2..."></textarea>
+
+            <div class="sd-refs">
+              <div class="sd-refs-label">Референсы (drag из правой панели):</div>
+              <div id="sd-ref-slots" class="sd-ref-slots"
+                ondragover="event.preventDefault()"
+                ondrop="sdHandleDrop(event)"></div>
+            </div>
+
+            <div class="sd-row sd-params">
+              <label class="sd-duration-label">Длит:
+                <input type="range" id="sd-duration" min="5" max="15" step="1" value="15" style="width:140px;vertical-align:middle">
+                <span id="sd-duration-val" style="display:inline-block;min-width:32px;text-align:right">15с</span>
+              </label>
+              <label>Разреш:
+                <select id="sd-resolution">
+                  <option value="720p" selected>720p</option>
+                  <option value="480p">480p</option>
+                </select>
+              </label>
+              <label>Обход модер:
+                <select id="sd-mod-bypass">
+                  <option value="off">off</option>
+                  <option value="grid">grid</option>
+                  <option value="collage_grid" selected>collage_grid</option>
+                </select>
+              </label>
+              <button class="btn-primary btn-sm" onclick="sdGenerate()">▶ Сгенерировать</button>
+            </div>
+          </div>
+
+          <div id="sd-gen-list" class="sd-gen-list"></div>
+        </div>
+
+        <div class="field-group reteller-only">
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
+            <label style="margin:0">Промпт для Reteller</label>
+            <div style="display:flex;gap:6px;align-items:center">
+              <span id="ep-rtl-status" style="font-size:0.78rem;color:var(--muted)"></span>
+              <button class="btn-sm btn-accent" id="ep-rtl-gen-btn" onclick="generateEpRettellerPrompt()">⚡ Сгенерировать</button>
+            </div>
+          </div>
+          <textarea id="ep-reteller-prompt" class="notes-area" style="min-height:160px;font-family:monospace;font-size:0.78rem" placeholder="Промпт для Reteller будет здесь после генерации сценария..."></textarea>
+        </div>
+      </div>
+    </div>
+
+    <aside class="episode-sidebar">
+      <div class="sidebar-section">
+        <div class="sidebar-section-header">
+          <h3>Персонажи</h3>
+          <button class="btn-folder" title="Открыть папку с фото" onclick="openAssetFolder('characters')">📁</button>
+        </div>
+        <div id="ep-characters-list" class="ep-characters-check"></div>
+      </div>
+
+      <div class="sidebar-section">
+        <div class="sidebar-section-header">
+          <h3>Локации</h3>
+          <button class="btn-folder" title="Открыть папку с фото" onclick="openAssetFolder('locations')">📁</button>
+        </div>
+        <div id="ep-locations-list" class="ep-locations-check"></div>
+      </div>
+
+      <div id="ep-reteller-section" class="sidebar-section reteller-only">
+        <h3>Reteller</h3>
+        <div id="ep-reteller-info" class="reteller-info"></div>
+        <button class="btn-primary btn-sm" id="ep-rtl-submit-btn" style="margin-top:10px;width:100%" onclick="submitEpisodeToReteller()">
+          📝 Создать драфт этой серии
+        </button>
+        <div id="ep-rtl-submit-status" style="font-size:0.78rem;color:var(--muted);margin-top:6px;text-align:center"></div>
+        <button class="btn-ghost btn-sm" style="margin-top:8px;width:100%" onclick="openReteller()">📋 Драфты для диапазона →</button>
+      </div>
+    </aside>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════ -->
+<!-- DRAWER: RETELLER PANEL                                -->
+<!-- ══════════════════════════════════════════════════════ -->
+<div id="reteller-overlay" class="overlay hidden" onclick="closeReteller()"></div>
+<div id="reteller-drawer" class="drawer hidden">
+  <div class="drawer-header">
+    <h2>Отправить в Reteller</h2>
+    <button class="btn-icon" onclick="closeReteller()">✕</button>
+  </div>
+
+  <div class="drawer-body">
+    <!-- Range selector -->
+    <div class="drawer-section">
+      <h3>Диапазон серий</h3>
+      <div class="range-picker">
+        <div class="range-field">
+          <label>С эпизода</label>
+          <input id="range-from" type="number" min="1" value="1" onchange="updateRangePreview()">
+        </div>
+        <div class="range-sep">—</div>
+        <div class="range-field">
+          <label>По эпизод</label>
+          <input id="range-to" type="number" min="1" value="1" onchange="updateRangePreview()">
+        </div>
+      </div>
+      <div id="range-episodes-preview" class="range-preview"></div>
+    </div>
+
+    <!-- Asset slots -->
+    <div class="drawer-section">
+      <h3>Ассеты персонажей</h3>
+      <div id="asset-characters" class="asset-grid"></div>
+    </div>
+
+    <div class="drawer-section">
+      <h3>Ассеты локаций</h3>
+      <div id="asset-locations" class="asset-grid"></div>
+    </div>
+
+    <div class="drawer-section">
+      <h3>Референсы стиля</h3>
+      <div id="asset-style" class="asset-grid"></div>
+      <label class="upload-zone" id="style-upload-zone">
+        <input type="file" accept="image/*" multiple onchange="uploadStyleRefs(this.files)" hidden>
+        <span>+ Добавить референс стиля</span>
+      </label>
+    </div>
+
+    <!-- Settings -->
+    <div class="drawer-section">
+      <h3>Настройки генерации</h3>
+      <div class="settings-grid">
+        <div class="setting-field" style="grid-column: 1 / -1">
+          <label>Хронометраж (сек)</label>
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <input id="rtl-duration" type="number" min="15" max="1800" value="90" style="width:100px">
+            <div id="rtl-duration-presets" style="display:flex;gap:4px;flex-wrap:wrap">
+              <button type="button" class="btn-ghost btn-sm" onclick="setRtlDuration(60)">1x · 60с</button>
+              <button type="button" class="btn-ghost btn-sm" onclick="setRtlDuration(90)">1.5x · 90с</button>
+              <button type="button" class="btn-ghost btn-sm" onclick="setRtlDuration(120)">2x · 120с</button>
+              <button type="button" class="btn-ghost btn-sm" onclick="setRtlDuration(150)">2.5x · 150с</button>
+              <button type="button" class="btn-ghost btn-sm" onclick="setRtlDuration(180)">3x · 3мин</button>
+              <button type="button" class="btn-ghost btn-sm" onclick="setRtlDuration(240)">4x · 4мин</button>
+              <button type="button" class="btn-ghost btn-sm" onclick="setRtlDuration(300)">5x · 5мин</button>
+              <button type="button" class="btn-ghost btn-sm" onclick="setRtlDuration(480)">8x · 8мин</button>
+            </div>
+          </div>
+          <div style="font-size:0.72rem;color:var(--muted);margin-top:4px">Применяется ко всем эпизодам в диапазоне</div>
+        </div>
+        <div class="setting-field">
+          <label>Язык</label>
+          <select id="rtl-language">
+            <option value="Russian">Русский</option>
+            <option value="English">English</option>
+          </select>
+        </div>
+        <div class="setting-field">
+          <label>Стиль изображений</label>
+          <select id="rtl-style">
+            <option value="cinematic">Кинематограф</option>
+            <option value="photorealistic">Фотореализм</option>
+            <option value="anime">Аниме</option>
+            <option value="auto">Авто</option>
+            <option value="custom">Свой</option>
+          </select>
+        </div>
+        <div class="setting-field">
+          <label>Провайдер изображений</label>
+          <select id="rtl-image-provider">
+            <option value="seedream">Seedream (4K)</option>
+            <option value="banana">Banana (Gemini)</option>
+            <option value="flux2">Flux2</option>
+          </select>
+        </div>
+        <div class="setting-field">
+          <label>Голос</label>
+          <input id="rtl-voice" type="text" value="Enceladus" placeholder="Enceladus">
+        </div>
+        <div class="setting-field">
+          <label>Провайдер озвучки</label>
+          <select id="rtl-tts-provider">
+            <option value="elevenlabs">ElevenLabs</option>
+            <option value="gemini">Gemini TTS</option>
+          </select>
+        </div>
+        <div class="setting-field">
+          <label>Соотношение сторон</label>
+          <select id="rtl-aspect">
+            <option value="9:16">9:16 (вертикальное)</option>
+            <option value="16:9">16:9 (горизонтальное)</option>
+            <option value="1:1">1:1 (квадрат)</option>
+          </select>
+        </div>
+        <div class="setting-field checkbox-field">
+          <label>
+            <input id="rtl-music" type="checkbox" checked>
+            Фоновая музыка
+          </label>
+        </div>
+        <div class="setting-field checkbox-field">
+          <label>
+            <input id="rtl-animation" type="checkbox">
+            Анимация кадров
+          </label>
+        </div>
+        <div class="setting-field checkbox-field">
+          <label>
+            <input id="rtl-multivoice" type="checkbox">
+            Мультиозвучка
+          </label>
+        </div>
+      </div>
+    </div>
+
+    <!-- Range prompt -->
+    <div class="drawer-section">
+      <h3>Промпт для диапазона</h3>
+      <button class="btn-secondary btn-full" id="rtl-range-prompt-btn" onclick="generateRangePrompt()">📋 Сгенерировать промпт для Reteller</button>
+      <div id="rtl-range-prompt-result" class="hidden" style="margin-top:12px">
+        <textarea id="rtl-range-prompt-text" class="script-area" rows="6" readonly style="background:var(--surface2);cursor:text;font-size:0.82rem"></textarea>
+        <div id="rtl-range-cast" style="margin-top:10px;font-size:0.82rem;color:var(--muted)"></div>
+        <button class="btn-ghost btn-sm" style="margin-top:6px" onclick="copyRangePrompt()">Копировать</button>
+      </div>
+      <div id="rtl-range-prompt-status" class="pipeline-status" style="margin-top:6px"></div>
+    </div>
+
+    <!-- Submit + results -->
+    <div class="drawer-section">
+      <button id="rtl-submit-btn" class="btn-primary btn-lg btn-full" onclick="submitToReteller()">
+        📝 Создать драфты в Reteller
+      </button>
+      <div id="rtl-results" class="rtl-results"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════ -->
+<!-- MODALS                                                -->
+<!-- ══════════════════════════════════════════════════════ -->
+
+<!-- Create Series Modal -->
+<div id="modal-create-series" class="modal hidden">
+  <div class="modal-box modal-wide">
+    <div class="modal-header">
+      <h2>Новый сериал</h2>
+      <button class="btn-icon" onclick="closeModal('modal-create-series')">✕</button>
+    </div>
+    <div class="modal-body">
+
+      <!-- AI idea block -->
+      <div class="idea-gen-block">
+        <div class="field-group" style="margin-bottom:0">
+          <label>Опиши идею — AI заполнит все поля</label>
+          <textarea id="series-idea-input" rows="2" placeholder="Например: История девушки-официантки которая влюбляется в своего босса-мафиози..."></textarea>
+        </div>
+
+        <!-- Genre filters -->
+        <div class="genre-filter-block" id="genre-filter-block">
+          <span class="genre-filter-label">Жанр:</span>
+        </div>
+        <div id="genre-tooltip" class="genre-tooltip hidden"></div>
+
+        <div style="margin-top:6px;display:flex;justify-content:flex-end">
+          <button type="button" class="btn-ghost" id="btn-randomize-genres" onclick="randomizeGenres()" style="font-size:0.85rem;padding:4px 10px">🎲 Случайные жанры</button>
+        </div>
+
+        <div class="idea-gen-actions">
+          <button class="btn-idea-gen" id="btn-gen-from-idea" onclick="generateFromIdea()">✨ Сгенерировать по идее</button>
+          <span class="idea-gen-sep">или</span>
+          <button class="btn-idea-random" id="btn-gen-ideas" onclick="generateSeriesIdeas()">💡 5 идей на выбор</button>
+        </div>
+        <div id="series-ideas-list" class="series-ideas-list hidden"></div>
+        <div id="series-gen-status" class="series-gen-status"></div>
+      </div>
+
+      <!-- Auto-generate assets toggle -->
+      <div class="field-group" style="display:flex;align-items:flex-start;gap:10px;background:rgba(132,94,247,0.06);border:1px solid rgba(132,94,247,0.2);border-radius:8px;padding:10px 12px;margin:12px 0">
+        <input type="checkbox" id="new-series-autogen" checked style="margin-top:3px;width:18px;height:18px;flex-shrink:0">
+        <label for="new-series-autogen" style="cursor:pointer;flex:1">
+          <div style="font-weight:600;color:var(--text)">⚡ Авто-генерация всех картинок</div>
+          <div style="font-size:0.83rem;color:var(--muted);margin-top:2px">Все персонажи, их костюмы и локации будут генериться автоматически как только появятся в сюжете. Сними галочку, чтобы запускать вручную.</div>
+        </label>
+      </div>
+
+      <div class="idea-divider"><span>Поля сериала</span></div>
+
+      <div class="field-group">
+        <label>Название *</label>
+        <input id="new-series-title" type="text" placeholder="Название сериала">
+      </div>
+      <div class="two-col">
+        <div class="field-group">
+          <label>Жанр</label>
+          <input id="new-series-genre" type="text" placeholder="Романтика, Триллер...">
+        </div>
+        <div class="field-group">
+          <label>Тон</label>
+          <input id="new-series-tone" type="text" placeholder="Драматичный, Мистический...">
+        </div>
+      </div>
+      <div class="field-group">
+        <label>Целевая аудитория</label>
+        <input id="new-series-audience" type="text" placeholder="Женщины 25-35, TikTok...">
+      </div>
+      <div class="field-group">
+        <label>Описание мира</label>
+        <textarea id="new-series-world" placeholder="Кратко о сеттинге, времени действия..."></textarea>
+      </div>
+      <div class="field-group">
+        <label>Синопсис</label>
+        <textarea id="new-series-synopsis" rows="3" placeholder="Краткое описание основного конфликта и арки сериала..."></textarea>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn-ghost" onclick="closeModal('modal-create-series')">Отмена</button>
+      <button class="btn-primary" onclick="createSeries()">Создать</button>
+    </div>
+  </div>
+</div>
+
+<!-- Script History Modal -->
+<div id="modal-script-history" class="modal hidden">
+  <div class="modal-box modal-wide">
+    <div class="modal-header">
+      <h2>История версий сценария</h2>
+      <button class="btn-icon" onclick="closeModal('modal-script-history')">✕</button>
+    </div>
+    <div class="modal-body">
+      <div id="script-history-list" style="display:flex;flex-direction:column;gap:8px"></div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn-ghost" onclick="closeModal('modal-script-history')">Закрыть</button>
+    </div>
+  </div>
+</div>
+
+<!-- Bible Editor Modal -->
+<div id="modal-bible" class="modal hidden">
+  <div class="modal-box modal-wide">
+    <div class="modal-header">
+      <h2>Библия сериала</h2>
+      <button class="btn-icon" onclick="closeModal('modal-bible')">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="field-group">
+        <label>Название</label>
+        <input id="bible-title" type="text">
+      </div>
+      <div class="two-col">
+        <div class="field-group">
+          <label>Жанр</label>
+          <input id="bible-genre" type="text">
+        </div>
+        <div class="field-group">
+          <label>Тон</label>
+          <input id="bible-tone" type="text">
+        </div>
+      </div>
+      <div class="field-group">
+        <label>Целевая аудитория</label>
+        <input id="bible-audience" type="text">
+      </div>
+      <div class="field-group">
+        <label>Описание мира</label>
+        <textarea id="bible-world" rows="5"></textarea>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn-ghost" onclick="closeModal('modal-bible')">Отмена</button>
+      <button class="btn-primary" onclick="saveBible()">Сохранить</button>
+    </div>
+  </div>
+</div>
+
+<!-- Add Character Modal -->
+<div id="modal-character" class="modal hidden">
+  <div class="modal-box">
+    <div class="modal-header">
+      <h2 id="char-modal-title">Новый персонаж</h2>
+      <button class="btn-icon" onclick="closeModal('modal-character')">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="field-group">
+        <label>Имя *</label>
+        <input id="char-name" type="text" placeholder="Имя персонажа">
+      </div>
+      <div class="field-group">
+        <label>Описание / роль</label>
+        <textarea id="char-description" placeholder="Кто этот персонаж, его роль в истории..."></textarea>
+      </div>
+      <div class="field-group">
+        <label>Внешность</label>
+        <textarea id="char-appearance" placeholder="Как выглядит (для AI генерации изображений)..."></textarea>
+      </div>
+      <div class="two-col">
+        <div class="field-group">
+          <label>Пол</label>
+          <select id="char-gender">
+            <option value="female">Женский</option>
+            <option value="male">Мужской</option>
+          </select>
+        </div>
+        <div class="field-group">
+          <label>ID голоса ElevenLabs</label>
+          <input id="char-voice-id" type="text" placeholder="опционально">
+        </div>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn-ghost" onclick="closeModal('modal-character')">Отмена</button>
+      <button class="btn-primary" onclick="saveCharacter()">Сохранить</button>
+    </div>
+  </div>
+</div>
+
+<!-- Style Editor Modal -->
+<div id="modal-style" class="modal hidden">
+  <div class="modal-box">
+    <div class="modal-header">
+      <h2>Стиль сериала</h2>
+      <button class="btn-icon" onclick="closeModal('modal-style')">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="field-group">
+        <label>Визуальный стиль</label>
+        <select id="style-type">
+          <option value="cinematic">Кинематограф</option>
+          <option value="photorealistic">Фотореализм</option>
+          <option value="anime">Аниме</option>
+          <option value="auto">Авто (AI выберет)</option>
+          <option value="custom">Свой стиль</option>
+        </select>
+      </div>
+      <div class="field-group">
+        <label>Описание своего стиля</label>
+        <textarea id="style-custom-desc" placeholder="Описание стиля (для style=custom)..."></textarea>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn-ghost" onclick="closeModal('modal-style')">Отмена</button>
+      <button class="btn-primary" onclick="saveStyle()">Сохранить</button>
+    </div>
+  </div>
+</div>
+
+<!-- Create Episode Modal -->
+<div id="modal-create-episode" class="modal hidden">
+  <div class="modal-box">
+    <div class="modal-header">
+      <h2 id="new-ep-modal-title">Новый эпизод</h2>
+      <button class="btn-icon" onclick="closeModal('modal-create-episode')">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="field-group" style="margin-bottom:14px">
+        <label>Номер эпизода</label>
+        <input id="new-ep-number" type="number" min="1" step="1" style="width:100px">
+      </div>
+      <div class="field-group">
+        <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;">
+          <label style="margin:0">Синопсис</label>
+          <button id="btn-gen-new-ep-synopsis" class="btn-sm btn-accent" onclick="generateNewEpSynopsis()">✨ Сгенерировать</button>
+          <span id="new-ep-synopsis-status" style="font-size:12px;color:var(--muted)"></span>
+        </div>
+        <textarea id="new-ep-synopsis" placeholder="Краткое содержание..." style="min-height:100px"></textarea>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn-ghost" onclick="closeModal('modal-create-episode')">Отмена</button>
+      <button class="btn-primary" onclick="createEpisode()">Создать</button>
+    </div>
+  </div>
+</div>
+
+<!-- Add Location Modal -->
+<div id="modal-location" class="modal hidden">
+  <div class="modal-box">
+    <div class="modal-header">
+      <h2 id="loc-modal-title">Новая локация</h2>
+      <button class="btn-icon" onclick="closeModal('modal-location')">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="field-group">
+        <label>Название *</label>
+        <input id="loc-name" type="text" placeholder="Кафе на углу, Офис главного героя...">
+      </div>
+      <div class="field-group">
+        <label>Описание</label>
+        <textarea id="loc-description" placeholder="Как выглядит локация, атмосфера, детали интерьера/экстерьера..."></textarea>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn-ghost" onclick="closeModal('modal-location')">Отмена</button>
+      <button class="btn-primary" onclick="saveLocation()">Сохранить</button>
+    </div>
+  </div>
+</div>
+
+<!-- Location Assets Modal -->
+<div id="modal-loc-assets" class="modal hidden">
+  <div class="modal-box modal-wide">
+    <div class="modal-header">
+      <h2 id="loc-assets-title">Фото локации</h2>
+      <button class="btn-icon" onclick="closeModal('modal-loc-assets')">✕</button>
+    </div>
+    <div class="modal-body">
+      <div id="loc-assets-grid" class="assets-photo-grid"></div>
+      <label class="upload-zone">
+        <input type="file" accept="image/*" multiple id="loc-asset-file-input" hidden>
+        <span>+ Загрузить фото локации</span>
+      </label>
+    </div>
+    <div class="modal-footer">
+      <button class="btn-primary" onclick="closeModal('modal-loc-assets')">Готово</button>
+    </div>
+  </div>
+</div>
+
+<!-- Prompt Display Modal -->
+<div id="modal-prompt" class="modal hidden">
+  <div class="modal-box modal-wide">
+    <div class="modal-header">
+      <h2>Промпт для Banana 2</h2>
+      <button class="btn-icon" onclick="closeModal('modal-prompt')">✕</button>
+    </div>
+    <div class="modal-body">
+      <p style="color:var(--muted);font-size:0.85rem;margin-bottom:8px">
+        Скопируй этот промпт и используй в Banana 2 / Gemini Image для генерации референса.
+      </p>
+      <textarea id="prompt-text" class="script-area" rows="7" readonly style="background:var(--surface2);cursor:text"></textarea>
+    </div>
+    <div class="modal-footer">
+      <button class="btn-ghost" onclick="closeModal('modal-prompt')">Закрыть</button>
+      <button class="btn-primary" onclick="copyPrompt()">Копировать</button>
+    </div>
+  </div>
+</div>
+
+<!-- Translation Modal -->
+<div id="modal-translate" class="modal hidden">
+  <div class="modal-box modal-wide">
+    <div class="modal-header">
+      <h2 id="translate-modal-title">Перевод</h2>
+      <button class="btn-icon" onclick="closeModal('modal-translate')">✕</button>
+    </div>
+    <div class="modal-body">
+      <div id="translate-content" style="white-space:pre-wrap;line-height:1.6;font-size:0.9rem;max-height:60vh;overflow-y:auto;padding:4px 0"></div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn-ghost" onclick="closeModal('modal-translate')">Закрыть</button>
+      <button class="btn-primary" onclick="copyTranslation()">Копировать</button>
+    </div>
+  </div>
+</div>
+
+<!-- Settings Modal -->
+<div id="modal-settings" class="modal hidden">
+  <div class="modal-box">
+    <div class="modal-header">
+      <h2>Настройки</h2>
+      <button class="btn-icon" onclick="closeModal('modal-settings')">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="field-group">
+        <label>Reteller API Key</label>
+        <input id="settings-rtl-key" type="password" placeholder="rtl_sk_...">
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn-ghost" onclick="closeModal('modal-settings')">Отмена</button>
+      <button class="btn-primary" onclick="saveSettings()">Сохранить</button>
+    </div>
+  </div>
+</div>
+
+<!-- Character Asset Modal -->
+<div id="modal-char-assets" class="modal hidden">
+  <div class="modal-box modal-wide">
+    <div class="modal-header">
+      <h2 id="char-assets-title">Фото персонажа</h2>
+      <button class="btn-icon" onclick="closeModal('modal-char-assets')">✕</button>
+    </div>
+    <div class="modal-body">
+      <div id="char-assets-grid" class="assets-photo-grid"></div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:6px">
+        <label class="upload-zone" style="flex:1;min-width:200px">
+          <input type="file" accept="image/*" multiple id="char-asset-file-input" hidden>
+          <span>+ Загрузить фото</span>
+        </label>
+        <button class="btn-ghost" style="color:var(--accent);border:1px solid rgba(0,212,170,0.4);padding:10px 14px"
+                onclick="openRegenChar()">↻ Перегенерировать персонажа</button>
+      </div>
+
+      <div class="outfits-section">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+          <span style="font-size:0.78rem;font-weight:700;text-transform:uppercase;letter-spacing:0.8px;color:var(--muted)">Костюмы</span>
+          <button class="btn-ghost btn-sm" onclick="openAddOutfit(currentCharId)">+ Добавить костюм</button>
+        </div>
+        <div id="outfits-list" class="outfit-list"></div>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn-primary" onclick="closeModal('modal-char-assets')">Готово</button>
+    </div>
+  </div>
+</div>
+
+<!-- Regenerate Character Modal -->
+<div id="modal-regen-char" class="modal hidden">
+  <div class="modal-box">
+    <div class="modal-header">
+      <h2>↻ Перегенерировать персонажа</h2>
+      <button class="btn-icon" onclick="closeModal('modal-regen-char')">✕</button>
+    </div>
+    <div class="modal-body">
+      <div style="font-size:0.85rem;color:var(--muted);line-height:1.5;margin-bottom:12px">
+        Сначала перегенерируется <strong style="color:var(--text)">основной образ</strong>,
+        затем по нему как по референсу — все костюмы. Старые фото удалятся.
+      </div>
+      <div class="field-group">
+        <label>Что учесть / исправить</label>
+        <textarea id="regen-char-wishes" rows="4"
+          placeholder="Например: «Без шрама на лице. Глаза карие, не голубые. Волосы чуть короче.»"
+          style="width:100%;background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius-sm);padding:10px;color:var(--text);font-family:inherit;font-size:0.9rem;resize:vertical"></textarea>
+        <div style="font-size:0.78rem;color:var(--muted);margin-top:4px">
+          Эти пожелания сохранятся в персонаже и будут применяться при всех будущих генерациях.
+        </div>
+      </div>
+      <label style="display:flex;align-items:center;gap:8px;margin-top:10px;cursor:pointer">
+        <input type="checkbox" id="regen-char-outfits" checked>
+        <span>Также перегенерировать все костюмы по новому основному образу</span>
+      </label>
+      <div id="regen-char-status" style="margin-top:12px;font-size:0.85rem;color:var(--warning);min-height:18px"></div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn-ghost" onclick="closeModal('modal-regen-char')">Отмена</button>
+      <button id="regen-char-confirm-btn" class="btn-primary" onclick="regenerateCharacter()">↻ Перегенерировать</button>
+    </div>
+  </div>
+</div>
+
+<!-- Outfit Add/Edit Modal -->
+<div id="modal-outfit" class="modal hidden">
+  <div class="modal-box">
+    <div class="modal-header">
+      <h2 id="outfit-modal-title">Костюм</h2>
+      <button class="btn-icon" onclick="closeModal('modal-outfit')">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="field-group">
+        <label>Название *</label>
+        <input id="outfit-label" type="text" placeholder="Парадная форма, Рабочая одежда, Тренировочный костюм...">
+      </div>
+      <div class="field-group">
+        <label>Описание для генерации</label>
+        <textarea id="outfit-description" rows="3" placeholder="Детальное описание одежды: цвета, материалы, фасон, детали..."></textarea>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn-ghost" onclick="closeModal('modal-outfit')">Отмена</button>
+      <button class="btn-primary" onclick="saveOutfit()">Сохранить</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── Checkpoint modal ── -->
+<div id="modal-checkpoint" class="modal hidden">
+  <div class="modal-box modal-wide">
+    <div class="modal-header">
+      <h2 id="modal-checkpoint-title">🎯 Контрольная точка</h2>
+      <button class="btn-icon" onclick="closeModal('modal-checkpoint')">✕</button>
+    </div>
+    <div class="modal-body">
+      <p class="muted" style="margin:0">Закрепи мощное событие на конкретной серии. Сценарист предыдущих серий будет постепенно выводить сюжет к этому моменту, не выстреливая раньше времени.</p>
+      <div class="form-row" style="display:flex;gap:10px;align-items:center">
+        <label style="margin:0;min-width:140px">Номер серии:</label>
+        <input type="number" id="cp-episode" min="1" step="1" style="width:120px" placeholder="напр. 25">
+      </div>
+      <div class="form-row">
+        <label>Что должно произойти в этой серии</label>
+        <textarea id="cp-description" rows="6" placeholder="Например: «Кейтлин публично объявляет, что она настоящий владелец компании, и увольняет Маркуса в прямом эфире пресс-конференции.»"></textarea>
+      </div>
+      <div style="display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap">
+        <button class="btn-ghost" id="cp-gen-btn" onclick="generateCheckpointDraft()">✨ Сгенерировать поворот</button>
+        <button class="btn-ghost" id="cp-delete-btn" onclick="deleteCheckpoint()" style="display:none;color:var(--danger)">🗑 Удалить</button>
+        <button class="btn-primary" id="cp-save-btn" onclick="saveCheckpoint()">Сохранить</button>
+      </div>
+      <div id="cp-status" style="font-size:0.82rem;color:var(--muted)"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ── Finale modal ── -->
+<div id="modal-finale" class="modal hidden">
+  <div class="modal-box modal-wide">
+    <div class="modal-header">
+      <h2>🏁 Финал сериала</h2>
+      <button class="btn-icon" onclick="closeModal('modal-finale')">✕</button>
+    </div>
+    <div class="modal-body">
+      <p class="muted" style="margin:0">Опиши финальную серию и её события. Сценарист будет следить, чтобы сюжет вёл к этому финалу и не нарушал его условий (не убивал нужных живыми персонажей, не раскрывал тайны раньше времени и т. п.).</p>
+      <div class="form-row" style="display:flex;gap:10px;align-items:center">
+        <label style="margin:0;min-width:140px">Номер финальной серии:</label>
+        <input type="number" id="fin-episode" min="1" step="1" style="width:120px" placeholder="напр. 70">
+      </div>
+      <div class="form-row">
+        <label>Что произойдёт в финале</label>
+        <textarea id="fin-description" rows="8" placeholder="Например: «Маркус разоблачён как убийца отца Кейтлин и арестован. Кейтлин выбирает Дэниела и они уезжают вместе. Сын Кейтлин остаётся жив.»"></textarea>
+      </div>
+      <div style="display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap">
+        <button class="btn-ghost" id="fin-gen-btn" onclick="generateFinaleDraft()">✨ Сгенерировать финал</button>
+        <button class="btn-ghost" id="fin-delete-btn" onclick="deleteFinale()" style="display:none;color:var(--danger)">🗑 Убрать финал</button>
+        <button class="btn-primary" id="fin-save-btn" onclick="saveFinale()">Сохранить</button>
+      </div>
+      <div id="fin-status" style="font-size:0.82rem;color:var(--muted)"></div>
+    </div>
+  </div>
+</div>
+
+<!-- Floating task monitor — survives view switches, not browser tab close -->
+<div id="task-monitor" class="task-monitor hidden" aria-live="polite">
+  <div class="task-monitor-head">
+    <span class="task-monitor-title">⚙ Задачи <span id="task-monitor-count">0</span></span>
+    <div class="task-monitor-actions">
+      <button type="button" class="task-monitor-btn" id="task-monitor-clear" title="Скрыть выполненные">✕</button>
+      <button type="button" class="task-monitor-btn" id="task-monitor-toggle" title="Свернуть">—</button>
+    </div>
+  </div>
+  <div class="task-monitor-body" id="task-monitor-list"></div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
