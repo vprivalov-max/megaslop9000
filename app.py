@@ -5996,10 +5996,18 @@ def create_episode(sid):
     with lock:
         episodes = list_episodes(sid)
         data = request.json or {}
-        # Use requested number if provided and not already taken, otherwise auto-assign
         requested = data.get('number')
         existing_nums = {e['number'] for e in episodes}
-        if requested and int(requested) not in existing_nums:
+        if requested:
+            # Reject duplicate requests loudly. Falling through to N+1 silently
+            # used to produce two episodes when the client suggested an already-
+            # taken number (e.g. proposing N=1 over an existing empty episode 1).
+            if int(requested) in existing_nums:
+                return jsonify({
+                    'error': f'Эпизод {int(requested)} уже существует',
+                    'code': 'episode_number_taken',
+                    'existing_number': int(requested),
+                }), 409
             num = int(requested)
         else:
             num = max((e['number'] for e in episodes), default=0) + 1

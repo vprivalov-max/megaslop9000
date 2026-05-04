@@ -2709,15 +2709,13 @@ async function saveStyle() {
 
 // ── Episodes ──────────────────────────────────────────────────────────────────
 function openCreateEpisode() {
-  // Find first number that either doesn't exist OR exists without a synopsis
-  const existing = new Map(S.episodes.map(e => [e.number, e]));
-  const maxNum = existing.size > 0 ? Math.max(...existing.keys()) : 0;
-  let defaultNum = maxNum + 1;
-  for (let n = 1; n <= maxNum + 1; n++) {
-    if (!existing.has(n)) { defaultNum = n; break; }
-    const ep = existing.get(n);
-    if (!ep.synopsis || !ep.synopsis.trim()) { defaultNum = n; break; }
-  }
+  // Default to the first number that doesn't yet exist. Never suggest a number
+  // already taken — the prior "first empty-synopsis slot" rule caused the user
+  // to re-submit number=1 on top of an existing empty episode 1, after which
+  // the backend silently fell through to N+1, producing two episodes.
+  const existing = new Set(S.episodes.map(e => e.number));
+  let defaultNum = 1;
+  while (existing.has(defaultNum)) defaultNum++;
   document.getElementById('new-ep-number').value = defaultNum;
   document.getElementById('new-ep-synopsis').value = '';
   document.getElementById('new-ep-synopsis-status').textContent = '';
@@ -4041,8 +4039,6 @@ function buildEpCharCard(c, inEpisode) {
     photoUrl = `/assets/${S.seriesId}/${c.ref_images[0]}`;
   }
   const hasBasePhoto = !!(c.ref_images?.length);
-  // Overlay shown if the primary outfit needs gen
-  const needsOutfitGen = !!(primaryOutfit && !primaryOutfit.photo && !primaryOutfit.is_base && hasBasePhoto);
 
   const card = document.createElement('div');
   card.className = `ep-char-card ${inEpisode ? 'in-episode' : ''}`;
@@ -4064,14 +4060,8 @@ function buildEpCharCard(c, inEpisode) {
            ondrop="event.preventDefault();this.classList.remove('drop-hover');dropCharPhoto(event,'${c.id}')"
            title="${photoUrl ? 'Открыть фото крупно (можно перегенерировать)' : ''}">
         ${photoUrl
-          ? `<img src="${photoUrl}" alt="${esc(c.name)}" ${needsOutfitGen ? 'style="opacity:0.45;filter:grayscale(0.6)"' : ''}>`
+          ? `<img src="${photoUrl}" alt="${esc(c.name)}">`
           : `<div class="no-photo">${primaryOutfit ? '👗' : '👤'}</div>`}
-        ${needsOutfitGen ? `
-          <div class="outfit-gen-overlay" id="ep-outfit-overlay-${c.id}" onclick="event.stopPropagation();generateEpOutfit('${c.id}','${primaryOutfit.id}')"
-               title="Переодеть в образ «${esc(primaryOutfit.label)}» (i2i из базового фото)"
-               style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.6);color:#fff;cursor:pointer;font-size:1.2rem;font-weight:700;">
-            ⚡
-          </div>` : ''}
         <div class="ep-outfit-gen-status" id="ep-outfit-status-${c.id}" title=""
              style="position:absolute;bottom:0;left:0;right:0;max-height:32%;font-size:0.6rem;line-height:1.05;color:#fff;text-align:center;text-shadow:0 1px 2px rgba(0,0,0,0.9);background:rgba(0,0,0,0.55);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:1px 2px;"></div>
       </div>
@@ -4090,7 +4080,7 @@ function buildEpCharCard(c, inEpisode) {
                 const stateIcon = o.photo ? '✓' : (o.is_base ? '★' : '⚡');
                 return `<button type="button"
                   class="ep-outfit-chip ${on ? 'on' : ''} ${isPrimary ? 'primary' : ''}"
-                  title="${on ? 'Снять выбор' : 'Добавить образ для этой серии'} — ${esc(o.label)}${o.photo ? ' (фото готово)' : (o.is_base ? ' (базовое фото)' : ' (фото не готово — кликни ⚡)')}"
+                  title="${on ? 'Снять выбор' : 'Добавить образ для этой серии'} — ${esc(o.label)}${o.photo ? ' (фото готово)' : (o.is_base ? ' (базовое фото)' : ' (фото не готово)')}"
                   onclick="event.stopPropagation();toggleEpCharOutfit('${c.id}','${o.id}')">
                   ${esc(o.label)} ${stateIcon}
                 </button>`;
@@ -4102,8 +4092,6 @@ function buildEpCharCard(c, inEpisode) {
                         onclick="event.stopPropagation();showOutfitPrompt('${c.id}','${primaryOutfit.id}')">📋</button>
                 ${hasBasePhoto && !primaryOutfit.is_base ? `<button class="btn-prompt" style="padding:2px 6px;font-size:0.7rem" title="Это базовый образ — связать с базовым фото без перегенерации"
                         onclick="event.stopPropagation();linkOutfitToBase('${c.id}','${primaryOutfit.id}')">🔗</button>` : ''}
-                ${hasBasePhoto && !primaryOutfit.is_base ? `<button class="btn-prompt" style="padding:2px 6px;font-size:0.7rem" title="${primaryOutfit.photo ? 'Перегенерировать образ' : 'Сгенерировать образ (i2i из базы)'}"
-                        onclick="event.stopPropagation();generateEpOutfit('${c.id}','${primaryOutfit.id}')">${primaryOutfit.photo ? '↻' : '⚡'}</button>` : ''}
               </div>
             ` : ''}
           </div>
@@ -4124,39 +4112,6 @@ function buildEpCharCard(c, inEpisode) {
     </div>
   `;
   return card;
-}
-
-async function generateEpOutfit(charId, outfitId) {
-  const statusEl = document.getElementById(`ep-outfit-status-${charId}`);
-  const overlay = document.getElementById(`ep-outfit-overlay-${charId}`);
-  if (overlay) { overlay.style.pointerEvents = 'none'; overlay.innerHTML = '<span class="spinner"></span>'; }
-  if (statusEl) statusEl.textContent = 'Переодеваем (~15с)...';
-  try {
-    const res = await api.post(
-      `/api/series/${S.seriesId}/characters/${charId}/outfits/${outfitId}/generate`,
-      {},
-      { timeoutMs: 180000 }
-    );
-    if (res.ready) {
-      // Refresh series so the new outfit.photo is reflected
-      S.series = await api.get(`/api/series/${S.seriesId}`);
-      const c = S.series.characters.find(x => x.id === charId);
-      const used = S.episode.characters_used || [];
-      const oldCard = document.getElementById(`ep-char-${charId}`);
-      if (oldCard && c) oldCard.replaceWith(buildEpCharCard(c, used.includes(charId)));
-      showToast('Готово — образ переодет');
-    } else {
-      const msg = res.error || 'Не удалось сгенерировать';
-      if (statusEl) { statusEl.textContent = '✕ ошибка'; statusEl.title = msg; }
-      if (overlay) { overlay.style.pointerEvents = ''; overlay.innerHTML = '⚡'; }
-      showToast(msg.length > 200 ? msg.slice(0, 200) + '…' : msg);
-    }
-  } catch (e) {
-    const msg = (e && e.message) || String(e);
-    if (statusEl) { statusEl.textContent = '✕ ошибка'; statusEl.title = msg; }
-    if (overlay) { overlay.style.pointerEvents = ''; overlay.innerHTML = '⚡'; }
-    showToast(msg.length > 200 ? msg.slice(0, 200) + '…' : msg);
-  }
 }
 
 // Toggle a single outfit on/off for this episode. Multiple outfits per character
