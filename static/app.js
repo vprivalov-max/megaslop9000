@@ -172,6 +172,17 @@ async function trackTask(label, ctx, fn) {
 
 // Wire up monitor controls once DOM is ready
 document.addEventListener('DOMContentLoaded', () => {
+  // Random ironic slogan under the logo, picked fresh each page load
+  const SLOGANS = [
+    "Because deadlines don’t care about taste.",
+    "For creators with vision, deadlines, and no shame.",
+    "Write it. Cut it. Deny responsibility.",
+    "Making “somehow it works” a business model.",
+    "Make dramas faster than you can regret them.",
+  ];
+  const slEl = document.getElementById('nav-slogan');
+  if (slEl) slEl.textContent = SLOGANS[Math.floor(Math.random() * SLOGANS.length)];
+
   const t = document.getElementById('task-monitor-toggle');
   const c = document.getElementById('task-monitor-clear');
   if (t) t.addEventListener('click', () => Tasks.toggleMin());
@@ -197,7 +208,27 @@ function navigate(view, params = {}) {
   document.getElementById('view-' + view).classList.remove('hidden');
   Object.assign(S, params);
 
+  // Topnav "Редактор" button — visible whenever a series is open and we're
+  // not already inside the montage editor.
+  const navMt = document.getElementById('nav-montage-btn');
+  if (navMt) {
+    const showMt = !!S.seriesId && view !== 'montage' && view !== 'projects';
+    navMt.classList.toggle('hidden', !showMt);
+  }
+
+  // Persist current location in URL hash so a page reload restores the view.
+  try {
+    let h = '';
+    if (view === 'projects')      h = '';
+    else if (view === 'series')   h = `#series/${encodeURIComponent(S.seriesId || '')}`;
+    else if (view === 'episode')  h = `#episode/${encodeURIComponent(S.seriesId || '')}/${S.episodeNum || ''}`;
+    else if (view === 'montage')  h = `#montage/${encodeURIComponent(S.seriesId || '')}`;
+    if (location.hash !== h) location.hash = h;
+  } catch {}
+
   if (view === 'projects') {
+    S.seriesId = null;
+    if (navMt) navMt.classList.add('hidden');
     setBreadcrumb([]);
     loadProjects();
   } else if (view === 'series') {
@@ -208,6 +239,35 @@ function navigate(view, params = {}) {
     loadMontageView();
   }
 }
+
+function _navFromHash() {
+  const h = (location.hash || '').replace(/^#/, '');
+  if (!h) { navigate('projects'); return; }
+  const parts = h.split('/').map(decodeURIComponent);
+  const [view, sid, epNum] = parts;
+  if (view === 'series' && sid)   { navigate('series',  { seriesId: sid }); return; }
+  if (view === 'episode' && sid && epNum) {
+    navigate('episode', { seriesId: sid, episodeNum: parseInt(epNum, 10) });
+    return;
+  }
+  if (view === 'montage' && sid)  { navigate('montage', { seriesId: sid }); return; }
+  navigate('projects');
+}
+
+window.addEventListener('hashchange', () => {
+  // Only react to genuine outside changes (back/forward) — guard re-entry
+  // by comparing to current state, otherwise navigate() already wrote it.
+  const h = (location.hash || '').replace(/^#/, '');
+  const currentExpected = (() => {
+    if (!S.seriesId) return '';
+    const view = document.querySelector('.view:not(.hidden)')?.id?.replace('view-', '');
+    if (view === 'series')  return `series/${encodeURIComponent(S.seriesId)}`;
+    if (view === 'episode') return `episode/${encodeURIComponent(S.seriesId)}/${S.episodeNum || ''}`;
+    if (view === 'montage') return `montage/${encodeURIComponent(S.seriesId)}`;
+    return '';
+  })();
+  if (h !== currentExpected) _navFromHash();
+});
 
 function setBreadcrumb(items) {
   const el = document.getElementById('breadcrumb');
@@ -1590,6 +1650,7 @@ function openBibleEditor() {
   setVal('bible-tone', s.tone);
   setVal('bible-audience', s.target_audience);
   setVal('bible-world', s.world_description);
+  setVal('bible-visual-style', s.visual_style || '');
   openModal('modal-bible');
 }
 
@@ -1598,6 +1659,7 @@ async function saveBible() {
     title: val('bible-title'), genre: val('bible-genre'),
     tone: val('bible-tone'), target_audience: val('bible-audience'),
     world_description: val('bible-world'),
+    visual_style: val('bible-visual-style'),
   };
   S.series = await api.put(`/api/series/${S.seriesId}`, data);
   closeModal('modal-bible');
@@ -1605,6 +1667,252 @@ async function saveBible() {
 }
 
 // ── Characters ────────────────────────────────────────────────────────────────
+// ── Quick-add character (from episode sidebar) ────────────────────────────
+const QC = { file: null, generatedRel: null };
+
+function openQuickAddChar() {
+  if (!S.seriesId) return;
+  QC.file = null;
+  QC.generatedRel = null;
+  setVal('qc-name', '');
+  setVal('qc-gender', 'male');
+  setVal('qc-description', '');
+  document.getElementById('qc-gen-block')?.classList.add('hidden');
+  document.getElementById('qc-gen-status').textContent = '';
+  const prev = document.getElementById('qc-preview');
+  if (prev) { prev.src = ''; prev.classList.add('hidden'); }
+  const empty = document.querySelector('#qc-drop .qc-drop-empty');
+  if (empty) empty.classList.remove('hidden');
+  const f = document.getElementById('qc-file');
+  if (f) f.value = '';
+  openModal('modal-quickchar');
+}
+
+function qcHandleDrop(e) {
+  e.preventDefault();
+  e.currentTarget.classList.remove('hover');
+  const f = e.dataTransfer.files?.[0];
+  if (f) qcHandleFile(f);
+}
+
+function qcHandleFile(file) {
+  if (!file || !file.type.startsWith('image/')) {
+    showToast('Можно перетащить только картинку');
+    return;
+  }
+  QC.file = file;
+  QC.generatedRel = null;
+  const prev = document.getElementById('qc-preview');
+  const empty = document.querySelector('#qc-drop .qc-drop-empty');
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    prev.src = e.target.result;
+    prev.classList.remove('hidden');
+    empty?.classList.add('hidden');
+  };
+  reader.readAsDataURL(file);
+}
+
+function qcToggleGen() {
+  document.getElementById('qc-gen-block')?.classList.toggle('hidden');
+}
+
+async function qcGenerate() {
+  const name = (val('qc-name') || '').trim();
+  const description = (val('qc-description') || '').trim();
+  if (!name) return alert('Сначала введи имя');
+  if (!description) return alert('Опиши персонажа');
+  const btn = document.getElementById('qc-gen-btn');
+  const st  = document.getElementById('qc-gen-status');
+  btn.disabled = true; btn.innerHTML = '⏳ генерирую...';
+  st.textContent = '';
+  try {
+    // Create char first (so /generate-image can attach output to it)
+    const created = await api.post(`/api/series/${S.seriesId}/characters`, {
+      name, description, appearance: description, gender: val('qc-gender') || 'male',
+    });
+    const charId = created.character?.id || created.id;
+    if (!charId) throw new Error('cannot create char');
+    QC._tempCharId = charId;
+    const r = await api.post(`/api/series/${S.seriesId}/characters/${charId}/generate-image`, {});
+    if (!r.ready) throw new Error(r.error || 'no image');
+    QC.generatedRel = r.url || '';
+    QC.file = null;
+    const prev = document.getElementById('qc-preview');
+    const empty = document.querySelector('#qc-drop .qc-drop-empty');
+    if (prev) { prev.src = QC.generatedRel; prev.classList.remove('hidden'); }
+    if (empty) empty.classList.add('hidden');
+    st.textContent = '✓ готово · нажми Сохранить';
+    showToast('🪄 Фото сгенерировано');
+  } catch (e) {
+    st.textContent = '✗ ' + (e.message || e);
+  } finally {
+    btn.disabled = false; btn.innerHTML = '🪄 Сгенерировать фото';
+  }
+}
+
+async function qcSave() {
+  const name = (val('qc-name') || '').trim();
+  if (!name) return alert('Введи имя персонажа');
+  const btn = document.getElementById('qc-save-btn');
+  const old = btn.innerHTML;
+  btn.disabled = true; btn.innerHTML = '⏳';
+  try {
+    let charId = QC._tempCharId;  // set if user already generated photo
+    if (!charId) {
+      // Create char now
+      const created = await api.post(`/api/series/${S.seriesId}/characters`, {
+        name,
+        description: (val('qc-description') || '').trim(),
+        appearance:  (val('qc-description') || '').trim(),
+        gender: val('qc-gender') || 'male',
+      });
+      charId = created.character?.id || created.id;
+      if (!charId) throw new Error('cannot create char');
+    }
+    // Upload dropped file if any
+    if (QC.file) {
+      const fd = new FormData();
+      fd.append('photo', QC.file);
+      const resp = await fetch(`/api/series/${S.seriesId}/characters/${charId}/upload-photo`, {
+        method: 'POST', body: fd,
+      });
+      if (!resp.ok) throw new Error(await resp.text());
+    }
+    // Refresh series view
+    S.series = await api.get(`/api/series/${S.seriesId}`);
+    closeModal('modal-quickchar');
+    QC._tempCharId = null;
+    if (typeof renderCharactersList === 'function') renderCharactersList();
+    if (typeof renderEpisodeView === 'function') renderEpisodeView();
+    if (S.episodeNum) { try { await loadEpisodeView(); } catch {} }
+    showToast('✓ Персонаж добавлен');
+  } catch (e) {
+    showToast('✗ ' + (e.message || e), 5000);
+  } finally {
+    btn.disabled = false; btn.innerHTML = old;
+  }
+}
+
+// ── Quick-add location (from episode sidebar) ────────────────────────────
+const QL = { file: null, generatedRel: null };
+
+function openQuickAddLoc() {
+  if (!S.seriesId) return;
+  QL.file = null;
+  QL.generatedRel = null;
+  QL._tempLocId = null;
+  setVal('ql-name', '');
+  setVal('ql-description', '');
+  document.getElementById('ql-gen-block')?.classList.add('hidden');
+  document.getElementById('ql-gen-status').textContent = '';
+  const prev = document.getElementById('ql-preview');
+  if (prev) { prev.src = ''; prev.classList.add('hidden'); }
+  const empty = document.querySelector('#ql-drop .qc-drop-empty');
+  if (empty) empty.classList.remove('hidden');
+  const f = document.getElementById('ql-file');
+  if (f) f.value = '';
+  openModal('modal-quickloc');
+}
+
+function qlHandleDrop(e) {
+  e.preventDefault();
+  e.currentTarget.classList.remove('hover');
+  const f = e.dataTransfer.files?.[0];
+  if (f) qlHandleFile(f);
+}
+
+function qlHandleFile(file) {
+  if (!file || !file.type.startsWith('image/')) {
+    showToast('Можно перетащить только картинку');
+    return;
+  }
+  QL.file = file;
+  QL.generatedRel = null;
+  const prev = document.getElementById('ql-preview');
+  const empty = document.querySelector('#ql-drop .qc-drop-empty');
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    prev.src = e.target.result;
+    prev.classList.remove('hidden');
+    empty?.classList.add('hidden');
+  };
+  reader.readAsDataURL(file);
+}
+
+function qlToggleGen() {
+  document.getElementById('ql-gen-block')?.classList.toggle('hidden');
+}
+
+async function qlGenerate() {
+  const name = (val('ql-name') || '').trim();
+  const description = (val('ql-description') || '').trim();
+  if (!name) return alert('Сначала введи название');
+  if (!description) return alert('Опиши локацию');
+  const btn = document.getElementById('ql-gen-btn');
+  const st  = document.getElementById('ql-gen-status');
+  btn.disabled = true; btn.innerHTML = '⏳ генерирую...';
+  st.textContent = '';
+  try {
+    const created = await api.post(`/api/series/${S.seriesId}/locations`, {
+      name, description,
+    });
+    const locId = created.location?.id || created.id;
+    if (!locId) throw new Error('cannot create location');
+    QL._tempLocId = locId;
+    const r = await api.post(`/api/series/${S.seriesId}/locations/${locId}/generate-image`, {});
+    if (!r.ready) throw new Error(r.error || 'no image');
+    QL.generatedRel = r.url || '';
+    QL.file = null;
+    const prev = document.getElementById('ql-preview');
+    const empty = document.querySelector('#ql-drop .qc-drop-empty');
+    if (prev) { prev.src = QL.generatedRel; prev.classList.remove('hidden'); }
+    if (empty) empty.classList.add('hidden');
+    st.textContent = '✓ готово · нажми Сохранить';
+    showToast('🪄 Фото сгенерировано');
+  } catch (e) {
+    st.textContent = '✗ ' + (e.message || e);
+  } finally {
+    btn.disabled = false; btn.innerHTML = '🪄 Сгенерировать фото';
+  }
+}
+
+async function qlSave() {
+  const name = (val('ql-name') || '').trim();
+  if (!name) return alert('Введи название локации');
+  const btn = document.getElementById('ql-save-btn');
+  const old = btn.innerHTML;
+  btn.disabled = true; btn.innerHTML = '⏳';
+  try {
+    let locId = QL._tempLocId;
+    if (!locId) {
+      const created = await api.post(`/api/series/${S.seriesId}/locations`, {
+        name, description: (val('ql-description') || '').trim(),
+      });
+      locId = created.location?.id || created.id;
+      if (!locId) throw new Error('cannot create location');
+    }
+    if (QL.file) {
+      const fd = new FormData();
+      fd.append('photo', QL.file);
+      const resp = await fetch(`/api/series/${S.seriesId}/locations/${locId}/upload-photo`, {
+        method: 'POST', body: fd,
+      });
+      if (!resp.ok) throw new Error(await resp.text());
+    }
+    S.series = await api.get(`/api/series/${S.seriesId}`);
+    closeModal('modal-quickloc');
+    QL._tempLocId = null;
+    if (typeof renderLocationsList === 'function') renderLocationsList();
+    if (S.episodeNum) { try { await loadEpisodeView(); } catch {} }
+    showToast('✓ Локация добавлена');
+  } catch (e) {
+    showToast('✗ ' + (e.message || e), 5000);
+  } finally {
+    btn.disabled = false; btn.innerHTML = old;
+  }
+}
+
 function openAddCharacter() {
   S.editingCharId = null;
   document.getElementById('char-modal-title').textContent = 'Новый персонаж';
@@ -1699,9 +2007,34 @@ function openLocAssets(locId) {
   if (!l) return;
   document.getElementById('loc-assets-title').textContent = `Фото: ${l.name}`;
   renderLocAssetsGrid(l);
+  setVal('regen-loc-wishes', l.image_constraints || '');
   const inp = document.getElementById('loc-asset-file-input');
   inp.onchange = () => uploadLocationRefs(locId, inp.files);
   openModal('modal-loc-assets');
+}
+
+async function regenerateLocation() {
+  if (!currentLocId) return;
+  const wishes = (val('regen-loc-wishes') || '').trim();
+  const btn = document.getElementById('regen-loc-btn');
+  const old = btn ? btn.innerHTML : '';
+  if (btn) { btn.disabled = true; btn.innerHTML = '⏳ генерирую...'; }
+  try {
+    const r = await api.post(
+      `/api/series/${S.seriesId}/locations/${currentLocId}/regenerate`,
+      { wishes }
+    );
+    if (!r.ready) throw new Error(r.error || 'unknown');
+    S.series = await api.get(`/api/series/${S.seriesId}`);
+    const l = (S.series.locations || []).find(x => x.id === currentLocId);
+    if (l) renderLocAssetsGrid(l);
+    if (typeof renderLocationsList === 'function') renderLocationsList();
+    showToast('✓ Локация перегенерирована');
+  } catch (e) {
+    showToast('✗ ' + (e.message || e), 5000);
+  } finally {
+    if (btn) { btn.disabled = false; btn.innerHTML = old; }
+  }
 }
 
 function renderLocAssetsGrid(loc) {
@@ -2321,6 +2654,305 @@ async function restoreScriptVersion(idx) {
   } catch (e) {
     alert('Ошибка: ' + e.message);
   }
+}
+
+// ── Scene & 15s-segment view ─────────────────────────────────────────────
+const SCENE_COLORS = [
+  'rgba(124,92,252,0.10)',  // purple
+  'rgba(0,212,170,0.10)',   // teal
+  'rgba(255,165,2,0.10)',   // orange
+  'rgba(46,213,115,0.10)',  // green
+  'rgba(255,71,87,0.10)',   // red
+  'rgba(54,162,235,0.10)',  // blue
+  'rgba(232,67,147,0.10)',  // pink
+];
+const SCENE_BORDERS = [
+  '#7c5cfc', '#00d4aa', '#ffa502', '#2ed573', '#ff4757', '#36a2eb', '#e84393',
+];
+
+// Match SLUGLINE (location heading) — start of a new scene.
+//   English: INT., EXT., INT./EXT., I/E.
+//   Russian: ИНТ., ИНТА. (typo seen in scripts), ЭКСТ., ЭКС., НАТ., НАТУРА.,
+//            ВНУТР., ИНТЕРЬЕР, ВНЕ, СНАРУЖИ
+const SCENE_HEADING_RE = /^\s*(INT\.|EXT\.|INT\.?\s*\/\s*EXT\.?|I\/E\.|ИНТ\.|ИНТА\.|ЭКСТ\.|ЭКС\.|НАТ\.|НАТУРА\.|ВНУТР\.|ИНТЕРЬЕР|ВНЕ\.|СНАРУЖИ)\s+/i;
+
+// Lines we filter OUT entirely from scene/segment view (cast, notes, separators).
+const _SCRIPT_SKIP_PATTERNS = [
+  /^={3,}\s*EPISODE CAST/i,        // start of cast block (handled with toggle)
+  /^={3,}\s*END CAST/i,
+  /^EPISODE NOTES\b/i,
+  /^━+/,
+  /^Hook type:/i, /^Reversal type:/i, /^Cliffhanger type:/i,
+  /^Escalation rung:/i, /^Spoken word count:/i,
+  /^Estimated runtime:/i, /^Setup for next episode:/i,
+];
+
+// Heuristic per-line duration in seconds (only counts what's actually on screen).
+function _lineDuration(line) {
+  const t = (line || '').trim();
+  if (!t) return 0;
+  if (SCENE_HEADING_RE.test(t)) return 0;
+  if (/^[-—=]{3,}\s*$/.test(t)) return 0;
+  if (/^\[REVERSAL\]\s*$/i.test(t)) return 0;
+  if (/^[\s—-]*(FADE|CUT|DISSOLVE|SMASH|MATCH)\s+(IN|OUT|TO|BACK)\b/i.test(t)) return 0;
+
+  // Action line: bracketed prose `[Волк входит и...]`
+  if (/^\[/.test(t) && /\]\s*$/.test(t)) {
+    const words = t.replace(/[\[\]]/g, '').split(/\s+/).filter(Boolean).length;
+    if (words === 0) return 0;
+    return 1 + words / 1.8;          // 1s overhead + ~1.8 wps
+  }
+
+  // Dialogue line: "CHAR_NAME: (parens) actual text"
+  const m = t.match(/^([A-ZА-ЯЁ_][A-ZА-ЯЁ_0-9 ()\-']{0,40})\s*[:：]\s*(.*)$/);
+  if (m && m[1].toUpperCase() === m[1]) {
+    let rest = m[2] || '';
+    // Drop parenthetical tone notes — they're not spoken
+    rest = rest.replace(/\([^)]*\)/g, ' ').trim();
+    if (!rest) return 0.5;
+    const words = rest.split(/\s+/).filter(Boolean).length;
+    return 0.4 + words / 2.4;        // tiny pre-pause + ~2.4 wps speech
+  }
+
+  // Standalone parenthetical "(angry)" — small
+  if (/^\(.+\)$/.test(t)) return 0.4;
+
+  // Plain prose action (no brackets)
+  const words = t.split(/\s+/).filter(Boolean).length;
+  return Math.max(0.4, words / 1.8);
+}
+
+// Find a chunk's [start, end] byte-offset in the script via long-line anchors.
+// Mirrors the server-side logic in app.py compose endpoint.
+function _findChunkRange(scriptText, chunkText) {
+  if (!chunkText || !scriptText) return [-1, -1];
+  const cands = [];
+  for (const ln of chunkText.split('\n')) {
+    const s = ln.trim();
+    if (s.length < 25) continue;
+    if (SCENE_HEADING_RE.test(s)) continue;
+    cands.push(s);
+    if (cands.length >= 6) break;
+  }
+  let start = -1;
+  for (const c of cands) {
+    const idx = scriptText.indexOf(c);
+    if (idx === -1) continue;
+    if (scriptText.indexOf(c, idx + 1) === -1) { start = idx; break; }
+  }
+  if (start < 0) {
+    for (const c of cands) {
+      const idx = scriptText.indexOf(c);
+      if (idx !== -1) { start = idx; break; }
+    }
+  }
+  if (start < 0) return [-1, -1];
+  let end = start + chunkText.length;
+  for (let i = chunkText.split('\n').length - 1; i >= 0; i--) {
+    const s = chunkText.split('\n')[i].trim();
+    if (s.length < 25) continue;
+    if (SCENE_HEADING_RE.test(s)) continue;
+    const idx = scriptText.indexOf(s, start);
+    if (idx >= 0) { end = idx + s.length; break; }
+  }
+  return [start, end];
+}
+
+function _parseScriptScenes(scriptText) {
+  const rawLines = (scriptText || '').split('\n');
+  const scenes = [];
+  let inCast = false;
+  let inNotes = false;
+  let cur = null;
+  let runningOffset = 0;
+  for (const rawLine of rawLines) {
+    const lineStart = runningOffset;
+    const lineEnd = runningOffset + rawLine.length;
+    runningOffset = lineEnd + 1; // +1 for the \n we removed
+    const t = rawLine.trim();
+    // CAST block — skip entirely
+    if (/^={3,}\s*EPISODE CAST/i.test(t)) { inCast = true;  continue; }
+    if (/^={3,}\s*END CAST/i.test(t))     { inCast = false; continue; }
+    if (inCast) continue;
+    // Episode notes / trailer block — once we hit it, stop processing
+    if (_SCRIPT_SKIP_PATTERNS.some(re => re.test(t))) {
+      if (/^(EPISODE NOTES|━+|Hook type:|Reversal type:|Cliffhanger type:|Escalation rung:|Spoken word count:|Estimated runtime:|Setup for next episode:)/i.test(t)) {
+        inNotes = true;
+      }
+      continue;
+    }
+    if (inNotes) continue;
+    // Markdown title (#)
+    if (/^#\s/.test(t)) continue;
+    // Horizontal separators
+    if (/^[-—=]{3,}\s*$/.test(t)) continue;
+
+    // Scene heading: open a new scene
+    if (SCENE_HEADING_RE.test(t)) {
+      cur = { id: scenes.length, heading: t, lines: [], totalSec: 0 };
+      scenes.push(cur);
+      continue;
+    }
+
+    // Lines BEFORE first scene heading are dropped (title block, etc.)
+    if (!cur) continue;
+
+    const dur = _lineDuration(rawLine);
+    // Empty / structural lines aren't visual time AND not visible body either
+    if (!t) continue;
+    cur.lines.push({
+      text: rawLine, duration: dur, segIdx: 0,
+      offset: lineStart, offsetEnd: lineEnd,
+    });
+    cur.totalSec += dur;
+  }
+
+  // Assign 15-second segment indices based on REAL on-screen time only.
+  const TARGET = 14.0;     // aim for ≤15s per chunk
+  const SOFT_MAX = 15.5;   // hard cap before forcing a break
+  for (const sc of scenes) {
+    let acc = 0, seg = 0;
+    for (const l of sc.lines) {
+      if (acc > 0 && acc + l.duration > SOFT_MAX) {
+        seg += 1;
+        acc = 0;
+      }
+      l.segIdx = seg;
+      acc += l.duration;
+      // If we just exactly hit/exceeded TARGET, allow the next line to start a new segment
+      if (acc >= TARGET && acc <= SOFT_MAX) {
+        // Defer: next iteration's check will decide based on next line's duration
+      }
+    }
+    sc.segCount = sc.lines.length ? (sc.lines[sc.lines.length - 1].segIdx + 1) : 0;
+  }
+  return scenes;
+}
+
+// Build coverage map: { lineOffset → {status, idx} } based on Seedance chunks.
+function _buildSeedanceCoverage(scriptText, chunks) {
+  const ranges = [];
+  for (const c of chunks || []) {
+    const [s, e] = _findChunkRange(scriptText, c.chunk_text || '');
+    if (s >= 0) ranges.push({ start: s, end: e, status: c.status, idx: c.idx, video: !!c.video_path });
+  }
+  return ranges;
+}
+function _statusForLine(line, coverage) {
+  // Return tightest covering range (latest start that contains the line)
+  let best = null;
+  for (const r of coverage) {
+    if (r.start <= line.offset + 5 && r.end >= line.offsetEnd - 5) {
+      if (!best || r.start > best.start) best = r;
+    }
+  }
+  return best;
+}
+
+function _renderScenesHTML(scenes, coverage = []) {
+  if (!scenes.length) {
+    return '<div class="muted" style="padding:16px">Сценарий пустой или не содержит ни одного scene heading (INT./EXT./ИНТ./ЭКСТ.).</div>';
+  }
+  const showCov = !!SCENE_VIEW_STATE.showCoverage && coverage.length;
+  let html = '';
+  if (coverage.length) {
+    const stats = { completed: 0, pending: 0, failed: 0 };
+    for (const r of coverage) {
+      if (r.status === 'completed') stats.completed++;
+      else if (r.status === 'failed') stats.failed++;
+      else stats.pending++;
+    }
+    html += `<div class="ep-scene-toolbar">
+      <label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer">
+        <input type="checkbox" id="ep-cov-toggle" ${showCov ? 'checked' : ''} onchange="toggleCoverage(this.checked)">
+        Подсветить что уже сгенерено в Seedance
+      </label>
+      <span class="muted" style="font-size:0.78rem">
+        · ${stats.completed} ✓  · ${stats.pending} ⏳  · ${stats.failed} ✗
+      </span>
+    </div>`;
+  }
+  scenes.forEach((sc, sIdx) => {
+    const bg = SCENE_COLORS[sIdx % SCENE_COLORS.length];
+    const bdr = SCENE_BORDERS[sIdx % SCENE_BORDERS.length];
+    const heading = sc.heading || `(без scene heading) — сцена #${sIdx + 1}`;
+    html += `<div class="ep-scene" style="background:${bg};border-left:4px solid ${bdr}">`;
+    html += `<div class="ep-scene-header">
+        <span class="ep-scene-tag">Сцена ${sIdx + 1}</span>
+        <span class="ep-scene-loc">${esc(heading.slice(0, 120))}</span>
+        <span class="ep-scene-meta">~${sc.totalSec.toFixed(0)}с · ${sc.segCount} сегмент(ов) ×15с</span>
+      </div>`;
+    let lastSeg = -1;
+    let segAcc = 0;
+    sc.lines.forEach((l, lIdx) => {
+      if (l.segIdx !== lastSeg) {
+        if (lastSeg !== -1) html += `</div></div>`; // close prev seg-body + ep-seg
+        lastSeg = l.segIdx;
+        segAcc = 0;
+        html += `<div class="ep-seg" data-seg="${l.segIdx + 1}">
+          <div class="ep-seg-bracket" title="Seedance-сегмент ${l.segIdx + 1}">${l.segIdx + 1}</div>
+          <div class="ep-seg-body">`;
+      }
+      segAcc += l.duration;
+      let _cls = 'ep-line';
+      let _tag = '';
+      if (showCov) {
+        const cov = _statusForLine(l, coverage);
+        if (cov) {
+          _cls += cov.status === 'completed' ? ' sd-done' : cov.status === 'failed' ? ' sd-failed' : ' sd-pending';
+          const ic = cov.status === 'completed' ? '✓' : cov.status === 'failed' ? '✗' : '⏳';
+          _tag = `<span class="ep-line-tag" title="Seedance #${cov.idx} · ${cov.status}">${ic} #${cov.idx}</span>`;
+        }
+      }
+      html += `<div class="${_cls}">${_tag}${esc(l.text || ' ')}</div>`;
+    });
+    if (lastSeg !== -1) html += `</div></div>`;
+    html += `</div>`;
+  });
+  return html;
+}
+
+function toggleSceneView() {
+  const ta = document.getElementById('ep-script');
+  const view = document.getElementById('ep-script-scenes');
+  const btn = document.getElementById('ep-scenes-btn');
+  if (!ta || !view || !btn) return;
+  const isOpen = !view.classList.contains('hidden');
+  if (isOpen) {
+    view.classList.add('hidden');
+    ta.classList.remove('hidden');
+    btn.classList.remove('active');
+    btn.innerHTML = '🎬 Сцены';
+  } else {
+    try {
+      const saved = localStorage.getItem('sceneCov');
+      if (saved !== null) SCENE_VIEW_STATE.showCoverage = (saved === '1');
+    } catch {}
+    _renderSceneViewBody();
+    view.classList.remove('hidden');
+    ta.classList.add('hidden');
+    btn.classList.add('active');
+    btn.innerHTML = '✏ Редактировать';
+  }
+}
+
+const SCENE_VIEW_STATE = { showCoverage: true };
+
+function _renderSceneViewBody() {
+  const ta = document.getElementById('ep-script');
+  const view = document.getElementById('ep-script-scenes');
+  if (!ta || !view) return;
+  const scriptText = ta.value || '';
+  const scenes = _parseScriptScenes(scriptText);
+  const chunks = (S.episode && S.episode.seedance_chunks) || [];
+  const coverage = _buildSeedanceCoverage(scriptText, chunks);
+  view.innerHTML = _renderScenesHTML(scenes, coverage);
+}
+
+function toggleCoverage(on) {
+  SCENE_VIEW_STATE.showCoverage = !!on;
+  try { localStorage.setItem('sceneCov', SCENE_VIEW_STATE.showCoverage ? '1' : '0'); } catch {}
+  _renderSceneViewBody();
 }
 
 async function doctorScript() {
@@ -4160,13 +4792,108 @@ async function sdUploadCustomUrl(srcUrl) {
 function sdRenderRefs() {
   const slot = document.getElementById('sd-ref-slots');
   if (!slot) return;
-  slot.innerHTML = SD.refs.map((r, i) => `
-    <div class="sd-ref-chip" title="@Image${i+1}: ${esc(r.name)}${r.outfit ? ' / '+esc(r.outfit) : ''}">
-      ${r.photoUrl ? `<img src="${r.photoUrl}" alt="">` : '<div class="label">no photo</div>'}
-      <div class="label">@Image${i+1}<br>${esc(r.name)}</div>
+  slot.innerHTML = SD.refs.map((r, i) => {
+    const subtitle = r.outfit ? `<div class="ref-sub">${esc(r.outfit)}</div>` : '';
+    const kindIcon = r.kind === 'loc' ? '🏛'
+                  : r.kind === 'lastframe' ? '🎞'
+                  : r.kind === 'char' ? '👤' : '🖼';
+    return `
+    <div class="sd-ref-chip" data-i="${i}"
+         ondragover="sdSlotDragOver(event)"
+         ondragleave="sdSlotDragLeave(event)"
+         ondrop="sdSlotDrop(event,${i})"
+         title="@Image${i+1}: ${esc(r.name)}${r.outfit ? ' / '+esc(r.outfit) : ''} — перетащи сюда другую карточку чтобы заменить">
+      <div class="ref-top">@Image${i+1}</div>
+      ${r.photoUrl
+        ? `<img src="${r.photoUrl}" alt="">`
+        : '<div class="ref-noimg">no photo</div>'}
+      <div class="ref-bottom">
+        <span class="ref-kind">${kindIcon}</span>
+        <span class="ref-name">${esc(r.name || '—')}</span>
+        ${subtitle}
+      </div>
       <button class="rm" onclick="sdRemoveRef(${i})" title="Убрать">×</button>
-    </div>
-  `).join('');
+    </div>`;
+  }).join('');
+}
+
+function sdSlotDragOver(e) {
+  e.preventDefault();
+  e.currentTarget.classList.add('drop-target');
+}
+function sdSlotDragLeave(e) {
+  e.currentTarget.classList.remove('drop-target');
+}
+async function sdSlotDrop(e, idx) {
+  e.preventDefault();
+  e.stopPropagation();
+  e.currentTarget.classList.remove('drop-target');
+
+  // 1. File from desktop
+  const files = Array.from(e.dataTransfer.files || []).filter(f => f.type.startsWith('image/'));
+  if (files.length) {
+    // Replace this slot with custom-uploaded file
+    const fd = new FormData();
+    fd.append('file', files[0]);
+    try {
+      const res = await api.upload(
+        `/api/series/${S.seriesId}/episodes/${S.episode.number}/seedance/upload-ref`, fd
+      );
+      if (res.url) {
+        SD.refs[idx] = {
+          kind: 'url', id: 'custom-' + Date.now(),
+          name: res.name || files[0].name, photoUrl: res.url, url: res.url,
+        };
+        sdRenderRefs();
+      }
+    } catch (err) { showToast('✗ ' + (err.message || err)); }
+    return;
+  }
+
+  // 2. URL from external tab
+  const uri = e.dataTransfer.getData('text/uri-list') || e.dataTransfer.getData('text/plain');
+  if (uri && /^https?:\/\//.test(uri.trim()) && /\.(png|jpe?g|webp|gif)(\?|$)/i.test(uri.trim())) {
+    try {
+      const res = await api.post(
+        `/api/series/${S.seriesId}/episodes/${S.episode.number}/seedance/upload-ref`,
+        { url: uri.trim() }
+      );
+      if (res.url) {
+        SD.refs[idx] = {
+          kind: 'url', id: 'custom-' + Date.now(),
+          name: res.name || 'custom', photoUrl: res.url, url: res.url,
+        };
+        sdRenderRefs();
+      }
+    } catch (err) { showToast('✗ ' + (err.message || err)); }
+    return;
+  }
+
+  // 3. Internal char/loc card payload
+  let payload;
+  try { payload = JSON.parse(e.dataTransfer.getData('application/json') || '{}'); }
+  catch { return; }
+  if (!payload.kind || !payload.id) return;
+  // Resolve name + photoUrl from series data so chip renders correctly
+  let name = payload.name || '', photoUrl = payload.photoUrl || '';
+  if (!name || !photoUrl) {
+    if (payload.kind === 'char') {
+      const c = (S.series.characters || []).find(x => x.id === payload.id);
+      if (c) {
+        name = c.name;
+        if (payload.outfit) {
+          const o = (c.outfits || []).find(o => o.label === payload.outfit);
+          if (o?.photo) photoUrl = `/assets/${S.seriesId}/${o.photo}`;
+        }
+        if (!photoUrl && c.ref_images?.[0]) photoUrl = `/assets/${S.seriesId}/${c.ref_images[0]}`;
+      }
+    } else if (payload.kind === 'loc') {
+      const l = (S.series.locations || []).find(x => x.id === payload.id);
+      if (l) { name = l.name; if (l.ref_images?.[0]) photoUrl = `/assets/${S.seriesId}/${l.ref_images[0]}`; }
+    }
+  }
+  SD.refs[idx] = { ...payload, name, photoUrl };
+  sdRenderRefs();
 }
 
 function sdRemoveRef(i) {
@@ -4179,10 +4906,19 @@ async function sdCompose() {
   if (!chunk) { showToast('Вставь кусок сценария'); return; }
   const st = document.getElementById('sd-compose-status');
   st.textContent = '⚙ компоную через Claude...';
+  const useLastframe = !!document.getElementById('sd-use-lastframe')?.checked;
+  const useStyle     = !!document.getElementById('sd-use-style')?.checked;
+  const styleVal     = (document.getElementById('sd-style')?.value || '').trim();
+  const baseOnly     = !!document.getElementById('sd-base-only')?.checked;
   try {
     const res = await api.post(
       `/api/series/${S.seriesId}/episodes/${S.episode.number}/seedance/compose`,
-      { chunk_text: chunk }
+      {
+        chunk_text: chunk,
+        use_prev_lastframe: useLastframe,
+        style: useStyle ? styleVal : '',
+        base_outfits_only: baseOnly,
+      }
     );
     document.getElementById('sd-prompt').value = res.prompt || '';
     SD.refs = (res.refs || []).map(r => {
@@ -4204,11 +4940,26 @@ async function sdCompose() {
           name = l.name;
           if (l.ref_images?.[0]) photoUrl = `/assets/${S.seriesId}/${l.ref_images[0]}`;
         }
+      } else if (r.kind === 'lastframe') {
+        // Server-attached continuity frame from previous chunk
+        name = r.name || 'last frame';
+        photoUrl = r.url || '';
       }
       return { ...r, name, photoUrl };
     });
     sdRenderRefs();
     let msg = res.scene_continuity ? '✓ продолжение прошлой сцены' : '✓ скомпоновано';
+    if (res.lastframe_attached) msg += ' · 🎞 last frame прицеплен';
+    if (!res.cur_pos_found) {
+      msg += ' · ⚠ позицию в сценарии не нашёл (continuity без соседа)';
+    } else if (res.prev_neighbour) {
+      const pn = res.prev_neighbour;
+      const epPart = pn.episode && pn.episode !== S.episode.number ? ` (эп ${pn.episode})` : '';
+      const vid = pn.has_video ? '' : ' [нет видео]';
+      msg += ` · prev: #${pn.idx}${epPart}${vid}`;
+    } else {
+      msg += ' · prev: нет (первый в эп.)';
+    }
     if ((res.unresolved_refs || []).length) {
       const names = res.unresolved_refs.map(r => `${r.kind}:${r.id}`).join(', ');
       msg += ` · ⚠ не подгрузились: ${names}`;
@@ -4220,12 +4971,25 @@ async function sdCompose() {
   }
 }
 
+function sdToggleStyleField() {
+  const cb = document.getElementById('sd-use-style');
+  const inp = document.getElementById('sd-style');
+  if (!inp) return;
+  inp.classList.toggle('hidden', !cb?.checked);
+  if (cb?.checked) inp.focus();
+  sdSavePrefs();
+}
+
 function sdSavePrefs() {
   try {
     localStorage.setItem('sd_prefs', JSON.stringify({
       duration: document.getElementById('sd-duration').value,
       resolution: document.getElementById('sd-resolution').value,
       moderation_bypass: document.getElementById('sd-mod-bypass').value,
+      use_prev_lastframe: !!document.getElementById('sd-use-lastframe')?.checked,
+      use_style: !!document.getElementById('sd-use-style')?.checked,
+      style: (document.getElementById('sd-style')?.value || '').trim(),
+      base_outfits_only: !!document.getElementById('sd-base-only')?.checked,
     }));
   } catch (e) {}
 }
@@ -4236,12 +5000,29 @@ function sdLoadPrefs() {
     if (p.duration) document.getElementById('sd-duration').value = p.duration;
     if (p.resolution) document.getElementById('sd-resolution').value = p.resolution;
     if (p.moderation_bypass) document.getElementById('sd-mod-bypass').value = p.moderation_bypass;
+    const cb = document.getElementById('sd-use-lastframe');
+    if (cb && typeof p.use_prev_lastframe === 'boolean') cb.checked = p.use_prev_lastframe;
+    const sc = document.getElementById('sd-use-style');
+    const si = document.getElementById('sd-style');
+    if (sc && typeof p.use_style === 'boolean') sc.checked = p.use_style;
+    if (si && typeof p.style === 'string') si.value = p.style;
+    if (si && sc) si.classList.toggle('hidden', !sc.checked);
+    const bo = document.getElementById('sd-base-only');
+    if (bo && typeof p.base_outfits_only === 'boolean') bo.checked = p.base_outfits_only;
   } catch (e) {}
 }
 
 async function sdGenerate() {
-  const prompt = document.getElementById('sd-prompt').value.trim();
-  if (!prompt) { showToast('Промпт пустой'); return; }
+  console.log('[sdGenerate] click');
+  const promptEl = document.getElementById('sd-prompt');
+  const prompt = (promptEl?.value || '').trim();
+  if (!prompt) {
+    showToast('⚠ Промпт пустой — заполни поле "Prompt"', 4000);
+    promptEl?.focus();
+    promptEl?.classList.add('input-error');
+    setTimeout(() => promptEl?.classList.remove('input-error'), 2000);
+    return;
+  }
   const chunk = document.getElementById('sd-chunk-text').value.trim();
   const duration = parseInt(document.getElementById('sd-duration').value) || 15;
   const resolution = document.getElementById('sd-resolution').value;
@@ -4253,12 +5034,16 @@ async function sdGenerate() {
   if (btn) { btn.disabled = true; btn.innerHTML = '⏳ ...'; }
 
   // Optimistic placeholder so the user sees a card immediately
-  const optimistic = {
-    idx: '…', status: 'submitting', prompt, duration, resolution,
-    moderation_bypass, progress: null, _optimistic: true,
-  };
-  sdRenderList([...(SD._lastChunks || []), optimistic]);
-  document.getElementById('sd-gen-list')?.scrollIntoView({behavior:'smooth', block:'nearest'});
+  try {
+    const optimistic = {
+      idx: '…', status: 'submitting', prompt, duration, resolution,
+      moderation_bypass, progress: null, _optimistic: true,
+    };
+    sdRenderList([...(SD._lastChunks || []), optimistic]);
+    document.getElementById('sd-gen-list')?.scrollIntoView({behavior:'smooth', block:'nearest'});
+  } catch (err) {
+    console.warn('[sdGenerate] optimistic render failed (continuing anyway):', err);
+  }
 
   try {
     const res = await api.post(
@@ -4269,10 +5054,8 @@ async function sdGenerate() {
       }
     );
     showToast(`▶ Чанк #${res.chunk?.idx ?? '?'} в очереди — можно листать дальше, генерация 1-15 мин`);
-    document.getElementById('sd-chunk-text').value = '';
-    document.getElementById('sd-prompt').value = '';
-    SD.refs = [];
-    sdRenderRefs();
+    // Не очищаем prompt/chunk_text/refs — часто хочется доработать тот же промпт
+    // и сгенерировать вариацию. Хочешь чистый лист — кнопка ↻ Reuse / руками.
     await sdRefreshList();
     sdEnsurePoll();
   } catch (e) {
@@ -4293,40 +5076,91 @@ async function sdRefreshList() {
   } catch (e) { /* ignore */ }
 }
 
+function _sdCardHTML(c) {
+  const stCls = `sd-status-${c.status || 'pending'}`;
+  const videoUrl = c.video_path ? `/assets/${S.seriesId}/${c.video_path}` : '';
+  const cost = c.cost != null ? `· $${Number(c.cost).toFixed(2)}` : '';
+  let placeholderText;
+  if (c.status === 'failed') placeholderText = '✗ failed';
+  else if (c.status === 'submitting') placeholderText = '📤 отправляю...';
+  else if (c.progress != null) placeholderText = c.progress + '%';
+  else placeholderText = '⏳ генерируется';
+  return `
+    ${videoUrl
+      ? `<video src="${videoUrl}" controls preload="metadata"></video>`
+      : `<div class="sd-placeholder">${placeholderText}</div>`}
+    <div class="sd-gen-meta">
+      <div><span class="${stCls}">●</span> #${c.idx} · ${c.status} · ${c.duration}s ${c.resolution} · ${c.moderation_bypass} ${cost}</div>
+      <div class="sd-prompt">${esc(c.prompt || '')}</div>
+      ${c.error ? `<div style="color:#e74c3c">${esc(c.error)}</div>` : ''}
+      <div class="sd-gen-actions">
+        ${videoUrl ? `<a class="btn-ghost btn-sm" href="${videoUrl}" download>⬇ Скачать</a>` : ''}
+        ${videoUrl ? `<button class="btn-ghost btn-sm" onclick="sdAddToTimeline(${c.idx}, this)">➕ На таймлайн</button>` : ''}
+        <button class="btn-ghost btn-sm" onclick="sdReuse(${c.idx})">↻ Reuse</button>
+        ${c.status === 'failed' ? `<button class="btn-ghost btn-sm" onclick="sdHealAndReuse(${c.idx}, this)" title="Переписать промпт чтобы прошёл модерацию + Reuse">🩹 Лечить</button>` : ''}
+        <button class="btn-ghost btn-sm" onclick="sdDelete(${c.idx})">🗑</button>
+      </div>
+    </div>
+  `;
+}
+
+function _sdCardSig(c) {
+  // Signature changes only on something user-visible — so playback isn't reset
+  // when the poll just brought the same card back.
+  return [
+    c.idx, c.status, c.video_path || '',
+    c.progress ?? '', c.error || '',
+    c.prompt || '', c.duration, c.resolution, c.moderation_bypass,
+    c.cost ?? '',
+  ].join('|');
+}
+
 function sdRenderList(chunks) {
   const el = document.getElementById('sd-gen-list');
   if (!el) return;
   // cache the last server-state list so optimistic adds can stack on top
   if (!chunks.some(c => c._optimistic)) SD._lastChunks = chunks;
   if (!chunks.length) { el.innerHTML = ''; return; }
-  el.innerHTML = chunks.slice().reverse().map(c => {
-    const stCls = `sd-status-${c.status || 'pending'}`;
-    const videoUrl = c.video_path ? `/assets/${S.seriesId}/${c.video_path}` : '';
-    const cost = c.cost != null ? `· $${Number(c.cost).toFixed(2)}` : '';
-    let placeholderText;
-    if (c.status === 'failed') placeholderText = '✗ failed';
-    else if (c.status === 'submitting') placeholderText = '📤 отправляю...';
-    else if (c.progress != null) placeholderText = c.progress + '%';
-    else placeholderText = '⏳ генерируется';
-    return `
-      <div class="sd-gen-card" data-idx="${c.idx}">
-        ${videoUrl
-          ? `<video src="${videoUrl}" controls preload="metadata"></video>`
-          : `<div class="sd-placeholder">${placeholderText}</div>`}
-        <div class="sd-gen-meta">
-          <div><span class="${stCls}">●</span> #${c.idx} · ${c.status} · ${c.duration}s ${c.resolution} · ${c.moderation_bypass} ${cost}</div>
-          <div class="sd-prompt">${esc(c.prompt || '')}</div>
-          ${c.error ? `<div style="color:#e74c3c">${esc(c.error)}</div>` : ''}
-          <div class="sd-gen-actions">
-            ${videoUrl ? `<a class="btn-ghost btn-sm" href="${videoUrl}" download>⬇ Скачать</a>` : ''}
-            ${videoUrl ? `<button class="btn-ghost btn-sm" onclick="sdAddToTimeline(${c.idx}, this)">➕ На таймлайн</button>` : ''}
-            <button class="btn-ghost btn-sm" onclick="sdReuse(${c.idx})">↻ Reuse</button>
-            <button class="btn-ghost btn-sm" onclick="sdDelete(${c.idx})">🗑</button>
-          </div>
-        </div>
-      </div>
-    `;
-  }).join('');
+  try {
+    // Order in DOM: newest (highest idx) first — same as before (.slice().reverse()).
+    const ordered = chunks.slice().reverse();
+    const wantedIdxs = new Set(ordered.map(c => String(c.idx)));
+    const existing = new Map();
+    el.querySelectorAll('.sd-gen-card[data-idx]').forEach(node => {
+      existing.set(node.getAttribute('data-idx'), node);
+    });
+    // Remove cards that no longer exist on server
+    existing.forEach((node, idx) => { if (!wantedIdxs.has(idx)) node.remove(); });
+    // Walk wanted order, inserting / updating in place
+    let prevNode = null;
+    for (const c of ordered) {
+      const idx = String(c.idx);
+      const sig = _sdCardSig(c);
+      let node = existing.get(idx);
+      if (!node) {
+        node = document.createElement('div');
+        node.className = 'sd-gen-card';
+        node.setAttribute('data-idx', idx);
+        node.setAttribute('data-sig', sig);
+        node.innerHTML = _sdCardHTML(c);
+      } else if (node.getAttribute('data-sig') !== sig) {
+        node.setAttribute('data-sig', sig);
+        node.innerHTML = _sdCardHTML(c);
+      }
+      // Place node at correct DOM slot
+      if (prevNode) {
+        if (node.previousSibling !== prevNode) prevNode.after(node);
+      } else {
+        if (el.firstChild !== node) el.prepend(node);
+      }
+      prevNode = node;
+    }
+  } catch (err) {
+    console.error('[sdRenderList] diff failed, falling back to full render:', err);
+    el.innerHTML = chunks.slice().reverse().map(c => {
+      return `<div class="sd-gen-card" data-idx="${c.idx}">${_sdCardHTML(c)}</div>`;
+    }).join('');
+  }
 }
 
 async function sdDelete(idx) {
@@ -4348,6 +5182,38 @@ async function sdAddToTimeline(idx, btn) {
   } catch (e) {
     showToast('✗ ' + (e.message || e));
     if (btn) { btn.innerHTML = old; btn.disabled = false; }
+  }
+}
+
+async function sdHealAndReuse(idx, btn) {
+  const oldHtml = btn ? btn.innerHTML : '';
+  if (btn) { btn.disabled = true; btn.innerHTML = '⏳ лечу...'; }
+  try {
+    // 1) Reuse first — fills prompt, chunk_text, refs, params from the failed chunk
+    await sdReuse(idx);
+    // 2) Ask backend to rewrite prompt+chunk to pass moderation
+    const res = await api.post(
+      `/api/series/${S.seriesId}/episodes/${S.episode.number}/seedance/${idx}/heal-prompt`,
+      {}
+    );
+    // 3) Apply healed text into composer
+    if (res.prompt) document.getElementById('sd-prompt').value = res.prompt;
+    if (res.chunk_text) document.getElementById('sd-chunk-text').value = res.chunk_text;
+    // 4) Show changes summary in a modal so user understands what shifted
+    const changes = res.changes || [];
+    const lines = changes.length
+      ? changes.map(s => `  • ${s}`).join('\n')
+      : '  (модель не выделила конкретных правок — проверь сам)';
+    const reason = res.reasoning ? `\n\nОбоснование: ${res.reasoning}` : '';
+    alert(
+      `🩹 Промпт пролечен. Что изменено:\n\n${lines}${reason}\n\n` +
+      'Промпт и chunk_text обновлены в композере. Нажми ▶ Сгенерировать чтобы попробовать.'
+    );
+    showToast('🩹 Готово · промпт пролечен', 4000);
+  } catch (e) {
+    showToast('✗ heal: ' + (e.message || e), 6000);
+  } finally {
+    if (btn) { btn.disabled = false; btn.innerHTML = oldHtml || '🩹 Лечить'; }
   }
 }
 
@@ -4376,6 +5242,10 @@ async function sdReuse(idx) {
     } else if (r.kind === 'loc') {
       const l = (S.series.locations || []).find(x => x.id === r.id);
       if (l) { name = l.name; if (l.ref_images?.[0]) photoUrl = `/assets/${S.seriesId}/${l.ref_images[0]}`; }
+    } else if (r.kind === 'lastframe') {
+      // Last-frame ref: URL is already a public AVAI image — use it as the thumbnail too.
+      name = r.name || `last frame · prev #${r.prev_idx ?? '?'}`;
+      photoUrl = r.url || '';
     }
     return { ...r, name, photoUrl };
   });
@@ -4457,12 +5327,9 @@ const MT = {
 
 function openMontage() {
   if (!S.seriesId) return;
-  // Hash route — survives full page reload
-  try { location.hash = `#montage/${encodeURIComponent(S.seriesId)}`; } catch {}
   navigate('montage', { seriesId: S.seriesId });
 }
 function closeMontage() {
-  try { location.hash = ''; } catch {}
   navigate('series', { seriesId: S.seriesId });
 }
 
@@ -4516,6 +5383,15 @@ async function loadMontageView() {
       e.preventDefault();
       mtZoom(e.deltaY < 0 ? 1 : -1);
     }, { passive: false });
+    // Block horizontal page scroll / browser-back swipe anywhere on the
+    // montage view, EXCEPT when the wheel happens over the timeline strip
+    // (which has its own horizontal-scroll handler).
+    document.getElementById('view-montage')?.addEventListener('wheel', (e) => {
+      if (Math.abs(e.deltaX) <= Math.abs(e.deltaY)) return; // only horizontal-intent
+      // If event originated inside the timeline strip, let its handler do its job
+      if (e.target.closest && e.target.closest('#mt-timeline')) return;
+      e.preventDefault();
+    }, { passive: false });
     // Cmd/Ctrl+Z while montage view is open
     document.addEventListener('keydown', (e) => {
       const view = document.getElementById('view-montage');
@@ -4526,11 +5402,55 @@ async function loadMontageView() {
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'z' && !e.shiftKey) {
         e.preventDefault();
         mtUndo();
-      } else if ((e.metaKey || e.ctrlKey) && (
+        return;
+      }
+      if ((e.metaKey || e.ctrlKey) && (
         (e.key.toLowerCase() === 'z' && e.shiftKey) || e.key.toLowerCase() === 'y'
       )) {
         e.preventDefault();
         mtRedo();
+        return;
+      }
+      // Plain (no-modifier) playback shortcuts
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      if (!MT.clips || !MT.clips.length) return;
+      if (e.code === 'Space') {
+        e.preventDefault();
+        mtTogglePlay();
+      } else if (e.key === 'ArrowLeft') {
+        e.preventDefault();
+        mtStepFrame(-1);
+      } else if (e.key === 'ArrowRight') {
+        e.preventDefault();
+        mtStepFrame(1);
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        mtJumpClip(-1);
+      } else if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        mtJumpClip(1);
+      } else if (e.key === 'c' || e.key === 'C' || e.key === 'с' || e.key === 'С') {
+        e.preventDefault();
+        mtCutAtPlayhead();
+      } else if (e.key === 'q' || e.key === 'Q' || e.key === 'й' || e.key === 'Й') {
+        e.preventDefault();
+        mtTrimToPlayhead('left');
+      } else if (e.key === 'w' || e.key === 'W' || e.key === 'ц' || e.key === 'Ц') {
+        e.preventDefault();
+        mtTrimToPlayhead('right');
+      } else if (e.key === 'Home') {
+        e.preventDefault();
+        mtSeekToStart();
+      } else if (e.key === 'End') {
+        e.preventDefault();
+        mtSeekToEnd();
+      } else if (e.key === 'Backspace' || e.key === 'Delete') {
+        e.preventDefault();
+        if (MT.curIdx >= 0 && MT.clips[MT.curIdx]) {
+          mtRemoveClip(MT.clips[MT.curIdx].id);
+        } else {
+          showToast('Поставь playhead на клип');
+        }
       }
     });
     MT._respBound = true;
@@ -4648,9 +5568,36 @@ function mtRenderTimeline() {
       </div>
     `;
   }).join('');
+  mtRenderRuler();
+  // Bind ruler scrubbing once
+  const ruler = document.getElementById('mt-ruler');
+  if (ruler && !ruler._mtBound) {
+    ruler.addEventListener('mousedown', mtScrubStart);
+    ruler.style.cursor = 'pointer';
+    ruler._mtBound = true;
+  }
   // Click on the strip to scrub
   if (!el._mtBound) {
     el.addEventListener('mousedown', mtScrubStart);
+    el.addEventListener('dragover',  mtStripDragOver);
+    el.addEventListener('dragleave', mtStripDragLeave);
+    el.addEventListener('drop',      mtStripDrop);
+    // Sync ruler scroll with timeline scroll
+    el.addEventListener('scroll', () => {
+      const r = document.getElementById('mt-ruler');
+      if (r) r.scrollLeft = el.scrollLeft;
+    });
+    // Capture wheel/trackpad — scroll the timeline horizontally instead of
+    // letting the page scroll. Vertical wheel translates to horizontal too.
+    el.addEventListener('wheel', (ev) => {
+      const dx = Math.abs(ev.deltaX) > Math.abs(ev.deltaY) ? ev.deltaX : ev.deltaY;
+      if (dx === 0) return;
+      // Only consume if there is room to scroll in that direction
+      const max = el.scrollWidth - el.clientWidth;
+      const before = el.scrollLeft;
+      el.scrollLeft = Math.max(0, Math.min(max, before + dx));
+      if (el.scrollLeft !== before || max > 0) ev.preventDefault();
+    }, { passive: false });
     el._mtBound = true;
   }
   mtUpdatePlayhead();
@@ -4722,10 +5669,47 @@ function mtUpdatePlayhead() {
   ph.classList.toggle('hidden', !visible);
 }
 
+function mtFmtTime(s) {
+  // MM:SS.t  (one decimal)
+  s = Math.max(0, s || 0);
+  const m = Math.floor(s / 60);
+  const sec = s - m * 60;
+  return `${String(m).padStart(2,'0')}:${sec.toFixed(1).padStart(4,'0')}`;
+}
 function mtUpdateTimeLabel() {
   const lbl = document.getElementById('mt-time');
   if (!lbl) return;
-  lbl.textContent = `${mtFmtSec(MT.globalTime)} / ${mtFmtSec(mtTotalDur())}`;
+  lbl.textContent = `${mtFmtTime(MT.globalTime)} / ${mtFmtTime(mtTotalDur())}`;
+}
+
+function mtRenderRuler() {
+  const inner = document.getElementById('mt-ruler-inner');
+  const strip = document.getElementById('mt-timeline');
+  if (!inner || !strip) return;
+  const total = mtTotalDur();
+  const pps = MT.pxPerSec || 30;
+  const padLeft = 12; // matches .mt-timeline padding
+  const widthPx = Math.max(strip.scrollWidth, total * pps + padLeft * 2);
+  inner.style.width = widthPx + 'px';
+  if (total <= 0) { inner.innerHTML = ''; return; }
+  // Pick a tick step that gives ~50-100 px between major labels
+  const targetMajorPx = 80;
+  const candidates = [1, 2, 5, 10, 15, 30, 60, 120, 300];
+  let major = candidates[candidates.length - 1];
+  for (const c of candidates) {
+    if (c * pps >= targetMajorPx) { major = c; break; }
+  }
+  const minor = major / (major >= 5 ? 5 : (major >= 2 ? 2 : 1));
+  const parts = [];
+  for (let t = 0; t <= total + 0.001; t += minor) {
+    const x = padLeft + t * pps;
+    const isMajor = Math.abs(t / major - Math.round(t / major)) < 1e-6;
+    parts.push(`<div class="mt-ruler-tick ${isMajor ? 'major' : 'minor'}" style="left:${x}px"></div>`);
+    if (isMajor) {
+      parts.push(`<div class="mt-ruler-label" style="left:${x}px">${mtFmtTime(t)}</div>`);
+    }
+  }
+  inner.innerHTML = parts.join('');
 }
 
 function mtScrubStart(e) {
@@ -4949,6 +5933,36 @@ function mtSetZoom(v) {
   mtUpdatePlayhead();
 }
 
+// Jump playhead to the previous/next clip boundary (cut between clips).
+// dir = -1 → previous boundary, +1 → next.
+// Boundaries are at the start of each clip (0, dur(0), dur(0)+dur(1), …) and
+// at the end of the last clip (= total duration).
+function mtJumpClip(dir) {
+  if (!MT.clips || !MT.clips.length) return;
+  const v = document.getElementById('mt-preview');
+  if (v && !v.paused) { v.pause(); MT.playing = false;
+    const btn = document.getElementById('mt-playbtn'); if (btn) btn.textContent = '▶'; }
+  // Build sorted list of boundary times
+  const bounds = [0];
+  let acc = 0;
+  for (const c of MT.clips) {
+    acc += Math.max(0, (c.out || 0) - (c.in || 0));
+    bounds.push(acc);
+  }
+  const t = MT.globalTime || 0;
+  const eps = 0.01;
+  let target;
+  if (dir < 0) {
+    // largest boundary strictly less than t (with small epsilon to avoid getting stuck)
+    target = bounds.filter(b => b < t - eps).pop();
+    if (target == null) target = 0;
+  } else {
+    target = bounds.find(b => b > t + eps);
+    if (target == null) target = bounds[bounds.length - 1];
+  }
+  mtSeek(target);
+}
+
 // Step the playhead by ±1 frame (assume 30fps).
 function mtStepFrame(dir) {
   if (!MT.clips.length) return;
@@ -4979,6 +5993,12 @@ function mtTogglePlay() {
 }
 
 function mtSeekToStart() { mtSeek(0); }
+function mtSeekToEnd() {
+  const total = mtTotalDur();
+  if (total <= 0) return;
+  // Land just-before-end so playhead is visible / video doesn't auto-stop awkwardly
+  mtSeek(Math.max(0, total - 0.05));
+}
 function mtSeekToClip(idx) {
   // Compute global time at start of clip idx
   let t = 0;
@@ -5024,6 +6044,32 @@ function mtAttachPreviewListeners() {
   v._mtBound = true;
 }
 
+async function mtTrimToPlayhead(side /* 'left' | 'right' */) {
+  if (MT.curIdx < 0 || !MT.clips[MT.curIdx]) { showToast('Поставь playhead на клип'); return; }
+  const c = MT.clips[MT.curIdx];
+  let pre = 0;
+  for (let i = 0; i < MT.curIdx; i++) pre += Math.max(0, (MT.clips[i].out || 0) - (MT.clips[i].in || 0));
+  const at = MT.globalTime - pre;                 // offset inside trimmed clip
+  const dur = (c.out || 0) - (c.in || 0);
+  if (at < 0.1 || at > dur - 0.1) { showToast('Слишком близко к краю'); return; }
+  const splitAbs = (c.in || 0) + at;              // absolute seconds in original media
+  const newIn  = side === 'left'  ? splitAbs : (c.in  || 0);
+  const newOut = side === 'right' ? splitAbs : (c.out || 0);
+  try {
+    const r = await fetch(
+      `/api/series/${S.seriesId}/timeline/clips/${c.id}/trim`,
+      { method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ in: newIn, out: newOut }) }
+    );
+    if (!r.ok) throw new Error(await r.text());
+    showToast(side === 'left' ? '✂ обрезано слева' : '✂ обрезано справа');
+    await mtRefreshTimeline();
+    const total = mtTotalDur();
+    if (MT.globalTime > total) MT.globalTime = Math.max(0, total - 0.1);
+    mtSeek(MT.globalTime);
+  } catch (e) { showToast('✗ trim: ' + (e.message || e)); }
+}
+
 async function mtCutAtPlayhead() {
   if (MT.curIdx < 0 || !MT.clips[MT.curIdx]) { showToast('Поставь playhead на клип'); return; }
   const c = MT.clips[MT.curIdx];
@@ -5046,6 +6092,13 @@ function mtDragStart(e, id) {
   e.currentTarget.classList.add('dragging');
 }
 function mtDragOver(e, id) {
+  // Allow drop if reordering an existing clip OR dropping a library item
+  if (MT.libDragRef) {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+    e.currentTarget.classList.add('drop-target');
+    return;
+  }
   if (!MT.dragId || MT.dragId === id) return;
   e.preventDefault();
   e.dataTransfer.dropEffect = 'move';
@@ -5056,11 +6109,20 @@ function mtDragEnd(e) {
   document.querySelectorAll('.mt-clip').forEach(el => {
     el.classList.remove('dragging','drop-target');
   });
+  const strip = document.getElementById('mt-timeline');
+  if (strip) strip.classList.remove('drop-target');
   MT.dragId = null;
 }
 async function mtDrop(e, targetId) {
   e.preventDefault();
   e.currentTarget.classList.remove('drop-target');
+  // Library drop → insert before target clip
+  if (MT.libDragRef) {
+    const ref = MT.libDragRef;
+    MT.libDragRef = null;
+    await mtInsertFromLib(ref.ep, ref.idx, targetId);
+    return;
+  }
   if (!MT.dragId || MT.dragId === targetId) return;
   const order = MT.clips.map(c => c.id);
   const fromIdx = order.indexOf(MT.dragId);
@@ -5079,6 +6141,60 @@ async function mtDrop(e, targetId) {
   }
 }
 
+// ─── Library → timeline drag ──────────────────────────────────────────────
+function mtLibDragStart(e, ep, idx) {
+  MT.libDragRef = { ep, idx };
+  e.dataTransfer.effectAllowed = 'copy';
+  try { e.dataTransfer.setData('text/plain', `lib:${ep}:${idx}`); } catch {}
+  e.currentTarget.classList.add('dragging');
+}
+function mtLibDragEnd(e) {
+  document.querySelectorAll('.mt-lib-item').forEach(el => el.classList.remove('dragging'));
+  document.querySelectorAll('.mt-clip').forEach(el => el.classList.remove('drop-target'));
+  const strip = document.getElementById('mt-timeline');
+  if (strip) strip.classList.remove('drop-target');
+  MT.libDragRef = null;
+}
+function mtStripDragOver(e) {
+  if (!MT.libDragRef) return;
+  e.preventDefault();
+  e.dataTransfer.dropEffect = 'copy';
+  document.getElementById('mt-timeline')?.classList.add('drop-target');
+}
+function mtStripDragLeave(e) {
+  document.getElementById('mt-timeline')?.classList.remove('drop-target');
+}
+async function mtStripDrop(e) {
+  if (!MT.libDragRef) return;
+  e.preventDefault();
+  document.getElementById('mt-timeline')?.classList.remove('drop-target');
+  const ref = MT.libDragRef;
+  MT.libDragRef = null;
+  // If drop landed on a child .mt-clip, the clip's own drop fired already; skip.
+  if (e.target.closest && e.target.closest('.mt-clip')) return;
+  await mtInsertFromLib(ref.ep, ref.idx, null); // append
+}
+
+async function mtInsertFromLib(ep, idx, targetClipId /* null = append */) {
+  try {
+    const r = await api.post(`/api/series/${S.seriesId}/timeline/clips/add`, {
+      episode: ep, chunk_idx: idx,
+    });
+    const newId = r.clip?.id;
+    if (newId && targetClipId) {
+      const order = MT.clips.map(c => c.id);
+      const tIdx = order.indexOf(targetClipId);
+      // newly added clip is appended on the server; build new order:
+      const newOrder = order.slice();
+      if (tIdx >= 0) newOrder.splice(tIdx, 0, newId);
+      else newOrder.push(newId);
+      await api.post(`/api/series/${S.seriesId}/timeline/reorder`, { order: newOrder });
+    }
+    showToast('✓ Добавлено');
+    await mtRefreshTimeline();
+  } catch (e) { showToast('✗ ' + (e.message || e)); }
+}
+
 async function mtRemoveClip(id) {
   await api.del(`/api/series/${S.seriesId}/timeline/clips/${id}`);
   await mtRefreshTimeline();
@@ -5089,29 +6205,55 @@ async function mtRemoveClip(id) {
 async function mtRefreshLibrary() {
   const lib = document.getElementById('mt-library');
   if (!lib) return;
+  const filterSel = document.getElementById('mt-lib-filter');
+  const countEl = document.getElementById('mt-lib-count');
   lib.innerHTML = '<div class="muted" style="font-size:12px">Загружаю...</div>';
   try {
     const eps = await api.get(`/api/series/${S.seriesId}/episodes`);
-    const items = [];
-    for (const ep of (eps.episodes || eps || [])) {
+    const epList = (eps.episodes || eps || []);
+    const allItems = [];
+    for (const ep of epList) {
       try {
         const r = await api.get(`/api/series/${S.seriesId}/episodes/${ep.number}/seedance/list`);
         for (const c of (r.chunks || [])) {
           if (c.status === 'completed' && c.video_path) {
-            items.push({ ep: ep.number, ep_title: ep.title || '', ...c });
+            allItems.push({ ep: ep.number, ep_title: ep.title || '', ...c });
           }
         }
       } catch {}
     }
+    // Populate filter dropdown (preserve current selection)
+    if (filterSel) {
+      const prev = filterSel.value || 'all';
+      const epsWithClips = [...new Set(allItems.map(c => c.ep))].sort((a,b) => a-b);
+      const opts = ['<option value="all">Все эпизоды</option>']
+        .concat(epsWithClips.map(n => {
+          const t = (epList.find(e => e.number === n)?.title || '').slice(0, 24);
+          return `<option value="${n}">Эпизод ${n}${t ? ' · ' + esc(t) : ''}</option>`;
+        }));
+      filterSel.innerHTML = opts.join('');
+      // restore previous filter if still valid
+      if ([...filterSel.options].some(o => o.value === prev)) filterSel.value = prev;
+    }
+    const filterVal = filterSel?.value || 'all';
+    const items = filterVal === 'all'
+      ? allItems
+      : allItems.filter(c => String(c.ep) === String(filterVal));
+    if (countEl) countEl.textContent = `${items.length} из ${allItems.length}`;
     if (!items.length) {
-      lib.innerHTML = '<div class="muted" style="font-size:12px">Нет готовых видео. Сгенерируй что-нибудь в эпизодах через Seedance.</div>';
+      lib.innerHTML = allItems.length
+        ? '<div class="muted" style="font-size:12px">В этом эпизоде нет готовых клипов.</div>'
+        : '<div class="muted" style="font-size:12px">Нет готовых видео. Сгенерируй что-нибудь в эпизодах через Seedance.</div>';
       return;
     }
     lib.innerHTML = items.map(c => {
       const url = `/assets/${S.seriesId}/${c.video_path}`;
       return `
-        <div class="mt-lib-item">
-          <video src="${url}" preload="metadata" muted></video>
+        <div class="mt-lib-item" draggable="true"
+             ondragstart="mtLibDragStart(event,${c.ep},${c.idx})"
+             ondragend="mtLibDragEnd(event)"
+             title="Клик — фуллскрин · перетащи на таймлайн">
+          <video data-src="${url}" preload="none" muted onclick="mtLibFullscreen(event,'${url}')" style="cursor:zoom-in"></video>
           <div class="mt-lib-meta">
             <div class="ep">ep${c.ep}·#${c.idx} · ${c.duration}с</div>
             <div class="preview">${esc((c.prompt||'').slice(0,80))}</div>
@@ -5119,9 +6261,82 @@ async function mtRefreshLibrary() {
           </div>
         </div>`;
     }).join('');
+    // Hover-scrub: водишь мышью по превью — кадры пролистываются.
+    // Lazy-load (preload=none → src on first hover) + throttle seeks to ~30 fps
+    // so браузер не захлёбывался range-запросами при большой библиотеке.
+    if (!lib._mtHoverBound) {
+      let lastMove = 0;
+      let pendingFrac = 0;
+      let pendingVid  = null;
+      const flush = () => {
+        if (!pendingVid) return;
+        const v = pendingVid;
+        const dur = v.duration;
+        if (isFinite(dur) && dur > 0) {
+          try { v.currentTime = pendingFrac * dur; } catch {}
+        }
+        pendingVid = null;
+      };
+      const onMove = (e) => {
+        const v = e.target.closest('.mt-lib-item video');
+        if (!v) return;
+        // Lazy-attach src on first hover so we don't fan out 20+ metadata requests
+        if (!v.src && v.dataset.src) {
+          v.src = v.dataset.src;
+          v.preload = 'metadata';
+        }
+        const rect = v.getBoundingClientRect();
+        const frac = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+        pendingFrac = frac;
+        pendingVid  = v;
+        const now = performance.now();
+        if (now - lastMove >= 33) {       // ~30 fps cap
+          lastMove = now;
+          flush();
+        }
+      };
+      const resetVid = (v) => { try { v.currentTime = 0; } catch {} };
+      lib.addEventListener('mousemove', onMove);
+      lib.addEventListener('mouseout', (e) => {
+        const v = e.target.closest && e.target.closest('.mt-lib-item video');
+        if (!v) return;
+        const item = v.closest('.mt-lib-item');
+        if (!item.contains(e.relatedTarget)) {
+          if (pendingVid === v) pendingVid = null;
+          resetVid(v);
+        }
+      });
+      lib._mtHoverBound = true;
+    }
   } catch (e) {
     lib.innerHTML = '<div class="muted">Ошибка загрузки</div>';
   }
+}
+
+function mtLibFullscreen(e, url) {
+  // Stop the click from bubbling (e.g. starting a drag-related side-effect)
+  e.stopPropagation();
+  e.preventDefault();
+  // Build a one-shot overlay with a big video player
+  const old = document.getElementById('mt-lib-fs');
+  if (old) old.remove();
+  const overlay = document.createElement('div');
+  overlay.id = 'mt-lib-fs';
+  overlay.className = 'mt-lib-fs-overlay';
+  overlay.innerHTML = `
+    <button class="mt-lib-fs-close" title="Закрыть (Esc)">✕</button>
+    <video src="${url}" controls autoplay playsinline></video>
+  `;
+  const close = () => {
+    overlay.remove();
+    document.removeEventListener('keydown', onKey);
+  };
+  const onKey = (ev) => { if (ev.key === 'Escape') close(); };
+  overlay.addEventListener('click', (ev) => {
+    if (ev.target === overlay || ev.target.classList.contains('mt-lib-fs-close')) close();
+  });
+  document.addEventListener('keydown', onKey);
+  document.body.appendChild(overlay);
 }
 
 async function mtAddFromLib(ep, idx, btn) {
@@ -5377,22 +6592,6 @@ async function cropSave() {
   } catch (e) { showToast('✗ ' + (e.message || e)); }
 }
 
-// ── Init ──────────────────────────────────────────────────────────────────────
-(function bootRoute() {
-  const m = (location.hash || '').match(/^#montage\/([^/?#]+)/);
-  if (m) {
-    const sid = decodeURIComponent(m[1]);
-    navigate('montage', { seriesId: sid });
-    return;
-  }
-  navigate('projects');
-})();
-window.addEventListener('hashchange', () => {
-  const m = (location.hash || '').match(/^#montage\/([^/?#]+)/);
-  if (m) {
-    const sid = decodeURIComponent(m[1]);
-    if (sid !== S.seriesId || document.getElementById('view-montage')?.classList.contains('hidden')) {
-      navigate('montage', { seriesId: sid });
-    }
-  }
-});
+// ── Init: restore view from URL hash ─────────────────────────────────────────
+(function bootRoute() { _navFromHash(); })();
+// (hashchange listener already registered next to navigate())

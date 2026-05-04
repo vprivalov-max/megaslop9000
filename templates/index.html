@@ -3,7 +3,10 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Series Writer</title>
+<title>MegaSlop 9000</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
@@ -11,10 +14,14 @@
 <!-- ── TOP NAV ── -->
 <nav id="topnav">
   <div class="nav-left">
-    <button class="nav-logo" onclick="navigate('projects')">Series Writer</button>
+    <div class="nav-brand">
+      <button class="nav-logo" onclick="navigate('projects')">MegaSlop 9000</button>
+      <span id="nav-slogan" class="nav-slogan"></span>
+    </div>
     <div id="breadcrumb" class="breadcrumb"></div>
   </div>
   <div class="nav-right">
+    <button id="nav-montage-btn" class="btn-primary nav-editor-btn hidden" onclick="openMontage()" title="Перейти в редактор монтажа">🎬 Редактор</button>
     <span id="balance-badge" class="badge"></span>
     <button class="btn-icon" onclick="openSettings()" title="Настройки">⚙</button>
     <span id="user-pill" class="user-pill hidden" title="">
@@ -134,7 +141,6 @@
           </label>
           <button class="btn-secondary reteller-only" onclick="openReteller()">🎬 Отправить в Reteller</button>
           <button class="btn-ghost" onclick="renameOutFiles()" title="Переименовать файлы в папке OUT по студийным требованиям">📁 Переименовать OUT</button>
-          <button class="btn-ghost seedance-only" onclick="openMontage()" title="Склеить сгенерированные ролики в одно видео">🎬 Монтаж</button>
           <button class="btn-primary" onclick="openCreateEpisode()">+ Эпизод</button>
         </div>
       </div>
@@ -169,37 +175,55 @@
     <div class="montage-body">
       <aside class="montage-library">
         <h3>Библиотека клипов</h3>
-        <div class="muted" style="font-size:12px;margin-bottom:8px">Только готовые Seedance-ролики из всех эпизодов</div>
+        <div class="muted" style="font-size:12px;margin-bottom:8px">Только готовые Seedance-ролики</div>
+        <div style="display:flex;gap:6px;align-items:center;margin-bottom:8px;flex-wrap:wrap">
+          <select id="mt-lib-filter" onchange="mtRefreshLibrary()" style="font-size:12px;padding:4px 6px"></select>
+          <span id="mt-lib-count" class="muted" style="font-size:11px"></span>
+        </div>
         <div id="mt-library" class="mt-library"></div>
       </aside>
 
       <main class="montage-main">
-        <div class="mt-preview-wrap">
-          <div class="mt-preview-frame">
-            <video id="mt-preview" class="mt-preview" preload="metadata" playsinline></video>
-          </div>
-          <div class="mt-preview-controls">
-            <button class="btn-ghost" onclick="mtTogglePlay()" id="mt-playbtn">▶</button>
-            <span id="mt-time" class="muted">0.0с / 0.0с</span>
-            <div style="display:flex;gap:6px">
-              <button class="btn-ghost" onclick="mtStepFrame(-1)" title="−1 кадр">⏪</button>
-              <button class="btn-ghost" onclick="mtStepFrame(1)" title="+1 кадр">⏩</button>
+        <div class="mt-top-row">
+          <div class="mt-top-side mt-top-side-left">
+            <span id="mt-time" class="mt-time-display" title="Текущая позиция / общая длительность">00:00.0 / 00:00.0</span>
+            <div class="mt-transport">
+              <button class="btn-ghost" onclick="mtSeekToStart()" title="В начало (Home)">⏮</button>
+              <button class="btn-ghost" onclick="mtStepFrame(-1)" title="−1 кадр (←)">⏪</button>
+              <button class="btn-ghost" onclick="mtTogglePlay()" id="mt-playbtn" title="Play/Pause (Space)">▶</button>
+              <button class="btn-ghost" onclick="mtStepFrame(1)" title="+1 кадр (→)">⏩</button>
+              <button class="btn-ghost" onclick="mtSeekToEnd()" title="В конец (End)">⏭</button>
+              <button class="btn-ghost mt-cut-btn" onclick="mtCutAtPlayhead()" title="Разрезать клип в позиции playhead (C)">✂ Разрезать</button>
             </div>
-            <button class="btn-ghost" onclick="mtCutAtPlayhead()" title="Разрезать клип в позиции playhead">✂ Разрезать</button>
-            <button class="btn-ghost" onclick="mtSeekToStart()" title="В начало">⏮</button>
           </div>
-        </div>
-
-        <h3>Таймлайн <span class="muted" style="font-weight:normal;font-size:12px">· тяни клипы для перестановки · перетаскивай линию для скраба</span></h3>
-        <div class="mt-timeline-toolbar">
-          <span class="muted">Масштаб:</span>
-          <button class="btn-ghost" onclick="mtZoom(-1)" title="Уменьшить">−</button>
-          <span id="mt-zoom-val" class="mt-zoom-val">30 px/s</span>
-          <button class="btn-ghost" onclick="mtZoom(1)" title="Увеличить">+</button>
-          <button class="btn-ghost" onclick="mtZoomFit()" title="Вписать в ширину">Fit</button>
-          <span class="muted" style="margin-left:8px;font-size:11px">⌘+колесо — зум</span>
+          <div class="mt-preview-wrap">
+            <div class="mt-preview-frame">
+              <video id="mt-preview" class="mt-preview" preload="metadata" playsinline></video>
+            </div>
+          </div>
+          <div class="mt-top-side mt-top-side-right">
+            <div class="mt-top-side-top">
+              <h3 style="margin:0 0 8px">Таймлайн</h3>
+              <div class="mt-timeline-toolbar">
+                <span class="muted">Масштаб:</span>
+                <button class="btn-ghost" onclick="mtZoom(-1)" title="Уменьшить">−</button>
+                <span id="mt-zoom-val" class="mt-zoom-val">30 px/s</span>
+                <button class="btn-ghost" onclick="mtZoom(1)" title="Увеличить">+</button>
+                <button class="btn-ghost" onclick="mtZoomFit()" title="Вписать в ширину">Fit</button>
+                <span class="muted" style="margin-left:8px;font-size:11px">⌘+колесо — зум</span>
+              </div>
+            </div>
+            <div class="mt-help muted" style="font-size:12px;line-height:1.7">
+              · тяни клипы для перестановки · перетаскивай линию для скраба<br>
+              · <kbd>Space</kbd> play, <kbd>←/→</kbd> кадр, <kbd>↑/↓</kbd> склейка<br>
+              · <kbd>C</kbd> разрезать, <kbd>Q</kbd>/<kbd>W</kbd> обрезать слева/справа<br>
+              · <kbd>⌫</kbd> удалить, <kbd>⌘Z</kbd>/<kbd>⌘⇧Z</kbd> undo/redo<br>
+              · <kbd>Home</kbd>/<kbd>End</kbd> в начало/конец
+            </div>
+          </div>
         </div>
         <div id="mt-timeline-wrap" class="mt-timeline-wrap">
+          <div id="mt-ruler" class="mt-ruler"><div id="mt-ruler-inner" class="mt-ruler-inner"></div></div>
           <div id="mt-timeline" class="mt-timeline"></div>
           <div id="mt-playhead" class="mt-playhead hidden"></div>
         </div>
@@ -283,10 +307,12 @@
               <button class="btn-ghost btn-sm" id="ep-history-btn" onclick="openScriptHistory()" title="Предыдущие версии сценария (после регенерации или Доктора)">↩ История</button>
               <button class="btn-ghost btn-sm" id="ep-doctor-btn" onclick="doctorScript()" title="Найти и исправить логические дыры в сценарии (статус персонажей, мотивации, enabling conditions)">🩺 Доктор сценария</button>
               <button class="btn-ghost btn-sm" id="ep-extract-chars-btn" onclick="extractCharsFromScript()" title="Найти персонажей и локации в сценарии, добавить новые в сериал и пересверить активных в этой сцене">🤖 Извлечь персонажей и локации</button>
+              <button class="btn-ghost btn-sm" id="ep-scenes-btn" onclick="toggleSceneView()" title="Подсветить сцены и разбить на ~15-секундные сегменты для Seedance">🎬 Сцены</button>
               <button class="ep-script-btn ready" id="ep-gen-script-btn" onclick="generateEpisodeScript()">⚡ Сгенерировать</button>
             </div>
           </div>
           <textarea id="ep-script" class="script-area" placeholder="Screenplay / Script..."></textarea>
+          <div id="ep-script-scenes" class="ep-script-scenes hidden"></div>
           <div class="char-counter" style="display:flex;justify-content:space-between">
             <span id="ep-script-gen-status" style="font-size:0.78rem;color:var(--warning)"></span>
             <span><span id="script-char-count">0</span> символов</span>
@@ -325,8 +351,25 @@
             <textarea id="sd-chunk-text" class="notes-area" style="min-height:90px"
               placeholder="Вставь сюда кусок сценария (5-15 сек экранного времени)..."></textarea>
 
-            <div class="sd-row">
+            <div class="sd-row" style="flex-wrap:wrap">
               <button class="btn-sm btn-accent" onclick="sdCompose()">⚙ Скомпоновать (LLM)</button>
+              <label style="font-size:0.78rem;color:var(--muted);display:inline-flex;align-items:center;gap:4px"
+                     title="Если предыдущий чанк в той же сцене и уже сгенерён — последний кадр его видео добавится первым референсом. Резко улучшает консистентность позиций и фона.">
+                <input type="checkbox" id="sd-use-lastframe" checked style="margin:0">
+                использовать last frame предыдущего чанка
+              </label>
+              <label style="font-size:0.78rem;color:var(--muted);display:inline-flex;align-items:center;gap:4px"
+                     title="Включает стилизацию (например Pixar / аниме / нуар) — composer вшивает стиль во все блоки промпта.">
+                <input type="checkbox" id="sd-use-style" onchange="sdToggleStyleField()" style="margin:0">
+                стиль
+              </label>
+              <label style="font-size:0.78rem;color:var(--muted);display:inline-flex;align-items:center;gap:4px"
+                     title="Composer не выбирает варианты костюмов (outfits) — для каждого персонажа берётся только его базовое референс-фото. Полезно когда в сериале outfits сделаны под другие сцены и в текущей надо вернуться к базе.">
+                <input type="checkbox" id="sd-base-only" style="margin:0">
+                только базовые образы персов
+              </label>
+              <input type="text" id="sd-style" class="hidden" placeholder="Pixar, anime, film noir, oil-painting, cyberpunk..."
+                     style="flex:1;min-width:220px;padding:5px 10px;font-size:0.8rem">
               <span id="sd-compose-status" style="font-size:0.78rem;color:var(--muted)"></span>
             </div>
 
@@ -356,6 +399,7 @@
                   <option value="off">off</option>
                   <option value="grid">grid</option>
                   <option value="collage_grid" selected>collage_grid</option>
+                  <option value="cartoon">cartoon</option>
                 </select>
               </label>
               <button class="btn-primary btn-sm" onclick="sdGenerate()">▶ Сгенерировать</button>
@@ -382,7 +426,10 @@
       <div class="sidebar-section">
         <div class="sidebar-section-header">
           <h3>Персонажи</h3>
-          <button class="btn-folder" title="Открыть папку с фото" onclick="openAssetFolder('characters')">📁</button>
+          <div style="display:flex;gap:4px">
+            <button class="btn-icon" title="Быстро добавить персонажа" onclick="openQuickAddChar()">+</button>
+            <button class="btn-folder" title="Открыть папку с фото" onclick="openAssetFolder('characters')">📁</button>
+          </div>
         </div>
         <div id="ep-characters-list" class="ep-characters-check"></div>
       </div>
@@ -390,7 +437,10 @@
       <div class="sidebar-section">
         <div class="sidebar-section-header">
           <h3>Локации</h3>
-          <button class="btn-folder" title="Открыть папку с фото" onclick="openAssetFolder('locations')">📁</button>
+          <div style="display:flex;gap:4px">
+            <button class="btn-icon" title="Быстро добавить локацию" onclick="openQuickAddLoc()">+</button>
+            <button class="btn-folder" title="Открыть папку с фото" onclick="openAssetFolder('locations')">📁</button>
+          </div>
         </div>
         <div id="ep-locations-list" class="ep-locations-check"></div>
       </div>
@@ -694,6 +744,15 @@
         <label>Описание мира</label>
         <textarea id="bible-world" rows="5"></textarea>
       </div>
+      <div class="field-group">
+        <label>Визуальный стиль проекта</label>
+        <input id="bible-visual-style" type="text"
+               placeholder="По умолчанию: реалистичный сериал. Можно: Pixar, anime, film noir, oil painting, cyberpunk...">
+        <div class="muted" style="font-size:0.78rem;margin-top:4px">
+          Этот стиль автоматически применяется при генерации фото персонажей, локаций и при компоновке промптов Seedance.
+          Оставь пустым для realistic photo look.
+        </div>
+      </div>
     </div>
     <div class="modal-footer">
       <button class="btn-ghost" onclick="closeModal('modal-bible')">Отмена</button>
@@ -739,6 +798,103 @@
     <div class="modal-footer">
       <button class="btn-ghost" onclick="closeModal('modal-character')">Отмена</button>
       <button class="btn-primary" onclick="saveCharacter()">Сохранить</button>
+    </div>
+  </div>
+</div>
+
+<!-- Quick-add character (sidebar) -->
+<div id="modal-quickchar" class="modal hidden">
+  <div class="modal-box" style="max-width:520px">
+    <div class="modal-header">
+      <h2>✨ Быстро добавить персонажа</h2>
+      <button class="btn-icon" onclick="closeModal('modal-quickchar')">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="field-group">
+        <label>Имя *</label>
+        <input id="qc-name" type="text" placeholder="Например: Marcus">
+      </div>
+      <div class="field-group">
+        <label>Пол</label>
+        <select id="qc-gender">
+          <option value="female">Женский</option>
+          <option value="male" selected>Мужской</option>
+        </select>
+      </div>
+      <div class="field-group">
+        <label>Фото</label>
+        <div id="qc-drop" class="qc-drop-zone"
+             ondragover="event.preventDefault();event.currentTarget.classList.add('hover')"
+             ondragleave="event.currentTarget.classList.remove('hover')"
+             ondrop="qcHandleDrop(event)"
+             onclick="document.getElementById('qc-file').click()">
+          <div class="qc-drop-empty">
+            📷 Перетащи фото сюда или <span style="text-decoration:underline">выбери файл</span>
+          </div>
+          <img id="qc-preview" class="qc-preview hidden" alt="">
+        </div>
+        <input id="qc-file" type="file" accept="image/*" class="hidden" onchange="qcHandleFile(this.files[0])">
+        <div style="text-align:center;color:var(--muted);font-size:0.85rem;margin:8px 0">— или —</div>
+        <button id="qc-gen-toggle" class="btn-secondary btn-full" type="button" onclick="qcToggleGen()">🪄 Сгенерировать через AI</button>
+      </div>
+      <div id="qc-gen-block" class="field-group hidden">
+        <label>Опиши персонажа для AI</label>
+        <textarea id="qc-description" rows="4"
+          placeholder="Например: высокий мужчина 35 лет, тёмные волосы, серый деловой костюм, уверенный взгляд, чисто выбрит..."></textarea>
+        <button class="btn-primary btn-full" type="button" onclick="qcGenerate()" id="qc-gen-btn" style="margin-top:8px">
+          🪄 Сгенерировать фото
+        </button>
+        <div id="qc-gen-status" class="muted" style="font-size:0.83rem;margin-top:6px;text-align:center"></div>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn-ghost" onclick="closeModal('modal-quickchar')">Отмена</button>
+      <button class="btn-primary" id="qc-save-btn" onclick="qcSave()">Сохранить</button>
+    </div>
+  </div>
+</div>
+
+<!-- Quick-add location (sidebar) -->
+<div id="modal-quickloc" class="modal hidden">
+  <div class="modal-box" style="max-width:520px">
+    <div class="modal-header">
+      <h2>✨ Быстро добавить локацию</h2>
+      <button class="btn-icon" onclick="closeModal('modal-quickloc')">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="field-group">
+        <label>Название *</label>
+        <input id="ql-name" type="text" placeholder="Например: Corporate Lobby">
+      </div>
+      <div class="field-group">
+        <label>Фото</label>
+        <div id="ql-drop" class="qc-drop-zone"
+             ondragover="event.preventDefault();event.currentTarget.classList.add('hover')"
+             ondragleave="event.currentTarget.classList.remove('hover')"
+             ondrop="qlHandleDrop(event)"
+             onclick="document.getElementById('ql-file').click()">
+          <div class="qc-drop-empty">
+            📷 Перетащи фото сюда или <span style="text-decoration:underline">выбери файл</span>
+          </div>
+          <img id="ql-preview" class="qc-preview hidden" alt="">
+        </div>
+        <input id="ql-file" type="file" accept="image/*" class="hidden" onchange="qlHandleFile(this.files[0])">
+        <div style="text-align:center;color:var(--muted);font-size:0.85rem;margin:8px 0">— или —</div>
+        <button id="ql-gen-toggle" class="btn-secondary btn-full" type="button" onclick="qlToggleGen()">🪄 Сгенерировать через AI</button>
+      </div>
+      <div id="ql-gen-block" class="field-group hidden">
+        <label>Опиши локацию для AI</label>
+        <textarea id="ql-description" rows="4"
+          placeholder="Например: стеклянное лобби корпорации, мраморный пол, флуоресцентное освещение, стойка ресепшн, охрана у входа..."></textarea>
+        <button class="btn-primary btn-full" type="button" onclick="qlGenerate()" id="ql-gen-btn" style="margin-top:8px">
+          🪄 Сгенерировать фото
+        </button>
+        <div id="ql-gen-status" class="muted" style="font-size:0.83rem;margin-top:6px;text-align:center"></div>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn-ghost" onclick="closeModal('modal-quickloc')">Отмена</button>
+      <button class="btn-primary" id="ql-save-btn" onclick="qlSave()">Сохранить</button>
     </div>
   </div>
 </div>
@@ -838,9 +994,18 @@
         <input type="file" accept="image/*" multiple id="loc-asset-file-input" hidden>
         <span>+ Загрузить фото локации</span>
       </label>
+      <div class="field-group" style="margin-top:14px">
+        <label>Пожелания (применятся при перегенерации)</label>
+        <textarea id="regen-loc-wishes" rows="3"
+          placeholder="Например: «больше окон», «утренний свет», «без людей в кадре», «теплая палитра»..."></textarea>
+        <div class="muted" style="font-size:0.78rem;margin-top:4px">
+          Эти пожелания сохранятся в локации и будут применяться при всех будущих генерациях.
+        </div>
+      </div>
     </div>
     <div class="modal-footer">
-      <button class="btn-primary" onclick="closeModal('modal-loc-assets')">Готово</button>
+      <button class="btn-secondary" onclick="closeModal('modal-loc-assets')">Закрыть</button>
+      <button id="regen-loc-btn" class="btn-primary" onclick="regenerateLocation()">↻ Перегенерировать</button>
     </div>
   </div>
 </div>

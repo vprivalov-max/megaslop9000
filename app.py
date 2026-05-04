@@ -119,7 +119,8 @@ def _render_queue_depth():
 
 _RECOVERY_DONE = False
 _RECOVERY_LOCK = threading.Lock()
-_SUBMITTING_TIMEOUT_SEC = 5 * 60  # any "submitting" older than this is dead
+_SUBMITTING_TIMEOUT_SEC = 5 * 60  # boot-time recovery: be conservative
+_SUBMITTING_TIMEOUT_RUNTIME_SEC = 180  # runtime poll: submit usually <10s, but AVAI sometimes lags w/ heavy prompts
 
 def _recover_inflight_chunks():
     """Sweep all per-user episode files once at startup."""
@@ -1300,6 +1301,39 @@ def delete_series(sid):
     return jsonify({'ok': True})
 
 
+# ── Style helpers ────────────────────────────────────────────────────────────
+
+_DEFAULT_VISUAL_STYLE = (
+    "Photorealistic, cinematic quality, high detail. "
+    "Realistic short-drama TV-series look (TikTok/Reels), natural skin textures, "
+    "subtle film grain, professional cinematography lighting."
+)
+
+def _series_visual_style(s):
+    """Returns the project's visual style override or the realistic default."""
+    val = ((s or {}).get('visual_style') or '').strip()
+    return val or _DEFAULT_VISUAL_STYLE
+
+def _series_style_clause(s):
+    """Inline-style clause for character/location image generation prompts."""
+    v = _series_visual_style(s)
+    if not v:
+        return ""
+    # Some hint phrasing depending on whether project picked a stylised look
+    low = v.lower()
+    stylised = any(k in low for k in (
+        'pixar', 'anime', 'manga', 'cartoon', 'claymation', 'oil painting',
+        'cyberpunk', 'noir', 'film noir', 'watercolor', 'graphic novel',
+        'studio ghibli', 'arcane', 'comic',
+    ))
+    if stylised:
+        return (
+            f"VISUAL STYLE — strict: {v}. The whole image MUST be rendered in this style "
+            f"(materials, faces, lighting, palette). Do NOT mix with photorealism."
+        )
+    return f"Visual style: {v}"
+
+
 # ── Characters ───────────────────────────────────────────────────────────────
 
 @app.route('/api/series/<sid>/characters', methods=['POST'])
@@ -1659,13 +1693,14 @@ def generate_character_image(sid, char_id):
         return jsonify({'error': 'not found'}), 404
 
     gender = 'woman' if char.get('gender') == 'female' else 'man'
+    style_clause = _series_style_clause(s)
     prompt = (
         f"Full body portrait of {char['name']}, a {gender}. "
         f"{char.get('appearance', '')}. {char.get('description', '')}. "
         f"Standing facing camera, slight 3/4 angle. Neutral relaxed pose, arms at sides. "
         f"Uniform solid gray background, #808080. No shadows or reflections on background. "
         f"Studio lighting, soft and even, no harsh shadows on face or body. "
-        f"Photorealistic, cinematic quality, high detail on face and clothing."
+        f"{style_clause}"
     )
     prompt = re.sub(r'\s+', ' ', prompt).strip()
 
@@ -1709,13 +1744,14 @@ def regenerate_character(sid, char_id):
 
     gender = 'woman' if char.get('gender') == 'female' else 'man'
     constraints_clause = f" IMPORTANT — strictly follow these constraints: {wishes}." if wishes else ""
+    style_clause = _series_style_clause(s)
     prompt = (
         f"Full body portrait of {char['name']}, a {gender}. "
         f"{char.get('appearance', '')}. {char.get('description', '')}.{constraints_clause} "
         f"Standing facing camera, slight 3/4 angle. Neutral relaxed pose, arms at sides. "
         f"Uniform solid gray background, #808080. No shadows or reflections on background. "
         f"Studio lighting, soft and even, no harsh shadows on face or body. "
-        f"Photorealistic, cinematic quality, high detail on face and clothing."
+        f"{style_clause}"
     )
     prompt = re.sub(r'\s+', ' ', prompt).strip()
 
@@ -1928,12 +1964,15 @@ def generate_location_image(sid, loc_id):
         return jsonify({'error': 'not found'}), 404
 
     tone = s.get('tone', '')
+    style_clause = _series_style_clause(s)
+    constraints = (loc.get('image_constraints') or '').strip()
+    constraints_clause = f" IMPORTANT — strictly follow these constraints: {constraints}." if constraints else ""
     prompt = (
-        f"{loc['name']}. {loc.get('description', '')}. "
+        f"{loc['name']}. {loc.get('description', '')}.{constraints_clause} "
         f"No people, no characters in frame. "
         f"{(tone + ' atmosphere. ') if tone else ''}"
         f"Cinematic wide establishing shot. Horizontal landscape composition, 16:9 framing. "
-        f"Photorealistic, cinematic quality, high detail. Atmospheric lighting."
+        f"{style_clause}"
     )
     prompt = re.sub(r'\s+', ' ', prompt).strip()
 
@@ -1948,6 +1987,48 @@ def generate_location_image(sid, loc_id):
         refs[:] = [r for r in refs if not r.endswith(out_path.name)]
         refs.insert(0, rel_path)
         loc['avai_url'] = image_url  # used by Seedance for video refs
+        save_series(sid, s)
+        return jsonify({'ready': True, 'url': f'/assets/{sid}/{rel_path}', 'image_url': image_url})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/series/<sid>/locations/<loc_id>/regenerate', methods=['POST'])
+def regenerate_location(sid, loc_id):
+    """Regenerate the location's establishing shot with user-supplied constraints.
+    Persists constraints on the location."""
+    s = load_series(sid)
+    loc = next((l for l in s.get('locations', []) if l['id'] == loc_id), None)
+    if not loc:
+        return jsonify({'error': 'location not found'}), 404
+    body = request.get_json(silent=True) or {}
+    wishes = (body.get('wishes') or '').strip()
+    loc['image_constraints'] = wishes
+    tone = s.get('tone', '')
+    style_clause = _series_style_clause(s)
+    constraints_clause = f" IMPORTANT — strictly follow these constraints: {wishes}." if wishes else ""
+    prompt = (
+        f"{loc['name']}. {loc.get('description', '')}.{constraints_clause} "
+        f"No people, no characters in frame. "
+        f"{(tone + ' atmosphere. ') if tone else ''}"
+        f"Cinematic wide establishing shot. Horizontal landscape composition, 16:9 framing. "
+        f"{style_clause}"
+    )
+    prompt = re.sub(r'\s+', ' ', prompt).strip()
+    loc_slug = slugify(loc['name'])
+    loc_dir = assets_dir(sid) / 'locations' / loc_slug
+    loc_dir.mkdir(parents=True, exist_ok=True)
+    out_path = loc_dir / f'{asset_name(loc["name"])}.png'
+    try:
+        if out_path.exists():
+            try: out_path.unlink()
+            except Exception: pass
+        image_url = avai_generate(prompt, out_path, aspect_ratio='16:9')
+        rel_path = str(out_path.relative_to(series_path(sid)))
+        refs = loc.setdefault('ref_images', [])
+        refs[:] = [r for r in refs if not r.endswith(out_path.name)]
+        refs.insert(0, rel_path)
+        loc['avai_url'] = image_url
         save_series(sid, s)
         return jsonify({'ready': True, 'url': f'/assets/{sid}/{rel_path}', 'image_url': image_url})
     except Exception as e:
@@ -5946,6 +6027,32 @@ def _next_chunk_idx(ep):
     chunks = _seedance_chunks(ep)
     return (max((c.get('idx', -1) for c in chunks), default=-1)) + 1
 
+def _extract_last_frame(sid, video_relpath):
+    """Extract a JPEG of the last frame of a chunk's video.
+    Cached: returns (relpath, abs_path). Re-extracted if missing.
+    """
+    src = series_path(sid) / video_relpath
+    if not src.exists():
+        return None
+    out = src.with_name(src.stem + '_lastframe.jpg')
+    if out.exists() and out.stat().st_size > 0:
+        return (str(out.relative_to(series_path(sid))), out)
+    ffmpeg_bin = shutil.which('ffmpeg')
+    if not ffmpeg_bin:
+        return None
+    try:
+        # -sseof -0.1 → seek to 0.1s before end (works without re-encode)
+        subprocess.run(
+            [ffmpeg_bin, '-y', '-sseof', '-0.1', '-i', str(src),
+             '-frames:v', '1', '-q:v', '3', str(out)],
+            capture_output=True, timeout=30, check=True
+        )
+        if out.exists() and out.stat().st_size > 0:
+            return (str(out.relative_to(series_path(sid))), out)
+    except Exception:
+        return None
+    return None
+
 def _avai_seedance_start(prompt, ref_urls, duration, resolution, moderation_bypass,
                           aspect_ratio='9:16', generate_audio=True,
                           moderation_bypass_prompt=None):
@@ -6075,6 +6182,26 @@ def _ensure_loc_avai_url(sid, loc):
         print(f'[seedance] loc upload failed for {loc.get("name")}: {e}')
         return None
 
+def _ensure_char_avai_base_url(sid, char):
+    """Lazy-upload the character's first local ref_image to AVAI when
+    avai_base_url is missing. Persists the URL on the char dict in-memory
+    (caller must save_series). Returns the URL or None."""
+    if char.get('avai_base_url'):
+        return char['avai_base_url']
+    refs = char.get('ref_images') or []
+    if not refs:
+        return None
+    local = series_path(sid) / refs[0]
+    if not local.exists():
+        return None
+    try:
+        url = _avai_upload_local_image(local)
+        char['avai_base_url'] = url
+        return url
+    except Exception as e:
+        print(f'[seedance] char base upload failed for {char.get("name")}: {e}')
+        return None
+
 def _resolve_ref_url(s, ref, sid=None):
     """ref = {'kind':'char'|'outfit'|'loc', 'id':..., 'outfit':...}.
     Returns public AVAI URL or None."""
@@ -6089,7 +6216,15 @@ def _resolve_ref_url(s, ref, sid=None):
             for o in c.get('outfits', []) or []:
                 if o.get('label') == ref['outfit']:
                     return o.get('avai_url') or c.get('avai_base_url')
-        return c.get('avai_base_url')
+        # Base look. Lazy-upload local ref_image if avai_base_url absent.
+        if c.get('avai_base_url'):
+            return c['avai_base_url']
+        if sid:
+            url = _ensure_char_avai_base_url(sid, c)
+            if url:
+                save_series(sid, s)
+                return url
+        return None
     if kind == 'loc':
         l = next((x for x in s.get('locations', []) if x['id'] == ref.get('id')), None)
         if not l:
@@ -6101,6 +6236,9 @@ def _resolve_ref_url(s, ref, sid=None):
                 save_series(sid, s)  # persist new avai_url
         return url
     if kind == 'url':
+        return ref.get('url')
+    if kind == 'lastframe':
+        # Continuity reference: URL is already resolved & uploaded by /compose
         return ref.get('url')
     return None
 
@@ -6190,22 +6328,220 @@ def seedance_compose(sid, num):
     chunk_text = (body.get('chunk_text') or '').strip()
     if not chunk_text:
         return jsonify({'error': 'chunk_text required'}), 400
+    use_prev_lastframe = bool(body.get('use_prev_lastframe', True))
+    base_outfits_only  = bool(body.get('base_outfits_only', False))
+    style_override = (body.get('style') or '').strip()
+    # Fall back to project's visual_style (default = realistic — no special handling needed)
+    if not style_override:
+        proj_style = (s.get('visual_style') or '').strip()
+        if proj_style:
+            style_override = proj_style
 
-    # Previous chunk continuity
-    prev_chunks = _seedance_chunks(ep)
-    prev = prev_chunks[-1] if prev_chunks else None
-    prev_block = ''
-    if prev and prev.get('ending_state'):
+    # ── Adjacent-chunk continuity ─────────────────────────────────────────
+    # Find chunks that sit BEFORE / AFTER the current chunk_text in the FULL
+    # script (by substring position), not by creation order. This is what
+    # actually matters for "who was just in frame" continuity.
+    full_script_for_pos = (ep.get('script') or '')
+    _heading_re = re.compile(r'^\s*(INT\.|EXT\.|INT\/EXT\.)\s', re.IGNORECASE)
+    def _pos_in_script(txt):
+        """Find the script byte-offset where this chunk_text starts.
+        Tries multiple anchors and prefers the FIRST unique match — falls back
+        to any match. Skips scene headings and very short lines as anchors
+        because those tend to repeat across the script."""
+        if not txt or not full_script_for_pos:
+            return -1
+        cands = []
+        for ln in txt.splitlines():
+            s = ln.strip()
+            if len(s) < 25:
+                continue
+            if _heading_re.match(s):
+                continue
+            cands.append(s)
+            if len(cands) >= 6:
+                break
+        # Pass 1: prefer anchors that match exactly once in the script
+        for c in cands:
+            idx = full_script_for_pos.find(c)
+            if idx == -1:
+                continue
+            if full_script_for_pos.find(c, idx + 1) == -1:
+                return idx
+        # Pass 2: any anchor that matches at all
+        for c in cands:
+            idx = full_script_for_pos.find(c)
+            if idx != -1:
+                return idx
+        return -1
+    def _range_in_script(txt):
+        """Return (start, end) byte-offsets of the chunk in the script.
+        End is estimated via the LAST long unique-ish anchor inside the chunk
+        (so chunks that share their first line still get distinct ranges)."""
+        start = _pos_in_script(txt)
+        if start < 0:
+            return -1, -1
+        # Walk text lines in reverse to find the last anchor we can locate
+        # forward from `start`.
+        for ln in reversed(txt.splitlines()):
+            s = ln.strip()
+            if len(s) < 25:
+                continue
+            if _heading_re.match(s):
+                continue
+            idx = full_script_for_pos.find(s, start)
+            if idx >= 0:
+                return start, idx + len(s)
+        return start, start + len(txt)
+
+    cur_start, cur_end = _range_in_script(chunk_text)
+    cur_pos = cur_start  # keep old name for downstream code
+    all_chunks = _seedance_chunks(ep)
+    located = []
+    for c in all_chunks:
+        sp, ep_ = _range_in_script(c.get('chunk_text') or '')
+        if sp >= 0:
+            located.append((sp, ep_, c))
+    prev_neighbour = None
+    next_neighbour = None
+    prev_neighbour_ep = num         # which episode prev_neighbour belongs to
+    prev_neighbour_obj = ep         # the loaded episode dict (for save_episode)
+    if cur_start >= 0:
+        # PREV = chunk whose END is closest to (but ≤) the current chunk's START.
+        # On ties (regenerations of the same fragment): prefer completed,
+        # then prefer the most recently created.
+        def _prev_score(c, end_pos):
+            return (
+                end_pos,                                    # 1) max end position
+                1 if c.get('status') == 'completed' else 0, # 2) completed wins
+                int(c.get('created_at') or 0),              # 3) newer wins
+            )
+        best_prev = None  # (score_tuple, chunk)
+        for sp, ep_pos, c in located:
+            if sp == cur_start and ep_pos == cur_end:
+                continue   # same chunk
+            if ep_pos <= cur_start + 5:           # tolerate tiny overlap of 5 chars
+                sc = _prev_score(c, ep_pos)
+                if best_prev is None or sc > best_prev[0]:
+                    best_prev = (sc, c)
+        if best_prev:
+            prev_neighbour = best_prev[1]
+        # NEXT = smallest start > cur_end (ties: completed > newer)
+        def _next_score(c, sp):
+            # Negate sp so smaller start = higher score under > comparison
+            return (
+                -sp,
+                1 if c.get('status') == 'completed' else 0,
+                int(c.get('created_at') or 0),
+            )
+        best_next = None
+        for sp, ep_pos, c in located:
+            if sp >= cur_end - 5 and sp != cur_start:
+                sc = _next_score(c, sp)
+                if best_next is None or sc > best_next[0]:
+                    best_next = (sc, c)
+        if best_next:
+            next_neighbour = best_next[1]
+    elif located:
+        # Fallback: chunk_text not found in script (edited?) — use last by creation
+        prev_neighbour = all_chunks[-1] if all_chunks else None
+
+    # ── Cross-episode continuity ──────────────────────────────────────────
+    # If we're at the start of this episode (no PREVIOUS chunk found in current
+    # ep), pull the LAST chunk of episode N-1 by its position in that script.
+    # This makes Seedance compose aware of what just happened on screen even
+    # across episode boundaries.
+    if not prev_neighbour and num > 1:
+        prev_ep_obj_x = load_episode(sid, num - 1)
+        if prev_ep_obj_x:
+            prev_ep_script = (prev_ep_obj_x.get('script') or '')
+            def _pos_in_prev(txt):
+                if not txt: return -1
+                anchor = next((ln.strip() for ln in txt.splitlines() if len(ln.strip()) > 25), txt[:80].strip())
+                return prev_ep_script.find(anchor)
+            prev_ep_chunks = _seedance_chunks(prev_ep_obj_x)
+            located_prev = []
+            for c in prev_ep_chunks:
+                p = _pos_in_prev(c.get('chunk_text') or '')
+                if p >= 0:
+                    located_prev.append((p, c))
+            if located_prev:
+                located_prev.sort(key=lambda x: x[0])
+                prev_neighbour = located_prev[-1][1]      # latest by script pos
+            elif prev_ep_chunks:
+                prev_neighbour = prev_ep_chunks[-1]       # fallback by creation order
+            if prev_neighbour:
+                prev_neighbour_ep = num - 1
+                prev_neighbour_obj = prev_ep_obj_x
+
+    def _summarize_neighbour(c, where, ep_label=None):
+        if not c:
+            return ''
+        bits = []
+        ep_tag = f", from EP {ep_label}" if ep_label else ""
+        bits.append(f"\n=== {where} CHUNK (idx={c.get('idx')}, status={c.get('status')}{ep_tag}) ===")
+        # Who was in frame: derived from the chunk's own refs
+        char_names = []
+        loc_name = ''
+        for r in (c.get('refs') or []):
+            if r.get('kind') == 'char':
+                ch = next((x for x in (s.get('characters') or []) if x['id'] == r['id']), None)
+                if ch:
+                    nm = ch['name']
+                    if r.get('outfit'): nm += f" ({r['outfit']})"
+                    char_names.append(nm)
+            elif r.get('kind') == 'loc':
+                lc = next((x for x in (s.get('locations') or []) if x['id'] == r['id']), None)
+                if lc: loc_name = lc['name']
+        if char_names:
+            bits.append(f"  IN FRAME: {', '.join(char_names)}")
+        if loc_name:
+            bits.append(f"  LOCATION: {loc_name}")
+        if c.get('prompt'):
+            bits.append(f"  PROMPT (1 line): {(c['prompt'][:200]).replace(chr(10), ' ')}")
+        if c.get('ending_state'):
+            bits.append(f"  ENDING STATE: {c['ending_state']}")
+        snippet = (c.get('chunk_text') or '').strip().replace('\n', ' ')[:200]
+        if snippet:
+            bits.append(f"  SCRIPT SNIPPET: {snippet}")
+        return '\n'.join(bits)
+
+    prev_label = (prev_neighbour_ep if prev_neighbour_ep != num else None)
+    prev_block = _summarize_neighbour(prev_neighbour, 'PREVIOUS', ep_label=prev_label)
+    next_block = _summarize_neighbour(next_neighbour, 'NEXT')
+    if prev_block or next_block:
+        cross_note = ""
+        if prev_neighbour_ep != num:
+            cross_note = (
+                f"ВНИМАНИЕ: PREVIOUS CHUNK взят из ПРЕДЫДУЩЕГО ЭПИЗОДА (ep {prev_neighbour_ep}), "
+                f"потому что текущий CHUNK — самое начало эпизода {num}. "
+                "Если в начале нового эпизода нет явного time-jump или смены локации — "
+                "это продолжение той же сцены конца прошлого эпизода. Сохрани локацию, "
+                "состав в кадре и позы из предыдущего чанка. Если же scene heading в начале "
+                "нового эпизода явно говорит о новой локации/времени — начинай свежо.\n"
+            )
         prev_block = (
-            f"\nPREVIOUS CHUNK ENDING STATE (continue physically if same scene):\n"
-            f"{prev.get('ending_state')}\n"
+            "\n=== ADJACENT GENERATED CHUNKS — CONTINUITY CONTEXT ===\n"
+            f"{cross_note}"
+            "Эти чанки соседствуют с твоим CHUNK по позиции в сценарии. "
+            "Если они в той же сцене (та же локация, нет скачка во времени) — "
+            "ВСЕ персонажи из IN FRAME предыдущего чанка ОБЯЗАНЫ остаться в кадре, "
+            "если в сценарии явно не сказано что они вышли. Если кто-то из них был "
+            "в фокусе действия (например, его держали, бьют, он на коленях) — он точно в кадре."
+            f"{prev_block}{next_block}\n"
+            "=== END ADJACENT ===\n"
         )
+    else:
+        prev_block = ''
 
     # Compact char/loc rosters
     chars_lines = []
     for c in s.get('characters', []) or []:
-        if c.get('avai_base_url'):
-            chars_lines.append(f"- {c['name']} (id={c['id']}): {c.get('appearance','')[:120]}")
+        # Include any char that has SOME image source — base AVAI url, outfit url,
+        # or local ref_images (we'll lazy-upload base on resolve).
+        has_outfit = any((o.get('avai_url')) for o in (c.get('outfits') or []))
+        if c.get('avai_base_url') or has_outfit or (c.get('ref_images') or []):
+            tag = '' if c.get('avai_base_url') else ' [no_base_url]'
+            chars_lines.append(f"- {c['name']} (id={c['id']}){tag}: {c.get('appearance','')[:120]}")
     locs_lines = []
     for l in s.get('locations', []) or []:
         # Include all locations that have any image (ref_images OR avai_url) — LLM can still pick them.
@@ -6227,10 +6563,20 @@ def seedance_compose(sid, num):
         "  2) ACTION — что они делают (одно главное действие/конфликт, без каши).\n"
         "  3) SCENE — где (ссылка на @Image<N> локации) + время суток / атмосфера.\n"
         "  4) CAMERA — конкретно: 'tracking shot', 'medium close-up', 'slow dolly in', 'handheld', 'over-the-shoulder', 'low angle'.\n"
-        "  5) DIALOGUE — для КАЖДОЙ реплики из сценария формат: '@ImageN, <эмоция/тон на русском>, говорит: \"<точная реплика как в сценарии>\"'.\n"
-        "     Пример: '@Image2, ухмыляясь с презрением, говорит: \"Lost, Aria? The garbage dump is three blocks down.\"'.\n"
+        "  5) DIALOGUE — для КАЖДОЙ реплики формат из ДВУХ ЧАСТЕЙ:\n"
+        "     (a) ШОТ-БИТ перед репликой, чтобы модель знала чьи губы двигать: 'Камера склейкой/наездом переходит на крупный план @ImageN — '\n"
+        "         Варианты ракурса чередуй: 'крупный план лица @ImageN', 'средний план @ImageN', 'через плечо на @ImageN'.\n"
+        "     (b) Сама реплика: '@ImageN, <эмоция/тон на русском>, говорит: \"<точная реплика как в сценарии>\"'\n"
+        "     Полный пример (две реплики двух разных персов):\n"
+        "       'Склейка на крупный план лица @Image2. @Image2, ухмыляясь с презрением, говорит: \"Lost, Aria?\" "
+        "Камера переключается на средний план @Image1 через плечо @Image2. @Image1, дрожа от ярости, отвечает: \"Get out.\"'\n"
+        "     ПРАВИЛО: между сменой говорящего ОБЯЗАТЕЛЬНО шот-бит со склейкой/наездом на нового спикера. "
+        "Без этого Seedance путает кому принадлежит реплика и липсинк прилипает к не тому персу.\n"
         "     Эмоция/тон по-русски ОБЯЗАТЕЛЬНА перед каждой репликой — без неё лип-синк хуже.\n"
-        "  6) STYLE/ATMOSPHERE — короткие фразы (cinematic, harsh fluorescent light, cold colour palette).\n"
+        "  6) STYLE/ATMOSPHERE — короткие фразы (cinematic, harsh fluorescent light, cold colour palette). "
+        "Если в userprompt задан STYLE OVERRIDE — ВСЕ описания (рендер, материалы, освещение, текстуры лиц и одежды, фон) подчиняются этому стилю; "
+        "перепиши style-блок и вшей стилистические маркеры также в SUBJECT и SCENE (например 'Pixar 3D animation, soft volumetric light, exaggerated facial expressions, slightly stylised proportions, vibrant saturated palette'). "
+        "Реплики в кавычках при этом не меняй.\n"
         "  7) CONSTRAINTS — ТОЛЬКО позитивные формулировки ('smooth gimbal motion', 'stable framing'). "
         "     НЕ пиши 'no shake', 'without distortion' — модель плохо понимает отрицания.\n\n"
         "АНАЛИЗ КОНТЕКСТА — ОБЯЗАТЕЛЬНО ДЕЛАЙ ЭТО ДО ПРОМПТА:\n"
@@ -6251,8 +6597,28 @@ def seedance_compose(sid, num):
         "   Локацию НЕ ВКЛЮЧАЙ только если в roster вообще нет ни одной подходящей локации с фото.\n"
         "3. В тексте промпта в блоке SCENE явно упомяни локацию: 'Действие в @Image<N+1> — стеклянное лобби корпорации, холодное освещение'.\n"
         "4. Максимум 5 референсов (обычно 1–3 перса + 1 локация).\n\n"
-        "CONTINUITY: если есть PREVIOUS CHUNK ENDING STATE и сцена та же (локация + состав персов + нет скачка во времени) — "
-        "отрази стартовую позу/состояние. Если локация/время/состав сменились — начинай свежо, состояние не тащим."
+        "CONTINUITY — КРИТИЧНО:\n"
+        "Если в userprompt есть блок ADJACENT GENERATED CHUNKS — это твой главный источник кто физически в кадре.\n"
+        "Алгоритм:\n"
+        "  1. Определи: соседний чанк (PREVIOUS) — это ТА ЖЕ СЦЕНА что и текущий CHUNK? "
+        "Та же сцена = одна и та же локация + нет смены времени суток + нет скачка дня + действие непрерывно.\n"
+        "     • Та же сцена → ВСЕ персонажи из 'IN FRAME' предыдущего чанка ДОЛЖНЫ быть в твоих refs, "
+        "если в сценарии (между предыдущим чанком и текущим) НЕТ явного указания что они ушли/убежали/вышли. "
+        "Если предыдущий кончился на 'Liam держит Leo за горло' — Leo в твоём кадре. Не выкидывать тихо.\n"
+        "     • ФИЗИЧЕСКИЕ ПОЗИЦИИ — ХРАНИТЬ. Если в PREVIOUS Leo стоял рядом с Liam — он РЯДОМ С LIAM, "
+        "а не телепортируется к маме. Если Selena была в правом углу — она остаётся в правом углу. "
+        "В ACTION прямо пиши конкретные позиции: '@Image3 (Leo) остаётся вплотную к @Image2 (Liam) справа от него, "
+        "@Image4 (Selena) на заднем плане у двери'. Без явного описания позиций модель шафлит героев.\n"
+        "     • ФОНОВЫЕ ЭЛЕМЕНТЫ из ENDING STATE / PROMPT предыдущего чанка тоже сохраняй: "
+        "если Kaelen только что вышел из лифта — в кадре за его спиной должен быть открытый/закрывающийся лифт. "
+        "Если до этого в кадре был стол с ноутбуком — он тут же. В SCENE так и пиши: "
+        "'на заднем плане @Image<loc> — двери лифта только что закрылись за @Image1'.\n"
+        "     • Если ENDING STATE говорит что персонаж 'на коленях' / 'без сознания' / 'у двери' — "
+        "отрази эту позу в SUBJECT/ACTION текущего промпта.\n"
+        "     • Локация: если PREVIOUS использовал @Image<X>=Lobby и сцена та же — твой last @Image тоже Lobby.\n"
+        "  2. Если сцена другая (новый scene heading INT./EXT. между чанками, перепрыг во времени, "
+        "явный CUT TO другую локацию) — начинай свежо, состояние НЕ тащим.\n"
+        "  3. NEXT CHUNK (если есть) используй только для проверки: твой ending не должен противоречить началу следующего."
     )
     # Active episode cast & locations (already checked off in sidebar)
     active_char_ids = set(ep.get('characters_used') or [])
@@ -6272,12 +6638,40 @@ def seedance_compose(sid, num):
     full_script = (ep.get('script') or '').strip()
     full_script_block = full_script[:8000]  # safety cap
 
+    base_only_block = ''
+    if base_outfits_only:
+        base_only_block = (
+            "\n=== BASE OUTFITS ONLY — STRICT ===\n"
+            "Для КАЖДОГО персонажа в refs ВСЕГДА выставляй \"outfit\": null. "
+            "Не подбирай и не упоминай альтернативные outfit-варианты этого персонажа "
+            "(костюмы для других сцен, формы, повседневные вариации). "
+            "Используется только базовое референс-фото каждого персонажа. "
+            "В тексте промпта тоже не описывай специфическую одежду которая отличается от базы — "
+            "только то что видно на базовом референсе.\n"
+            "=== END BASE OUTFITS ONLY ===\n"
+        )
+
+    style_block = ''
+    if style_override:
+        style_block = (
+            "\n=== STYLE OVERRIDE (важно) ===\n"
+            f"Финальный визуальный стиль клипа: «{style_override}».\n"
+            "Перепиши блок STYLE/ATMOSPHERE целиком вокруг этого стиля. Также добавь "
+            "стилистические маркеры в SUBJECT и SCENE (рендер/материалы/освещение/палитра/линии лиц). "
+            "Если стиль предполагает анимацию или нереалистичный рендер (Pixar / anime / claymation / oil painting) — "
+            "явно укажи это в первых 20 словах промпта (модель решает рендер по началу). "
+            "Реплики персонажей в кавычках НЕ менять. Continuity-логику (персонажи в кадре, позы, локация) "
+            "сохрани как обычно — стиль это только оболочка рендера, не сюжет.\n"
+            "=== END STYLE ===\n"
+        )
     userprompt = (
         f"AVAILABLE CHARACTERS (весь roster серии):\n{chr(10).join(chars_lines) or '(none)'}\n\n"
         f"AVAILABLE LOCATIONS (весь roster серии):\n{chr(10).join(locs_lines) or '(none)'}\n\n"
         f"ACTIVE THIS EPISODE (отмечены в эпизоде — приоритет при выборе):\n"
         f"  Characters:\n{active_chars_block}\n"
         f"  Locations:\n{active_locs_block}\n"
+        f"{base_only_block}"
+        f"{style_block}"
         f"{prev_block}\n"
         f"FULL EPISODE SCRIPT (читай ВЕСЬ — тут scene headings, ремарки, кто где находится):\n"
         f"```\n{full_script_block}\n```\n\n"
@@ -6307,6 +6701,11 @@ def seedance_compose(sid, num):
         return jsonify({'error': f'compose failed: {e}'}), 500
 
     refs = data.get('refs') or []
+    # If base-only flag is on, strip outfit selection from every char ref
+    if base_outfits_only:
+        for r in refs:
+            if r.get('kind') == 'char':
+                r['outfit'] = None
     ref_urls = []
     ref_meta = []
     unresolved = []
@@ -6317,6 +6716,55 @@ def seedance_compose(sid, num):
             ref_meta.append({**r, 'url': url})
         else:
             unresolved.append({**r, 'reason': 'нет фото / avai_url не получился'})
+
+    # Optional: attach previous chunk's LAST FRAME as a continuity reference
+    lastframe_attached = False
+    if (use_prev_lastframe and prev_neighbour
+            and prev_neighbour.get('video_path')
+            and data.get('scene_continuity') is not False
+            and len(ref_urls) < 9):
+        try:
+            extracted = _extract_last_frame(sid, prev_neighbour['video_path'])
+            if extracted:
+                relpath, abs_path = extracted
+                lf_url = prev_neighbour.get('lastframe_avai_url')
+                if not lf_url:
+                    try:
+                        lf_url = _avai_upload_local_image(abs_path)
+                        prev_neighbour['lastframe_avai_url'] = lf_url
+                        # save to whichever episode owns the prev_neighbour
+                        save_episode(sid, prev_neighbour_ep, prev_neighbour_obj)
+                    except Exception:
+                        lf_url = None
+                if lf_url:
+                    img_idx = len(ref_urls) + 1  # 1-based
+                    ref_urls.append(lf_url)
+                    ref_meta.append({
+                        'kind': 'lastframe',
+                        'source': 'prev_chunk',
+                        'prev_idx': prev_neighbour.get('idx'),
+                        'name': f'last frame · prev #{prev_neighbour.get("idx")}',
+                        'url': lf_url,
+                    })
+                    extra = (
+                        f"\n\nДополнительно: @Image{img_idx} — это ПОСЛЕДНИЙ КАДР предыдущего чанка "
+                        f"эпизода. Используй его ТОЛЬКО как continuity-референс: повтори ту же расстановку "
+                        f"персонажей и тот же задний план, плавно продолжая действие. НЕ описывай его как "
+                        f"отдельный кадр в SUBJECT/SCENE — это инструкция модели по композиции."
+                    )
+                    data['prompt'] = (data.get('prompt') or '').rstrip() + extra
+                    lastframe_attached = True
+        except Exception:
+            pass
+
+    debug_prev = None
+    if prev_neighbour:
+        debug_prev = {
+            'idx': prev_neighbour.get('idx'),
+            'episode': prev_neighbour_ep,
+            'has_video': bool(prev_neighbour.get('video_path')),
+            'pos_found': cur_pos >= 0,
+        }
     return jsonify({
         'prompt': data.get('prompt', ''),
         'refs': ref_meta,
@@ -6324,6 +6772,9 @@ def seedance_compose(sid, num):
         'unresolved_refs': unresolved,
         'scene_continuity': data.get('scene_continuity'),
         'reasoning': data.get('reasoning', ''),
+        'lastframe_attached': lastframe_attached,
+        'prev_neighbour': debug_prev,
+        'cur_pos_found': cur_pos >= 0,
     })
 
 @app.route('/api/series/<sid>/episodes/<int:num>/seedance/start', methods=['POST'])
@@ -6348,7 +6799,7 @@ def seedance_start(sid, num):
     if resolution not in ('720p', '480p'):
         resolution = '720p'
     mod = body.get('moderation_bypass') or 'collage_grid'
-    if mod not in ('off', 'grid', 'collage_grid'):
+    if mod not in ('off', 'grid', 'collage_grid', 'cartoon'):
         mod = 'collage_grid'
     aspect = body.get('aspect_ratio') or '9:16'
     gen_audio = bool(body.get('generate_audio', True))
@@ -6391,17 +6842,27 @@ def seedance_start(sid, num):
             ep2 = load_episode(sid, num)
             for c in _seedance_chunks(ep2):
                 if c.get('idx') == idx:
+                    # Reaper may have already marked us 'failed' (slow AVAI).
+                    # Still record job_id so user/admin can find/cancel it,
+                    # but don't resurrect to 'pending' — respect reaper.
                     c['job_id'] = job['job_id']
                     c['status_url'] = job['status_url']
-                    c['status'] = 'pending'
+                    if c.get('status') == 'submitting':
+                        c['status'] = 'pending'
+                    else:
+                        # Late arrival — leave status alone, mark in error
+                        prev_err = c.get('error') or ''
+                        c['error'] = (prev_err + ' | late submit returned job_id=' + str(job.get('job_id', ''))).strip(' |')
                     break
             save_episode(sid, num, ep2)
         except Exception as e:
             ep2 = load_episode(sid, num)
             for c in _seedance_chunks(ep2):
                 if c.get('idx') == idx:
-                    c['status'] = 'failed'
-                    c['error'] = f'submit failed: {e}'
+                    # Don't overwrite a more specific reaper message
+                    if c.get('status') != 'failed':
+                        c['status'] = 'failed'
+                        c['error'] = f'submit failed: {e}'
                     break
             save_episode(sid, num, ep2)
 
@@ -6417,10 +6878,19 @@ def seedance_poll(sid, num):
         return jsonify({'error': 'not found'}), 404
     chunks = _seedance_chunks(ep)
     changed = False
+    now = int(time.time())
     for c in chunks:
         if c.get('status') in ('completed', 'failed'):
             continue
         if not c.get('job_id'):
+            # Reap stale 'submitting' rows whose background submit thread
+            # died silently (network hang etc). Lets the user retry.
+            if c.get('status') == 'submitting':
+                age = now - int(c.get('created_at') or now)
+                if age > _SUBMITTING_TIMEOUT_RUNTIME_SEC:
+                    c['status'] = 'failed'
+                    c['error'] = f'submit timed out after {age}s — нажми ↻ Reuse и попробуй снова'
+                    changed = True
             continue
         try:
             st = _avai_seedance_status(c['job_id'], c.get('status_url'))
@@ -6437,10 +6907,30 @@ def seedance_poll(sid, num):
         if st.get('error'):
             c['error'] = st['error']
         if st.get('status') == 'completed' and st.get('video_url') and not c.get('video_path'):
+            vurl = (st.get('video_url') or '').strip()
+            # Detect AVAI moderation rejection: they return a placeholder
+            # image path like "/moderation.jpg" instead of a real mp4 URL.
+            vurl_lower = vurl.lower()
+            is_moderation = (
+                'moderation' in vurl_lower
+                or vurl.startswith('/')                # relative — not a real video host
+                or not vurl_lower.startswith(('http://', 'https://'))
+                or not (vurl_lower.endswith('.mp4') or '.mp4?' in vurl_lower or '/video' in vurl_lower)
+            )
+            if is_moderation:
+                c['status'] = 'failed'
+                c['error'] = (
+                    f'Заблокировано модерацией Seedance (вернул "{vurl[:60]}"). '
+                    'Перепиши промпт мягче — убери: царапины/раны/кровь, удары в лицо, '
+                    'обнажение, оружие, явное насилие. Попробуй collage_grid bypass или '
+                    'переформулируй действие через эмоцию вместо физического урона.'
+                )
+                changed = True
+                continue
             try:
                 vid_local = vid_dir(sid) / f'seedance_ep{int(num):03d}_chunk{c["idx"]:03d}.mp4'
-                _download_video(st['video_url'], vid_local)
-                c['video_url'] = st['video_url']
+                _download_video(vurl, vid_local)
+                c['video_url'] = vurl
                 c['video_path'] = str(vid_local.relative_to(series_path(sid)))
                 # Extract ending state from chunk_text via Claude (best-effort)
                 if c.get('chunk_text'):
@@ -6481,6 +6971,71 @@ def seedance_delete(sid, num, idx):
     chunks[:] = [c for c in chunks if c.get('idx') != idx]
     save_episode(sid, num, ep)
     return jsonify({'ok': True})
+
+@app.route('/api/series/<sid>/episodes/<int:num>/seedance/<int:idx>/heal-prompt', methods=['POST'])
+def seedance_heal_prompt(sid, num, idx):
+    """Rewrite a chunk's prompt + chunk_text to pass Seedance moderation.
+    Returns {prompt, chunk_text, changes:[...], reasoning}."""
+    s = load_series(sid)
+    ep = load_episode(sid, num)
+    if not s or not ep:
+        return jsonify({'error': 'not found'}), 404
+    chunk = next((c for c in _seedance_chunks(ep) if c.get('idx') == idx), None)
+    if not chunk:
+        return jsonify({'error': 'chunk not found'}), 404
+
+    sysprompt = (
+        "Ты — редактор промптов для ByteDance Seedance 2.0. Твоя задача — переписать "
+        "промпт и фрагмент сценария так, чтобы они прошли модерацию Seedance, СОХРАНИВ "
+        "драматический эффект сцены.\n\n"
+        "ЧТО БЛОКИРУЕТ МОДЕРАЦИЯ (заменяй на эмоциональные эквиваленты):\n"
+        "  • Кровь, раны, царапины, порезы, синяки → убрать видимые повреждения. "
+        "Замена: «звонкий шлепок отпечатывается на щеке», «след от удара», «дрожь от боли».\n"
+        "  • Удары в лицо, кулаком, по голове → заменить на: пощёчина (слабая), толчок в плечо, "
+        "грубое схватывание за воротник, рывок руки. Без видимого урона.\n"
+        "  • Удушение, держать за горло → заменить: «схватил за плечи и трясёт», «прижал к стене за плечо».\n"
+        "  • Оружие (нож, пистолет, бита) → убрать или заменить безоружным жестом / угрожающим взглядом.\n"
+        "  • Кровь на одежде/полу/руках → убрать.\n"
+        "  • Явное насилие, побои, пытки → заменить психологическим давлением, "
+        "крик в лицо, нависание, унижающий жест.\n"
+        "  • Обнажение, эротика → одежда, сцена в публичном месте.\n"
+        "  • Самоубийство, явная смерть → потеря сознания, обморок, шок.\n\n"
+        "ЧТО ОБЯЗАТЕЛЬНО СОХРАНИТЬ:\n"
+        "  • ВСЕ реплики персонажей в кавычках — VERBATIM (не переводи, не меняй).\n"
+        "  • Все ссылки @Image1, @Image2... и их количество/порядок.\n"
+        "  • Структуру шотов и склеек, эмоции перед репликами.\n"
+        "  • Локацию и общий смысл сцены.\n"
+        "  • Язык: описания на русском, реплики как были (обычно англ).\n\n"
+        "Верни СТРОГО JSON и ничего кроме него:\n"
+        "{\n"
+        '  "prompt": "переписанный motion prompt",\n'
+        '  "chunk_text": "переписанный фрагмент сценария (если в нём были запрещённые элементы — иначе верни как было)",\n'
+        '  "changes": ["изменение 1 коротким предложением", "изменение 2", ...],\n'
+        '  "reasoning": "одно предложение — что было критичного и как обошёл"\n'
+        "}\n"
+        "Каждое изменение в 'changes' пиши ясно, например: "
+        '«Убрана царапина на щеке Selena — заменена на красный след от удара картой (без повреждения кожи)».'
+    )
+
+    error_hint = (chunk.get('error') or '').strip()[:300]
+    user = (
+        f"ОРИГИНАЛЬНЫЙ ПРОМПТ:\n```\n{(chunk.get('prompt') or '')}\n```\n\n"
+        f"ОРИГИНАЛЬНЫЙ CHUNK TEXT:\n```\n{(chunk.get('chunk_text') or '')}\n```\n\n"
+        f"ОШИБКА МОДЕРАЦИИ (что не пропустило): {error_hint or '(не указано — обработай оба текста на любые потенциально блокируемые элементы)'}\n\n"
+        "Найди и замени блокирующие элементы. Дай список изменений на русском."
+    )
+    try:
+        raw = claude_ask(user, system=sysprompt)
+        data = json.loads(strip_json(raw))
+    except Exception as e:
+        return jsonify({'error': f'heal failed: {e}'}), 500
+    return jsonify({
+        'prompt':     data.get('prompt') or chunk.get('prompt') or '',
+        'chunk_text': data.get('chunk_text') or chunk.get('chunk_text') or '',
+        'changes':    data.get('changes') or [],
+        'reasoning':  data.get('reasoning') or '',
+    })
+
 
 @app.route('/api/series/<sid>/episodes/<int:num>/seedance/<int:idx>/ending_state', methods=['PATCH'])
 def seedance_patch_ending(sid, num, idx):
