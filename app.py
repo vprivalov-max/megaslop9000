@@ -9,6 +9,7 @@ import datetime
 import time
 import subprocess
 import threading
+from concurrent.futures import ThreadPoolExecutor
 import requests
 from pathlib import Path
 from functools import wraps
@@ -675,11 +676,66 @@ def load_episode(sid, num):
     f = episodes_dir(sid) / f'{int(num):03d}.json'
     return json.loads(f.read_text()) if f.exists() else None
 
+def _episode_ready_flag(ep_data):
+    """The 'ready' condition list_series uses to count finished episodes.
+    Single source of truth — keep in sync with list_series and the index
+    builder below."""
+    if not ep_data:
+        return False
+    if ep_data.get('ready'):
+        return True
+    return bool((ep_data.get('reteller') or {}).get('project_id'))
+
+
+_EPISODE_INDEX_LOCKS = {}
+
+def _episode_index_lock(sid):
+    return _EPISODE_INDEX_LOCKS.setdefault(sid, threading.Lock())
+
+
+def _update_episode_index(sid, num, ep_data):
+    """Write a single entry into series.json's _episode_index without re-
+    scanning the episodes folder. Cheap (one series.json read+write) and
+    avoids the O(N) per-listing scan in list_series.
+
+    Held under a per-series lock so concurrent saves of different episodes
+    can't lose each other's index entry through a read-modify-write race."""
+    with _episode_index_lock(sid):
+        s = load_series(sid)
+        if not s:
+            return
+        idx = s.setdefault('_episode_index', {})
+        key = f'{int(num):03d}'
+        idx[key] = {'ready': _episode_ready_flag(ep_data)}
+        save_series(sid, s)
+
+
+def _drop_episode_from_index(sid, num):
+    with _episode_index_lock(sid):
+        s = load_series(sid)
+        if not s:
+            return
+        idx = s.get('_episode_index') or {}
+        key = f'{int(num):03d}'
+        if key in idx:
+            idx.pop(key, None)
+            s['_episode_index'] = idx
+            save_series(sid, s)
+
+
 def save_episode(sid, num, data):
     episodes_dir(sid).mkdir(exist_ok=True)
     (episodes_dir(sid) / f'{int(num):03d}.json').write_text(
         json.dumps(data, indent=2, ensure_ascii=False)
     )
+    # Keep the per-series episode index in sync so list_series can answer
+    # without re-parsing every episode file.
+    try:
+        _update_episode_index(sid, num, data)
+    except Exception as e:
+        # Index is a cache — never let a stale-index write break the actual save.
+        print(f'[episode-index] WARN failed to update {sid}/{int(num):03d}: {e}', flush=True)
+
 
 def list_episodes(sid):
     d = episodes_dir(sid)
@@ -837,6 +893,45 @@ def config_route():
 
 # ── Series ───────────────────────────────────────────────────────────────────
 
+def _episode_counts_from_index(sid, series_data, series_dir):
+    """Return {ready, total} for a series. Prefers _episode_index in
+    series.json; rebuilds from disk on miss and persists the index so the
+    next listing is O(1). Old series.json files without an index get the
+    index lazily on first listing."""
+    idx = series_data.get('_episode_index')
+    if isinstance(idx, dict):
+        total = len(idx)
+        ready = sum(1 for v in idx.values() if isinstance(v, dict) and v.get('ready'))
+        return {'ready': ready, 'total': total}
+
+    # Lazy migration: old project, no index. Build it once.
+    ep_dir = series_dir / 'episodes'
+    new_idx = {}
+    if ep_dir.exists():
+        for p in ep_dir.glob('*.json'):
+            if p.name.startswith('.'):
+                continue
+            try:
+                ep_data = json.loads(p.read_text())
+            except Exception:
+                continue
+            try:
+                num = int(p.stem)
+            except ValueError:
+                continue
+            new_idx[f'{num:03d}'] = {'ready': _episode_ready_flag(ep_data)}
+
+    series_data['_episode_index'] = new_idx
+    try:
+        save_series(sid, series_data)
+    except Exception as e:
+        print(f'[episode-index] WARN initial build failed for {sid}: {e}', flush=True)
+
+    total = len(new_idx)
+    ready = sum(1 for v in new_idx.values() if v.get('ready'))
+    return {'ready': ready, 'total': total}
+
+
 @app.route('/api/series', methods=['GET'])
 def list_series():
     # ?archived=1 → only archived projects. Default → only non-archived.
@@ -854,23 +949,10 @@ def list_series():
                 continue
             if not want_archived and is_archived:
                 continue
-            ep_dir = d / 'episodes'
-            ready = 0
-            total = 0
-            if ep_dir.exists():
-                for p in ep_dir.glob('*.json'):
-                    # Filter out macOS AppleDouble metadata (._*) and any dotfile
-                    if p.name.startswith('.'):
-                        continue
-                    total += 1
-                    try:
-                        ep_data = json.loads(p.read_text())
-                    except Exception:
-                        continue
-                    if ep_data.get('ready') or ep_data.get('reteller', {}).get('project_id'):
-                        ready += 1
-            s['_episode_count'] = ready
-            s['_episode_total'] = total
+            sid = d.name
+            counts = _episode_counts_from_index(sid, s, d)
+            s['_episode_count'] = counts['ready']
+            s['_episode_total'] = counts['total']
             result.append(s)
     if want_archived:
         # Most recently archived first
@@ -5137,9 +5219,13 @@ def generate_episode_script(sid, num):
         prompt = base_prompt
         for attempt in range(MAX_RETRIES + 1):
             script = claude_ask(prompt, system=script_system)
-            report = audit_script(sid, num, script, brief)
-            # Run logic-hole auditor in parallel with continuity auditor — different concerns.
-            logic_report = audit_logic_holes(sid, num, script)
+            # Run continuity and logic-hole auditors in parallel — different concerns,
+            # both are pure read+LLM, so this halves audit-loop wall time.
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                fut_cont = pool.submit(audit_script, sid, num, script, brief)
+                fut_logic = pool.submit(audit_logic_holes, sid, num, script)
+                report = fut_cont.result()
+                logic_report = fut_logic.result()
             all_violations = list(report.get('violations', [])) + list(logic_report.get('violations', []))
             critical = [v for v in all_violations if v.get('severity') == 'critical']
             audit_report = {
@@ -6064,6 +6150,10 @@ def delete_episode(sid, num):
     f = episodes_dir(sid) / f'{num:03d}.json'
     if f.exists():
         f.unlink()
+    try:
+        _drop_episode_from_index(sid, num)
+    except Exception as e:
+        print(f'[episode-index] WARN drop failed for {sid}/{num:03d}: {e}', flush=True)
     return jsonify({'ok': True})
 
 
