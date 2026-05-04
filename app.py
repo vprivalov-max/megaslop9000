@@ -50,6 +50,11 @@ def asset_name(*parts):
 app = Flask(__name__, static_folder='static', template_folder='templates')
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB
 
+# Behind Traefik / Caddy / nginx — trust X-Forwarded-* so url_for(_external=True)
+# generates correct https://<public-host>/... URLs (critical for OAuth redirect_uri).
+from werkzeug.middleware.proxy_fix import ProxyFix
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
+
 BASE = Path(__file__).parent
 # DATA_ROOT holds per-user subfolders: <DATA_ROOT>/<email>/projects/<sid>/...
 # Override via env (DATA_ROOT=/var/lib/series-writer on the server).
