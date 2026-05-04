@@ -119,6 +119,14 @@
       </div>
 
       <div class="sidebar-section">
+        <div class="section-header">
+          <h3>Предметы</h3>
+          <button class="btn-icon" onclick="openAddItem()" title="Добавить предмет">+</button>
+        </div>
+        <div id="items-list" class="characters-list"></div>
+      </div>
+
+      <div class="sidebar-section">
         <h3>Стиль</h3>
         <div id="style-section" class="style-section"></div>
         <button class="btn-ghost btn-sm" onclick="openStyleEditor()">Редактировать стиль</button>
@@ -357,6 +365,11 @@
                      title="Если предыдущий чанк в той же сцене и уже сгенерён — последний кадр его видео добавится первым референсом. Резко улучшает консистентность позиций и фона.">
                 <input type="checkbox" id="sd-use-lastframe" checked style="margin:0">
                 использовать last frame предыдущего чанка
+              </label>
+              <label style="font-size:0.78rem;color:var(--muted);display:inline-flex;align-items:center;gap:4px"
+                     title="Кроме самого последнего кадра — найти склейки внутри прошлого видео и взять кадр перед каждой склейкой (до 2 кадров). Даёт модели контекст всей мизансцены, а не только финального шота. Ест слоты в бюджете рефов (макс 9).">
+                <input type="checkbox" id="sd-use-cutframes" style="margin:0">
+                + кадры перед склейками
               </label>
               <label style="font-size:0.78rem;color:var(--muted);display:inline-flex;align-items:center;gap:4px"
                      title="Включает стилизацию (например Pixar / аниме / нуар) — composer вшивает стиль во все блоки промпта.">
@@ -977,6 +990,60 @@
     <div class="modal-footer">
       <button class="btn-ghost" onclick="closeModal('modal-location')">Отмена</button>
       <button class="btn-primary" onclick="saveLocation()">Сохранить</button>
+    </div>
+  </div>
+</div>
+
+<!-- Item Modal (add/edit) -->
+<div id="modal-item" class="modal hidden">
+  <div class="modal-box">
+    <div class="modal-header">
+      <h2 id="item-modal-title">Новый предмет</h2>
+      <button class="btn-icon" onclick="closeModal('modal-item')">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="field-group">
+        <label>Название *</label>
+        <input id="item-name" type="text" placeholder="Сумочка Ани, Револьвер деда, Медальон с фото...">
+      </div>
+      <div class="field-group">
+        <label>Описание</label>
+        <textarea id="item-description"
+          placeholder="Как выглядит: материал, цвет, размер, особенности (царапины, гравировки, наклейки)..."></textarea>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn-ghost" onclick="closeModal('modal-item')">Отмена</button>
+      <button class="btn-primary" onclick="saveItem()">Сохранить</button>
+    </div>
+  </div>
+</div>
+
+<!-- Item Assets Modal -->
+<div id="modal-item-assets" class="modal hidden">
+  <div class="modal-box modal-wide">
+    <div class="modal-header">
+      <h2 id="item-assets-title">Фото предмета</h2>
+      <button class="btn-icon" onclick="closeModal('modal-item-assets')">✕</button>
+    </div>
+    <div class="modal-body">
+      <div id="item-assets-grid" class="assets-photo-grid"></div>
+      <label class="upload-zone">
+        <input type="file" accept="image/*" multiple id="item-asset-file-input" hidden>
+        <span>+ Загрузить фото предмета</span>
+      </label>
+      <div class="field-group" style="margin-top:14px">
+        <label>Пожелания (применятся при перегенерации)</label>
+        <textarea id="regen-item-wishes" rows="3"
+          placeholder="Например: «потёртая кожа», «золотая фурнитура», «царапина на боку», «без бренда»..."></textarea>
+        <div class="muted" style="font-size:0.78rem;margin-top:4px">
+          Эти пожелания сохранятся в предмете и будут применяться при всех будущих генерациях.
+        </div>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn-secondary" onclick="closeModal('modal-item-assets')">Закрыть</button>
+      <button id="regen-item-btn" class="btn-primary" onclick="regenerateItem()">↻ Перегенерировать</button>
     </div>
   </div>
 </div>

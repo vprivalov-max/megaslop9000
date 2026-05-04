@@ -47,6 +47,60 @@ def asset_name(*parts):
     combined = re.sub(r'[^\w]+', '_', combined)     # non-word chars → underscore
     return combined.upper().strip('_')
 
+
+# ── Scene heading detection (mirrors static/app.js _matchSceneHeading) ────────
+# Used by Seedance compose to skip scene headings as text anchors when locating
+# chunks in the script. Recognises BOTH formal (INT./EXT./ИНТ./...) AND inferred
+# headings (Локация:, СЦЕНА N, standalone ALL-CAPS slugs, [bracketed slugs])
+# so continuity logic survives in scripts that don't use INT./EXT.
+_SCENE_HEADING_FORMAL_RE = re.compile(
+    r'^\s*(INT\.|EXT\.|INT\.?\s*/\s*EXT\.?|I/E\.|ИНТ\.|ИНТА\.|ЭКСТ\.|ЭКС\.|НАТ\.|НАТУРА\.|ВНУТР\.|ИНТЕРЬЕР|ВНЕ\.|СНАРУЖИ)\s+',
+    re.IGNORECASE,
+)
+_SCENE_HEADING_INFER_RE = re.compile(
+    r'^\s*(Локация\s*[:：]|Location\s*[:：]|СЦЕНА\s*\d|Сцена\s*\d|SCENE\s*\d)',
+    re.IGNORECASE,
+)
+_SLUG_BLOCKLIST_RE = re.compile(
+    r'^(REVERSAL|END|FIN|КОНЕЦ|TBD|TBC|БИТ|BIT|HOOK|TWIST|CLIFFHANGER|КЛИФФХЭНГЕР|РАЗВОРОТ|ПАУЗА|ТИШИНА|FLASHBACK|FLASH BACK|MONTAGE|МОНТАЖ|VOICE OVER|V\.O\.|O\.S\.)$',
+    re.IGNORECASE,
+)
+_TRANSITION_PREFIX_RE = re.compile(r'^(FADE|CUT|DISSOLVE|SMASH|MATCH)\b', re.IGNORECASE)
+_LOWERCASE_LETTER_RE = re.compile(r'[a-zа-яё]')
+_UPPERCASE_LETTER_RE = re.compile(r'[A-ZА-ЯЁ]')
+
+def _is_all_caps_slug(t: str) -> bool:
+    """ALL-CAPS standalone slug like 'ДОМ АННЫ — НОЧЬ' or 'OFFICE — DAY'."""
+    if not t or len(t) < 5 or len(t) > 80: return False
+    if any(ch in t for ch in ':：[]'):     return False
+    if _LOWERCASE_LETTER_RE.search(t):      return False
+    if not _UPPERCASE_LETTER_RE.search(t):  return False
+    if _TRANSITION_PREFIX_RE.match(t):      return False
+    if _SLUG_BLOCKLIST_RE.match(re.sub(r'[\.\—\-\s]+$', '', t)): return False
+    return True
+
+def _is_bracket_slug(t: str) -> bool:
+    """Bracketed slug like '[КАФЕ — НОЧЬ]'. Inner must be uppercase only."""
+    m = re.match(r'^\[\s*([^\]]{3,80})\s*\]\s*$', t or '')
+    if not m: return False
+    inner = m.group(1).strip()
+    if _LOWERCASE_LETTER_RE.search(inner): return False
+    if _SLUG_BLOCKLIST_RE.match(inner):    return False
+    if _TRANSITION_PREFIX_RE.match(inner): return False
+    return True
+
+def is_scene_heading(line: str) -> bool:
+    """True if the line opens a new scene — formal (INT./EXT./ИНТ./...) OR inferred
+    (Локация:, СЦЕНА N, standalone ALL-CAPS slug, [bracketed slug])."""
+    if not line: return False
+    t = line.strip()
+    if not t: return False
+    if _SCENE_HEADING_FORMAL_RE.match(t): return True
+    if _SCENE_HEADING_INFER_RE.match(t):  return True
+    if _is_all_caps_slug(t):              return True
+    if _is_bracket_slug(t):               return True
+    return False
+
 app = Flask(__name__, static_folder='static', template_folder='templates')
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB
 
@@ -373,6 +427,34 @@ def claude_ask_quality(prompt: str, system: str = '') -> str:
     """Sonnet — creative tasks (scripts, synopses, ideas)."""
     return claude_ask(prompt, system=system, model='sonnet', max_tokens=8192)
 
+
+def claude_ask_vision(prompt: str, image_urls, system: str = '',
+                      model: str = 'haiku', max_tokens: int = 2048) -> str:
+    """Multimodal Claude call — accepts list of HTTPS image URLs alongside prompt.
+    Used to label continuity frames (who's visible / state / mise-en-scène)."""
+    sdk_model = _MODEL_ALIAS.get(model, model) if model else 'claude-haiku-4-5'
+    client = _get_anthropic_client()
+    content = []
+    for url in (image_urls or []):
+        if not url or not url.lower().startswith(('http://', 'https://')):
+            continue
+        content.append({'type': 'image', 'source': {'type': 'url', 'url': url}})
+    content.append({'type': 'text', 'text': prompt})
+    n_imgs = len(content) - 1
+    print(f'[claude_vision] {n_imgs} img(s) → {sdk_model}', flush=True)
+    t0 = time.time()
+    kwargs = {
+        'model': sdk_model,
+        'max_tokens': max_tokens,
+        'messages': [{'role': 'user', 'content': content}],
+    }
+    if system:
+        kwargs['system'] = system
+    msg = client.messages.create(**kwargs)
+    text = ''.join(b.text for b in msg.content if getattr(b, 'type', '') == 'text').strip()
+    print(f'[claude_vision] done in {time.time()-t0:.1f}s', flush=True)
+    return text
+
 def strip_json(raw: str) -> str:
     """Extract a JSON object/array from a model response.
     Handles: bare JSON, ```json fenced blocks, JSON with trailing summary text after the closing brace.
@@ -582,6 +664,7 @@ def load_series(sid):
     # Forward-compat defaults so old series.json don't break new features.
     data.setdefault('video_provider', 'reteller')        # 'reteller' | 'seedance'
     data.setdefault('auto_reteller_prompt', True)        # auto-build Reteller prompt after script gen
+    data.setdefault('items', [])                         # story-relevant props (handbag, gun, locket...)
     return data
 
 def save_series(sid, data):
@@ -1186,8 +1269,10 @@ def create_series():
         'checkpoints': [],   # [{episode: int, description: str}]  story landmarks
         'finale': None,      # {episode: int, description: str} | None
         'created_at': datetime.datetime.utcnow().isoformat(),
+        'video_provider': 'seedance',  # default for NEW series — Seedance mode active
         'characters': [],
         'locations': [],
+        'items': [],                   # story-relevant props (handbag, gun, locket...)
         'style': {
             'type': 'cinematic',
             'custom_description': '',
@@ -1479,6 +1564,111 @@ def delete_location_asset(sid, loc_id, filename):
     for loc in s.get('locations', []):
         if loc['id'] == loc_id:
             loc['ref_images'] = [r for r in loc.get('ref_images', []) if r != rel]
+    save_series(sid, s)
+    return jsonify({'ok': True})
+
+
+# ── Items (story-relevant props: handbag, gun, locket, etc.) ─────────────────
+# Items are like locations but for THINGS. Same shape: { id, name, description,
+# ref_images, image_constraints?, avai_url? }. Used by Seedance/Reteller as
+# additional reference images when the item is plot-critical (e.g. the stolen
+# handbag passed between characters across episodes).
+
+@app.route('/api/series/<sid>/items', methods=['POST'])
+def add_item(sid):
+    s = load_series(sid)
+    if not s:
+        return jsonify({'error': 'not found'}), 404
+    data = request.json
+    item = {
+        'id': str(uuid.uuid4())[:8],
+        'name': data['name'],
+        'description': data.get('description', ''),
+        'ref_images': []
+    }
+    s.setdefault('items', []).append(item)
+    save_series(sid, s)
+    return jsonify(item), 201
+
+@app.route('/api/series/<sid>/items/<item_id>', methods=['PUT'])
+def update_item(sid, item_id):
+    s = load_series(sid)
+    if not s:
+        return jsonify({'error': 'not found'}), 404
+    for i, it in enumerate(s.get('items', [])):
+        if it['id'] == item_id:
+            s['items'][i].update(request.json)
+            save_series(sid, s)
+            return jsonify(s['items'][i])
+    return jsonify({'error': 'not found'}), 404
+
+@app.route('/api/series/<sid>/items/<item_id>', methods=['DELETE'])
+def delete_item(sid, item_id):
+    s = load_series(sid)
+    if not s:
+        return jsonify({'error': 'not found'}), 404
+    # Capture name BEFORE removing so we can also clean a slug-named dir
+    # (in case generate-image used slug-based path).
+    item_obj = next((it for it in s.get('items', []) if it['id'] == item_id), None)
+    item_slug = slugify(item_obj['name']) if item_obj else None
+
+    s['items'] = [it for it in s.get('items', []) if it['id'] != item_id]
+    for d in (assets_dir(sid) / 'items' / item_id, ):
+        if d.exists():
+            shutil.rmtree(d)
+    if item_slug:
+        d2 = assets_dir(sid) / 'items' / item_slug
+        if d2.exists():
+            shutil.rmtree(d2)
+    for ep in list_episodes(sid):
+        if item_id in ep.get('items_used', []):
+            ep['items_used'].remove(item_id)
+            save_episode(sid, ep['number'], ep)
+    save_series(sid, s)
+    return jsonify({'ok': True})
+
+@app.route('/api/series/<sid>/assets/item/<item_id>', methods=['POST'])
+def upload_item_asset(sid, item_id):
+    s = load_series(sid)
+    if not s:
+        return jsonify({'error': 'series not found'}), 404
+    if 'file' not in request.files:
+        return jsonify({'error': 'no file'}), 400
+    file = request.files['file']
+    if not file or not allowed_file(file.filename):
+        return jsonify({'error': 'invalid file type'}), 400
+
+    item_dir = assets_dir(sid) / 'items' / item_id
+    item_dir.mkdir(parents=True, exist_ok=True)
+    filename = secure_filename(file.filename)
+    stem = Path(filename).stem
+    ext = Path(filename).suffix
+    final = item_dir / filename
+    counter = 1
+    while final.exists():
+        final = item_dir / f'{stem}_{counter}{ext}'
+        counter += 1
+
+    file.save(final)
+    rel_path = str(final.relative_to(series_path(sid)))
+    for it in s.get('items', []):
+        if it['id'] == item_id:
+            it.setdefault('ref_images', []).append(rel_path)
+    save_series(sid, s)
+    return jsonify({'path': rel_path, 'url': f'/assets/{sid}/{rel_path}'})
+
+@app.route('/api/series/<sid>/assets/item/<item_id>/<path:filename>', methods=['DELETE'])
+def delete_item_asset(sid, item_id, filename):
+    s = load_series(sid)
+    if not s:
+        return jsonify({'error': 'not found'}), 404
+    full = series_path(sid) / 'assets' / 'items' / item_id / filename
+    if full.exists():
+        full.unlink()
+    rel = f'assets/items/{item_id}/{filename}'
+    for it in s.get('items', []):
+        if it['id'] == item_id:
+            it['ref_images'] = [r for r in it.get('ref_images', []) if r != rel]
     save_series(sid, s)
     return jsonify({'ok': True})
 
@@ -1951,6 +2141,7 @@ def open_folder(sid):
     paths = {
         'characters': base / 'characters',
         'locations':  base / 'locations',
+        'items':      base / 'items',
         'assets':     base,
     }
     folder = paths.get(folder_type, base)
@@ -2079,6 +2270,110 @@ def save_location_frame(sid, loc_id, project_id):
     loc.setdefault('ref_images', []).append(rel_path)
     save_series(sid, s)
     return jsonify({'ready': True, 'url': f'/assets/{sid}/{rel_path}'})
+
+
+# ── Item image generation (story prop reference) ─────────────────────────────
+
+@app.route('/api/series/<sid>/items/<item_id>/upload-photo', methods=['POST'])
+def upload_item_photo(sid, item_id):
+    s = load_series(sid)
+    item = next((it for it in s.get('items', []) if it['id'] == item_id), None)
+    if not item:
+        return jsonify({'error': 'not found'}), 404
+    f = request.files.get('photo')
+    if not f:
+        return jsonify({'error': 'no file'}), 400
+    item_slug = slugify(item['name'])
+    item_dir = assets_dir(sid) / 'items' / item_slug
+    item_dir.mkdir(parents=True, exist_ok=True)
+    ext = f.filename.rsplit('.', 1)[-1].lower() if '.' in f.filename else 'jpg'
+    filename = f'{asset_name(item["name"])}.{ext}'
+    (item_dir / filename).write_bytes(f.read())
+    rel_path = f'assets/items/{item_slug}/{filename}'
+    refs = item.setdefault('ref_images', [])
+    if rel_path not in refs:
+        refs.insert(0, rel_path)
+    save_series(sid, s)
+    return jsonify({'ready': True, 'url': f'/assets/{sid}/{rel_path}', 'series': s})
+
+
+@app.route('/api/series/<sid>/items/<item_id>/generate-image', methods=['POST'])
+def generate_item_image(sid, item_id):
+    s = load_series(sid)
+    item = next((it for it in s.get('items', []) if it['id'] == item_id), None)
+    if not item:
+        return jsonify({'error': 'not found'}), 404
+
+    style_clause = _series_style_clause(s)
+    constraints = (item.get('image_constraints') or '').strip()
+    constraints_clause = f" IMPORTANT — strictly follow these constraints: {constraints}." if constraints else ""
+    prompt = (
+        f"{item['name']}. {item.get('description', '')}.{constraints_clause} "
+        f"Product-style still-life photo of the object alone. No people, no hands, no characters. "
+        f"Centered composition, neutral seamless background (#dadada), soft even studio lighting, "
+        f"subtle shadow on ground, sharp focus on object texture and details. "
+        f"Square 1:1 framing. Photorealistic, high detail. {style_clause}"
+    )
+    prompt = re.sub(r'\s+', ' ', prompt).strip()
+
+    item_slug = slugify(item['name'])
+    item_dir = assets_dir(sid) / 'items' / item_slug
+    out_path = item_dir / f'{asset_name(item["name"])}.png'
+
+    try:
+        # Items use square aspect — works as a portable reference for both
+        # vertical (Reteller) and horizontal (Seedance) compositions.
+        image_url = avai_generate(prompt, out_path, aspect_ratio='1:1')
+        rel_path = str(out_path.relative_to(series_path(sid)))
+        refs = item.setdefault('ref_images', [])
+        refs[:] = [r for r in refs if not r.endswith(out_path.name)]
+        refs.insert(0, rel_path)
+        item['avai_url'] = image_url  # used by Seedance for video refs
+        save_series(sid, s)
+        return jsonify({'ready': True, 'url': f'/assets/{sid}/{rel_path}', 'image_url': image_url})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/series/<sid>/items/<item_id>/regenerate', methods=['POST'])
+def regenerate_item(sid, item_id):
+    """Regenerate the item's reference image with user-supplied constraints.
+    Persists constraints on the item for future regenerations."""
+    s = load_series(sid)
+    item = next((it for it in s.get('items', []) if it['id'] == item_id), None)
+    if not item:
+        return jsonify({'error': 'item not found'}), 404
+    body = request.get_json(silent=True) or {}
+    wishes = (body.get('wishes') or '').strip()
+    item['image_constraints'] = wishes
+    style_clause = _series_style_clause(s)
+    constraints_clause = f" IMPORTANT — strictly follow these constraints: {wishes}." if wishes else ""
+    prompt = (
+        f"{item['name']}. {item.get('description', '')}.{constraints_clause} "
+        f"Product-style still-life photo of the object alone. No people, no hands, no characters. "
+        f"Centered composition, neutral seamless background (#dadada), soft even studio lighting, "
+        f"subtle shadow on ground, sharp focus on object texture and details. "
+        f"Square 1:1 framing. Photorealistic, high detail. {style_clause}"
+    )
+    prompt = re.sub(r'\s+', ' ', prompt).strip()
+    item_slug = slugify(item['name'])
+    item_dir = assets_dir(sid) / 'items' / item_slug
+    item_dir.mkdir(parents=True, exist_ok=True)
+    out_path = item_dir / f'{asset_name(item["name"])}.png'
+    try:
+        if out_path.exists():
+            try: out_path.unlink()
+            except Exception: pass
+        image_url = avai_generate(prompt, out_path, aspect_ratio='1:1')
+        rel_path = str(out_path.relative_to(series_path(sid)))
+        refs = item.setdefault('ref_images', [])
+        refs[:] = [r for r in refs if not r.endswith(out_path.name)]
+        refs.insert(0, rel_path)
+        item['avai_url'] = image_url
+        save_series(sid, s)
+        return jsonify({'ready': True, 'url': f'/assets/{sid}/{rel_path}', 'image_url': image_url})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 
 # ── Auto-generate missing assets (background sweep) ──────────────────────────
@@ -2414,20 +2709,48 @@ LANGUAGE RULE — NON-NEGOTIABLE:
 TITLE RULES — CRITICAL. Titles in this format are LITERAL PREMISES, not artistic names.
 The audience must instantly picture the entire premise from the title alone.
 
-Title templates that work (use these structures):
+Title templates that work — VARIETY IS REQUIRED. Among any 5 generated ideas, use AT LEAST 4 DIFFERENT templates from this list. Do not start every title with "My" or "Pregnant by":
+
+  Power-imbalance templates (use at most 2 out of 5 ideas):
   • "Never [Verb] a [Hidden Identity]" → "Never Divorce a Secret Billionaire Heiress"
   • "My [Dismissible Role] Is Actually a [Shocking Reality]" → "My Poor Husband Is a Billionaire"
-  • "[Verb]-ing My [Forbidden Person]" → "Craving My Brother's Best Friend"
-  • "[Shocking Premise in One Line]" → "I Got Pregnant at My Ex's Wedding"
+  • "Pregnant by [Powerful/Forbidden Person]" → "Pregnant by My Billionaire Stepbrother"
   • "[Contract/Flash/Fake] [Marriage/Dating] with [Twist]" → "Flash Marriage with My Bodyguard Boss"
+
+  Time-anchor templates (great for second-chance, comeback, fall-from-grace):
+  • "After [Time], [Shocking Comeback]" → "After 10 Years, I'm Coming Back as His Wife"
+  • "[Number] Years [Status]" → "Five Years Hidden as His Maid"
+  • "[Number] Days to [Stake]" → "Seven Days to Stop My Wedding"
+  • "When [Trigger], He [Realized Truth]" → "When She Walked In, He Knew He'd Made a Mistake"
+
+  First-person-extreme templates (great for revenge, found-family, survival):
+  • "I [Did Extreme Thing] Just to [Goal]" → "I Faked My Death to See Who'd Cry"
+  • "I Wasn't Supposed to [Outcome]" → "I Wasn't Supposed to Survive That Night"
+  • "[Verb]-ing My [Forbidden/Unlikely Person]" → "Craving My Brother's Best Friend"
+
+  Statement-as-hook templates (great for cold revenge, quiet menace):
+  • "[Quiet Statement Reframing Power]" → "He Calls Me His Mistake. He's Wrong."
+  • "The [Person] Who [Extreme Action]" → "The Maid Who Owns This Building"
+  • "[Possessive Sequence]" → "Her CEO. Her Brother. Her Worst Mistake."
+  • "[Question Demanding Answer]" → "Why Did My Husband Vanish?"
+
+  Situational-shock templates (great for mystery, found-family, courtroom):
+  • "[Shocking Premise in One Line]" → "I Got Pregnant at My Ex's Wedding"
   • "[Exclamation about situation]" → "Oh No, I Married the Mafia King!"
   • "[Character] [Does Extreme Thing]" → "I Went to the Mafia Boss for a Baby"
-  • "Pregnant by [Powerful/Forbidden Person]" → "Pregnant by My Billionaire Stepbrother"
 
-Power nouns to use freely: Billionaire, CEO, Mafia Boss, Alpha, King, Heiress, Ruthless, Secret, Forbidden, Contract, Rejected, Rival, Stepbrother, Boss
-Relationship modifiers: My husband, my ex, my boss, my stepbrother, my brother's best friend, my enemy
+Power nouns (mix freely, do NOT pile multiple on one title): Billionaire, CEO, Mafia Boss, Alpha, King, Heiress, Surgeon, Detective, Heiress, Pilot, Soldier, Bodyguard, Coach, Tutor, Pastor, Therapist, Judge, Driver, Nanny, Chef, Architect, Influencer, Twin
+Relationship modifiers: my husband, my ex, my boss, my stepbrother, my brother's best friend, my enemy, my therapist, my doctor, my driver, my landlord, my tutor, my coach, my mentor, my mother, my sister, my fiance, my late husband (alive), my fake husband, my contract wife
 
-FORBIDDEN title styles: metaphorical ("Shadows of Yesterday"), vague ("The Choices We Make"), literary ("When Light Finds Darkness"), anything that sounds like an indie film or a book club pick.
+DIVERSITY ENFORCEMENT — MANDATORY when generating multiple ideas:
+- Among any 5 ideas, use AT LEAST 4 different title templates (don't reuse the same template more than twice).
+- AT LEAST 2 of the 5 ideas must NOT be set in elite/luxury environments (corporate/penthouse/mafia/royal). Mix in working-class, institutional, blue-collar, immigrant, mid-tier, suburban, road-trip settings.
+- AT LEAST 2 of the 5 should NOT be primarily romance — center other engines: revenge tour, single-case mystery, found-family forming, survival pact, custody fight, comeback redemption.
+- AT LEAST 1 of the 5 should NOT use a billionaire/CEO/mafia archetype. Force a different antagonist: corrupt judge, gaslighting mother, charming therapist with recordings, megachurch pastor, ex who faked their death, etc.
+- Do NOT make 3+ ideas about pregnancy/secret child/forced marriage in the same batch. Pick at most 2 in that family.
+- If two ideas share the same setting+twist combo or feel like reflavoured versions — rewrite ONE with a different premise structure.
+
+FORBIDDEN title styles: metaphorical ("Shadows of Yesterday"), vague ("The Choices We Make"), literary ("When Light Finds Darkness"), anything that sounds like an indie film or a book club pick. But "soft-literal" titles ARE encouraged ("After 10 Years, He Was Still Waiting" reads literal enough — keep these alongside the louder templates for variety).
 
 SYNOPSIS RULES:
 - 3 sentences max. Every word is plot, zero atmosphere-setting.
@@ -2492,21 +2815,69 @@ _IDEAS_SCHEMA = """{
 }"""
 
 _IDEA_SETTINGS = [
-    'corporate boardroom', 'small coastal town', 'luxury hotel', 'underground music scene',
-    'high-end fashion house', 'elite university', 'family vineyard', 'tech startup',
-    'hospital ER', 'old money estate', 'art gallery', 'professional sports team',
-    'law firm', 'private island resort', 'foreign city expat community', 'royal court',
-    'film set', 'military base', 'crime family', 'political campaign',
+    # Elite / luxury (kept — but we WILL force diversity to non-elite below)
+    'corporate boardroom', 'luxury hotel', 'high-end fashion house', 'old money estate',
+    'art gallery', 'professional sports team', 'law firm', 'private island resort',
+    'royal court', 'film set', 'crime family', 'political campaign', 'family vineyard',
+    'tech startup', 'foreign city expat community', 'fashion week backstage',
+    'megachurch leadership', 'private boarding school', 'modeling agency',
+    # Working-class / blue-collar / mundane
+    '24-hour highway diner', 'truck stop motel', 'family-run nail salon', 'food delivery startup',
+    'immigrant restaurant family', 'food truck rivalry circuit', 'working-class neighborhood block',
+    'gated suburban subdivision', 'small coastal fishing town', 'mining company town',
+    'family farm dairy', 'cattle ranch', 'inherited bookshop', 'antique auction house',
+    'mid-tier law firm in trouble', 'failing chinese restaurant kitchen brigade',
+    # Institutional
+    'hospital ER', 'maternity ward', 'IVF clinic', 'private rehab center',
+    'AA meeting / 12-step group', 'public defender office', 'prison women\'s wing',
+    'jury deliberation room', 'private detective agency', 'crime scene investigation unit',
+    'couples therapy clinic', 'divorce lawyer office', 'adoption agency',
+    'forensic accounting firm', 'witness protection safehouse',
+    # Insulated / closed-world (great for trapped-together)
+    'cruise ship', 'airline crew on overseas route', 'mountain ski lodge', 'desert oil town',
+    'offshore oil rig', 'archaeology dig site', 'remote research lab', 'lighthouse compound',
+    'monastery / convent', 'charismatic cult retreat', 'tour bus on the road',
+    'music festival camp', 'e-sports team house', 'reality TV competition set',
+    # Creative / media / niche
+    'underground music scene', 'art conservatory', 'ballet academy', 'circus / carnival circuit',
+    'influencer content house', 'talk show set', 'podcast production studio',
+    'veterinary practice', 'dog rescue shelter', 'gospel choir',
+    # Power-adjacent (alternative to corporate/mafia)
+    'military intelligence unit', 'private security firm', 'biotech research lab',
+    'fertility research lab', 'family court chambers', 'PR crisis firm',
+    'tabloid newsroom', 'investigative journalism desk',
 ]
 _IDEA_TWISTS = [
-    'secret identity', 'forbidden love', 'revenge plot', 'hidden past',
-    'class war', 'betrayal within family', 'blackmail', 'second chance romance',
-    'deadly competition', 'love triangle', 'corporate sabotage', 'fake relationship',
-    'long-lost sibling', 'obsessive ex', 'hidden heir', 'dangerous obsession',
-    'secret pregnancy', 'hidden billionaire status', 'mistaken identity humiliation',
-    'mafia protection deal', 'company inheritance shock', 'paternity reveal',
-    'the rescuer has an agenda', 'fall from grace and rebuild', 'murder attempt survived',
-    'the ally is the real villain', 'hidden recording surfaces', 'DNA test twist',
+    # Identity / deception cluster (de-duped from old 5+ → kept distinct)
+    'hidden true identity (rich/poor/profession)', 'mistaken-for-someone reveal',
+    'hidden heir / inheritance shock', 'fake death revealed', 'evil twin / doppelganger swap',
+    'amnesia + new identity rebuild', 'witness protection meet-cute',
+    # Power & betrayal
+    'forbidden love', 'revenge plot', 'class war', 'family betrayal', 'corporate sabotage',
+    'blackmail', 'the ally is the real villain', 'the rescuer has an agenda',
+    'fall from grace and rebuild', 'survived assassination attempt',
+    'estranged family member returns', 'second chance romance', 'love triangle',
+    'obsessive ex', 'dangerous obsession', 'long-lost sibling',
+    # Romance/family entanglements
+    'secret pregnancy with explicit recent conception', 'paternity reveal / DNA twist',
+    'wrong-baby swap at birth', 'fake relationship turns real', 'arranged marriage to a stranger',
+    'marriage of convenience for inheritance', 'wedding interrupted', 'left at the altar',
+    'inheritance condition (must marry by deadline)', 'forced cohabitation contract',
+    'surrogacy gone wrong', 'fertility lie', 'fake adoption uncovered',
+    # Returning ghosts
+    'the dead spouse is alive and watching', 'second life / reincarnation knowledge',
+    'amnesiac executive returns home', 'estranged child returns to family business',
+    'fugitive begs sanctuary at protagonist\'s door',
+    # Crime / mystery
+    'mafia protection deal', 'undercover op falls for the target', 'cult escape',
+    'inherited debt forces marriage', 'kidnapping with a twist (victim was bait)',
+    'organ donor reveal in OR', 'the surgeon is the assassin',
+    # Modern reveals
+    'paparazzi expose a private moment', 'social media downfall', 'catfish reveal in person',
+    'hidden recording surfaces in confrontation',
+    # Power dynamics
+    'company inheritance shock', 'rejected mate / pack outcast (supernatural)',
+    'reverse-Cinderella (rich woman / lower-status man)',
 ]
 _IDEA_TONES = [
     ('Dark thriller', 'Suspenseful'),
@@ -2521,6 +2892,122 @@ _IDEA_TONES = [
     ('Pregnancy drama', 'Emotional & volatile'),
     ('CEO power struggle', 'Cold & ruthless'),
     ('Mafia romance', 'Dangerous & intense'),
+    # Added 13 — broaden the emotional palette
+    ('Quietly devastating', 'Restrained heartbreak'),
+    ('Bittersweet & hopeful', 'Soft melancholy with warmth'),
+    ('Pulpy & operatic', 'Maximalist soap energy'),
+    ('Gritty realism', 'Unflinching, blue-collar'),
+    ('Whimsical melodrama', 'Almost fairytale, but with knives'),
+    ('Cosy slow burn', 'Tender, low-stakes-feeling, big payoff'),
+    ('Ferocious & vengeful', 'White-hot, no mercy'),
+    ('Surreal & dreamlike', 'Off-kilter, uncanny edges'),
+    ('Cold procedural', 'Detective-show clinical pacing'),
+    ('Found-family wholesome', 'Hugs and grit, low cynicism'),
+    ('Chaotic comedy', 'Everyone making bad decisions, fast'),
+    ('Pastoral noir', 'Sleepy small town, dark currents'),
+    ('Confessional first-person', 'Whispered intimacy, narrator-driven energy'),
+]
+_IDEA_PREMISE_STRUCTURES = [
+    'Forced cohabitation / locked-in scenario (snowstorm / contract / shared apartment by mistake)',
+    'Fake marriage / contract relationship that turns real',
+    'Marriage of convenience to satisfy inheritance condition',
+    'Amnesia after the inciting event — protagonist rebuilds from scraps',
+    'Body swap / soul switch — wakes up in another life',
+    'Fake death and observing the aftermath from the shadows',
+    'Wrong-place-wrong-time swap (mistaken for someone else, must keep playing the role)',
+    'Heist crew assembling for one impossible job',
+    'Found family forms among unlikely strangers',
+    'Rivals forced to work together (hostage/pact/case)',
+    'Mentor-apprentice with secret agenda from one side',
+    'Wedding sabotage from inside (planner, maid of honor, kid)',
+    'Reverse-Cinderella — rich woman falls for lower-status man',
+    'Pretending to be someone else (housekeeper, tutor, nanny) inside the target\'s house',
+    'Single-parent meets ex-flame returning years later (kid is his)',
+    'Mafia mole undercover, cover starts to crack',
+    'Witness protection meet-cute',
+    'Reality-TV competition where rivalry turns to romance / vengeance',
+    'Twin impersonating their sibling for an impossible reason',
+    'Estranged daughter returns to family business',
+    'Reunion at funeral / wedding / class reunion forces the reveal',
+    'Trapped in past — time loop / reincarnation / second-chance life with prior knowledge',
+    'Charity gala collision (one night, irreversible consequences)',
+    'New employee meets tyrant boss (turns out to be ex / target / kin)',
+    'Coming home from war / prison / overseas to find life rebuilt without you',
+    'Sister stealing fiance / brother stealing wife',
+    'Born-again sibling rivalry over inheritance',
+    'Methodical revenge tour planned over years',
+    'Survival scenario (storm / desert / quarantine forces strangers together)',
+    'Single-case mystery as the season spine (one murder, custody, missing person)',
+    'Crisis of faith — pastor / cult escapee unravelling beliefs',
+    'Long con — protagonist is being scammed but turns it back',
+    'Custody battle as the engine — fight over child or inheritance',
+    'Caregiver & patient — one is hiding why they really took the job',
+]
+_IDEA_PROTAG_ARCHETYPES = [
+    'Ex-intelligence operative posing as nanny / housekeeper / tutor',
+    'Twin impersonating their sibling',
+    'AI-assisted surgeon hiding addiction / past',
+    'Witness in protection program building a new identity',
+    'Estranged daughter of mob boss returning home reluctantly',
+    'Adopted heir who just learned they\'re adopted',
+    'Assistant secretly spying on her boss for a rival firm',
+    'Disgraced lawyer rebuilding career from a low-end firm',
+    'Single mother working three jobs after husband\'s disappearance',
+    'Veteran returning to civilian life with a haunted past',
+    'Influencer caught in real-world scandal she didn\'t cause',
+    'Heiress hiding from arranged marriage by working as someone\'s maid',
+    'Working-class line cook with a secret gift (savant memory / forensic palate)',
+    'Recovering addict in halfway house finding unexpected mentor',
+    'Forensic accountant uncovering family-scale fraud',
+    'Trauma surgeon with PTSD nightmares she can\'t admit',
+    'Police detective whose new case hits unbearably close',
+    'Investigative journalist on a story powerful people will kill to bury',
+    'ER nurse working night shifts who recognises a "dead" patient',
+    'Public defender with overloaded caseload taking one impossible client',
+    'Foster sister searching for biological family among the wealthy',
+    'Recently widowed person uncovering spouse\'s parallel life',
+    'Retired hitwoman trying to disappear in a small town',
+    'Fashion designer one week from launch, sabotaged from inside',
+    'Tech founder one round from bankruptcy, betrayed by co-founder',
+    'Star athlete with career-ending injury rebuilding identity',
+    'Chef who lost their restaurant working in the rival\'s kitchen',
+    'Music producer hiding pop-star past from new partner',
+    'Pastor\'s wife realising the church is a cult',
+    'Reality-TV contestant whose scripted villain edit is destroying her real life',
+]
+_IDEA_ANTAG_ARCHETYPES = [
+    'Charming AI-driven psychotherapist secretly recording sessions',
+    'Corrupt family court judge weaponising custody decisions',
+    'Her own mother — gaslighting, image-protecting, ruthless',
+    'The dead husband who is alive and watching from offshore',
+    'An old flame turned cult leader',
+    'Beloved family doctor with a long-running scheme',
+    'Mentor who built protagonist up specifically to bring her down',
+    'Childhood best friend turned chief rival in the same field',
+    'Sister-in-law plotting takeover of the family business',
+    'Powerful PR fixer protecting a far worse client',
+    'Tabloid editor weaponising real truths against innocent people',
+    'Tech billionaire with personal vendetta disguised as a buyout',
+    'Estranged twin pretending to be the protagonist',
+    'Therapist who\'s secretly recording sessions for blackmail',
+    'Step-parent slowly poisoning estate inheritance',
+    'Rival surgeon undermining career through whisper campaigns',
+    'Best friend\'s husband who\'s also the protagonist\'s ex',
+    'Government handler with their own off-book agenda',
+    'Tech-CEO blackmailer wielding deepfakes',
+    'School principal at the centre of a religious cult',
+    'Family lawyer who\'s been embezzling for 20 years',
+    'Pastor of the family\'s megachurch, hiding crimes',
+    'Coach / agent / manager controlling the protagonist\'s entire career',
+    'Mafia boss father who is also the only protection available',
+    'Ex-husband who never legally divorced and now claims her business',
+]
+_IDEA_AVOID_REPETITIVE_FRAMES = [
+    'avoid the "she\'s secretly the heiress and he doesn\'t know" frame if another idea uses it',
+    'avoid "billionaire CEO meets his employee" if another idea covers it',
+    'avoid "mafia boss kidnaps her" if another idea uses kidnapping/protection',
+    'avoid "she got pregnant from the one-night stand at the gala" if another already does it',
+    'avoid "stepbrother forbidden romance" if another uses step-family',
 ]
 
 @app.route('/api/generate-series-ideas', methods=['POST'])
@@ -2537,18 +3024,38 @@ def generate_series_ideas():
     else:
         genre_rule = ""
 
-    seed_settings = random.sample(_IDEA_SETTINGS, 5)
-    seed_twists   = random.sample(_IDEA_TWISTS, 5)
-    seed_tones    = random.sample(_IDEA_TONES, 5)
-    constraints   = '\n'.join(
-        f'{i+1}. Setting: {seed_settings[i]} | Twist: {seed_twists[i]} | Mood: {seed_tones[i][0]}'
+    # Six-axis sampling — produces ~ millions of unique combos so back-to-back
+    # batches don't repeat. Each idea gets ONE pick from every axis.
+    seed_settings   = random.sample(_IDEA_SETTINGS, 5)
+    seed_twists     = random.sample(_IDEA_TWISTS, 5)
+    seed_tones      = random.sample(_IDEA_TONES, 5)
+    seed_premises   = random.sample(_IDEA_PREMISE_STRUCTURES, 5)
+    seed_protag     = random.sample(_IDEA_PROTAG_ARCHETYPES, 5)
+    seed_antag      = random.sample(_IDEA_ANTAG_ARCHETYPES, 5)
+    constraints = '\n'.join(
+        f'{i+1}. Setting: {seed_settings[i]}\n'
+        f'   Premise structure: {seed_premises[i]}\n'
+        f'   Twist element: {seed_twists[i]}\n'
+        f'   Protagonist archetype: {seed_protag[i]}\n'
+        f'   Antagonist archetype: {seed_antag[i]}\n'
+        f'   Mood: {seed_tones[i][0]}'
         for i in range(5)
     )
     prompt = (
         "Generate exactly 5 SHORT DRAMA series concepts for TikTok/Reels.\n\n"
         + genre_rule
-        + "Use these creative constraints (one per idea) to ensure variety:\n"
+        + "Use these creative constraints (one per idea) — each idea gets its OWN combo:\n"
         f"{constraints}\n\n"
+        "How to use the constraints:\n"
+        "- Each idea must clearly USE its assigned setting, premise structure, and protagonist/antagonist archetype.\n"
+        "- The twist element should be THE turning point or central engine — not a side detail.\n"
+        "- If an archetype clashes with the title-template you'd reach for — pick a DIFFERENT title-template; don't override the archetype.\n\n"
+        "Diversity check before output (mandatory):\n"
+        "- No two ideas may share the same setting category (urban-elite vs blue-collar vs institutional vs road/island vs creative-niche).\n"
+        "- No two ideas may use the same TITLE TEMPLATE — pick from different rows of the title rules above.\n"
+        "- AT LEAST 2 of the 5 must NOT center primarily on a romantic relationship as the engine — pick revenge, mystery, found-family, custody, or comeback as the spine.\n"
+        "- AT LEAST 1 idea must use a non-billionaire/non-CEO/non-mafia antagonist (use the assigned antagonist archetype).\n"
+        "- If you find two of your drafts feel like reflavoured copies — rewrite the second with a different premise structure entirely.\n\n"
         "Rules:\n"
         "- All titles and English fields must be in English\n"
         "- synopsis_ru must be in Russian — short (2-3 sentences), vivid, makes you want to watch\n"
@@ -2563,6 +3070,7 @@ def generate_series_ideas():
 
 
 _FROM_IDEA_ANGLES = [
+    # Existing 12
     'Focus on a shocking betrayal as the central engine of the plot.',
     'Lead with an enemies-to-lovers arc that feels inevitable in hindsight.',
     'Make the protagonist morally ambiguous — the audience should question who to root for.',
@@ -2575,6 +3083,21 @@ _FROM_IDEA_ANGLES = [
     'Build every episode around a cliffhanger that recontextualizes what came before.',
     'Focus on class conflict as the hidden engine beneath the romance.',
     'Center around a lie told in episode 1 that the whole series stems from.',
+    # Added 14 — non-romance engines
+    'Anchor the season to a SINGLE CASE / mystery / missing person — every episode peels one layer.',
+    'Make CUSTODY the engine — the fight is over a child, an inheritance, or guardianship of an elder.',
+    'Drive the story through a methodical revenge tour — protagonist has years of plans and now executes them quietly.',
+    'Center the story on a found-family forming under pressure — the romance is secondary or absent.',
+    'Use a SURVIVAL scenario as season spine — storm, quarantine, desert, blackout — strangers must trust each other.',
+    'Anchor the story in a PROCEDURAL field — ER / forensic / journalist newsroom — and let romance live in the margins.',
+    'Make memory loss the engine — protagonist rebuilds her life and uncovers what she did before the gap.',
+    'Center on faith / cult / belief — protagonist either escaping or being pulled deeper, with a love interest on the other side.',
+    'Build around impostor syndrome literalised — protagonist is pretending to be someone in a closed world (heir, doctor, twin) and must keep it up.',
+    'Make the GHOST OF A DEAD CHARACTER the silent engine — every revelation reframes who they were.',
+    'Use a COMING HOME structure — protagonist returns after war / prison / abroad and finds their old life rearranged without them.',
+    'Anchor to a single COUNTDOWN — wedding date, deportation, surgery, deadline — everything pushes toward it.',
+    'Make the antagonist sympathetic — let the audience see their logic 60% of the way before flipping.',
+    'Use a documentary-style framing — the protagonist is being interviewed throughout, looking back from after the events.',
 ]
 
 @app.route('/api/generate-series-from-idea', methods=['POST'])
@@ -2584,9 +3107,13 @@ def generate_series_from_idea():
     genres = data_in.get('genres') or []
     if not idea:
         return jsonify({'error': 'Опиши идею'}), 400
-    angle   = random.choice(_FROM_IDEA_ANGLES)
-    setting = random.choice(_IDEA_SETTINGS)
-    twist   = random.choice(_IDEA_TWISTS)
+    angle    = random.choice(_FROM_IDEA_ANGLES)
+    setting  = random.choice(_IDEA_SETTINGS)
+    twist    = random.choice(_IDEA_TWISTS)
+    premise  = random.choice(_IDEA_PREMISE_STRUCTURES)
+    protag   = random.choice(_IDEA_PROTAG_ARCHETYPES)
+    antag    = random.choice(_IDEA_ANTAG_ARCHETYPES)
+    tone     = random.choice(_IDEA_TONES)[0]
     genre_rule = (
         f"The series MUST be a blend of these genres: {', '.join(genres)}. "
         "Every element of the concept should feel like it belongs in all of them simultaneously. "
@@ -2594,10 +3121,19 @@ def generate_series_from_idea():
     prompt = (
         f"Based on this idea: \"{idea}\"\n\n"
         + genre_rule
-        + f"Creative angle to explore: {angle}\n"
-        f"Consider incorporating: setting={setting}, twist element={twist}\n\n"
+        + f"Creative angle to explore: {angle}\n\n"
+        f"Use this 6-axis combo as the spine of the concept (each axis must be visibly present in the synopsis):\n"
+        f"  • Setting: {setting}\n"
+        f"  • Premise structure: {premise}\n"
+        f"  • Twist element: {twist}\n"
+        f"  • Protagonist archetype: {protag}\n"
+        f"  • Antagonist archetype: {antag}\n"
+        f"  • Mood: {tone}\n\n"
+        "Important: if the user's idea already implies one of these axes (e.g. a setting), HONOR the user's idea — "
+        "use the suggested combo only as creative pressure to avoid generic clichés, not to override what the user said. "
+        "Pick a TITLE TEMPLATE from the system prompt that fits the mood — don't default to 'My X Is A Y' if the mood is procedural or revenge-tour.\n\n"
         "Create a UNIQUE short drama series concept for TikTok/Reels that feels fresh and specific — "
-        "avoid generic plots. Give it a surprising title. "
+        "avoid generic plots. Give it a title that sets a clear visual expectation. "
         "Return JSON with exactly these fields: "
         "title, genre, tone, target_audience, world_description, synopsis. "
         "synopsis should be 3-5 sentences summarizing the full series arc."
@@ -6058,6 +6594,78 @@ def _extract_last_frame(sid, video_relpath):
         return None
     return None
 
+
+def _detect_cuts(video_abs_path, threshold=0.35):
+    """Detect hard cuts inside a video using ffmpeg's scene detection.
+    Returns sorted list of cut timestamps (seconds, float) where the FIRST
+    frame of the NEW shot starts. Returns [] on any failure or if ffmpeg
+    is not installed. Threshold: 0.3-0.45 catches most AI-generated cuts."""
+    ffmpeg_bin = shutil.which('ffmpeg')
+    if not ffmpeg_bin or not video_abs_path or not Path(video_abs_path).exists():
+        return []
+    try:
+        # showinfo prints pts_time for each frame the select filter passes.
+        proc = subprocess.run(
+            [ffmpeg_bin, '-hide_banner', '-i', str(video_abs_path),
+             '-vf', f"select='gt(scene,{threshold})',showinfo",
+             '-an', '-f', 'null', '-'],
+            capture_output=True, timeout=60, text=True
+        )
+        # ffmpeg writes filter output to stderr
+        out = (proc.stderr or '') + (proc.stdout or '')
+    except Exception:
+        return []
+    cuts = []
+    for m in re.finditer(r'pts_time:([\d.]+)', out):
+        try:
+            t = float(m.group(1))
+            # Drop very-early "cuts" (often the first frame itself).
+            if t > 0.4:
+                cuts.append(t)
+        except ValueError:
+            continue
+    # Dedupe near-duplicates (within 0.3s of each other) — sometimes ffmpeg
+    # emits 2 close hits for the same cut due to motion.
+    cuts.sort()
+    deduped = []
+    for t in cuts:
+        if not deduped or (t - deduped[-1]) > 0.3:
+            deduped.append(t)
+    return deduped
+
+
+def _extract_keyframes_at_cuts(sid, video_relpath, cut_timestamps, max_frames=2,
+                               pre_offset=0.05):
+    """For each cut timestamp T, extract the frame at T-pre_offset (i.e. the
+    LAST frame of the OUTGOING shot, just before the cut). Cached on disk as
+    <stem>_cutframe_<i>.jpg. Caps at max_frames (oldest cuts first → most context)
+    to keep ref budget under control. Returns list of (relpath, abs_path)."""
+    src = series_path(sid) / video_relpath
+    if not src.exists() or not cut_timestamps:
+        return []
+    ffmpeg_bin = shutil.which('ffmpeg')
+    if not ffmpeg_bin:
+        return []
+    selected = list(cut_timestamps)[:max_frames]
+    out_paths = []
+    for i, t in enumerate(selected):
+        seek_t = max(0.0, t - pre_offset)
+        out = src.with_name(f'{src.stem}_cutframe_{i}.jpg')
+        if out.exists() and out.stat().st_size > 0:
+            out_paths.append((str(out.relative_to(series_path(sid))), out))
+            continue
+        try:
+            subprocess.run(
+                [ffmpeg_bin, '-y', '-ss', f'{seek_t:.3f}', '-i', str(src),
+                 '-frames:v', '1', '-q:v', '3', str(out)],
+                capture_output=True, timeout=30, check=True
+            )
+            if out.exists() and out.stat().st_size > 0:
+                out_paths.append((str(out.relative_to(series_path(sid))), out))
+        except Exception:
+            continue
+    return out_paths
+
 def _avai_seedance_start(prompt, ref_urls, duration, resolution, moderation_bypass,
                           aspect_ratio='9:16', generate_audio=True,
                           moderation_bypass_prompt=None):
@@ -6209,7 +6817,12 @@ def _ensure_char_avai_base_url(sid, char):
 
 def _resolve_ref_url(s, ref, sid=None):
     """ref = {'kind':'char'|'outfit'|'loc', 'id':..., 'outfit':...}.
-    Returns public AVAI URL or None."""
+    Returns public AVAI URL or None.
+
+    Side-effect: if a non-null outfit label was requested but doesn't match any
+    of the character's outfits, marks ref['_outfit_fallback']=True so the caller
+    can warn the user. Without this signal, hallucinated outfit labels (e.g.
+    'casual', 'formal') silently fall through to base — outfit drift bug."""
     if not ref:
         return None
     kind = ref.get('kind')
@@ -6217,10 +6830,14 @@ def _resolve_ref_url(s, ref, sid=None):
         c = next((x for x in s.get('characters', []) if x['id'] == ref.get('id')), None)
         if not c:
             return None
-        if ref.get('outfit'):
+        requested = ref.get('outfit')
+        if requested:
             for o in c.get('outfits', []) or []:
-                if o.get('label') == ref['outfit']:
+                if o.get('label') == requested:
                     return o.get('avai_url') or c.get('avai_base_url')
+            # Outfit label was requested but not found → fall back to base, but mark it
+            ref['_outfit_fallback'] = True
+            ref['_outfit_requested'] = requested
         # Base look. Lazy-upload local ref_image if avai_base_url absent.
         if c.get('avai_base_url'):
             return c['avai_base_url']
@@ -6334,6 +6951,7 @@ def seedance_compose(sid, num):
     if not chunk_text:
         return jsonify({'error': 'chunk_text required'}), 400
     use_prev_lastframe = bool(body.get('use_prev_lastframe', True))
+    use_prev_cutframes = bool(body.get('use_prev_cutframes', False))
     base_outfits_only  = bool(body.get('base_outfits_only', False))
     style_override = (body.get('style') or '').strip()
     # Fall back to project's visual_style (default = realistic — no special handling needed)
@@ -6347,7 +6965,9 @@ def seedance_compose(sid, num):
     # script (by substring position), not by creation order. This is what
     # actually matters for "who was just in frame" continuity.
     full_script_for_pos = (ep.get('script') or '')
-    _heading_re = re.compile(r'^\s*(INT\.|EXT\.|INT\/EXT\.)\s', re.IGNORECASE)
+    # Use the shared is_scene_heading() helper — recognises BOTH formal
+    # (INT./EXT./ИНТ./...) AND inferred (Локация:, СЦЕНА N, ALL-CAPS slug,
+    # [bracketed slug]) headings so continuity survives in scripts without INT./EXT.
     def _pos_in_script(txt):
         """Find the script byte-offset where this chunk_text starts.
         Tries multiple anchors and prefers the FIRST unique match — falls back
@@ -6360,7 +6980,7 @@ def seedance_compose(sid, num):
             s = ln.strip()
             if len(s) < 25:
                 continue
-            if _heading_re.match(s):
+            if is_scene_heading(s):
                 continue
             cands.append(s)
             if len(cands) >= 6:
@@ -6391,7 +7011,7 @@ def seedance_compose(sid, num):
             s = ln.strip()
             if len(s) < 25:
                 continue
-            if _heading_re.match(s):
+            if is_scene_heading(s):
                 continue
             idx = full_script_for_pos.find(s, start)
             if idx >= 0:
@@ -6538,15 +7158,37 @@ def seedance_compose(sid, num):
     else:
         prev_block = ''
 
-    # Compact char/loc rosters
+    # Compact char/loc rosters. Critical: list each char's available outfit
+    # labels so the composer can pick a VALID one (not hallucinate). Without
+    # this list the composer either fills "outfit": null (always base) or
+    # invents a label that fails to resolve and silently falls back to base —
+    # both lead to outfit drift across chunks of the same scene.
     chars_lines = []
     for c in s.get('characters', []) or []:
         # Include any char that has SOME image source — base AVAI url, outfit url,
         # or local ref_images (we'll lazy-upload base on resolve).
         has_outfit = any((o.get('avai_url')) for o in (c.get('outfits') or []))
-        if c.get('avai_base_url') or has_outfit or (c.get('ref_images') or []):
-            tag = '' if c.get('avai_base_url') else ' [no_base_url]'
-            chars_lines.append(f"- {c['name']} (id={c['id']}){tag}: {c.get('appearance','')[:120]}")
+        if not (c.get('avai_base_url') or has_outfit or (c.get('ref_images') or [])):
+            continue
+        tag = '' if c.get('avai_base_url') else ' [no_base_url]'
+        line = f"- {c['name']} (id={c['id']}){tag}: {c.get('appearance','')[:120]}"
+        outfits_with_url = [o for o in (c.get('outfits') or []) if o.get('avai_url')]
+        if outfits_with_url:
+            outfit_lines = []
+            for o in outfits_with_url:
+                desc = (o.get('description') or '').replace('\n', ' ')[:100]
+                label = o.get('label', '')
+                if not label:
+                    continue
+                marker = ' [base]' if o.get('is_base') else ''
+                outfit_lines.append(f'    • "{label}"{marker}: {desc}')
+            if outfit_lines:
+                line += "\n  Доступные значения для \"outfit\" (выбирай ТОЛЬКО из этого списка):\n"
+                line += "\n".join(outfit_lines)
+                line += "\n    • null — базовый портрет (если нет специфики сцены ИЛИ персонаж появляется в первый раз)"
+        else:
+            line += "\n  Outfits: только база (\"outfit\": null)"
+        chars_lines.append(line)
     locs_lines = []
     for l in s.get('locations', []) or []:
         # Include all locations that have any image (ref_images OR avai_url) — LLM can still pick them.
@@ -6564,20 +7206,27 @@ def seedance_compose(sid, num):
         "'движение камеры за героем', 'medium close-up' → 'средний крупный план', 'OTS' → 'через плечо', "
         "'slow dolly in' → 'медленный наезд'. Если поймал себя на английской фразе вне кавычек — перепиши.\n\n"
         "СТРУКТУРА промпта (~60–110 слов всего, первые 20–30 слов решают):\n"
-        "  1) SUBJECT — кто в кадре, со ссылками @Image1, @Image2... — каждый ключевой перс упомянут.\n"
-        "  2) ACTION — что они делают (одно главное действие/конфликт, без каши).\n"
-        "  3) SCENE — где (ссылка на @Image<N> локации) + время суток / атмосфера.\n"
+        "  0) BINDING — ПЕРВАЯ строка промпта. Биндим имена к ref-слотам ровно ОДИН раз:\n"
+        "     'В refs: @Image1=Ethan, @Image2=Maya, @Image3=Lobby (локация).' "
+        "Дальше в промпте используй ИМЕНА (Ethan, Maya, Lobby) — без @ImageN.\n"
+        "     Зачем: повторение @ImageN в каждом блоке поощряет Seedance рендерить персонажа дважды "
+        "(каждое упоминание = potential render anchor). Биндинг один раз в начале — модель уже знает кто кто.\n"
+        "  1) SUBJECT — кто в кадре. После биндинга используй ИМЕНА: 'Ethan и Maya в лобби'.\n"
+        "  2) ACTION — что они делают, ИМЕНАМИ: 'Ethan ставит чашку на стол, Maya садится напротив'.\n"
+        "  3) SCENE — где, ИМЕНЕМ локации: 'Действие в Lobby — стеклянное холодное лобби, утренний свет'.\n"
         "  4) CAMERA — конкретно: 'tracking shot', 'medium close-up', 'slow dolly in', 'handheld', 'over-the-shoulder', 'low angle'.\n"
-        "  5) DIALOGUE — для КАЖДОЙ реплики формат из ДВУХ ЧАСТЕЙ:\n"
-        "     (a) ШОТ-БИТ перед репликой, чтобы модель знала чьи губы двигать: 'Камера склейкой/наездом переходит на крупный план @ImageN — '\n"
-        "         Варианты ракурса чередуй: 'крупный план лица @ImageN', 'средний план @ImageN', 'через плечо на @ImageN'.\n"
-        "     (b) Сама реплика: '@ImageN, <эмоция/тон на русском>, говорит: \"<точная реплика как в сценарии>\"'\n"
+        "  5) DIALOGUE — ИСКЛЮЧЕНИЕ из правила биндинга. Для КАЖДОЙ реплики — формат из ДВУХ частей "
+        "ОБЯЗАТЕЛЬНО с @ImageN (для lipsync-привязки):\n"
+        "     (a) ШОТ-БИТ перед репликой, имя + @ImageN: 'Камера склейкой/наездом переходит на крупный план Maya (@Image2) — '\n"
+        "         Варианты ракурса чередуй: 'крупный план лица Maya (@Image2)', 'средний план Ethan (@Image1)', 'через плечо на Maya (@Image2)'.\n"
+        "     (b) Сама реплика: 'Maya (@Image2), <эмоция/тон на русском>, говорит: \"<точная реплика как в сценарии>\"'\n"
         "     Полный пример (две реплики двух разных персов):\n"
-        "       'Склейка на крупный план лица @Image2. @Image2, ухмыляясь с презрением, говорит: \"Lost, Aria?\" "
-        "Камера переключается на средний план @Image1 через плечо @Image2. @Image1, дрожа от ярости, отвечает: \"Get out.\"'\n"
-        "     ПРАВИЛО: между сменой говорящего ОБЯЗАТЕЛЬНО шот-бит со склейкой/наездом на нового спикера. "
-        "Без этого Seedance путает кому принадлежит реплика и липсинк прилипает к не тому персу.\n"
+        "       'Склейка на крупный план лица Maya (@Image2). Maya (@Image2), ухмыляясь с презрением, говорит: \"Lost, Aria?\" "
+        "Камера переключается на средний план Ethan (@Image1) через плечо Maya. Ethan (@Image1), дрожа от ярости, отвечает: \"Get out.\"'\n"
+        "     ПРАВИЛО: в DIALOGUE между сменой говорящего ОБЯЗАТЕЛЬНО шот-бит со склейкой/наездом на нового спикера + указание @ImageN. "
+        "Без @ImageN в shot-bit'е и в самой реплике Seedance прицеливает lipsync к не тому персу.\n"
         "     Эмоция/тон по-русски ОБЯЗАТЕЛЬНА перед каждой репликой — без неё лип-синк хуже.\n"
+        "     Внутри DIALOGUE @ImageN можно повторить (это нужно для lipsync). В SUBJECT/ACTION/SCENE — НЕТ.\n"
         "  6) STYLE/ATMOSPHERE — короткие фразы (cinematic, harsh fluorescent light, cold colour palette). "
         "Если в userprompt задан STYLE OVERRIDE — ВСЕ описания (рендер, материалы, освещение, текстуры лиц и одежды, фон) подчиняются этому стилю; "
         "перепиши style-блок и вшей стилистические маркеры также в SUBJECT и SCENE (например 'Pixar 3D animation, soft volumetric light, exaggerated facial expressions, slightly stylised proportions, vibrant saturated palette'). "
@@ -6587,7 +7236,11 @@ def seedance_compose(sid, num):
         "АНАЛИЗ КОНТЕКСТА — ОБЯЗАТЕЛЬНО ДЕЛАЙ ЭТО ДО ПРОМПТА:\n"
         "Тебе дают: (а) полный сценарий эпизода, (б) выделенный кусок (CHUNK), (в) активный состав персов и локаций эпизода.\n"
         "Прочитай ПОЛНЫЙ сценарий, найди в нём CHUNK и ответь себе на вопросы:\n"
-        "  • В какой ЛОКАЦИИ происходит этот кусок? (Сцен-хедер сценария 'INT./EXT. <LOCATION> — <TIME>' — ищи последний перед CHUNK.)\n"
+        "  • В какой ЛОКАЦИИ происходит этот кусок? Ищи ПОСЛЕДНИЙ scene heading перед CHUNK. Маркеры могут быть РАЗНЫЕ:\n"
+        "    – формальные: 'INT./EXT./INT.\\/EXT. <LOCATION> — <TIME>', 'ИНТ./ЭКСТ./НАТ./ВНУТР./ИНТЕРЬЕР <ЛОКАЦИЯ>'\n"
+        "    – явные: 'Локация: <место>. <время>.', 'СЦЕНА N', 'Сцена N', 'SCENE N'\n"
+        "    – inferred: одиночная ALL-CAPS строка ('ДОМ АННЫ — НОЧЬ', 'OFFICE — DAY') или в скобках '[КАФЕ — НОЧЬ]'\n"
+        "    Если scene heading не нашёлся вообще — локация продолжается с самого начала сценария или предыдущей сцены.\n"
         "  • Какие ПЕРСОНАЖИ физически находятся в кадре? Это НЕ только говорящие. "
         "Если в сцене сказано что Liam стоит рядом и наблюдает — он в кадре, даже если в этом куске молчит. "
         "Если предыдущий чанк закончился тем что Selena вошла в комнату — она всё ещё в кадре в новом чанке той же сцены.\n"
@@ -6600,7 +7253,7 @@ def seedance_compose(sid, num):
         "   ОБЯЗАТЕЛЬНО прикрепи её последним @Image. Без локации фон будет рандомным и серия развалится визуально.\n"
         "   Если в roster нет идеально совпадающей локации — выбери максимально близкую по описанию (офис, лобби, спальня и т.п.).\n"
         "   Локацию НЕ ВКЛЮЧАЙ только если в roster вообще нет ни одной подходящей локации с фото.\n"
-        "3. В тексте промпта в блоке SCENE явно упомяни локацию: 'Действие в @Image<N+1> — стеклянное лобби корпорации, холодное освещение'.\n"
+        "3. В тексте промпта в блоке SCENE явно упомяни локацию ИМЕНЕМ (после BINDING): 'Действие в Lobby — стеклянное лобби корпорации, холодное освещение'.\n"
         "4. Максимум 5 референсов (обычно 1–3 перса + 1 локация).\n\n"
         "CONTINUITY — КРИТИЧНО:\n"
         "Если в userprompt есть блок ADJACENT GENERATED CHUNKS — это твой главный источник кто физически в кадре.\n"
@@ -6612,18 +7265,67 @@ def seedance_compose(sid, num):
         "Если предыдущий кончился на 'Liam держит Leo за горло' — Leo в твоём кадре. Не выкидывать тихо.\n"
         "     • ФИЗИЧЕСКИЕ ПОЗИЦИИ — ХРАНИТЬ. Если в PREVIOUS Leo стоял рядом с Liam — он РЯДОМ С LIAM, "
         "а не телепортируется к маме. Если Selena была в правом углу — она остаётся в правом углу. "
-        "В ACTION прямо пиши конкретные позиции: '@Image3 (Leo) остаётся вплотную к @Image2 (Liam) справа от него, "
-        "@Image4 (Selena) на заднем плане у двери'. Без явного описания позиций модель шафлит героев.\n"
+        "В ACTION прямо пиши конкретные позиции ИМЕНАМИ (без @Image): "
+        "'Leo остаётся вплотную к Liam справа от него, Selena на заднем плане у двери'. "
+        "Без явного описания позиций модель шафлит героев.\n"
         "     • ФОНОВЫЕ ЭЛЕМЕНТЫ из ENDING STATE / PROMPT предыдущего чанка тоже сохраняй: "
         "если Kaelen только что вышел из лифта — в кадре за его спиной должен быть открытый/закрывающийся лифт. "
-        "Если до этого в кадре был стол с ноутбуком — он тут же. В SCENE так и пиши: "
-        "'на заднем плане @Image<loc> — двери лифта только что закрылись за @Image1'.\n"
+        "Если до этого в кадре был стол с ноутбуком — он тут же. В SCENE так и пиши именами: "
+        "'на заднем плане Lobby — двери лифта только что закрылись за Kaelen'.\n"
         "     • Если ENDING STATE говорит что персонаж 'на коленях' / 'без сознания' / 'у двери' — "
         "отрази эту позу в SUBJECT/ACTION текущего промпта.\n"
         "     • Локация: если PREVIOUS использовал @Image<X>=Lobby и сцена та же — твой last @Image тоже Lobby.\n"
-        "  2. Если сцена другая (новый scene heading INT./EXT. между чанками, перепрыг во времени, "
-        "явный CUT TO другую локацию) — начинай свежо, состояние НЕ тащим.\n"
-        "  3. NEXT CHUNK (если есть) используй только для проверки: твой ending не должен противоречить началу следующего."
+        "  2. Если сцена другая (новый scene heading МЕЖДУ чанками — формальный INT./EXT./ИНТ./..., либо "
+        "'Локация:', 'СЦЕНА N', одиночный ALL-CAPS slug 'ДОМ АННЫ — НОЧЬ', либо явный 'CUT TO:' / 'FADE TO:' "
+        "на другую локацию, либо явный перепрыг во времени) — начинай свежо, состояние НЕ тащим.\n"
+        "  3. NEXT CHUNK (если есть) используй только для проверки: твой ending не должен противоречить началу следующего.\n\n"
+        "OUTFIT CONSISTENCY — КРИТИЧНО ДЛЯ КОНСИСТЕНТНОСТИ ОДЕЖДЫ:\n"
+        "Это самая частая причина дрейфа костюмов между чанками. Жёсткие правила:\n"
+        "  1. Поле \"outfit\" в каждом char-ref'е выбирай ТОЛЬКО из списка значений, явно перечисленного "
+        "под персонажем в AVAILABLE CHARACTERS / ACTIVE THIS EPISODE. Если списка нет — ставь null. "
+        "НЕ ПРИДУМЫВАЙ label'ы (типа 'casual', 'formal', 'dress' и т.п.) — они тихо упадут к base.\n"
+        "  2. SAME-SCENE LOCK: Если в блоке ADJACENT GENERATED CHUNKS есть PREVIOUS CHUNK И он в той же сцене что текущий CHUNK "
+        "(см. CONTINUITY алгоритм выше), то outfit КАЖДОГО перса ОБЯЗАН СОВПАДАТЬ с тем что использовал PREVIOUS CHUNK. "
+        "Имя outfit'а видно в IN FRAME предыдущего чанка как 'Maya (work_scrubs)'. Берёшь дословно тот же label. "
+        "Менять outfit в той же сцене категорически нельзя — даже если по описанию сцены кажется что другой подходит лучше.\n"
+        "  3. SCENE-CHANGE ROUTE: Если сцена меняется (новый scene heading, time-jump) — выбери outfit по контексту "
+        "новой сцены. Например в roster Maya: work_scrubs (для смен в больнице), street_clothes (для улицы), "
+        "evening_dress (для свидания). Сценарий обычно сам подсказывает контекст. Если нет явного — null (база).\n"
+        "  4. WARDROBE-CHANGE EXCEPTION: outfit меняется ВНУТРИ той же сцены ТОЛЬКО если сценарий явно описывает "
+        "переодевание ('Maya меняет блузку', 'переодевается в платье', 'снимает пальто'). Без явной ремарки — не менять.\n\n"
+        "АНТИ-ДУБЛИРОВАНИЕ ПЕРСОНАЖЕЙ — КРИТИЧНО (частый баг 'две Maya в одном кадре'):\n"
+        "Seedance с reference-pro может рендерить персонажа дважды если получит несколько визуальных "
+        "источников одного и того же перса. ЖЁСТКИЕ правила:\n"
+        "  1. Каждый персонаж = РОВНО ОДИН char-ref в массиве refs[]. Не пихай Maya дважды с разными outfit'ами. "
+        "Если по сценарию ей надо переодеться — это либо новая сцена (тогда новый compose с новым outfit'ом), "
+        "либо явный wardrobe-change внутри сцены (тогда выбираешь финальный outfit для всего чанка).\n"
+        "  2. Если continuity-кадр (lastframe / cutframe) уже содержит персонажа Maya — это композиционный "
+        "референс расстановки, НЕ повод добавить второй ref для Maya. У Maya остаётся ОДИН char-ref (@Image1) "
+        "плюс continuity-кадр как @Image_LF — этого Seedance'у достаточно. Если ты добавишь Maya base portrait "
+        "и Maya outfit и lastframe c Maya — она появится в кадре дважды или трижды.\n"
+        "  3. В SUBJECT/ACTION/SCENE НЕ повторяй @ImageN многократно. После BINDING-строки используй имя. "
+        "Не пиши: 'Maya у двери. @Image1 говорит. @Image1 поворачивается.' — Seedance может сплитнуть "
+        "это в 3 разные Maya. Пиши слитно с именем: 'Maya, поворачиваясь у двери, говорит ...'. "
+        "@ImageN допустим ТОЛЬКО в DIALOGUE shot-bit'ах (для lipsync-привязки) и в BINDING.\n"
+        "  4. Если в кадре ОДИН перс (моноспикер монологом) — refs может содержать только: 1 char-ref + "
+        "1 loc-ref (= 2 ref'а минимум) или плюс continuity-кадр. Не раздувай 5 рефами одного перса.\n"
+        "  5. Легитимный кейс двух Maya — ТОЛЬКО если сценарий явно говорит про зеркало/двойника/раздвоение "
+        "('Maya видит себя в отражении', 'два разных временных Maya'). В этом случае пиши явно: "
+        "'@Image1 — настоящая Maya у окна, отражение в зеркале справа дублирует её' — и это всё равно "
+        "ОДИН char-ref.\n\n"
+        "ЗАПРЕТ ОПИСЫВАТЬ ОДЕЖДУ ТЕКСТОМ — КРИТИЧНО:\n"
+        "Одежда персонажей поступает В МОДЕЛЬ ТОЛЬКО через @Image-ref. Любое описание одежды в тексте "
+        "промпта (SUBJECT/ACTION/SCENE) КОНФЛИКТУЕТ с ref-изображением и заставляет Seedance дрейфовать. "
+        "ПРАВИЛА:\n"
+        "  • НЕ пиши 'в красном платье', 'in black suit', 'медицинская форма', 'hoodie', 'jeans', "
+        "'tie', 'белая рубашка', цвета одежды, тип одежды — НИЧЕГО про костюм словами.\n"
+        "  • Описывай в SUBJECT/ACTION ТОЛЬКО: лицо/выражение, причёску (если ремарка её обсуждает), "
+        "позу, физическое действие, эмоцию.\n"
+        "  • Если в continuity-кадрах видно изменение СОСТОЯНИЯ одежды (порвана, мокрая, в крови) — "
+        "это можно и нужно отметить ('разорванная блузка', 'мокрая одежда', 'кровавое пятно'), "
+        "но БЕЗ описания исходной одежды ('разорванная блузка' — ок; 'разорванная белая блузка' — нет).\n"
+        "  • Hair/makeup тоже частично через ref. Описывай словами только если меняется состояние "
+        "(растрёпанные волосы, размазанная помада) — не сам стиль причёски/макияжа."
     )
     # Active episode cast & locations (already checked off in sidebar)
     active_char_ids = set(ep.get('characters_used') or [])
@@ -6631,10 +7333,13 @@ def seedance_compose(sid, num):
     active_chars = [c for c in (s.get('characters') or []) if c['id'] in active_char_ids]
     active_locs  = [l for l in (s.get('locations') or []) if l['id'] in active_loc_ids]
 
-    active_chars_block = '\n'.join(
-        f"- {c['name']} (id={c['id']}): {c.get('appearance','')[:120]}"
-        for c in active_chars
-    ) or '(не отмечены)'
+    def _active_char_line(c):
+        line = f"- {c['name']} (id={c['id']}): {c.get('appearance','')[:120]}"
+        labels = [o.get('label') for o in (c.get('outfits') or []) if o.get('avai_url') and o.get('label')]
+        if labels:
+            line += "\n  outfit-варианты: " + ", ".join(f'"{l}"' for l in labels) + ", null"
+        return line
+    active_chars_block = '\n'.join(_active_char_line(c) for c in active_chars) or '(не отмечены)'
     active_locs_block = '\n'.join(
         f"- {l['name']} (id={l['id']}): {l.get('description','')[:120]}"
         for l in active_locs
@@ -6693,11 +7398,20 @@ def seedance_compose(sid, num):
         '  "reasoning": "одно предложение — почему именно эти референсы и continuity"\n'
         "}\n\n"
         "ПРОВЕРКА перед выводом:\n"
+        "- BINDING-строка (@Image1=<имя>, @Image2=<имя>, ...) идёт ПЕРВОЙ в prompt? Если нет — допиши.\n"
+        "- В SUBJECT/ACTION/SCENE используются ИМЕНА (без @ImageN)? Если нашёл @ImageN в этих блоках — замени на имя.\n"
+        "- В DIALOGUE shot-bit'ах есть И имя И @ImageN ('Maya (@Image2)')? Это нужно для lipsync.\n"
         "- ВСЕ описания на русском (кроме реплик в кавычках)? Если нашёл английское слово вне кавычек — перепиши.\n"
         "- Каждая реплика из chunk имеет эмоцию/тон по-русски перед ней? Если нет — допиши.\n"
-        "- Локация прикреплена последним @Image и упомянута в prompt? Если в roster есть подходящая — обязательно.\n"
-        "- Все @ImageN из prompt совпадают по индексу с порядком в refs?\n"
-        "- В prompt нет 'no <X>'? Замени на позитив."
+        "- Локация прикреплена последним ref и упомянута в SCENE именем? Если в roster есть подходящая — обязательно.\n"
+        "- Все @ImageN из BINDING/DIALOGUE совпадают по индексу с порядком в refs?\n"
+        "- В prompt нет 'no <X>'? Замени на позитив.\n"
+        "- ВЫБОР OUTFIT: для каждого char-ref значение outfit либо ровно из списка под этим персом в roster, либо null. "
+        "Если PREVIOUS CHUNK той же сцены — outfit совпадает с PREVIOUS дословно (см. IN FRAME).\n"
+        "- В prompt НЕТ описания одежды словами (цвет/тип костюма, fabric, типы рубашек/платьев). "
+        "Если нашёл — удали. Допустимо только описание ИЗМЕНЁННОГО состояния одежды (порвана, мокрая, в крови).\n"
+        "- АНТИ-ДУБЛЬ: каждый персонаж в refs[] ОДИН раз (по id). Никаких повторов одного перса с разными outfit'ами. "
+        "Каждый @ImageN в тексте промпта тоже привязан к ровно одному персу."
     )
     try:
         raw = claude_ask(userprompt, system=sysprompt)
@@ -6711,14 +7425,42 @@ def seedance_compose(sid, num):
         for r in refs:
             if r.get('kind') == 'char':
                 r['outfit'] = None
+    # Hard de-dup: never let the same character go in twice (a frequent cause
+    # of "two Mayas in one frame"). Keep the FIRST occurrence — usually that's
+    # the composer's preferred (often outfit-specific) one. Any subsequent
+    # ref with the same kind=char + id is dropped and reported.
+    deduped_refs = []
+    seen_char_ids = set()
+    duplicate_chars = []
+    for r in refs:
+        if r.get('kind') == 'char':
+            cid = r.get('id')
+            if cid in seen_char_ids:
+                duplicate_chars.append({'char_id': cid, 'dropped_outfit': r.get('outfit')})
+                continue
+            seen_char_ids.add(cid)
+        deduped_refs.append(r)
+    refs = deduped_refs
     ref_urls = []
     ref_meta = []
     unresolved = []
+    outfit_fallbacks = []  # composer requested outfit label that doesn't exist → fell back to base
     for r in refs:
         url = _resolve_ref_url(s, r, sid=sid)
         if url:
+            if r.get('_outfit_fallback'):
+                # Composer hallucinated an outfit label — log so user sees the drift cause
+                ch = next((c for c in (s.get('characters') or []) if c['id'] == r.get('id')), None)
+                outfit_fallbacks.append({
+                    'char_id': r.get('id'),
+                    'char_name': ch['name'] if ch else r.get('id'),
+                    'requested_outfit': r.get('_outfit_requested'),
+                    'available_labels': [o.get('label') for o in (ch.get('outfits') or []) if o.get('avai_url')] if ch else [],
+                })
+            # Strip private bookkeeping fields before returning to client
+            clean = {k: v for k, v in r.items() if not k.startswith('_')}
             ref_urls.append(url)
-            ref_meta.append({**r, 'url': url})
+            ref_meta.append({**clean, 'url': url})
         else:
             unresolved.append({**r, 'reason': 'нет фото / avai_url не получился'})
 
@@ -6753,14 +7495,166 @@ def seedance_compose(sid, num):
                     })
                     extra = (
                         f"\n\nДополнительно: @Image{img_idx} — это ПОСЛЕДНИЙ КАДР предыдущего чанка "
-                        f"эпизода. Используй его ТОЛЬКО как continuity-референс: повтори ту же расстановку "
+                        f"эпизода. Биндить его в BINDING-строке НЕ надо (это композиционный референс, не персонаж/локация). "
+                        f"Используй его ТОЛЬКО как continuity-референс: повтори ту же расстановку "
                         f"персонажей и тот же задний план, плавно продолжая действие. НЕ описывай его как "
-                        f"отдельный кадр в SUBJECT/SCENE — это инструкция модели по композиции."
+                        f"отдельный кадр в SUBJECT/SCENE.\n"
+                        f"АНТИ-ДУБЛИРОВАНИЕ: персонажи видные на этом lastframe НЕ создают для себя дополнительные "
+                        f"char-ref'ы. Если на кадре Maya — это та же Maya из BINDING, не считай её отдельной. "
+                        f"В тексте промпта упоминай её только именем 'Maya' (или через её BINDING-@Image в DIALOGUE)."
                     )
                     data['prompt'] = (data.get('prompt') or '').rstrip() + extra
                     lastframe_attached = True
         except Exception:
             pass
+
+    # Optional: ALSO attach pre-cut keyframes from prev chunk's video.
+    # Detects internal cuts (склейки) inside the prev clip and grabs the last
+    # frame of EACH outgoing shot. Gives the next chunk visual context for
+    # mid-clip mise-en-scène, not just the absolute final frame. Capped at 2
+    # extra frames to leave budget for char/loc refs.
+    cutframes_attached = 0
+    if (use_prev_cutframes and prev_neighbour
+            and prev_neighbour.get('video_path')
+            and data.get('scene_continuity') is not False
+            and len(ref_urls) < 9):
+        try:
+            video_abs = series_path(sid) / prev_neighbour['video_path']
+            # Cache cut timestamps on the chunk so we don't re-run ffmpeg every compose.
+            cuts = prev_neighbour.get('cuts_detected')
+            if cuts is None:
+                cuts = _detect_cuts(str(video_abs))
+                prev_neighbour['cuts_detected'] = cuts
+                save_episode(sid, prev_neighbour_ep, prev_neighbour_obj)
+            if cuts:
+                # Cache uploaded urls per-cut on the chunk to avoid re-uploading.
+                cf_urls = list(prev_neighbour.get('cutframes_avai_urls') or [])
+                budget = 9 - len(ref_urls)
+                # max 2 extra cut frames (continuity is one signal, not the show)
+                max_attach = min(2, budget)
+                wanted_cuts = cuts[:max_attach]
+                # Need to extract any frames not yet uploaded
+                if len(cf_urls) < len(wanted_cuts):
+                    extracted = _extract_keyframes_at_cuts(
+                        sid, prev_neighbour['video_path'], wanted_cuts, max_frames=max_attach
+                    )
+                    while len(cf_urls) < len(extracted):
+                        relpath, abs_path = extracted[len(cf_urls)]
+                        try:
+                            cf_urls.append(_avai_upload_local_image(abs_path))
+                        except Exception:
+                            break
+                    prev_neighbour['cutframes_avai_urls'] = cf_urls
+                    save_episode(sid, prev_neighbour_ep, prev_neighbour_obj)
+                # Attach as refs (cap to budget)
+                cut_extras = []
+                for i, cf_url in enumerate(cf_urls[:max_attach]):
+                    if not cf_url or len(ref_urls) >= 9:
+                        break
+                    img_idx = len(ref_urls) + 1
+                    ref_urls.append(cf_url)
+                    ref_meta.append({
+                        'kind': 'cutframe',
+                        'source': 'prev_chunk',
+                        'prev_idx': prev_neighbour.get('idx'),
+                        'cut_index': i,
+                        'cut_time': float(wanted_cuts[i]) if i < len(wanted_cuts) else None,
+                        'name': f'pre-cut #{i+1} · prev #{prev_neighbour.get("idx")}',
+                        'url': cf_url,
+                    })
+                    cut_extras.append(f"@Image{img_idx} (кадр перед {i+1}-й склейкой прошлого чанка)")
+                    cutframes_attached += 1
+                if cut_extras:
+                    extra = (
+                        "\n\nЕщё continuity-референсы: " + ", ".join(cut_extras) + ". "
+                        "Это последние кадры разных шотов внутри прошлого чанка — каждый показывает "
+                        "состав в кадре и расстановку до соответствующей склейки. Биндить их в BINDING-строке "
+                        "НЕ надо. Используй их вместе с last frame для понимания мизансцены. "
+                        "В SUBJECT/SCENE их КАК отдельные кадры НЕ описывай.\n"
+                        "АНТИ-ДУБЛИРОВАНИЕ: персонажи на этих cutframe'ах НЕ создают новых char-ref'ов. "
+                        "Если Maya видна на cutframe — это та же Maya из BINDING, не отдельная инстанция. "
+                        "В тексте промпта ссылайся на неё именем."
+                    )
+                    data['prompt'] = (data.get('prompt') or '').rstrip() + extra
+        except Exception:
+            pass
+
+    # ── State analysis: tell Claude WHAT'S in each attached continuity frame ──
+    # If we attached lastframe and/or cutframes, run a single Haiku Vision call
+    # to label what each frame ACTUALLY shows (who's visible, in what state,
+    # mise-en-scène). Inject into the prompt so the composer knows e.g. "Maya
+    # has a busted lip and wet hair RIGHT NOW" — base portrait won't tell it that.
+    state_analysis_attached = False
+    state_frames = [r for r in ref_meta if r.get('kind') in ('lastframe', 'cutframe')]
+    if state_frames and prev_neighbour:
+        cache_key = '|'.join(r.get('url', '') for r in state_frames)
+        cached = prev_neighbour.get('frame_state_analysis') or {}
+        analysis_text = ''
+        if cached.get('cache_key') == cache_key and cached.get('text'):
+            analysis_text = cached['text']
+        else:
+            # Roster of chars who were in prev chunk — bound the labelling task
+            prev_char_ids = [r['id'] for r in (prev_neighbour.get('refs') or []) if r.get('kind') == 'char']
+            prev_chars = [c for c in (s.get('characters') or []) if c['id'] in prev_char_ids]
+            roster_lines = '\n'.join(
+                f'  - {c["name"]}: {c.get("appearance","")[:140]}'
+                for c in prev_chars
+            ) or '  (нет данных о составе прошлого чанка)'
+            frame_labels = []
+            for i, r in enumerate(state_frames):
+                if r.get('kind') == 'lastframe':
+                    frame_labels.append(f'Кадр {i+1}: lastframe (последний кадр прошлого чанка)')
+                else:
+                    frame_labels.append(f'Кадр {i+1}: cutframe #{r.get("cut_index", i)+1} (перед склейкой внутри прошлого чанка)')
+            v_prompt = (
+                "Опиши ТЕКУЩЕЕ ФИЗИЧЕСКОЕ СОСТОЯНИЕ персонажей на присоединённых кадрах. "
+                "Это последние кадры предыдущего сгенерированного видео-чанка, используются как continuity-контекст для генерации СЛЕДУЮЩЕГО чанка.\n\n"
+                f"ПЕРСОНАЖИ ИЗ ПРОШЛОГО ЧАНКА (roster — кого ожидать в кадрах):\n{roster_lines}\n\n"
+                f"КАДРЫ В ТОМ ЖЕ ПОРЯДКЕ ЧТО ПРИКРЕПЛЕНЫ:\n" + '\n'.join(frame_labels) + "\n\n"
+                "Для КАЖДОГО кадра по порядку:\n"
+                "1) Видимые персонажи (имя из roster + краткое 'кто это', если roster короткий — просто имя).\n"
+                "2) Для каждого: поза (стоит/сидит/на коленях/лежит), выражение лица (страх/гнев/слёзы/нейтральное), "
+                "видимые повреждения (синяки, кровь, царапины, мокрые волосы, разорванная одежда), "
+                "положение в кадре относительно других (за спиной кого, вплотную к кому, на заднем плане).\n"
+                "3) Общая мизансцена кадра (где, освещение, ключевые объекты на фоне).\n\n"
+                "ПРАВИЛА:\n"
+                "- Описывай ТОЛЬКО то что РЕАЛЬНО видно на кадре. НЕ додумывай и НЕ фантазируй про повреждения которых нет.\n"
+                "- Если перс из roster на кадре не виден — НЕ упоминай его.\n"
+                "- ОЧЕНЬ КРАТКО. По 1-3 строки на каждого персонажа + 1 строка про мизансцену.\n"
+                "- ПО-РУССКИ.\n\n"
+                "Формат строго:\n"
+                "Кадр 1 (lastframe):\n"
+                "  • <Имя>: <состояние одной строкой>\n"
+                "  • <Имя>: <состояние>\n"
+                "  • Сцена: <мизансцена одной строкой>\n"
+                "Кадр 2 (cutframe #1):\n"
+                "  • ..."
+            )
+            try:
+                urls_only = [r.get('url') for r in state_frames if r.get('url')]
+                analysis_text = claude_ask_vision(v_prompt, urls_only).strip()
+                if analysis_text:
+                    prev_neighbour['frame_state_analysis'] = {
+                        'cache_key': cache_key,
+                        'text': analysis_text,
+                    }
+                    save_episode(sid, prev_neighbour_ep, prev_neighbour_obj)
+            except Exception as e:
+                print(f'[seedance_compose] vision analysis failed: {e}', flush=True)
+                analysis_text = ''
+
+        if analysis_text:
+            state_extra = (
+                "\n\nТЕКУЩЕЕ СОСТОЯНИЕ ПЕРСОНАЖЕЙ И СЦЕНЫ (из присоединённых continuity-кадров):\n"
+                f"{analysis_text}\n\n"
+                "ВАЖНО: базовые портреты персонажей (@Image1, @Image2...) показывают КАНОНИЧЕСКИЙ ВИД персонажа "
+                "ДО событий сцены. ТЕКУЩЕЕ СОСТОЯНИЕ — то что описано выше из continuity-кадров. "
+                "В SUBJECT/ACTION текущего промпта ОБЯЗАТЕЛЬНО отрази это состояние явными словами "
+                "(например: 'Maya, на губе кровь из разбитой губы, мокрые волосы, разорванная блузка, дрожит'). "
+                "НЕ описывай персонажей как «свежих» / в базовом виде — они продолжаются из прошлого кадра."
+            )
+            data['prompt'] = (data.get('prompt') or '').rstrip() + state_extra
+            state_analysis_attached = True
 
     debug_prev = None
     if prev_neighbour:
@@ -6775,9 +7669,13 @@ def seedance_compose(sid, num):
         'refs': ref_meta,
         'ref_urls': ref_urls,
         'unresolved_refs': unresolved,
+        'outfit_fallbacks': outfit_fallbacks,
+        'duplicate_chars_dropped': duplicate_chars,
         'scene_continuity': data.get('scene_continuity'),
         'reasoning': data.get('reasoning', ''),
         'lastframe_attached': lastframe_attached,
+        'cutframes_attached': cutframes_attached,
+        'state_analysis_attached': state_analysis_attached,
         'prev_neighbour': debug_prev,
         'cur_pos_found': cur_pos >= 0,
     })

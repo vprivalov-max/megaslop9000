@@ -887,6 +887,7 @@ async function pollAutogenStatus() {
           S.series = fresh;
           renderCharactersList();
           renderLocationsList();
+          renderItemsList();
         } catch {}
         setTimeout(() => { if (status) status.textContent = ''; }, 6000);
       }
@@ -1244,6 +1245,7 @@ async function plConfirmMilestones() {
     S.series = extracted.series;
     renderCharactersList();
     renderLocationsList();
+    renderItemsList();
     renderPipeline();
     S.episodes = await api.get(`/api/series/${S.seriesId}/episodes`);
     renderEpisodesList();
@@ -1310,6 +1312,7 @@ async function plExtractFromStory() {
     S.series = res.series;
     renderCharactersList();
     renderLocationsList();
+    renderItemsList();
     const chars = res.added_characters.join(', ');
     const locs  = res.added_locations.join(', ');
     status.textContent = `✓ Добавлено: персонажи [${chars || 'нет новых'}], локации [${locs || 'нет новых'}]`;
@@ -1408,6 +1411,9 @@ function renderSeriesView() {
 
   // Locations
   renderLocationsList();
+
+  // Items
+  renderItemsList();
 
   // Style
   renderStyleSection();
@@ -2042,13 +2048,80 @@ function renderLocAssetsGrid(loc) {
   const refs = loc.ref_images || [];
   grid.innerHTML = refs.map(r => {
     const fname = r.split('/').pop();
+    const url = `/assets/${S.seriesId}/${r}`;
     return `
-      <div class="photo-thumb-wrap">
-        <img src="/assets/${S.seriesId}/${r}" alt="">
-        <button class="del-btn" onclick="deleteLocRef('${loc.id}','${fname}')">✕</button>
+      <div class="photo-thumb-wrap" onclick="openLocLightbox('${loc.id}','${url}')">
+        <img src="${url}" alt="">
+        <button class="del-btn" onclick="event.stopPropagation();deleteLocRef('${loc.id}','${fname}')">✕</button>
       </div>`;
   }).join('');
   if (!refs.length) grid.innerHTML = '<div style="color:var(--muted);font-size:0.85rem">Нет фото</div>';
+}
+
+// Location-photo lightbox: image + regenerate panel (mirrors openCharLightbox).
+function openLocLightbox(locId, url) {
+  closeLightbox();
+  const l = (S.series.locations || []).find(x => x.id === locId);
+  if (!l) return;
+  currentLocId = locId;
+  const div = document.createElement('div');
+  div.id = 'lightbox-overlay';
+  div.className = 'lightbox-overlay';
+  div.innerHTML = `
+    <button class="lb-close" onclick="closeLightbox()">✕</button>
+    <div class="lightbox-content" onclick="event.stopPropagation()">
+      <div class="lb-img-wrap"><img src="${url}" alt=""></div>
+      <div class="lightbox-panel">
+        <h3>↻ Перегенерировать локацию</h3>
+        <div class="hint">
+          Старое фото удалится, новое сгенерируется с учётом пожеланий.
+          Пожелания сохранятся в локации и будут применяться при всех будущих генерациях.
+        </div>
+        <div>
+          <label style="font-size:0.82rem;color:var(--muted);display:block;margin-bottom:4px">
+            Что учесть / исправить
+          </label>
+          <textarea id="lb-regen-loc-wishes" rows="5"
+            placeholder="Например:&#10;«больше окон»&#10;«утренний свет»&#10;«без людей в кадре»&#10;«теплая палитра»">${esc(l.image_constraints || '')}</textarea>
+        </div>
+        <div id="lb-regen-loc-status" class="lb-status"></div>
+        <button id="lb-regen-loc-btn" class="btn-regen" onclick="regenerateLocationFromLightbox()">
+          ↻ Перегенерировать
+        </button>
+      </div>
+    </div>`;
+  div.onclick = (e) => { if (e.target === div) closeLightbox(); };
+  document.body.appendChild(div);
+}
+
+async function regenerateLocationFromLightbox() {
+  if (!currentLocId) return;
+  const wishes = (document.getElementById('lb-regen-loc-wishes').value || '').trim();
+  const status = document.getElementById('lb-regen-loc-status');
+  const btn = document.getElementById('lb-regen-loc-btn');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span> Генерируем...';
+  status.className = 'lb-status';
+  status.textContent = 'Перегенерируем фото локации (~15-30 сек)...';
+  try {
+    const res = await api.post(
+      `/api/series/${S.seriesId}/locations/${currentLocId}/regenerate`,
+      { wishes }
+    );
+    if (!res.ready) throw new Error(res.error || 'unknown');
+    status.className = 'lb-status ok';
+    status.textContent = '✓ Локация обновлена';
+    S.series = await api.get(`/api/series/${S.seriesId}`);
+    const l = (S.series.locations || []).find(x => x.id === currentLocId);
+    if (l) renderLocAssetsGrid(l);
+    renderLocationsList();
+    setTimeout(() => closeLightbox(), 800);
+  } catch (e) {
+    status.className = 'lb-status err';
+    status.textContent = 'Ошибка: ' + (e.message || e);
+    btn.disabled = false;
+    btn.innerHTML = '↻ Перегенерировать';
+  }
 }
 
 async function uploadLocationRefs(locId, files) {
@@ -2069,6 +2142,212 @@ async function deleteLocRef(locId, filename) {
   const l = (S.series.locations || []).find(x => x.id === locId);
   renderLocAssetsGrid(l);
   renderLocationsList();
+}
+
+// ── Items (story-relevant props: handbag, gun, locket, ...) ───────────────────
+let currentItemId = null;
+
+function renderItemsList() {
+  const s = S.series;
+  const el = document.getElementById('items-list');
+  if (!el) return;
+  const items = s.items || [];
+  if (!items.length) {
+    el.innerHTML = '<div style="color:var(--muted);font-size:0.83rem">Нет предметов</div>';
+    return;
+  }
+  el.innerHTML = items.map(it => {
+    const hasRefs = it.ref_images && it.ref_images.length > 0;
+    const imgUrl = hasRefs ? `/assets/${s.id}/${it.ref_images[0]}` : null;
+    return `
+      <div class="char-item" onclick="openItemAssets('${it.id}')">
+        <div class="char-avatar">
+          ${imgUrl ? `<img src="${imgUrl}" alt="${esc(it.name)}">` : '🎒'}
+        </div>
+        <div class="char-info">
+          <div class="char-name">${esc(it.name)}</div>
+          <div class="char-role">${esc(it.description?.slice(0,30) || '—')}</div>
+        </div>
+        <div class="char-ref-dot ${hasRefs ? 'has-refs' : 'no-refs'}" title="${hasRefs ? 'Есть фото' : 'Нет фото'}"></div>
+        <button class="btn-icon" onclick="event.stopPropagation();openEditItem('${it.id}')" title="Редактировать">✎</button>
+        <button class="btn-icon" onclick="event.stopPropagation();deleteItem('${it.id}')" title="Удалить" style="color:var(--danger)">✕</button>
+      </div>
+    `;
+  }).join('');
+}
+
+function openAddItem() {
+  S.editingItemId = null;
+  document.getElementById('item-modal-title').textContent = 'Новый предмет';
+  clearFields(['item-name','item-description']);
+  openModal('modal-item');
+}
+
+function openEditItem(itemId) {
+  const it = (S.series.items || []).find(x => x.id === itemId);
+  if (!it) return;
+  S.editingItemId = itemId;
+  document.getElementById('item-modal-title').textContent = 'Редактировать предмет';
+  setVal('item-name', it.name);
+  setVal('item-description', it.description);
+  openModal('modal-item');
+}
+
+async function saveItem() {
+  const data = { name: val('item-name'), description: val('item-description') };
+  if (!data.name) return alert('Введи название предмета');
+  if (S.editingItemId) {
+    await api.put(`/api/series/${S.seriesId}/items/${S.editingItemId}`, data);
+  } else {
+    await api.post(`/api/series/${S.seriesId}/items`, data);
+  }
+  S.series = await api.get(`/api/series/${S.seriesId}`);
+  closeModal('modal-item');
+  renderItemsList();
+}
+
+async function deleteItem(itemId) {
+  if (!confirm('Удалить предмет?')) return;
+  await api.del(`/api/series/${S.seriesId}/items/${itemId}`);
+  S.series = await api.get(`/api/series/${S.seriesId}`);
+  renderItemsList();
+}
+
+function openItemAssets(itemId) {
+  currentItemId = itemId;
+  const it = (S.series.items || []).find(x => x.id === itemId);
+  if (!it) return;
+  document.getElementById('item-assets-title').textContent = `Фото: ${it.name}`;
+  renderItemAssetsGrid(it);
+  setVal('regen-item-wishes', it.image_constraints || '');
+  const inp = document.getElementById('item-asset-file-input');
+  inp.onchange = () => uploadItemRefs(itemId, inp.files);
+  openModal('modal-item-assets');
+}
+
+function renderItemAssetsGrid(item) {
+  const grid = document.getElementById('item-assets-grid');
+  const refs = item.ref_images || [];
+  grid.innerHTML = refs.map(r => {
+    const fname = r.split('/').pop();
+    const url = `/assets/${S.seriesId}/${r}`;
+    return `
+      <div class="photo-thumb-wrap" onclick="openItemLightbox('${item.id}','${url}')">
+        <img src="${url}" alt="">
+        <button class="del-btn" onclick="event.stopPropagation();deleteItemRef('${item.id}','${fname}')">✕</button>
+      </div>`;
+  }).join('');
+  if (!refs.length) grid.innerHTML = '<div style="color:var(--muted);font-size:0.85rem">Нет фото</div>';
+}
+
+async function uploadItemRefs(itemId, files) {
+  for (const file of files) {
+    const fd = new FormData();
+    fd.append('file', file);
+    await api.upload(`/api/series/${S.seriesId}/assets/item/${itemId}`, fd);
+  }
+  S.series = await api.get(`/api/series/${S.seriesId}`);
+  const it = (S.series.items || []).find(x => x.id === itemId);
+  renderItemAssetsGrid(it);
+  renderItemsList();
+}
+
+async function deleteItemRef(itemId, filename) {
+  await api.del(`/api/series/${S.seriesId}/assets/item/${itemId}/${filename}`);
+  S.series = await api.get(`/api/series/${S.seriesId}`);
+  const it = (S.series.items || []).find(x => x.id === itemId);
+  renderItemAssetsGrid(it);
+  renderItemsList();
+}
+
+async function regenerateItem() {
+  if (!currentItemId) return;
+  const wishes = (val('regen-item-wishes') || '').trim();
+  const btn = document.getElementById('regen-item-btn');
+  const old = btn ? btn.innerHTML : '';
+  if (btn) { btn.disabled = true; btn.innerHTML = '⏳ генерирую...'; }
+  try {
+    const r = await api.post(
+      `/api/series/${S.seriesId}/items/${currentItemId}/regenerate`,
+      { wishes }
+    );
+    if (!r.ready) throw new Error(r.error || 'unknown');
+    S.series = await api.get(`/api/series/${S.seriesId}`);
+    const it = (S.series.items || []).find(x => x.id === currentItemId);
+    if (it) renderItemAssetsGrid(it);
+    renderItemsList();
+    showToast('✓ Предмет перегенерирован');
+  } catch (e) {
+    showToast('✗ ' + (e.message || e), 5000);
+  } finally {
+    if (btn) { btn.disabled = false; btn.innerHTML = old; }
+  }
+}
+
+// Item-photo lightbox: image + regenerate panel
+function openItemLightbox(itemId, url) {
+  closeLightbox();
+  const it = (S.series.items || []).find(x => x.id === itemId);
+  if (!it) return;
+  currentItemId = itemId;
+  const div = document.createElement('div');
+  div.id = 'lightbox-overlay';
+  div.className = 'lightbox-overlay';
+  div.innerHTML = `
+    <button class="lb-close" onclick="closeLightbox()">✕</button>
+    <div class="lightbox-content" onclick="event.stopPropagation()">
+      <div class="lb-img-wrap"><img src="${url}" alt=""></div>
+      <div class="lightbox-panel">
+        <h3>↻ Перегенерировать предмет</h3>
+        <div class="hint">
+          Старое фото удалится, новое сгенерируется по описанию + пожеланиям.
+          Пожелания сохранятся в предмете и будут применяться при всех будущих генерациях.
+        </div>
+        <div>
+          <label style="font-size:0.82rem;color:var(--muted);display:block;margin-bottom:4px">
+            Что учесть / исправить
+          </label>
+          <textarea id="lb-regen-item-wishes" rows="5"
+            placeholder="Например:&#10;«потёртая кожа, не новая»&#10;«золотая фурнитура»&#10;«царапина на боку»&#10;«без бренда»">${esc(it.image_constraints || '')}</textarea>
+        </div>
+        <div id="lb-regen-item-status" class="lb-status"></div>
+        <button id="lb-regen-item-btn" class="btn-regen" onclick="regenerateItemFromLightbox()">
+          ↻ Перегенерировать
+        </button>
+      </div>
+    </div>`;
+  div.onclick = (e) => { if (e.target === div) closeLightbox(); };
+  document.body.appendChild(div);
+}
+
+async function regenerateItemFromLightbox() {
+  if (!currentItemId) return;
+  const wishes = (document.getElementById('lb-regen-item-wishes').value || '').trim();
+  const status = document.getElementById('lb-regen-item-status');
+  const btn = document.getElementById('lb-regen-item-btn');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span> Генерируем...';
+  status.className = 'lb-status';
+  status.textContent = 'Перегенерируем фото предмета (~15-30 сек)...';
+  try {
+    const res = await api.post(
+      `/api/series/${S.seriesId}/items/${currentItemId}/regenerate`,
+      { wishes }
+    );
+    if (!res.ready) throw new Error(res.error || 'unknown');
+    status.className = 'lb-status ok';
+    status.textContent = '✓ Предмет обновлён';
+    S.series = await api.get(`/api/series/${S.seriesId}`);
+    const it = (S.series.items || []).find(x => x.id === currentItemId);
+    if (it) renderItemAssetsGrid(it);
+    renderItemsList();
+    setTimeout(() => closeLightbox(), 800);
+  } catch (e) {
+    status.className = 'lb-status err';
+    status.textContent = 'Ошибка: ' + (e.message || e);
+    btn.disabled = false;
+    btn.innerHTML = '↻ Перегенерировать';
+  }
 }
 
 // ── Character assets modal ────────────────────────────────────────────────────
@@ -2676,6 +2955,50 @@ const SCENE_BORDERS = [
 //            ВНУТР., ИНТЕРЬЕР, ВНЕ, СНАРУЖИ
 const SCENE_HEADING_RE = /^\s*(INT\.|EXT\.|INT\.?\s*\/\s*EXT\.?|I\/E\.|ИНТ\.|ИНТА\.|ЭКСТ\.|ЭКС\.|НАТ\.|НАТУРА\.|ВНУТР\.|ИНТЕРЬЕР|ВНЕ\.|СНАРУЖИ)\s+/i;
 
+// Inferred scene heading: when the writer didn't bother with INT./EXT./ИНТ.
+// — but the line still clearly opens a new scene. Three sub-patterns:
+//   • "Локация: ..." or "LOCATION: ..." context preamble
+//   • Numbered: "СЦЕНА 5", "Сцена 5.", "SCENE 12"
+const SCENE_HEADING_INFER_RE = /^\s*(Локация\s*[:：]|Location\s*[:：]|СЦЕНА\s*\d|Сцена\s*\d|SCENE\s*\d)/i;
+
+// Control / structural tokens that LOOK slug-ish but aren't scene starts.
+const _SLUG_BLOCKLIST_RE = /^(REVERSAL|END|FIN|КОНЕЦ|TBD|TBC|БИТ|BIT|HOOK|TWIST|CLIFFHANGER|КЛИФФХЭНГЕР|РАЗВОРОТ|ПАУЗА|ТИШИНА|FLASHBACK|FLASH BACK|MONTAGE|МОНТАЖ|VOICE OVER|V\.O\.|O\.S\.)$/i;
+
+// Standalone ALL-CAPS slug like "ДОМ АННЫ — НОЧЬ" or "OFFICE — DAY".
+// Must look like a place/time tag: 5..80 chars, no lowercase letters, no colon.
+function _isAllCapsSlug(t) {
+  if (!t) return false;
+  if (t.length < 5 || t.length > 80) return false;
+  if (/[:：\[\]]/.test(t)) return false;        // character cues, dialogue, brackets (handled elsewhere)
+  if (/[a-zа-яё]/.test(t)) return false;        // any lowercase → not a slug
+  if (!/[A-ZА-ЯЁ]/.test(t)) return false;       // need at least one letter
+  if (/^(FADE|CUT|DISSOLVE|SMASH|MATCH)\b/i.test(t)) return false;
+  if (_SLUG_BLOCKLIST_RE.test(t.replace(/[\.\—\-\s]+$/, ''))) return false;
+  return true;
+}
+
+// Bracketed slug: "[КАФЕ — НОЧЬ]" — must be uppercase-only inside.
+// Long mixed-case bracketed lines are action prose, not headings.
+function _isBracketSlug(t) {
+  const m = t.match(/^\[\s*([^\]]{3,80})\s*\]\s*$/);
+  if (!m) return false;
+  const inner = m[1].trim();
+  if (/[a-zа-яё]/.test(inner)) return false;
+  if (_SLUG_BLOCKLIST_RE.test(inner)) return false;
+  if (/^(FADE|CUT|DISSOLVE|SMASH|MATCH)\b/i.test(inner)) return false;
+  return true;
+}
+
+// Combined check: is this line some flavour of scene heading?
+// Returns { match: bool, inferred: bool } so the renderer can flag inferred ones.
+function _matchSceneHeading(t) {
+  if (SCENE_HEADING_RE.test(t)) return { match: true, inferred: false };
+  if (SCENE_HEADING_INFER_RE.test(t)) return { match: true, inferred: true };
+  if (_isAllCapsSlug(t)) return { match: true, inferred: true };
+  if (_isBracketSlug(t)) return { match: true, inferred: true };
+  return { match: false, inferred: false };
+}
+
 // Lines we filter OUT entirely from scene/segment view (cast, notes, separators).
 const _SCRIPT_SKIP_PATTERNS = [
   /^={3,}\s*EPISODE CAST/i,        // start of cast block (handled with toggle)
@@ -2691,7 +3014,7 @@ const _SCRIPT_SKIP_PATTERNS = [
 function _lineDuration(line) {
   const t = (line || '').trim();
   if (!t) return 0;
-  if (SCENE_HEADING_RE.test(t)) return 0;
+  if (_matchSceneHeading(t).match) return 0;
   if (/^[-—=]{3,}\s*$/.test(t)) return 0;
   if (/^\[REVERSAL\]\s*$/i.test(t)) return 0;
   if (/^[\s—-]*(FADE|CUT|DISSOLVE|SMASH|MATCH)\s+(IN|OUT|TO|BACK)\b/i.test(t)) return 0;
@@ -2730,7 +3053,7 @@ function _findChunkRange(scriptText, chunkText) {
   for (const ln of chunkText.split('\n')) {
     const s = ln.trim();
     if (s.length < 25) continue;
-    if (SCENE_HEADING_RE.test(s)) continue;
+    if (_matchSceneHeading(s).match) continue;
     cands.push(s);
     if (cands.length >= 6) break;
   }
@@ -2751,7 +3074,7 @@ function _findChunkRange(scriptText, chunkText) {
   for (let i = chunkText.split('\n').length - 1; i >= 0; i--) {
     const s = chunkText.split('\n')[i].trim();
     if (s.length < 25) continue;
-    if (SCENE_HEADING_RE.test(s)) continue;
+    if (_matchSceneHeading(s).match) continue;
     const idx = scriptText.indexOf(s, start);
     if (idx >= 0) { end = idx + s.length; break; }
   }
@@ -2787,19 +3110,27 @@ function _parseScriptScenes(scriptText) {
     // Horizontal separators
     if (/^[-—=]{3,}\s*$/.test(t)) continue;
 
-    // Scene heading: open a new scene
-    if (SCENE_HEADING_RE.test(t)) {
-      cur = { id: scenes.length, heading: t, lines: [], totalSec: 0 };
+    // Scene heading: open a new scene (formal INT./EXT. or inferred)
+    const headMatch = _matchSceneHeading(t);
+    if (headMatch.match) {
+      cur = { id: scenes.length, heading: t, lines: [], totalSec: 0, inferred: headMatch.inferred };
       scenes.push(cur);
       continue;
     }
 
-    // Lines BEFORE first scene heading are dropped (title block, etc.)
-    if (!cur) continue;
+    // Empty / structural lines aren't visual time AND not visible body either —
+    // skip BEFORE we'd open a synthetic scene, otherwise blank lines between
+    // CAST block and the first INT./EXT. would create an empty Сцена 1.
+    if (!t) continue;
+
+    // No heading seen yet AND we hit real content → open a synthetic Сцена 1
+    // so the script doesn't disappear entirely from the scene view.
+    if (!cur) {
+      cur = { id: 0, heading: '', lines: [], totalSec: 0, inferred: true, synthetic: true };
+      scenes.push(cur);
+    }
 
     const dur = _lineDuration(rawLine);
-    // Empty / structural lines aren't visual time AND not visible body either
-    if (!t) continue;
     cur.lines.push({
       text: rawLine, duration: dur, segIdx: 0,
       offset: lineStart, offsetEnd: lineEnd,
@@ -2851,7 +3182,7 @@ function _statusForLine(line, coverage) {
 
 function _renderScenesHTML(scenes, coverage = []) {
   if (!scenes.length) {
-    return '<div class="muted" style="padding:16px">Сценарий пустой или не содержит ни одного scene heading (INT./EXT./ИНТ./ЭКСТ.).</div>';
+    return '<div class="muted" style="padding:16px">Сценарий пустой.</div>';
   }
   const showCov = !!SCENE_VIEW_STATE.showCoverage && coverage.length;
   let html = '';
@@ -2875,11 +3206,15 @@ function _renderScenesHTML(scenes, coverage = []) {
   scenes.forEach((sc, sIdx) => {
     const bg = SCENE_COLORS[sIdx % SCENE_COLORS.length];
     const bdr = SCENE_BORDERS[sIdx % SCENE_BORDERS.length];
-    const heading = sc.heading || `(без scene heading) — сцена #${sIdx + 1}`;
+    const heading = sc.heading || `Сцена ${sIdx + 1} (без заголовка)`;
+    const inferredBadge = sc.inferred
+      ? `<span class="ep-scene-inferred" title="Заголовок определён автоматически — INT./EXT. в сценарии не указан">auto</span>`
+      : '';
     html += `<div class="ep-scene" style="background:${bg};border-left:4px solid ${bdr}">`;
     html += `<div class="ep-scene-header">
         <span class="ep-scene-tag">Сцена ${sIdx + 1}</span>
         <span class="ep-scene-loc">${esc(heading.slice(0, 120))}</span>
+        ${inferredBadge}
         <span class="ep-scene-meta">~${sc.totalSec.toFixed(0)}с · ${sc.segCount} сегмент(ов) ×15с</span>
       </div>`;
     let lastSeg = -1;
@@ -3123,6 +3458,7 @@ async function extractCharsFromScript() {
     // Refresh whatever views are currently shown
     if (typeof renderCharactersList === 'function') renderCharactersList();
     if (typeof renderLocationsList  === 'function') renderLocationsList();
+    if (typeof renderItemsList      === 'function') renderItemsList();
     if (typeof loadEpisodeView === 'function' && S.episode) loadEpisodeView(S.episode.number);
   } catch (e) {
     alert('Ошибка: ' + e.message);
@@ -4907,6 +5243,7 @@ async function sdCompose() {
   const st = document.getElementById('sd-compose-status');
   st.textContent = '⚙ компоную через Claude...';
   const useLastframe = !!document.getElementById('sd-use-lastframe')?.checked;
+  const useCutframes = !!document.getElementById('sd-use-cutframes')?.checked;
   const useStyle     = !!document.getElementById('sd-use-style')?.checked;
   const styleVal     = (document.getElementById('sd-style')?.value || '').trim();
   const baseOnly     = !!document.getElementById('sd-base-only')?.checked;
@@ -4916,6 +5253,7 @@ async function sdCompose() {
       {
         chunk_text: chunk,
         use_prev_lastframe: useLastframe,
+        use_prev_cutframes: useCutframes,
         style: useStyle ? styleVal : '',
         base_outfits_only: baseOnly,
       }
@@ -4944,12 +5282,18 @@ async function sdCompose() {
         // Server-attached continuity frame from previous chunk
         name = r.name || 'last frame';
         photoUrl = r.url || '';
+      } else if (r.kind === 'cutframe') {
+        // Pre-cut keyframe extracted from inside the previous chunk
+        name = r.name || 'pre-cut frame';
+        photoUrl = r.url || '';
       }
       return { ...r, name, photoUrl };
     });
     sdRenderRefs();
     let msg = res.scene_continuity ? '✓ продолжение прошлой сцены' : '✓ скомпоновано';
     if (res.lastframe_attached) msg += ' · 🎞 last frame прицеплен';
+    if (res.cutframes_attached) msg += ` · ✂ ${res.cutframes_attached} кадр(ов) перед склейками`;
+    if (res.state_analysis_attached) msg += ' · 🧠 состояние персов проанализировано';
     if (!res.cur_pos_found) {
       msg += ' · ⚠ позицию в сценарии не нашёл (continuity без соседа)';
     } else if (res.prev_neighbour) {
@@ -4964,6 +5308,26 @@ async function sdCompose() {
       const names = res.unresolved_refs.map(r => `${r.kind}:${r.id}`).join(', ');
       msg += ` · ⚠ не подгрузились: ${names}`;
       showToast('⚠ Часть рефов не удалось подгрузить (' + names + ') — проверь, есть ли у локации/перса фото');
+    }
+    if ((res.outfit_fallbacks || []).length) {
+      const fbs = res.outfit_fallbacks;
+      msg += ` · ⚠ outfit-fallback × ${fbs.length}`;
+      const lines = fbs.map(f => {
+        const avail = (f.available_labels || []).length
+          ? `имеются: ${f.available_labels.join(', ')}`
+          : 'у перса нет outfits — только база';
+        return `• ${f.char_name}: запрошен "${f.requested_outfit}", откатились на base (${avail})`;
+      }).join('\n');
+      showToast('⚠ Composer выбрал несуществующий outfit-label — откат на базу:\n' + lines, 9000);
+    }
+    if ((res.duplicate_chars_dropped || []).length) {
+      const dups = res.duplicate_chars_dropped;
+      msg += ` · 🚫 удалено дублей × ${dups.length}`;
+      showToast(
+        '🚫 Composer пытался добавить персонажа дважды — продублированные ref\'ы удалены автоматически (защита от двойников в кадре). ' +
+        'Если такое повторяется часто — пришли промпт, докрутим правила.',
+        7000
+      );
     }
     st.textContent = msg;
   } catch (e) {
@@ -4987,6 +5351,7 @@ function sdSavePrefs() {
       resolution: document.getElementById('sd-resolution').value,
       moderation_bypass: document.getElementById('sd-mod-bypass').value,
       use_prev_lastframe: !!document.getElementById('sd-use-lastframe')?.checked,
+      use_prev_cutframes: !!document.getElementById('sd-use-cutframes')?.checked,
       use_style: !!document.getElementById('sd-use-style')?.checked,
       style: (document.getElementById('sd-style')?.value || '').trim(),
       base_outfits_only: !!document.getElementById('sd-base-only')?.checked,
@@ -5002,6 +5367,8 @@ function sdLoadPrefs() {
     if (p.moderation_bypass) document.getElementById('sd-mod-bypass').value = p.moderation_bypass;
     const cb = document.getElementById('sd-use-lastframe');
     if (cb && typeof p.use_prev_lastframe === 'boolean') cb.checked = p.use_prev_lastframe;
+    const cf = document.getElementById('sd-use-cutframes');
+    if (cf && typeof p.use_prev_cutframes === 'boolean') cf.checked = p.use_prev_cutframes;
     const sc = document.getElementById('sd-use-style');
     const si = document.getElementById('sd-style');
     if (sc && typeof p.use_style === 'boolean') sc.checked = p.use_style;

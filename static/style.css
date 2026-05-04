@@ -1626,6 +1626,13 @@ body.seedance-mode .ep-loc-card:active { cursor: grabbing; }
   background: rgba(0,0,0,0.35); padding: 2px 8px; border-radius: 12px;
 }
 .ep-scene-loc { font-size: 0.85rem; color: var(--text); font-weight: 600; }
+.ep-scene-inferred {
+  font-size: 0.62rem; font-weight: 700; text-transform: uppercase;
+  letter-spacing: 0.5px; color: var(--muted);
+  background: rgba(255,165,2,0.16); border: 1px solid rgba(255,165,2,0.35);
+  padding: 1px 6px; border-radius: 8px;
+  cursor: help;
+}
 .ep-scene-meta {
   margin-left: auto; font-size: 0.75rem; color: var(--muted);
   font-family: 'SF Mono', Menlo, monospace;
