@@ -316,15 +316,36 @@
               <button class="btn-ghost btn-sm" id="ep-doctor-btn" onclick="doctorScript()" title="Найти и исправить логические дыры в сценарии (статус персонажей, мотивации, enabling conditions)">🩺 Доктор сценария</button>
               <button class="btn-ghost btn-sm" id="ep-extract-chars-btn" onclick="extractCharsFromScript()" title="Найти персонажей и локации в сценарии, добавить новые в сериал и пересверить активных в этой сцене">🤖 Извлечь персонажей и локации</button>
               <button class="btn-ghost btn-sm" id="ep-scenes-btn" onclick="toggleSceneView()" title="Подсветить сцены и разбить на ~15-секундные сегменты для Seedance">🎬 Сцены</button>
+              <label style="display:inline-flex;align-items:center;gap:4px;font-size:0.78rem;color:var(--muted);cursor:pointer;margin-left:6px" title="Звуковой сигнал по завершению генерации сценария">
+                <input type="checkbox" id="ep-script-sounds" checked style="cursor:pointer;margin:0"> 🔔
+              </label>
               <button class="ep-script-btn ready" id="ep-gen-script-btn" onclick="generateEpisodeScript()">⚡ Сгенерировать</button>
             </div>
           </div>
           <textarea id="ep-script" class="script-area" placeholder="Screenplay / Script..."></textarea>
           <div id="ep-script-scenes" class="ep-script-scenes hidden"></div>
-          <div class="char-counter" style="display:flex;justify-content:space-between">
-            <span id="ep-script-gen-status" style="font-size:0.78rem;color:var(--warning)"></span>
+          <div class="char-counter" style="display:flex;justify-content:space-between;align-items:center;gap:8px">
+            <span id="ep-script-gen-status" style="font-size:0.78rem;color:var(--warning);flex:1"></span>
+            <button class="btn-ghost btn-sm" id="ep-script-apply-btn" onclick="applyScriptChanges()" title="Сохранить ручные правки сценария на диск" style="display:none">💾 Применить изменения</button>
             <span><span id="script-char-count">0</span> символов</span>
           </div>
+        </div>
+
+        <div class="field-group">
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
+            <label style="margin:0" title="Единое описание геометрии сцены (где стоят/сидят персонажи, реквизит, окна, двери) — вшивается в Constraints каждого чанка при batch-compose в Auto-mode параллельно. Защита от spatial drift между сегментами.">
+              🎯 Расположение персонажей в сцене (SCENE BLOCKING)
+            </label>
+            <div style="display:flex;gap:6px;align-items:center">
+              <button class="btn-ghost btn-sm" id="ep-gen-blocking-btn" onclick="generateSceneBlocking()" title="Claude прочитает сценарий + roster и заполнит blocking 60-120 слов английского текста">✨ Сгенерить</button>
+              <button class="btn-ghost btn-sm" onclick="openBatchJsonViewer()" title="Просмотр единого JSON-промпта эпизода (batch-compose). Содержит episodeBlocking + per-segment prompts которые auto-mode parallel шлёт в Seedance.">📋 batch JSON</button>
+              <span id="ep-blocking-status" style="font-size:0.76rem;color:var(--muted)"></span>
+            </div>
+          </div>
+          <textarea id="ep-scene-blocking"
+            class="synopsis-area"
+            style="min-height:90px;font-family:'SF Mono',Menlo,monospace;font-size:0.84rem"
+            placeholder="Scene blocking — единое 60-120 слов англ. описание расстановки персонажей и геометрии локации на ВСЮ серию. Используется при batch-compose в Auto-mode параллельно — гарантирует что Lina всегда сидит у окна слева, Kyle всегда напротив справа, и т.д. между всеми чанками. Можно заполнить вручную или нажми ✨ Сгенерить."></textarea>
 
           <!-- Inline logic-check panel (appears after script gen if violations found) -->
           <div id="ep-logic-panel" class="logic-panel hidden">
@@ -343,11 +364,6 @@
           </div>
         </div>
 
-        <div class="field-group">
-          <label>Заметки</label>
-          <textarea id="ep-notes" class="notes-area" placeholder="Режиссёрские заметки, идеи..."></textarea>
-        </div>
-
         <!-- ── SEEDANCE PANEL — visible only in seedance-mode ───────────── -->
         <div class="field-group seedance-only" id="seedance-panel">
           <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
@@ -361,6 +377,7 @@
 
             <div class="sd-row" style="flex-wrap:wrap">
               <button class="btn-sm btn-accent" onclick="sdCompose()">⚙ Скомпоновать (LLM)</button>
+              <button class="btn-sm btn-ghost" onclick="sdRecomposeWithCurrentRefs()" title="Перекомпоновать промпт через Claude используя ТОЛЬКО текущие рефы (после ручного удаления лишних). Удалённые персы выпадут из текста.">🔄 Перекомпоновать с текущими рефами</button>
               <label style="font-size:0.78rem;color:var(--muted);display:inline-flex;align-items:center;gap:4px"
                      title="Если предыдущий чанк в той же сцене и уже сгенерён — последний кадр его видео добавится первым референсом. Резко улучшает консистентность позиций и фона.">
                 <input type="checkbox" id="sd-use-lastframe" checked style="margin:0">
@@ -380,6 +397,16 @@
                      title="Composer не выбирает варианты костюмов (outfits) — для каждого персонажа берётся только его базовое референс-фото. Полезно когда в сериале outfits сделаны под другие сцены и в текущей надо вернуться к базе.">
                 <input type="checkbox" id="sd-base-only" style="margin:0">
                 только базовые образы персов
+              </label>
+              <label style="font-size:0.78rem;color:var(--muted);display:inline-flex;align-items:center;gap:4px"
+                     title="STRICT close-up режим: оставить в refs только одного перса (того кто говорит больше всех в чанке) + локацию. Все остальные дроп даже если они присутствуют в сцене. Для крупных планов одного лица.">
+                <input type="checkbox" id="sd-close-up-only" style="margin:0">
+                🎯 close-up only
+              </label>
+              <label style="font-size:0.78rem;color:var(--muted);display:inline-flex;align-items:center;gap:4px"
+                     title="При смене локации (новая сцена) в первый чанк новой сцены добавляется 2-секундный wide shot фасада/экстерьера. Длительность чанка увеличивается на 2с (clamp ≤15с).">
+                <input type="checkbox" id="sd-establishing-shot" style="margin:0">
+                🏛️ заставка локации (2с)
               </label>
               <input type="text" id="sd-style" class="hidden" placeholder="Pixar, anime, film noir, oil-painting, cyberpunk..."
                      style="flex:1;min-width:220px;padding:5px 10px;font-size:0.8rem">
@@ -1077,6 +1104,34 @@
   </div>
 </div>
 
+<!-- Batch JSON viewer for the unified episode prompt -->
+<div id="modal-batch-json" class="modal hidden">
+  <div class="modal-box modal-wide">
+    <div class="modal-header">
+      <h2>📋 Единый batch-JSON эпизода</h2>
+      <button class="btn-icon" onclick="closeModal('modal-batch-json')">✕</button>
+    </div>
+    <div class="modal-body">
+      <div id="batch-json-meta" style="font-size:0.78rem;color:var(--muted);margin-bottom:8px;padding:8px;background:var(--surface3);border-radius:6px"></div>
+      <textarea id="batch-json-text" class="script-area" rows="20" readonly
+        style="background:var(--surface2);cursor:text;font-family:'SF Mono',Menlo,monospace;font-size:0.78rem;white-space:pre"></textarea>
+      <div class="muted" style="font-size:0.76rem;margin-top:6px">
+        Содержит <code>episodeBlocking</code> (общая геометрия серии) + per-segment <code>prompt</code> и <code>refs</code> которые
+        auto-mode parallel отправляет в Seedance напрямую без per-chunk Claude-вызовов. Хеш скрипта проверяется при запуске auto-mode —
+        если script изменился после batch-compose, кэш считается устаревшим.
+      </div>
+    </div>
+    <div class="modal-footer">
+      <label style="display:inline-flex;align-items:center;gap:6px;font-size:0.82rem;color:var(--muted);margin-right:auto;cursor:pointer" title="Звуковой сигнал по завершению batch-compose в этом окне">
+        <input type="checkbox" id="batch-json-sounds" checked style="cursor:pointer"> 🔔 Звук
+      </label>
+      <button class="btn-ghost" onclick="rebuildBatchPrompts()" title="Запустить batch-compose заново и перезаписать кэш">🔄 Пересобрать</button>
+      <button class="btn-ghost" onclick="closeModal('modal-batch-json')">Закрыть</button>
+      <button class="btn-primary" onclick="copyBatchJson()">📋 Копировать JSON</button>
+    </div>
+  </div>
+</div>
+
 <!-- Prompt Display Modal -->
 <div id="modal-prompt" class="modal hidden">
   <div class="modal-box modal-wide">
@@ -1126,6 +1181,36 @@
         <label>Reteller API Key</label>
         <input id="settings-rtl-key" type="password" placeholder="rtl_sk_...">
       </div>
+      <div class="field-group">
+        <label style="display:inline-flex;align-items:center;gap:8px;cursor:pointer;font-weight:500">
+          <input type="checkbox" id="settings-sounds-enabled" onchange="onSoundsToggleChanged(this.checked)">
+          🔊 Звуковые уведомления (готово / ошибка генерации)
+        </label>
+        <div class="muted" style="font-size:0.78rem;margin-top:4px">
+          Короткий мелодичный сигнал когда чанк завершается, диссонансный — на ошибке. Используется при ручной генерации и в Auto-mode.
+        </div>
+      </div>
+      <div class="field-group">
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+          <input type="checkbox" id="settings-sounds-enabled" style="margin:0">
+          <span>Звуковые эффекты (готово / ошибка)</span>
+        </label>
+        <div class="muted" style="font-size:0.78rem;margin-top:4px">
+          Тихий beep когда видео-чанк готов или упал с ошибкой генерации.
+        </div>
+        <button class="btn-ghost btn-sm" onclick="Sounds.playSuccess()" style="margin-right:6px;margin-top:6px">▶ test готово</button>
+        <button class="btn-ghost btn-sm" onclick="Sounds.playError()">▶ test ошибка</button>
+      </div>
+      <div class="field-group">
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+          <input type="checkbox" id="settings-voice-enabled" style="margin:0">
+          <span>🗣 Голосовое объявление "Episode generation finished"</span>
+        </label>
+        <div class="muted" style="font-size:0.78rem;margin-top:4px">
+          Когда Auto-mode заканчивает все сегменты эпизода — браузерный TTS произносит фразу на английском. Использует встроенный SpeechSynthesis API (бесплатно, без сервера, работает оффлайн).
+        </div>
+        <button class="btn-ghost btn-sm" onclick="Sounds.speak('Episode generation finished.')" style="margin-top:6px">▶ test голос</button>
+      </div>
     </div>
     <div class="modal-footer">
       <button class="btn-ghost" onclick="closeModal('modal-settings')">Отмена</button>
@@ -1150,6 +1235,19 @@
         </label>
         <button class="btn-ghost" style="color:var(--accent);border:1px solid rgba(0,212,170,0.4);padding:10px 14px"
                 onclick="openRegenChar()">↻ Перегенерировать персонажа</button>
+      </div>
+
+      <div class="canonical-desc-section" style="margin-top:12px;padding:10px;background:var(--surface3);border:1px solid var(--border);border-radius:6px">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+          <span style="font-size:0.76rem;font-weight:700;text-transform:uppercase;letter-spacing:0.6px;color:var(--muted)">
+            Каноническое описание (используется в Seedance)
+          </span>
+          <button class="btn-ghost btn-sm" onclick="copyCanonicalDescription()" title="Скопировать в буфер обмена">📋 Копировать</button>
+        </div>
+        <div id="char-canonical-desc" style="font-size:0.84rem;line-height:1.45;color:var(--text);white-space:pre-wrap"></div>
+        <div class="muted" style="font-size:0.74rem;margin-top:6px">
+          Тот же текст, по которому генерилось ref-фото. При компоновке Seedance-промпта он автоматически вставляется в BINDING-строку рядом с @Image-ссылкой персонажа — ref-картинка и текст совпадают, минимизируя дрейф.
+        </div>
       </div>
 
       <div class="outfits-section">

@@ -53,8 +53,10 @@ const api = {
     if (!r.ok) throw new Error(await parseApiError(r));
     return r.json();
   },
-  async post(url, body, { timeoutMs } = {}) {
-    const opts = { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) };
+  async post(url, body, { timeoutMs, idempotencyKey } = {}) {
+    const headers = { 'Content-Type': 'application/json' };
+    if (idempotencyKey) headers['Idempotency-Key'] = idempotencyKey;
+    const opts = { method: 'POST', headers, body: JSON.stringify(body) };
     if (timeoutMs) opts.signal = AbortSignal.timeout(timeoutMs);
     let r;
     try { r = await fetch(url, opts); }
@@ -702,7 +704,9 @@ async function generateSeriesIdeas() {
   const status = document.getElementById('series-gen-status');
   const list = document.getElementById('series-ideas-list');
   const genres = getSelectedGenres();
-  if (!genres.length) { showToast('Выбери хотя бы один жанр'); return; }
+  // No genres = full creative freedom across all 6 axes (settings/twists/
+  // premises/protag/antag/tones). Backend handles empty genres list fine —
+  // see /api/generate-series-ideas: genre_rule is empty when genres=[].
   btn.disabled = true;
   btn.innerHTML = '<span class="spinner"></span> Генерируем...';
   status.textContent = '';
@@ -856,19 +860,57 @@ async function triggerAutogenSweep() {
   }
 }
 
+function _autogenApplyInProgress(inProgress) {
+  // Reset all overlays
+  document.querySelectorAll('[data-autogen-kind] .autogen-overlay').forEach(el => {
+    el.hidden = true;
+  });
+  document.querySelectorAll('[data-autogen-kind].is-generating').forEach(el => {
+    el.classList.remove('is-generating');
+  });
+  // Apply current in-progress entries (char + loc only — outfits live in modal)
+  for (const entry of (inProgress || [])) {
+    if (entry.kind !== 'char' && entry.kind !== 'loc') continue;
+    const sel = `[data-autogen-kind="${entry.kind}"][data-autogen-id="${entry.parent_id}"]`;
+    const card = document.querySelector(sel);
+    if (!card) continue;
+    card.classList.add('is-generating');
+    const ov = card.querySelector('.autogen-overlay');
+    if (ov) ov.hidden = false;
+  }
+}
+
 async function pollAutogenStatus() {
   const btn = document.getElementById('autogen-sweep-btn');
   const status = document.getElementById('autogen-sweep-status');
   if (!status) return;
   if (_autogenPollTimer) { clearInterval(_autogenPollTimer); _autogenPollTimer = null; }
 
+  // Track previous done count so we know when to re-fetch+re-render lists
+  let prevDone = -1;
   const tick = async () => {
     try {
       const r = await fetch(`/api/series/${S.seriesId}/auto-generate/status`);
       const st = await r.json();
+      // Mark in-progress items on DOM (spinner overlay) and clear stale marks
+      _autogenApplyInProgress(st.in_progress || []);
       if (st.running) {
-        status.textContent = `генерация… ${st.done}/${st.queue}` + (st.errors.length ? ` · ошибок: ${st.errors.length}` : '');
+        const ipBits = (st.in_progress || []).map(x => x.name).filter(Boolean).slice(0, 3).join(', ');
+        const ipSuffix = ipBits ? ` · сейчас: ${ipBits}` : '';
+        status.textContent = `генерация… ${st.done}/${st.queue}` + (st.errors.length ? ` · ошибок: ${st.errors.length}` : '') + ipSuffix;
         if (btn) btn.innerHTML = '<span class="spinner"></span> ' + st.done + '/' + st.queue;
+        // Re-fetch + re-render every time `done` increments — lets assets pop in live
+        if (prevDone !== -1 && st.done > prevDone) {
+          try {
+            const fresh = await fetch(`/api/series/${S.seriesId}`).then(r => r.json());
+            S.series = fresh;
+            renderCharactersList();
+            renderLocationsList();
+            renderItemsList();
+            _autogenApplyInProgress(st.in_progress || []);  // re-apply spinners after re-render wipes them
+          } catch {}
+        }
+        prevDone = st.done;
       } else {
         if (_autogenPollTimer) { clearInterval(_autogenPollTimer); _autogenPollTimer = null; }
         if (btn) { btn.disabled = false; btn.innerHTML = '🎨 Сгенерировать недостающее'; }
@@ -1239,10 +1281,10 @@ async function plConfirmMilestones() {
   const status = document.getElementById('pl-stage2-status');
   try {
     S.series = await api.post(`/api/series/${S.seriesId}/confirm-milestones`, {});
-    status.textContent = 'Извлекаем персонажей и локации из сюжета...';
-    status.className = 'pipeline-status';
-    const extracted = await api.post(`/api/series/${S.seriesId}/extract-from-story`, {});
-    S.series = extracted.series;
+    // Characters/locations are NO LONGER auto-extracted from synopsis here —
+    // they'd often include people/places that never make it into the actual
+    // script. The episode view's "Извлечь персонажей и локации" button reads
+    // from the script instead, which is the single source of truth.
     renderCharactersList();
     renderLocationsList();
     renderItemsList();
@@ -1281,9 +1323,6 @@ function renderStage2(el) {
         <div class="pipeline-row">
           <button class="btn-idea-gen" id="pl-gen-ep-syn-btn" onclick="plGenerateEpSynopses()">${genBtnLabel}</button>
           <span style="font-size:0.8rem;color:var(--muted)">Уже написанные не будут перезаписаны</span>
-        </div>
-        <div class="pipeline-row" style="margin-top:-6px">
-          <button class="btn-idea-random" id="pl-extract-btn" onclick="plExtractFromStory()">🤖 Извлечь персонажей и локации из сюжета</button>
         </div>
         <div class="ep-synopsis-rows">
           ${slots.map(n => {
@@ -1433,9 +1472,10 @@ function renderCharactersList() {
     const hasRefs = c.ref_images && c.ref_images.length > 0;
     const imgUrl = hasRefs ? `/assets/${s.id}/${c.ref_images[0]}` : null;
     return `
-      <div class="char-item" onclick="openCharAssets('${c.id}')">
+      <div class="char-item" data-autogen-kind="char" data-autogen-id="${c.id}" onclick="openCharAssets('${c.id}')">
         <div class="char-avatar">
           ${imgUrl ? `<img src="${imgUrl}" alt="${esc(c.name)}">` : esc(c.name[0])}
+          <div class="autogen-overlay" hidden><span class="spinner"></span></div>
         </div>
         <div class="char-info">
           <div class="char-name">${esc(c.name)}</div>
@@ -1461,9 +1501,10 @@ function renderLocationsList() {
     const hasRefs = l.ref_images && l.ref_images.length > 0;
     const imgUrl = hasRefs ? `/assets/${s.id}/${l.ref_images[0]}` : null;
     return `
-      <div class="char-item" onclick="openLocAssets('${l.id}')">
+      <div class="char-item" data-autogen-kind="loc" data-autogen-id="${l.id}" onclick="openLocAssets('${l.id}')">
         <div class="char-avatar">
           ${imgUrl ? `<img src="${imgUrl}" alt="${esc(l.name)}">` : '📍'}
+          <div class="autogen-overlay" hidden><span class="spinner"></span></div>
         </div>
         <div class="char-info">
           <div class="char-name">${esc(l.name)}</div>
@@ -2360,10 +2401,50 @@ function openCharAssets(charId) {
   document.getElementById('char-assets-title').textContent = `Фото: ${c.name}`;
   renderCharAssetsGrid(c);
   renderOutfitsList(c);
+  renderCharCanonicalDesc(c);
 
   const inp = document.getElementById('char-asset-file-input');
   inp.onchange = () => uploadCharacterRefs(charId, inp.files);
   openModal('modal-char-assets');
+}
+
+// Build the canonical description shown in the card and copied into Seedance prompts.
+// Mirrors backend _canonical_char_description() — appearance + base outfit description.
+function _buildCanonicalCharDesc(char) {
+  if (!char) return '';
+  const appearance = (char.appearance || '').trim();
+  const outfits = char.outfits || [];
+  const base = outfits.find(o => o.is_base) || outfits[0];
+  const outfitDesc = (base && (base.description || '').trim()) || '';
+  return [appearance, outfitDesc].filter(Boolean).join('; ');
+}
+
+function renderCharCanonicalDesc(char) {
+  const el = document.getElementById('char-canonical-desc');
+  if (!el) return;
+  const text = _buildCanonicalCharDesc(char);
+  el.textContent = text || '(описание не задано — заполни appearance персонажа и/или базовый outfit)';
+  el.dataset.text = text;
+}
+
+async function copyCanonicalDescription() {
+  const el = document.getElementById('char-canonical-desc');
+  const text = el?.dataset.text || el?.textContent || '';
+  if (!text || text.startsWith('(')) {
+    showToast('⚠ Описание пустое', 2500);
+    return;
+  }
+  try {
+    await navigator.clipboard.writeText(text);
+    showToast('✓ Скопировано', 1800);
+  } catch {
+    // Fallback for older browsers
+    const ta = document.createElement('textarea');
+    ta.value = text; document.body.appendChild(ta);
+    ta.select(); document.execCommand('copy');
+    ta.remove();
+    showToast('✓ Скопировано', 1800);
+  }
 }
 
 function renderCharAssetsGrid(char) {
@@ -2764,14 +2845,24 @@ async function createEpisode() {
   if (submitBtn) { submitBtn.disabled = true; submitBtn.textContent = 'Создаю…'; }
   if (cancelBtn) cancelBtn.disabled = true;
 
+  // Idempotency key — fresh per click. If the same POST somehow fires twice
+  // (network retry, browser extension, double-handler), backend returns the
+  // CACHED first response instead of creating a second episode.
+  const idempotencyKey = (window.crypto && crypto.randomUUID && crypto.randomUUID())
+    || `ep-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+
   try {
     const epNum = parseInt(document.getElementById('new-ep-number').value) || null;
-    const ep = await api.post(`/api/series/${S.seriesId}/episodes`, {
-      synopsis: val('new-ep-synopsis'),
-      number: epNum,
-    });
+    const ep = await api.post(
+      `/api/series/${S.seriesId}/episodes`,
+      { synopsis: val('new-ep-synopsis'), number: epNum },
+      { idempotencyKey }
+    );
     closeModal('modal-create-episode');
-    S.episodes.push(ep);
+    // De-dup: if push would create a duplicate (idempotency replay), skip
+    if (!S.episodes.some(e => e.number === ep.number)) {
+      S.episodes.push(ep);
+    }
     navigate('episode', { seriesId: S.seriesId, episodeNum: ep.number });
   } finally {
     _creatingEpisode = false;
@@ -2808,7 +2899,7 @@ async function loadEpisodeView() {
   setVal('ep-title-input', S.episode.title);
   setVal('ep-synopsis', S.episode.synopsis);
   setVal('ep-script', S.episode.script);
-  setVal('ep-notes', S.episode.notes);
+  setVal('ep-scene-blocking', S.episode.scene_blocking || '');
   setVal('ep-reteller-prompt', S.episode.reteller_prompt || '');
   updateScriptCounter();
 
@@ -2824,13 +2915,11 @@ async function loadEpisodeView() {
     autoDetectFromScript();
   }
 
-  // Auto-extract characters/locations from story if series has none yet
-  const hasStory = !!(S.series.arc || S.series.synopsis || Object.keys(S.series.milestone_synopses || {}).length);
-  const hasChars = (S.series.characters || []).length > 0;
-  const hasLocs  = (S.series.locations  || []).length > 0;
-  if (hasStory && (!hasChars || !hasLocs)) {
-    autoExtractFromStory();
-  }
+  // NOTE: removed auto-extract-from-story trigger here. Characters & locations
+  // are now derived ONLY from the actual script — extraction-from-synopsis-text
+  // was producing chars/locs that don't appear in the episode. Use the
+  // "🎭 Извлечь персонажей и локации" button on the episode view instead, which
+  // calls /extract-characters (script-based).
 
   renderEpCharacters();
   renderEpLocations();
@@ -2969,7 +3058,7 @@ const _SLUG_BLOCKLIST_RE = /^(REVERSAL|END|FIN|КОНЕЦ|TBD|TBC|БИТ|BIT|HOO
 function _isAllCapsSlug(t) {
   if (!t) return false;
   if (t.length < 5 || t.length > 80) return false;
-  if (/[:：\[\]]/.test(t)) return false;        // character cues, dialogue, brackets (handled elsewhere)
+  if (/[:：\[\]#]/.test(t)) return false;       // character cues, dialogue, brackets, markdown #
   if (/[a-zа-яё]/.test(t)) return false;        // any lowercase → not a slug
   if (!/[A-ZА-ЯЁ]/.test(t)) return false;       // need at least one letter
   if (/^(FADE|CUT|DISSOLVE|SMASH|MATCH)\b/i.test(t)) return false;
@@ -3011,38 +3100,81 @@ const _SCRIPT_SKIP_PATTERNS = [
 ];
 
 // Heuristic per-line duration in seconds (only counts what's actually on screen).
+// Per-line on-screen duration (seconds). The 15-sec segmentation packs lines
+// into chunks based on these numbers, so what counts here = what eats the budget.
+// RULE (calibrated to English short-drama TikTok pacing):
+//   • Dialogue replicas are timed by SPEECH_WPS (~3.5 words/sec ≈ 210 wpm —
+//     short-drama delivery speed; faster than conversational ~2.4 wps).
+//   • Action lines (bracketed OR prose) cost a FIXED 1.5s regardless of length.
+//   • Bracketed action notes INSIDE a dialogue line ('[hands letter to her]')
+//     are NOT counted as spoken words — they're stage directions, not speech.
+//   • Scene headings, transitions, separators: 0s.
+const ACTION_BEAT_SEC = 1.5;
+const SPEECH_WPS = 3.8;  // ~228 wpm — short-drama TikTok delivery (faster than conversational)
+
 function _lineDuration(line) {
-  const t = (line || '').trim();
+  let t = (line || '').trim();
   if (!t) return 0;
+  // Strip leading line-numbering prefix: "1. ", "2) ", "12: ", "3 - " — common
+  // when scripts come back with enumerated dialogue/action. Without this strip
+  // the dialogue regex below fails (first char is a digit, not a letter) and
+  // the line falls into prose-action with fixed 1.5s — drastically underestimating
+  // long dialogues.
+  t = t.replace(/^\d+[.\):\-—–]\s+/, '');
   if (_matchSceneHeading(t).match) return 0;
   if (/^[-—=]{3,}\s*$/.test(t)) return 0;
   if (/^\[REVERSAL\]\s*$/i.test(t)) return 0;
   if (/^[\s—-]*(FADE|CUT|DISSOLVE|SMASH|MATCH)\s+(IN|OUT|TO|BACK)\b/i.test(t)) return 0;
+  // Beat-time headings: "[0:00 — 0:15] HOOK" / "[0:15 - 0:35] BUILD" — meta
+  // markers not visible as on-screen content.
+  if (/^\[\s*\d+:\d+\s*[—\-–]\s*\d+:\d+\s*\]/.test(t)) return 0;
 
-  // Action line: bracketed prose `[Волк входит и...]`
+  // Action line: bracketed prose `[Волк входит и...]`. Scale by length —
+  // real action takes time proportional to what's described; a one-liner
+  // ≈1.5s, a long sentence ≈4-6s. Cap so a paragraph doesn't blow a chunk.
   if (/^\[/.test(t) && /\]\s*$/.test(t)) {
-    const words = t.replace(/[\[\]]/g, '').split(/\s+/).filter(Boolean).length;
-    if (words === 0) return 0;
-    return 1 + words / 1.8;          // 1s overhead + ~1.8 wps
+    const inner = t.replace(/[\[\]]/g, '').trim();
+    if (!inner) return 0;
+    return _scaleActionDuration(inner);
   }
 
-  // Dialogue line: "CHAR_NAME: (parens) actual text"
-  const m = t.match(/^([A-ZА-ЯЁ_][A-ZА-ЯЁ_0-9 ()\-']{0,40})\s*[:：]\s*(.*)$/);
-  if (m && m[1].toUpperCase() === m[1]) {
+  // Dialogue line: "Name: (parens) [stage] actual text" — count by speech rate.
+  // Accepts BOTH all-caps (AVA:, MAYA:) and Title-case (Adrian:, Clara:) — modern
+  // short-drama scripts use Title-case for character cues, classic screenplay
+  // format uses all-caps. Discriminator is the colon — prose lines don't have one.
+  const m = t.match(/^([A-Za-zА-Яа-яЁё_][A-Za-zА-Яа-яЁё_0-9 ()\-']{0,40})\s*[:：]\s*(.*)$/);
+  // Reject only if the first letter is lowercase (e.g. random colon-prose like
+  // "the question: who killed her?"). Either ALL-CAPS or Title-case both pass.
+  if (m && /^[A-ZА-ЯЁ]/.test(m[1])) {
     let rest = m[2] || '';
-    // Drop parenthetical tone notes — they're not spoken
-    rest = rest.replace(/\([^)]*\)/g, ' ').trim();
+    rest = rest.replace(/\([^)]*\)/g, ' ');   // (parenthetical tone notes) — not spoken
+    rest = rest.replace(/\[[^\]]*\]/g, ' ');  // [stage actions inside dialogue] — not spoken
+    rest = rest.replace(/\*[^*]*\*/g, ' ');   // *italic emphasis / inline action* — also not spoken
+    rest = rest.trim();
     if (!rest) return 0.5;
     const words = rest.split(/\s+/).filter(Boolean).length;
-    return 0.4 + words / 2.4;        // tiny pre-pause + ~2.4 wps speech
+    return 0.4 + words / SPEECH_WPS;          // tiny pre-pause + speech rate
   }
 
-  // Standalone parenthetical "(angry)" — small
-  if (/^\(.+\)$/.test(t)) return 0.4;
+  // Standalone parenthetical: short emotional beat "(angry)" → 0.4s,
+  // long action wrapped in parens "(Каэлен падает...)" → scale by length.
+  const parenMatch = t.match(/^\((.+)\)\.?$/);
+  if (parenMatch) {
+    const inner = parenMatch[1].trim();
+    if (inner.length <= 25) return 0.4;
+    return _scaleActionDuration(inner);
+  }
 
-  // Plain prose action (no brackets)
-  const words = t.split(/\s+/).filter(Boolean).length;
-  return Math.max(0.4, words / 1.8);
+  // Plain prose action (no brackets) — scale by length.
+  return _scaleActionDuration(t);
+}
+
+// Action duration heuristic: ~35 chars per visible second of footage,
+// floor at ACTION_BEAT_SEC=1.5s, cap at 6s so a long paragraph doesn't
+// take over an entire 15s segment by itself.
+function _scaleActionDuration(text) {
+  const chars = (text || '').length;
+  return Math.max(ACTION_BEAT_SEC, Math.min(6, 1 + chars / 35));
 }
 
 // Find a chunk's [start, end] byte-offset in the script via long-line anchors.
@@ -3081,8 +3213,14 @@ function _findChunkRange(scriptText, chunkText) {
   return [start, end];
 }
 
-function _parseScriptScenes(scriptText) {
+function _parseScriptScenes(scriptText, overrides) {
   const rawLines = (scriptText || '').split('\n');
+  const overrideMap = new Map();
+  for (const o of (overrides || [])) {
+    if (o && o.anchor && (o.action === 'break' || o.action === 'merge')) {
+      overrideMap.set(o.anchor, o.action);
+    }
+  }
   const scenes = [];
   let inCast = false;
   let inNotes = false;
@@ -3105,8 +3243,16 @@ function _parseScriptScenes(scriptText) {
       continue;
     }
     if (inNotes) continue;
-    // Markdown title (#)
-    if (/^#\s/.test(t)) continue;
+    // Markdown headers (## ЭПИЗОД 4, ### Сцена и т.п.) — episode-level meta, not story content
+    if (/^#+\s/.test(t)) continue;
+    // Bold meta-labels — story-trailer / scene-trailer annotations the writer attaches:
+    //   **КРАТКОЕ СОДЕРЖАНИЕ:** …, **SUMMARY:** …
+    //   - **Cliffhanger:** "..."
+    //   - **Emotional peak:** Vivian's admission of forcing Clara…
+    //   - **Setup for Episode 5:** Legal confrontation begins…
+    // Pattern: optional bullet (-, *, •) + **Label:** where Label can include letters, digits, spaces.
+    // We do NOT include `.` or `—` in Label so scene headings like **INT. CAFE — DAY** stay safe.
+    if (/^(?:[-*•]\s+)?\*\*[A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё0-9\s]*:\s*\*\*/.test(t)) continue;
     // Horizontal separators
     if (/^[-—=]{3,}\s*$/.test(t)) continue;
 
@@ -3138,24 +3284,94 @@ function _parseScriptScenes(scriptText) {
     cur.totalSec += dur;
   }
 
-  // Assign 15-second segment indices based on REAL on-screen time only.
-  const TARGET = 14.0;     // aim for ≤15s per chunk
-  const SOFT_MAX = 15.5;   // hard cap before forcing a break
+  // Assign segment indices based on REAL on-screen time. Each Seedance chunk is
+  // technically 15s but we aim for ~13s of content + ~2s breathing room so cuts
+  // don't jam reactions back-to-back.
+  // TWO-PASS algorithm:
+  //   Pass 1 (greedy): pack lines into the current segment until it would exceed
+  //     SOFT_MAX. NEVER break before the segment has accumulated MIN_SEGMENT — a
+  //     1-line 4-second segment wastes a whole 15s Seedance chunk.
+  //   Pass 2 (merge tiny): post-walk segments. Any segment < MIN_SEGMENT gets
+  //     merged into a neighbour if the combined size stays ≤ HARD_MAX.
+  const TARGET = 11.0;          // aim around this (informational)
+  const SOFT_MAX = 13.0;        // normal break threshold (2s buffer below 15s chunk)
+  const MIN_SEGMENT_SEC = 5.0;  // smaller than this = wasted Seedance chunk
+  const HARD_MAX_SEC = 14.5;    // absolute ceiling — Seedance chunk is 15s
   for (const sc of scenes) {
+    // Pass 1: greedy, never break before MIN_SEGMENT
     let acc = 0, seg = 0;
     for (const l of sc.lines) {
-      if (acc > 0 && acc + l.duration > SOFT_MAX) {
+      if (acc >= MIN_SEGMENT_SEC && acc + l.duration > SOFT_MAX) {
         seg += 1;
         acc = 0;
       }
       l.segIdx = seg;
       acc += l.duration;
-      // If we just exactly hit/exceeded TARGET, allow the next line to start a new segment
-      if (acc >= TARGET && acc <= SOFT_MAX) {
-        // Defer: next iteration's check will decide based on next line's duration
+    }
+    // Pass 2: merge any tiny segments into a neighbour (prefer prev) up to HARD_MAX
+    const segTotals = [];
+    for (const l of sc.lines) {
+      while (segTotals.length <= l.segIdx) segTotals.push(0);
+      segTotals[l.segIdx] += l.duration;
+    }
+    // Walk backward so index shifts after splice don't break the iteration
+    for (let i = segTotals.length - 1; i >= 0; i--) {
+      if (segTotals[i] >= MIN_SEGMENT_SEC) continue;
+      // Try merge with previous
+      if (i > 0 && segTotals[i-1] + segTotals[i] <= HARD_MAX_SEC) {
+        for (const l of sc.lines) {
+          if (l.segIdx === i) l.segIdx = i - 1;
+          else if (l.segIdx > i) l.segIdx -= 1;
+        }
+        segTotals[i-1] += segTotals[i];
+        segTotals.splice(i, 1);
+        continue;
       }
+      // Else try merge with next
+      if (i < segTotals.length - 1 && segTotals[i] + segTotals[i+1] <= HARD_MAX_SEC) {
+        for (const l of sc.lines) {
+          if (l.segIdx === i+1) l.segIdx = i;
+          else if (l.segIdx > i+1) l.segIdx -= 1;
+        }
+        segTotals[i] += segTotals[i+1];
+        segTotals.splice(i+1, 1);
+        continue;
+      }
+      // Otherwise leave alone (single huge orphan line that can't fit anywhere)
     }
     sc.segCount = sc.lines.length ? (sc.lines[sc.lines.length - 1].segIdx + 1) : 0;
+  }
+
+  // Apply manual overrides (force-break / force-merge per line anchor) AFTER
+  // auto-segmentation so user's choices win. Skipped lines (meta, headings)
+  // never reach lines[] so they can't carry overrides — fine, those aren't
+  // displayed segments anyway.
+  if (overrideMap.size) {
+    for (const sc of scenes) {
+      // Snapshot auto-segmentation (transitions = points where auto wanted a break)
+      for (const l of sc.lines) l._autoSeg = l.segIdx;
+      let curSeg = 0;
+      for (let i = 0; i < sc.lines.length; i++) {
+        const l = sc.lines[i];
+        const action = overrideMap.get(_lineAnchor(l.text));
+        if (i === 0) {
+          l.segIdx = 0;
+          l._override = action || null;
+          continue;
+        }
+        const prev = sc.lines[i - 1];
+        if (action === 'break') {
+          curSeg += 1;                                  // user forces split here
+        } else if (action === 'merge') {
+          // user forces no-break — stay with prev
+        } else if (l._autoSeg !== prev._autoSeg) {
+          curSeg += 1;                                  // respect auto-decision
+        }
+        l.segIdx = curSeg;
+        l._override = action || null;
+      }
+      sc.segCount = sc.lines.length ? (sc.lines[sc.lines.length - 1].segIdx + 1) : 0;
+    }
   }
   return scenes;
 }
@@ -3184,25 +3400,45 @@ function _renderScenesHTML(scenes, coverage = []) {
   if (!scenes.length) {
     return '<div class="muted" style="padding:16px">Сценарий пустой.</div>';
   }
-  const showCov = !!SCENE_VIEW_STATE.showCoverage && coverage.length;
+  const showCov   = !!SCENE_VIEW_STATE.showCoverage && coverage.length;
+  const editMode  = !!SCENE_VIEW_STATE.editMode;
+  const overrideCount = _segmentOverrides().length;
   let html = '';
-  if (coverage.length) {
-    const stats = { completed: 0, pending: 0, failed: 0 };
-    for (const r of coverage) {
-      if (r.status === 'completed') stats.completed++;
-      else if (r.status === 'failed') stats.failed++;
-      else stats.pending++;
-    }
-    html += `<div class="ep-scene-toolbar">
-      <label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer">
-        <input type="checkbox" id="ep-cov-toggle" ${showCov ? 'checked' : ''} onchange="toggleCoverage(this.checked)">
-        Подсветить что уже сгенерено в Seedance
-      </label>
-      <span class="muted" style="font-size:0.78rem">
-        · ${stats.completed} ✓  · ${stats.pending} ⏳  · ${stats.failed} ✗
-      </span>
-    </div>`;
+  // Toolbar — always shown in scene view
+  const stats = { completed: 0, pending: 0, failed: 0 };
+  for (const r of coverage) {
+    if (r.status === 'completed') stats.completed++;
+    else if (r.status === 'failed') stats.failed++;
+    else stats.pending++;
   }
+  // Auto-mode state for the button label
+  const autoActive = (typeof AUTO !== 'undefined') && AUTO.active;
+  const autoErr    = (localStorage.getItem('auto_error_mode') || 'heal');  // 'heal' | 'stop'
+  html += `<div class="ep-scene-toolbar">
+    <button id="auto-mode-btn" class="${autoActive ? 'btn-danger' : 'btn-accent'}" onclick="_autoModeToggle()"
+      title="Запустить авто-генерацию всех сегментов через Seedance. Учитывает галочки lastframe / cut-frames в Seedance-панели.">
+      ${autoActive ? '⏸ Стоп Auto-mode' : '▶ Auto-mode'}
+    </button>
+    <span class="auto-err-mode" title="Что делать если Seedance вернёт moderation error">
+      <label><input type="radio" name="auto-err" id="auto-error-mode-heal" ${autoErr === 'heal' ? 'checked' : ''} onchange="_autoSaveErrMode('heal')"> 🩹 Авто-лечение</label>
+      <label><input type="radio" name="auto-err" id="auto-error-mode-stop" ${autoErr === 'stop' ? 'checked' : ''} onchange="_autoSaveErrMode('stop')"> ⏹ Стоп + сигнал</label>
+    </span>
+    <span id="auto-status" class="auto-status muted"></span>
+    <span class="ep-tb-separator"></span>
+    <label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer" title="Включает кнопки разделения/объединения сегментов. Выключи чтобы выделять текст не задевая UI.">
+      <input type="checkbox" id="ep-edit-toggle" ${editMode ? 'checked' : ''} onchange="toggleSegmentEditMode(this.checked)">
+      ✂ Ручная разбивка сегментов
+    </label>
+    ${overrideCount ? `<button class="btn-ghost btn-sm" onclick="clearSegmentOverrides()" title="Сбросить все ручные правки и пересчитать заново">Сбросить (×${overrideCount})</button>` : ''}
+    ${coverage.length ? `
+    <label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;margin-left:14px">
+      <input type="checkbox" id="ep-cov-toggle" ${showCov ? 'checked' : ''} onchange="toggleCoverage(this.checked)">
+      Подсветить что уже сгенерено в Seedance
+    </label>
+    <span class="muted" style="font-size:0.78rem">
+      · ${stats.completed} ✓  · ${stats.pending} ⏳  · ${stats.failed} ✗
+    </span>` : ''}
+  </div>`;
   scenes.forEach((sc, sIdx) => {
     const bg = SCENE_COLORS[sIdx % SCENE_COLORS.length];
     const bdr = SCENE_BORDERS[sIdx % SCENE_BORDERS.length];
@@ -3210,7 +3446,7 @@ function _renderScenesHTML(scenes, coverage = []) {
     const inferredBadge = sc.inferred
       ? `<span class="ep-scene-inferred" title="Заголовок определён автоматически — INT./EXT. в сценарии не указан">auto</span>`
       : '';
-    html += `<div class="ep-scene" style="background:${bg};border-left:4px solid ${bdr}">`;
+    html += `<div class="ep-scene${editMode ? ' edit-mode' : ''}" style="background:${bg};border-left:4px solid ${bdr}">`;
     html += `<div class="ep-scene-header">
         <span class="ep-scene-tag">Сцена ${sIdx + 1}</span>
         <span class="ep-scene-loc">${esc(heading.slice(0, 120))}</span>
@@ -3220,13 +3456,53 @@ function _renderScenesHTML(scenes, coverage = []) {
     let lastSeg = -1;
     let segAcc = 0;
     sc.lines.forEach((l, lIdx) => {
-      if (l.segIdx !== lastSeg) {
+      const startsNewSeg = (l.segIdx !== lastSeg);
+      // Edit mode: BETWEEN two lines INSIDE same segment, render thin "split here" handle
+      if (!startsNewSeg && editMode && lIdx > 0) {
+        const anchor = _lineAnchor(l.text);
+        const isOvr = l._override === 'break';
+        const safeAnchor = anchor.replace(/'/g, "\\'");
+        html += `<div class="ep-split-handle ${isOvr ? 'ovr' : ''}"
+          onclick="toggleSegmentBreak('${safeAnchor}')"
+          title="${isOvr ? 'Убрать ручной разрыв здесь' : 'Разделить сегмент перед этой строкой'}"
+        >${isOvr ? '✓ разрыв здесь — клик чтобы убрать' : '✂ разделить здесь'}</div>`;
+      }
+      if (startsNewSeg) {
         if (lastSeg !== -1) html += `</div></div>`; // close prev seg-body + ep-seg
         lastSeg = l.segIdx;
         segAcc = 0;
-        html += `<div class="ep-seg" data-seg="${l.segIdx + 1}">
+        // Compute this segment's total seconds for the toolbar summary
+        const segLines = sc.lines.filter(x => x.segIdx === l.segIdx);
+        const segTotal = segLines.reduce((s, x) => s + x.duration, 0);
+        const overflowWarn = segTotal > 14.5
+          ? `<span class="ep-seg-warn" title="Содержимое выходит за 15-сек лимит Seedance">${segTotal.toFixed(1)}с ⚠</span>`
+          : `<span class="ep-seg-dur" title="Расчётная длительность сегмента">${segTotal.toFixed(1)}с</span>`;
+        // First-line anchor of this segment = target for merge + auto-skip identity
+        const firstAnchor = _lineAnchor(l.text);
+        const safeFirstAnchor = firstAnchor.replace(/'/g, "\\'");
+        const isMergedHere = l._override === 'merge';
+        const isAutoSkipped = _isSegmentAutoSkipped(firstAnchor);
+        const editBtns = editMode && lIdx > 0
+          ? `<button class="ep-seg-mini" onclick="toggleSegmentMerge('${safeFirstAnchor}')"
+              title="${isMergedHere ? 'Восстановить разделение' : 'Объединить с предыдущим сегментом'}"
+            >${isMergedHere ? '↩ разъединить' : '🔗 ↑ объединить'}</button>`
+          : '';
+        const autoCb = `<label class="ep-seg-auto-cb" title="${isAutoSkipped ? 'Сегмент пропускается в Auto-mode — клик включит обратно' : 'Сегмент будет сгенерён при запуске Auto-mode — клик исключит его'}">
+            <input type="checkbox" ${isAutoSkipped ? '' : 'checked'} onchange="toggleSegmentAutoInclude('${safeFirstAnchor}')">
+            <span>auto</span>
+          </label>`;
+        html += `<div class="ep-seg${isAutoSkipped ? ' auto-skipped' : ''}" data-seg="${l.segIdx + 1}">
           <div class="ep-seg-bracket" title="Seedance-сегмент ${l.segIdx + 1}">${l.segIdx + 1}</div>
-          <div class="ep-seg-body">`;
+          <div class="ep-seg-body">
+            <div class="ep-seg-toolbar">
+              <button class="ep-seg-send" onclick="sendSceneSegmentToSeedance(${sIdx}, ${l.segIdx})"
+                title="Скопировать сегмент в Seedance compose и прокрутить вниз">
+                🎬 в Сиданс
+              </button>
+              ${autoCb}
+              ${overflowWarn}
+              ${editBtns}
+            </div>`;
       }
       segAcc += l.duration;
       let _cls = 'ep-line';
@@ -3239,7 +3515,20 @@ function _renderScenesHTML(scenes, coverage = []) {
           _tag = `<span class="ep-line-tag" title="Seedance #${cov.idx} · ${cov.status}">${ic} #${cov.idx}</span>`;
         }
       }
-      html += `<div class="${_cls}">${_tag}${esc(l.text || ' ')}</div>`;
+      if (l._override === 'break') _cls += ' ovr-break';
+      else if (l._override === 'merge') _cls += ' ovr-merge';
+      // Per-line close-up toggle for dialogue lines (always visible — small icon
+      // on the left, doesn't interfere with text selection unless clicked).
+      const isDialogue = _isDialogueLine(l.text);
+      const isCloseUp = isDialogue && _isLineCloseUp(l.text);
+      if (isCloseUp) _cls += ' line-close-up';
+      const closeUpBtn = isDialogue
+        ? `<button class="ep-line-cu-btn ${isCloseUp ? 'active' : ''}"
+            onclick="toggleLineCloseUp('${_lineAnchor(l.text).replace(/'/g, "\\'")}')"
+            title="${isCloseUp ? 'Убрать метку close-up' : 'Пометить эту реплику как close-up — спикер один в кадре крупным планом, фон размыт'}"
+          >${isCloseUp ? '🎯' : '○'}</button>`
+        : '';
+      html += `<div class="${_cls}">${closeUpBtn}${_tag}${esc(l.text || ' ')}</div>`;
     });
     if (lastSeg !== -1) html += `</div></div>`;
     html += `</div>`;
@@ -3271,14 +3560,122 @@ function toggleSceneView() {
   }
 }
 
-const SCENE_VIEW_STATE = { showCoverage: true };
+const SCENE_VIEW_STATE = { showCoverage: true, editMode: false };
+
+// Manual segment overrides per-episode. Loaded from S.episode.segment_overrides
+// at scene-view open time, mutated by user click, persisted via PUT.
+// Each override: {anchor: "first ~60 chars of trimmed line", action: "break"|"merge"}
+//   - "break"  → that line MUST start a new segment (split before it)
+//   - "merge"  → that line MUST stay with the previous segment (no break)
+function _segmentOverrides() {
+  return (S.episode && S.episode.segment_overrides) || [];
+}
+
+// ── Per-segment auto-mode skip flags ───────────────────────────────────────
+function _segmentAutoSkips() {
+  return (S.episode && S.episode.segment_auto_skips) || [];
+}
+function _isSegmentAutoSkipped(anchor) {
+  return _segmentAutoSkips().includes(anchor);
+}
+async function _persistAutoSkips(skips) {
+  if (!S.episode) return;
+  S.episode.segment_auto_skips = skips;
+  try {
+    await api.put(
+      `/api/series/${S.seriesId}/episodes/${S.episode.number}/segment-auto-skips`,
+      { skips }
+    );
+  } catch (e) {
+    console.warn('save segment auto-skips failed', e);
+    showToast('⚠ Не удалось сохранить флаг auto-mode', 4000);
+  }
+}
+async function toggleSegmentAutoInclude(anchor) {
+  if (!anchor) return;
+  const skips = _segmentAutoSkips().slice();
+  const idx = skips.indexOf(anchor);
+  if (idx >= 0) skips.splice(idx, 1);  // include — remove from skip list
+  else skips.push(anchor);              // skip — add to skip list
+  await _persistAutoSkips(skips);
+  _renderSceneViewBody();
+}
+
+// ── Per-line overrides (currently: close-up flag) ──────────────────────────
+function _lineOverrides() {
+  return (S.episode && S.episode.line_overrides) || [];
+}
+function _isLineCloseUp(text) {
+  const anchor = _lineAnchor(text);
+  if (!anchor) return false;
+  const found = _lineOverrides().find(o => o.anchor === anchor);
+  return !!(found && (found.flags || []).includes('close_up'));
+}
+function _isDialogueLine(text) {
+  if (!text) return false;
+  const t = text.trim();
+  // Same dialogue regex as _lineDuration — Title-case OR ALL-CAPS speaker name + colon
+  if (!/^[A-Za-zА-Яа-яЁё_][A-Za-zА-Яа-яЁё_0-9 ()\-']{0,40}\s*[:：]\s/.test(t)) return false;
+  return /^[A-ZА-ЯЁ]/.test(t);  // first letter must be uppercase
+}
+async function _persistLineOverrides(overrides) {
+  if (!S.episode) return;
+  S.episode.line_overrides = overrides;
+  try {
+    await api.put(
+      `/api/series/${S.seriesId}/episodes/${S.episode.number}/line-overrides`,
+      { overrides }
+    );
+  } catch (e) {
+    console.warn('save line overrides failed', e);
+    showToast('⚠ Не удалось сохранить close-up метку', 4000);
+  }
+}
+async function toggleLineCloseUp(anchor) {
+  if (!anchor) return;
+  const overrides = _lineOverrides().slice();
+  const idx = overrides.findIndex(o => o.anchor === anchor);
+  if (idx < 0) {
+    overrides.push({ anchor, flags: ['close_up'] });
+  } else {
+    const flags = overrides[idx].flags || [];
+    const cuPos = flags.indexOf('close_up');
+    if (cuPos >= 0) {
+      const newFlags = flags.filter(f => f !== 'close_up');
+      if (newFlags.length === 0) overrides.splice(idx, 1);
+      else overrides[idx] = { ...overrides[idx], flags: newFlags };
+    } else {
+      overrides[idx] = { ...overrides[idx], flags: [...flags, 'close_up'] };
+    }
+  }
+  await _persistLineOverrides(overrides);
+  _renderSceneViewBody();
+}
+async function _persistSegmentOverrides(overrides) {
+  if (!S.episode) return;
+  S.episode.segment_overrides = overrides;
+  try {
+    await api.put(
+      `/api/series/${S.seriesId}/episodes/${S.episode.number}/segment-overrides`,
+      { overrides }
+    );
+  } catch (e) {
+    console.warn('save segment overrides failed', e);
+    showToast('⚠ Не удалось сохранить ручную разбивку', 4000);
+  }
+}
+function _lineAnchor(text) {
+  // Stable enough anchor for a script line: first 60 chars of trimmed text.
+  // If user edits the line text, the override silently drops.
+  return (text || '').trim().slice(0, 60);
+}
 
 function _renderSceneViewBody() {
   const ta = document.getElementById('ep-script');
   const view = document.getElementById('ep-script-scenes');
   if (!ta || !view) return;
   const scriptText = ta.value || '';
-  const scenes = _parseScriptScenes(scriptText);
+  const scenes = _parseScriptScenes(scriptText, _segmentOverrides());
   const chunks = (S.episode && S.episode.seedance_chunks) || [];
   const coverage = _buildSeedanceCoverage(scriptText, chunks);
   view.innerHTML = _renderScenesHTML(scenes, coverage);
@@ -3288,6 +3685,810 @@ function toggleCoverage(on) {
   SCENE_VIEW_STATE.showCoverage = !!on;
   try { localStorage.setItem('sceneCov', SCENE_VIEW_STATE.showCoverage ? '1' : '0'); } catch {}
   _renderSceneViewBody();
+}
+
+function toggleSegmentEditMode(on) {
+  SCENE_VIEW_STATE.editMode = !!on;
+  _renderSceneViewBody();
+}
+
+// Compose segment text from auto-collected lines, then send to Seedance compose
+// textarea + scroll the compose panel into view + focus.
+function sendSegmentToSeedance(segText) {
+  const ta = document.getElementById('sd-chunk-text');
+  if (!ta) {
+    showToast('⚠ Seedance-панель не найдена на этом эпизоде', 4000);
+    return;
+  }
+  ta.value = segText;
+  // Trigger any onchange/oninput hooks listening on the textarea
+  ta.dispatchEvent(new Event('input', { bubbles: true }));
+  document.getElementById('seedance-panel')?.scrollIntoView({behavior:'smooth', block:'start'});
+  setTimeout(() => ta.focus(), 350);
+  showToast('✓ Сегмент отправлен в Сиданс — нажми "⚙ Скомпоновать (LLM)"', 4000);
+}
+
+// Internal: gather plain text for the Nth segment of the Mth scene.
+function _segmentText(sceneIdx, segIdx) {
+  const ta = document.getElementById('ep-script');
+  if (!ta) return '';
+  const scenes = _parseScriptScenes(ta.value || '', _segmentOverrides());
+  const sc = scenes[sceneIdx];
+  if (!sc) return '';
+  const lines = sc.lines.filter(l => l.segIdx === segIdx);
+  if (!lines.length) return '';
+  // Prepend scene heading so composer has context for INT/EXT
+  const head = sc.heading ? sc.heading + '\n\n' : '';
+  return head + lines.map(l => l.text).join('\n');
+}
+
+// User clicked "send segment N of scene M to Seedance"
+function sendSceneSegmentToSeedance(sceneIdx, segIdx) {
+  const txt = _segmentText(sceneIdx, segIdx);
+  if (!txt.trim()) {
+    showToast('⚠ Сегмент пустой', 3000);
+    return;
+  }
+  // If any line in this segment carries the close-up flag, auto-tick the
+  // global "🎯 close-up only" checkbox so the next compose enforces it.
+  const ta = document.getElementById('ep-script');
+  let segHasCloseUp = false;
+  if (ta) {
+    const scenes = _parseScriptScenes(ta.value || '', _segmentOverrides());
+    const sc = scenes[sceneIdx];
+    if (sc) {
+      segHasCloseUp = sc.lines.some(l => l.segIdx === segIdx && _isLineCloseUp(l.text));
+    }
+  }
+  const cuCb = document.getElementById('sd-close-up-only');
+  if (segHasCloseUp && cuCb && !cuCb.checked) {
+    cuCb.checked = true;
+    sdSavePrefs();
+    showToast('🎯 Сегмент содержит close-up метки — close-up only автоматически включён в Seedance-панели', 5500);
+  }
+  sendSegmentToSeedance(txt);
+}
+
+// Toggle "split" override on a specific line anchor within a scene.
+async function toggleSegmentBreak(anchor) {
+  if (!anchor) return;
+  const overrides = _segmentOverrides().slice();
+  const idx = overrides.findIndex(o => o.anchor === anchor);
+  if (idx < 0) {
+    overrides.push({ anchor, action: 'break' });
+  } else if (overrides[idx].action === 'break') {
+    overrides.splice(idx, 1);                      // toggle off
+  } else {
+    overrides[idx] = { anchor, action: 'break' };  // override merge → break
+  }
+  await _persistSegmentOverrides(overrides);
+  _renderSceneViewBody();
+}
+
+async function toggleSegmentMerge(anchor) {
+  if (!anchor) return;
+  const overrides = _segmentOverrides().slice();
+  const idx = overrides.findIndex(o => o.anchor === anchor);
+  if (idx < 0) {
+    overrides.push({ anchor, action: 'merge' });
+  } else if (overrides[idx].action === 'merge') {
+    overrides.splice(idx, 1);                      // toggle off
+  } else {
+    overrides[idx] = { anchor, action: 'merge' };  // override break → merge
+  }
+  await _persistSegmentOverrides(overrides);
+  _renderSceneViewBody();
+}
+
+async function openBatchJsonViewer() {
+  if (!S.episode) { showToast('⚠ Сначала открой эпизод', 3000); return; }
+  // Restore sounds-checkbox state from localStorage and wire persistence
+  const _bjSoundsCb = document.getElementById('batch-json-sounds');
+  if (_bjSoundsCb && !_bjSoundsCb.dataset.wired) {
+    const saved = localStorage.getItem('batch_json_sounds');
+    _bjSoundsCb.checked = saved === null ? true : saved === '1';
+    _bjSoundsCb.addEventListener('change', () => {
+      localStorage.setItem('batch_json_sounds', _bjSoundsCb.checked ? '1' : '0');
+    });
+    _bjSoundsCb.dataset.wired = '1';
+  }
+  // Re-fetch episode to get latest batch_prompts (may have been built in another session)
+  let ep;
+  try {
+    ep = await api.get(`/api/series/${S.seriesId}/episodes/${S.episodeNum}`);
+    S.episode = ep;
+  } catch (e) {
+    showToast('✗ ' + (e.message || e), 5000); return;
+  }
+
+  const promptsMap = ep.batch_prompts || {};
+  const anchors = Object.keys(promptsMap);
+  const meta = document.getElementById('batch-json-meta');
+  const ta   = document.getElementById('batch-json-text');
+
+  // Compute current script hash to compare
+  const currentScript = (ep.script || '');
+  const computeHash = async (text) => {
+    if (!window.crypto?.subtle) return null;
+    const buf = new TextEncoder().encode(text);
+    const hash = await crypto.subtle.digest('SHA-256', buf);
+    return Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, '0')).join('').slice(0, 16);
+  };
+  const curHash = await computeHash(currentScript);
+  const savedHash = ep.batch_script_hash || '';
+  const isStale = savedHash && curHash && savedHash !== curHash;
+
+  if (!anchors.length) {
+    meta.innerHTML = `<span style="color:var(--warning)">⚠ Batch-JSON ещё не построен.</span>
+      Запусти Auto-mode параллельно (lastframe / cut-frames OFF) — batch-compose построится автоматически.
+      Или нажми "🔄 Пересобрать" если хочешь сделать это вручную.`;
+    ta.value = '';
+    openModal('modal-batch-json');
+    return;
+  }
+
+  const builtAt = ep.batch_built_at ? new Date(ep.batch_built_at).toLocaleString('ru-RU') : '?';
+  const staleNote = isStale
+    ? `<span style="color:var(--warning)">⚠ STALE: сценарий менялся после батча (hash ${savedHash} → ${curHash}). Пересобери.</span>`
+    : `<span style="color:var(--success)">✓ Актуален (script_hash ${savedHash || '—'})</span>`;
+
+  // Compute current segments from frontend parser to compare with batch coverage
+  const currentSegs = (typeof _autoCollectSegments === 'function') ? _autoCollectSegments() : [];
+  const expectedCount = currentSegs.length;
+  const coverage = expectedCount > 0
+    ? `${anchors.length}/${expectedCount}`
+    : `${anchors.length}`;
+  const coverageWarn = expectedCount > 0 && anchors.length < expectedCount
+    ? `<span style="color:var(--warning)"> ⚠ ${expectedCount - anchors.length} сегмент(ов) не покрыто — Пересобери</span>`
+    : '';
+  // Check fallback markers
+  const viaFallback = Object.values(promptsMap).filter(p => p._via_fallback).length;
+  const fallbackNote = viaFallback > 0
+    ? `<br><span style="color:var(--muted)">📦 ${viaFallback} сегмент(ов) добраны через per-chunk fallback (Claude в batch'е их пропустил)</span>`
+    : '';
+  meta.innerHTML = `
+    <strong>Сегментов:</strong> ${coverage}${coverageWarn} ·
+    <strong>Built:</strong> ${builtAt} ·
+    ${staleNote}
+    ${ep.batch_episode_blocking ? `<br><strong>episodeBlocking words:</strong> ${ep.batch_episode_blocking.split(/\s+/).filter(Boolean).length}` : ''}
+    ${fallbackNote}
+  `;
+
+  // Construct readable JSON: sort segments by sceneIdx → segIdx
+  const segArr = anchors.map(a => ({ anchor: a, ...promptsMap[a] }));
+  segArr.sort((a, b) => (a.sceneIdx - b.sceneIdx) || (a.segIdx - b.segIdx));
+  const obj = {
+    episodeBlocking: ep.batch_episode_blocking || '',
+    script_hash: ep.batch_script_hash || '',
+    built_at: ep.batch_built_at || '',
+    segments: segArr,
+  };
+  ta.value = JSON.stringify(obj, null, 2);
+  openModal('modal-batch-json');
+}
+
+async function copyBatchJson() {
+  const ta = document.getElementById('batch-json-text');
+  const text = ta?.value || '';
+  if (!text) { showToast('⚠ JSON пустой', 2500); return; }
+  try {
+    await navigator.clipboard.writeText(text);
+    showToast('✓ Скопировано', 1800);
+  } catch {
+    ta.select(); document.execCommand('copy');
+    showToast('✓ Скопировано', 1800);
+  }
+}
+
+async function rebuildBatchPrompts() {
+  if (!S.episode) { showToast('⚠ Сначала открой эпизод', 3000); return; }
+  // Need segments from the parsed scene-view
+  const ta = document.getElementById('ep-script');
+  if (!ta) return;
+  const segs = (typeof _autoCollectSegments === 'function') ? _autoCollectSegments() : [];
+  if (!segs.length) {
+    showToast('⚠ Нет сегментов — открой "🎬 Сцены" чтобы сценарий разбился', 4000);
+    return;
+  }
+  const useStyle = !!document.getElementById('sd-use-style')?.checked;
+  const styleVal = (document.getElementById('sd-style')?.value || '').trim();
+  const baseOnly = !!document.getElementById('sd-base-only')?.checked;
+
+  // Locate UI elements for proper loading state
+  const meta = document.getElementById('batch-json-meta');
+  const jsonTa = document.getElementById('batch-json-text');
+  const rebuildBtn = Array.from(document.querySelectorAll('#modal-batch-json button'))
+    .find(b => /Пересобрать/.test(b.textContent));
+
+  // Visual loading state — all three areas (button, meta, textarea)
+  if (rebuildBtn) {
+    rebuildBtn.disabled = true;
+    rebuildBtn.dataset.origText = rebuildBtn.innerHTML;
+    rebuildBtn.innerHTML = '<span class="spinner"></span> Пересобираю...';
+  }
+  const startedAt = Date.now();
+  let elapsedTimer = null;
+  const updateMeta = () => {
+    if (!meta) return;
+    const elapsed = Math.round((Date.now() - startedAt) / 1000);
+    meta.innerHTML = `<span class="spinner"></span>
+      <strong>batch-compose работает...</strong>
+      &nbsp;<span style="color:var(--muted)">прошло ${elapsed}с</span>
+      &nbsp;<span style="color:var(--muted)">· сегментов в очереди: ${segs.length}</span>
+      &nbsp;<span style="color:var(--muted)">· один Claude call, обычно 15-30с</span>`;
+  };
+  updateMeta();
+  elapsedTimer = setInterval(updateMeta, 1000);
+  if (jsonTa) {
+    jsonTa.dataset.origValue = jsonTa.value;
+    jsonTa.style.opacity = '0.35';
+    jsonTa.style.filter = 'blur(0.5px)';
+    jsonTa.value = '⏳ Пересборка идёт... старый JSON будет заменён через ~15-30с.\n\nClaude получает: полный сценарий + roster персонажей + список ' + segs.length + ' сегментов\n + текущий scene_blocking из textarea выше.\n\nВ ответе: episodeBlocking + per-segment prompt+refs для всех сегментов разом.';
+  }
+  showToast('🧠 batch-compose: один Claude call, ~15-30с — жди завершения', 5000);
+
+  try {
+    await saveEpisodeSilent();
+    const res = await api.post(
+      `/api/series/${S.seriesId}/episodes/${S.episodeNum}/seedance/batch-compose`,
+      {
+        segments: segs.map(s => ({
+          anchor: s.anchor, sceneIdx: s.sceneIdx, segIdx: s.segIdx,
+          text: s.text, has_close_up: !!s.has_close_up, durationSec: s.durationSec,
+          establishing_shot: !!s.establishing_shot,
+        })),
+        base_outfits_only: baseOnly,
+        style: useStyle ? styleVal : '',
+      },
+      { timeoutMs: 900_000 }
+    );
+    const tookS = Math.round((Date.now() - startedAt) / 1000);
+    showToast(`✓ Batch пересобран за ${tookS}с · ${res.count} сегментов`, 4000);
+    if (document.getElementById('batch-json-sounds')?.checked) {
+      try { Sounds.playSuccess(); } catch (e) {}
+    }
+    if (jsonTa) {
+      jsonTa.style.opacity = '';
+      jsonTa.style.filter = '';
+    }
+    await openBatchJsonViewer();   // reload (this also resets meta to fresh state)
+  } catch (e) {
+    showToast('✗ ' + (e.message || e), 8000);
+    if (document.getElementById('batch-json-sounds')?.checked) {
+      try { Sounds.playError(); } catch (err) {}
+    }
+    if (meta) meta.innerHTML = `<span style="color:var(--danger)">✗ ${e.message || e}</span>`;
+    if (jsonTa) {
+      jsonTa.style.opacity = '';
+      jsonTa.style.filter = '';
+      if (jsonTa.dataset.origValue !== undefined) jsonTa.value = jsonTa.dataset.origValue;
+    }
+  } finally {
+    if (elapsedTimer) clearInterval(elapsedTimer);
+    if (rebuildBtn) {
+      rebuildBtn.disabled = false;
+      rebuildBtn.innerHTML = rebuildBtn.dataset.origText || '🔄 Пересобрать';
+    }
+  }
+}
+
+async function generateSceneBlocking() {
+  if (!S.episode) { showToast('⚠ Сначала открой эпизод', 3000); return; }
+  const script = (val('ep-script') || '').trim();
+  if (!script) { showToast('⚠ Сценарий пустой — заполни сначала', 3000); return; }
+  const btn = document.getElementById('ep-gen-blocking-btn');
+  const status = document.getElementById('ep-blocking-status');
+  const ta = document.getElementById('ep-scene-blocking');
+  if (!btn || !ta) return;
+  const orig = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>';
+  if (status) status.textContent = '⚙ Claude разбирает сцену...';
+  try {
+    // Save script first so server reads latest
+    await saveEpisodeSilent();
+    const res = await api.post(
+      `/api/series/${S.seriesId}/episodes/${S.episodeNum}/generate-scene-blocking`,
+      {}
+    );
+    ta.value = res.blocking || '';
+    if (S.episode) S.episode.scene_blocking = res.blocking || '';
+    if (status) status.textContent = `✓ Готово · ${(res.blocking || '').split(/\s+/).length} слов`;
+    showToast('✓ Blocking сгенерирован');
+  } catch (e) {
+    if (status) status.textContent = '✗ ' + (e.message || e);
+    showToast('✗ ' + (e.message || e), 6000);
+  } finally {
+    btn.disabled = false; btn.innerHTML = orig;
+  }
+}
+
+async function clearSegmentOverrides() {
+  if (!_segmentOverrides().length) {
+    showToast('Ручных правок и так нет', 2000);
+    return;
+  }
+  if (!confirm('Сбросить все ручные правки разбивки? Сегменты пересчитаются автоматически.')) return;
+  await _persistSegmentOverrides([]);
+  _renderSceneViewBody();
+  showToast('✓ Ручная разбивка сброшена', 2500);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// AUTO-MODE — sequentially (or parallel) run compose+start for every segment
+// in the episode, honoring use_prev_lastframe / use_prev_cutframes toggles.
+// On moderation failure: either auto-heal+retry or stop with error sound, per
+// user preference (radio in scene toolbar).
+// ════════════════════════════════════════════════════════════════════════════
+const AUTO = {
+  active: false,
+  cancelRequested: false,
+  segments: [],     // [{sceneIdx, segIdx, text}]
+  cursor: 0,
+  total: 0,
+  parallel: false,
+  errorMode: 'heal',
+  lastStatus: '',
+};
+
+function _autoSaveErrMode(mode) {
+  if (mode !== 'heal' && mode !== 'stop') return;
+  localStorage.setItem('auto_error_mode', mode);
+}
+
+function _autoCollectSegments() {
+  const ta = document.getElementById('ep-script');
+  if (!ta) return [];
+  const scenes = _parseScriptScenes(ta.value || '', _segmentOverrides());
+  const establishing = !!document.getElementById('sd-establishing-shot')?.checked;
+  const out = [];
+  scenes.forEach((sc, sIdx) => {
+    for (let g = 0; g < sc.segCount; g++) {
+      const lines = sc.lines.filter(l => l.segIdx === g);
+      if (!lines.length) continue;
+      const head = sc.heading ? sc.heading + '\n\n' : '';
+      const text = head + lines.map(l => l.text).join('\n');
+      const hasCloseUp = lines.some(l => _isLineCloseUp(l.text));
+      const anchor = _lineAnchor(lines[0].text);
+      // Establishing shot: first seg of each new scene gets a 2s wide-shot
+      // facade pre-roll merged into its action timeline. Toggle adds +2s to
+      // durationSec (clamped to 15) so the dialogue still fits.
+      const isFirstOfScene = (g === 0);
+      const wantsEstablishing = establishing && isFirstOfScene;
+      const contentSec = lines.reduce((s, l) => s + (l.duration || 0), 0);
+      const targetSec = Math.ceil(contentSec + 1.5) + (wantsEstablishing ? 2 : 0);
+      const durationSec = Math.max(5, Math.min(15, targetSec));
+      out.push({
+        sceneIdx: sIdx, segIdx: g, text, anchor,
+        has_close_up: hasCloseUp, durationSec,
+        establishing_shot: !!wantsEstablishing,
+      });
+    }
+  });
+  return out;
+}
+
+function _autoUpdateStatusUI() {
+  const el = document.getElementById('auto-status');
+  const btn = document.getElementById('auto-mode-btn');
+  if (btn) {
+    btn.innerHTML = AUTO.active ? '⏸ Стоп Auto-mode' : '▶ Auto-mode';
+    btn.className = AUTO.active ? 'btn-danger' : 'btn-accent';
+  }
+  if (!el) return;
+  if (!AUTO.active) {
+    el.textContent = (AUTO.completedCount || AUTO.cursor) > 0 && AUTO.total > 0
+      ? `Завершено: ${AUTO.completedCount || AUTO.cursor}/${AUTO.total}`
+      : '';
+    return;
+  }
+  const done = AUTO.completedCount || 0;
+  const status = AUTO.lastStatus || '...';
+  let mode;
+  if (AUTO.parallel) mode = 'паралл.';
+  else if ((AUTO.activeChains || 0) > 1) mode = `сцены × ${AUTO.activeChains}`;
+  else mode = 'последов.';
+  el.textContent = `Auto-mode (${mode}) · ${done}/${AUTO.total} · ${status}`;
+}
+
+function _autoModeToggle() {
+  if (AUTO.active) stopAutoMode();
+  else startAutoMode();
+}
+
+function stopAutoMode() {
+  if (!AUTO.active) return;
+  AUTO.cancelRequested = true;
+  showToast('⏸ Auto-mode остановится после текущего шага...', 3000);
+  _autoUpdateStatusUI();
+}
+
+async function startAutoMode() {
+  if (AUTO.active) {
+    showToast('Auto-mode уже активен');
+    return;
+  }
+  if (!S.episode) {
+    showToast('⚠ Сначала открой эпизод');
+    return;
+  }
+  // Auto-mode hard requirement: duration MUST be 15s. The whole segmentation
+  // logic (TARGET=12s, SOFT_MAX=13s, MIN=5s) is calibrated assuming 15s
+  // Seedance chunks. If user picked 5/10s clips, segments won't fit and the
+  // whole batch will be off-rhythm. Offer to auto-fix or cancel.
+  const durEl = document.getElementById('sd-duration');
+  const curDur = parseInt(durEl?.value, 10);
+  if (curDur !== 15) {
+    const confirmFix = confirm(
+      `⚠ Длительность Seedance стоит ${curDur || '?'}с, но Auto-mode калиброван под 15-секундные чанки.\n\n` +
+      `Сегментация рассчитывала контент ≤13с с 2с буфером — короткие чанки порежут реплики, ` +
+      `длинные дадут пустоту в конце.\n\n` +
+      `Поставить 15с автоматически и продолжить?\n` +
+      `OK — да, ставлю 15с и запускаю.\n` +
+      `Cancel — отменить, поставлю сам.`
+    );
+    if (!confirmFix) return;
+    if (durEl) {
+      durEl.value = '15';
+      durEl.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+  }
+
+  // Read current Seedance toggles — these define behaviour for the whole batch
+  const useLastframe = !!document.getElementById('sd-use-lastframe')?.checked;
+  const useCutframes = !!document.getElementById('sd-use-cutframes')?.checked;
+  const useStyle     = !!document.getElementById('sd-use-style')?.checked;
+  const styleVal     = (document.getElementById('sd-style')?.value || '').trim();
+  const baseOnly     = !!document.getElementById('sd-base-only')?.checked;
+  const closeUpOnly  = !!document.getElementById('sd-close-up-only')?.checked;
+  AUTO.parallel  = !useLastframe && !useCutframes;
+  AUTO.errorMode = (localStorage.getItem('auto_error_mode') || 'heal');
+  const allSegs  = _autoCollectSegments();
+  // Per-segment auto-mode skip filter
+  const skippedCount = allSegs.filter(s => _isSegmentAutoSkipped(s.anchor)).length;
+  AUTO.segments = allSegs.filter(s => !_isSegmentAutoSkipped(s.anchor));
+  // Annotate each segment with its script-order index so /seedance/start can
+  // record the canonical position regardless of network arrival order.
+  AUTO.segments.forEach((s, i) => { s.scriptOrder = i; });
+  AUTO.total    = AUTO.segments.length;
+  AUTO.cursor   = 0;             // back-compat with status UI
+  AUTO.completedCount = 0;       // atomic counter across chains
+  AUTO.activeChains = 0;
+  AUTO.cancelRequested = false;
+  AUTO.lastStatus = '';
+
+  if (!AUTO.total) {
+    showToast(`⚠ Нет сегментов для генерации${skippedCount ? ` (${skippedCount} помечены как skip)` : ''}`);
+    return;
+  }
+  // Group by scene → tells us scene-parallel layout
+  const sceneGroups = (() => {
+    const m = new Map();
+    for (const s of AUTO.segments) {
+      if (!m.has(s.sceneIdx)) m.set(s.sceneIdx, []);
+      m.get(s.sceneIdx).push(s);
+    }
+    return [...m.values()];
+  })();
+  // Confirm before kicking off
+  const modeWord = AUTO.parallel
+    ? 'все параллельно'
+    : (sceneGroups.length > 1
+        ? `${sceneGroups.length} сцен параллельно × последовательно внутри сцены`
+        : 'последовательно (1 сцена)');
+  const errWord  = AUTO.errorMode === 'heal' ? 'авто-лечение' : 'останов + сигнал';
+  const skipNote = skippedCount ? `\nПропущено по чекбоксу: ${skippedCount}` : '';
+  if (!confirm(
+    `Запустить Auto-mode?\n\n` +
+    `Сегментов: ${AUTO.total}${skipNote}\n` +
+    `Режим: ${modeWord}\n` +
+    `На ошибке модерации: ${errWord}\n\n` +
+    `${AUTO.parallel
+      ? 'Параллельный режим: все сегменты отправляются в очередь Seedance подряд (~2с между запусками). Текстовый контекст между чанками сохраняется.'
+      : sceneGroups.length > 1
+        ? 'Внутри каждой сцены чанки идут последовательно (нужно для last-frame / cut-frames continuity). Сцены друг от друга не зависят и идут параллельно (cap = 3 одновременно).'
+        : 'Последовательный режим: каждый чанк ждёт предыдущего.'}`
+  )) return;
+
+  AUTO.active = true;
+  _autoUpdateStatusUI();
+  showToast(`▶ Auto-mode запущен · ${AUTO.total} сегмент${AUTO.total > 1 ? 'ов' : ''} (${modeWord})`, 4000);
+
+  // CRITICAL: capture episode identity ONCE — every in-flight request must target
+  // the episode the user pressed "auto-mode" on. If user navigates to another
+  // episode mid-run, S.episode.number changes and pending writes leak into the
+  // wrong episode (chunks ended up in the wrong file, episode 2's batch wrote
+  // into episode 3 — May 2026 incident).
+  const epSid    = S.seriesId;
+  const epNumber = S.episode.number;
+
+  // Read params from sd panel (used for /seedance/start)
+  const duration = parseInt(document.getElementById('sd-duration').value) || 15;
+  const resolution = document.getElementById('sd-resolution').value;
+  const moderation_bypass = document.getElementById('sd-mod-bypass').value;
+  const POLL_INTERVAL_MS = 8000;
+  const PARALLEL_DELAY_MS = 2000;
+  const MAX_HEAL_RETRIES = 1;
+  const MAX_PARALLEL_SCENES = 3;
+  const sharedOpts = { useLastframe, useCutframes, useStyle, styleVal, baseOnly, closeUpOnly,
+                       duration, resolution, moderation_bypass, POLL_INTERVAL_MS, MAX_HEAL_RETRIES };
+
+  // Compose + start one segment, returns startRes or throws.
+  async function _autoComposeStart(seg, scriptOrder) {
+    const segCloseUp = sharedOpts.closeUpOnly || !!seg.has_close_up;
+    AUTO.lastStatus = segCloseUp ? '⚙ компоную (🎯 close-up)...' : '⚙ компоную...';
+    _autoUpdateStatusUI();
+    const composeRes = await api.post(
+      `/api/series/${epSid}/episodes/${epNumber}/seedance/compose`,
+      {
+        chunk_text: seg.text,
+        use_prev_lastframe: sharedOpts.useLastframe,
+        use_prev_cutframes: sharedOpts.useCutframes,
+        style: sharedOpts.useStyle ? sharedOpts.styleVal : '',
+        base_outfits_only: sharedOpts.baseOnly,
+        close_up_only: segCloseUp,
+      }
+    );
+    AUTO.lastStatus = '▶ запускаю генерацию...';
+    _autoUpdateStatusUI();
+    const startRes = await api.post(
+      `/api/series/${epSid}/episodes/${epNumber}/seedance/start`,
+      {
+        prompt: composeRes.prompt,
+        chunk_text: seg.text,
+        duration: seg.durationSec || sharedOpts.duration, resolution: sharedOpts.resolution,
+        moderation_bypass: sharedOpts.moderation_bypass,
+        script_order: (scriptOrder != null ? scriptOrder : (typeof seg.scriptOrder === 'number' ? seg.scriptOrder : null)),
+        refs: (composeRes.refs || []).map(r => ({
+          kind: r.kind, id: r.id, outfit: r.outfit || null, url: r.url || null,
+          source: r.source, prev_idx: r.prev_idx, name: r.name,
+          cut_index: r.cut_index, cut_time: r.cut_time,
+        })),
+      }
+    );
+    return { composeRes, startRes };
+  }
+
+  // Poll one chunk until completed/failed, with optional heal+retry.
+  // Returns { ok: bool, chunk?, error? }
+  async function _autoPollUntilDone(chunkIdx, composeRes, segText, segDuration) {
+    let healAttempts = 0;
+    let curIdx = chunkIdx;
+    while (true) {
+      if (AUTO.cancelRequested) return { ok: false, error: 'cancelled' };
+      await new Promise(r => setTimeout(r, sharedOpts.POLL_INTERVAL_MS));
+      const polled = await sdPollOnce();
+      const chunk = (polled || []).find(c => c.idx === curIdx);
+      if (!chunk) {
+        AUTO.lastStatus = `… не вижу чанка #${curIdx}`;
+        _autoUpdateStatusUI();
+        continue;
+      }
+      AUTO.lastStatus = chunk.status === 'processing' && chunk.progress != null
+        ? `⏳ #${curIdx} ${chunk.progress}%`
+        : `⏳ #${curIdx} ${chunk.status}`;
+      _autoUpdateStatusUI();
+      if (chunk.status === 'completed') return { ok: true, chunk };
+      if (chunk.status === 'failed') {
+        if (AUTO.errorMode === 'heal' && healAttempts < sharedOpts.MAX_HEAL_RETRIES) {
+          healAttempts++;
+          AUTO.lastStatus = `🩹 лечу промпт #${curIdx}...`;
+          _autoUpdateStatusUI();
+          const healRes = await api.post(
+            `/api/series/${epSid}/episodes/${epNumber}/seedance/${curIdx}/heal-prompt`,
+            {}
+          );
+          const restart = await api.post(
+            `/api/series/${epSid}/episodes/${epNumber}/seedance/start`,
+            {
+              prompt: healRes.prompt || composeRes.prompt,
+              chunk_text: healRes.chunk_text || segText,
+              duration: segDuration || sharedOpts.duration, resolution: sharedOpts.resolution,
+              moderation_bypass: sharedOpts.moderation_bypass,
+              refs: (composeRes.refs || []).map(r => ({
+                kind: r.kind, id: r.id, outfit: r.outfit || null, url: r.url || null,
+                source: r.source, prev_idx: r.prev_idx, name: r.name,
+                cut_index: r.cut_index, cut_time: r.cut_time,
+              })),
+            }
+          );
+          if (restart?.chunk?.idx != null) curIdx = restart.chunk.idx;
+          await sdRefreshList();
+          continue;
+        }
+        return { ok: false, chunk, error: chunk.error || 'failed' };
+      }
+      // processing / submitting / pending → keep polling
+    }
+  }
+
+  // Run one scene's segments sequentially: each waits for the previous video.
+  // Increments AUTO.completedCount as it goes. Returns 'completed' | 'failed' | 'cancelled'.
+  async function _autoRunSceneChain(sceneSegs) {
+    AUTO.activeChains++;
+    _autoUpdateStatusUI();
+    try {
+      for (const seg of sceneSegs) {
+        if (AUTO.cancelRequested) return 'cancelled';
+        let cs;
+        try {
+          cs = await _autoComposeStart(seg);
+        } catch (e) {
+          Sounds.playError();
+          showToast(`✗ Compose/start упал на сегменте сц.${seg.sceneIdx + 1}.${seg.segIdx + 1}: ${e.message || e}`, 8000);
+          return 'failed';
+        }
+        await sdRefreshList();
+        const chunkIdx = cs.startRes?.chunk?.idx;
+        if (chunkIdx == null) {
+          showToast(`✗ Не получил chunk_idx от /start`, 6000);
+          return 'failed';
+        }
+        const poll = await _autoPollUntilDone(chunkIdx, cs.composeRes, seg.text, seg.durationSec);
+        if (poll.error === 'cancelled') return 'cancelled';
+        if (!poll.ok) {
+          Sounds.playError();
+          const errBit = poll.error ? ` (${(poll.error || '').slice(0, 80)})` : '';
+          showToast(`✗ Auto-mode остановлен на сегменте сц.${seg.sceneIdx + 1}.${seg.segIdx + 1}${errBit}`, 10000);
+          return 'failed';
+        }
+        AUTO.completedCount++;
+        AUTO.cursor = AUTO.completedCount;   // back-compat for status UI
+        _autoUpdateStatusUI();
+      }
+      return 'completed';
+    } finally {
+      AUTO.activeChains--;
+      _autoUpdateStatusUI();
+    }
+  }
+
+  // Concurrency-capped runner — caps at MAX_PARALLEL_SCENES workers
+  async function _runWithCap(items, cap, asyncFn) {
+    const queue = items.slice();
+    const results = [];
+    async function worker() {
+      while (queue.length) {
+        if (AUTO.cancelRequested) return;
+        const item = queue.shift();
+        try { results.push(await asyncFn(item)); }
+        catch (e) { results.push({ error: e }); }
+      }
+    }
+    const workers = [];
+    for (let i = 0; i < Math.min(cap, items.length); i++) workers.push(worker());
+    await Promise.all(workers);
+    return results;
+  }
+
+  try {
+    if (AUTO.parallel) {
+      // Linear-parallel — first try BATCH-COMPOSE (single Claude call for all
+      // segments with shared episodeBlocking → guarantees consistent character
+      // positioning across all chunks). Then fire /start for each pre-built
+      // prompt. Falls back to per-chunk compose if batch-compose fails.
+      let batchPrompts = null;
+      AUTO.lastStatus = '🧠 batch-compose (один Claude call на всю серию)...';
+      _autoUpdateStatusUI();
+      try {
+        const batchRes = await api.post(
+          `/api/series/${epSid}/episodes/${epNumber}/seedance/batch-compose`,
+          {
+            segments: AUTO.segments.map(s => ({
+              anchor: s.anchor, sceneIdx: s.sceneIdx, segIdx: s.segIdx,
+              text: s.text, has_close_up: !!s.has_close_up, durationSec: s.durationSec,
+              establishing_shot: !!s.establishing_shot,
+            })),
+            base_outfits_only: baseOnly,
+            style: useStyle ? styleVal : '',
+          },
+          { timeoutMs: 900_000 }
+        );
+        // Pull batch_prompts from server response (count check only — full data on episode)
+        const epRes = await api.get(`/api/series/${epSid}/episodes/${epNumber}`);
+        batchPrompts = epRes.batch_prompts || {};
+        if (batchRes.unresolved_anchors?.length) {
+          showToast(`⚠ batch: не все сегменты в ответе (${batchRes.unresolved_anchors.length}). Откатимся на per-chunk compose для них.`, 6000);
+        }
+        showToast(`🧠 batch готов · ${Object.keys(batchPrompts).length}/${AUTO.segments.length} сегментов`, 4000);
+      } catch (e) {
+        showToast(`⚠ batch-compose упал — использую per-chunk: ${e.message || e}`, 6000);
+        batchPrompts = null;
+      }
+
+      // Now fire /start for ALL segments SIMULTANEOUSLY (per the reference
+      // pipeline: batch-compose pre-built prompts → all chunks queue at once).
+      // No 2s delay, no per-chunk Claude call. Just N concurrent Seedance API
+      // submissions. Concurrency capped at 5 to play nicely with provider
+      // rate-limits (Seedance and AvAIGen tolerate small bursts well).
+      const FIRE_CONCURRENCY = 5;
+      AUTO.lastStatus = `▶ запускаю ${AUTO.segments.length} чанк(ов) одновременно...`;
+      _autoUpdateStatusUI();
+
+      const fireOne = async (seg, i) => {
+        if (AUTO.cancelRequested) return;
+        const prebuilt = batchPrompts && batchPrompts[seg.anchor];
+        try {
+          let startRes;
+          if (prebuilt && prebuilt.prompt && (prebuilt.refs || []).length) {
+            // Per-segment duration: seg.durationSec is the source of truth (computed
+            // from line durations). prebuilt.plan.durationSec is just Claude echoing
+            // input — and stale batches built before durationSec was passed all say 15.
+            const segDur = seg.durationSec || (prebuilt.plan && prebuilt.plan.durationSec) || duration;
+            startRes = await api.post(
+              `/api/series/${epSid}/episodes/${epNumber}/seedance/start`,
+              {
+                prompt: prebuilt.prompt,
+                chunk_text: seg.text,
+                duration: segDur, resolution, moderation_bypass,
+                script_order: i,
+                refs: (prebuilt.refs || []).map(r => ({
+                  kind: r.kind, id: r.id, outfit: r.outfit || null, url: r.url || null,
+                  source: r.source, prev_idx: r.prev_idx, name: r.name,
+                })),
+              }
+            );
+          } else {
+            // Fallback per-chunk compose if batch missed this anchor
+            const cs = await _autoComposeStart(seg, i);
+            startRes = cs.startRes;
+          }
+          AUTO.completedCount++;
+          AUTO.cursor = AUTO.completedCount;
+          AUTO.lastStatus = `▶ ${AUTO.completedCount}/${AUTO.total} в очереди (#${startRes?.chunk?.idx ?? '?'})`;
+          _autoUpdateStatusUI();
+        } catch (e) {
+          console.warn(`[auto-mode] start failed for seg ${i}:`, e);
+          throw e;
+        }
+      };
+
+      // Run with concurrency cap so we don't fire 50 at once on huge episodes
+      const failures = [];
+      await _runWithCap(
+        AUTO.segments.map((seg, i) => ({ seg, i })),
+        FIRE_CONCURRENCY,
+        async ({ seg, i }) => {
+          try { await fireOne(seg, i); }
+          catch (e) { failures.push({ i, error: e.message || String(e) }); }
+        }
+      );
+      await sdRefreshList();
+      sdEnsurePoll();
+      if (failures.length) {
+        Sounds.playError();
+        showToast(`⚠ Auto-mode: ${failures.length} из ${AUTO.segments.length} сегментов не запустились — смотри карточки`, 8000);
+      }
+    } else {
+      // Scene-parallel: each scene's chain is sequential, scenes run in parallel
+      // with a concurrency cap. Each scene's first chunk doesn't depend on
+      // previous scene's lastframe (different setting), so they're independent.
+      await _runWithCap(sceneGroups, MAX_PARALLEL_SCENES, _autoRunSceneChain);
+    }
+
+    // All done
+    AUTO.active = false;
+    AUTO.lastStatus = '';
+    if (!AUTO.cancelRequested) {
+      // Voice-only announcement on whole-episode completion. Fanfare was
+      // removed by request — too startling. The TTS phrase already tells the
+      // user it's the BIG finish, not just a single segment.
+      const epNum = S.episode?.number;
+      Sounds.speak(`Episode ${epNum != null ? epNum + ' ' : ''}generation finished.`);
+      const tail = AUTO.parallel
+        ? ' (отправлены в очередь — следи за карточками)'
+        : '';
+      showToast(`✓ Auto-mode завершён · ${AUTO.completedCount}/${AUTO.total} сегмент${AUTO.completedCount === 1 ? '' : AUTO.completedCount < 5 ? 'а' : 'ов'}${tail}`, 6000);
+    } else {
+      showToast(`⏸ Auto-mode остановлен · обработано ${AUTO.completedCount}/${AUTO.total}`, 5000);
+    }
+    _autoUpdateStatusUI();
+  } catch (e) {
+    AUTO.active = false;
+    _autoUpdateStatusUI();
+    Sounds.playError();
+    showToast(`✗ Auto-mode упал: ${e.message || e}`, 8000);
+  }
 }
 
 async function doctorScript() {
@@ -3516,23 +4717,70 @@ async function generateEpisodeScript() {
     renderEpLocations();
     updateScriptCounter();
     updateGenScriptBtn();
-    status.textContent = '✓ Сценарий готов — проверяем логику...';
+    status.textContent = '✓ Сценарий готов. Жми «🤖 Извлечь персонажей и локации» когда будешь готов.';
     status.style.color = 'var(--success)';
-    // Kick off polling so user sees autogen progress for any new chars/outfits introduced
-    setTimeout(() => {
-      fetch(`/api/series/${S.seriesId}/auto-generate/status`)
-        .then(r => r.json())
-        .then(st => { if (st.running || st.queue > 0) pollAutogenStatus(); })
-        .catch(() => {});
-    }, 800);
-    // GATE: run logic check (with previous-episode context) BEFORE reteller prompt.
-    // If clean → auto-continue to reteller. If issues → show inline panel and wait.
-    runLogicCheckThenContinue();
+    // Sound notification — gated by per-episode toggle (default ON, persisted)
+    if (_scriptSoundsEnabled()) {
+      try { Sounds.playSuccess(); } catch (e) {}
+    }
+    // NOTE: auto-extraction of chars/locations is INTENTIONALLY skipped here.
+    // User wants explicit control — they'll click "🤖 Извлечь персонажей и локации"
+    // when ready. Backend also no longer auto-syncs cast block on script-save.
   } catch(e) {
     status.textContent = 'Ошибка: ' + e.message;
     status.style.color = 'var(--danger)';
+    if (_scriptSoundsEnabled()) {
+      try { Sounds.playError(); } catch (err) {}
+    }
     btn.disabled = false;
     updateGenScriptBtn();
+  }
+}
+
+// Persisted toggle: controls success/error sound at end of script generation.
+// Wired once when episode loads; user can toggle without affecting other sounds.
+function _scriptSoundsEnabled() {
+  const cb = document.getElementById('ep-script-sounds');
+  if (!cb) return false;
+  if (!cb.dataset.wired) {
+    const saved = localStorage.getItem('script_gen_sounds');
+    cb.checked = saved === null ? true : saved === '1';
+    cb.addEventListener('change', () => {
+      localStorage.setItem('script_gen_sounds', cb.checked ? '1' : '0');
+    });
+    cb.dataset.wired = '1';
+  }
+  return !!cb.checked;
+}
+
+// Apply manual edits to the script textarea — saves what's currently typed
+// to the episode on disk, surfaces the result in the gen-status line.
+async function applyScriptChanges() {
+  if (!S.episode) return;
+  const btn = document.getElementById('ep-script-apply-btn');
+  const status = document.getElementById('ep-script-gen-status');
+  const newScript = val('ep-script');
+  if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Сохраняю...'; }
+  if (status) { status.textContent = ''; }
+  try {
+    const updated = await api.put(
+      `/api/series/${S.seriesId}/episodes/${S.episodeNum}`,
+      { script: newScript }
+    );
+    S.episode = updated;
+    if (status) {
+      status.textContent = '✓ Изменения сохранены';
+      status.style.color = 'var(--success)';
+      setTimeout(() => { if (status.textContent === '✓ Изменения сохранены') status.textContent = ''; }, 4000);
+    }
+    if (btn) {
+      btn.style.display = 'none';
+      btn.dataset.dirty = '';
+    }
+  } catch (e) {
+    if (status) { status.textContent = '✗ ' + (e.message || e); status.style.color = 'var(--danger)'; }
+  } finally {
+    if (btn) { btn.disabled = false; btn.innerHTML = '💾 Применить изменения'; }
   }
 }
 
@@ -4444,6 +5692,13 @@ async function pollEpReteller(projectId) {
 function updateScriptCounter() {
   const len = (val('ep-script') || '').length;
   document.getElementById('script-char-count').textContent = len.toLocaleString('ru');
+  // Show "Apply changes" button when textarea diverges from saved episode script
+  const applyBtn = document.getElementById('ep-script-apply-btn');
+  if (applyBtn && S.episode) {
+    const dirty = val('ep-script') !== (S.episode.script || '');
+    applyBtn.style.display = dirty ? '' : 'none';
+    applyBtn.dataset.dirty = dirty ? '1' : '';
+  }
 }
 document.addEventListener('DOMContentLoaded', () => {
   const ta = document.getElementById('ep-script');
@@ -4455,8 +5710,8 @@ function collectEpisodeForm() {
     title: val('ep-title-input'),
     synopsis: val('ep-synopsis'),
     script: val('ep-script'),
-    notes: val('ep-notes'),
     reteller_prompt: val('ep-reteller-prompt'),
+    scene_blocking: val('ep-scene-blocking'),
     ready: !!document.getElementById('ep-ready-toggle')?.checked,
     characters_used: S.episode.characters_used || [],
     character_outfits: S.episode.character_outfits || {},
@@ -4979,10 +6234,24 @@ function copyPrompt() {
 }
 
 // ── Settings ──────────────────────────────────────────────────────────────────
+// Instant-apply for the sounds toggle so user can test it from modal-settings
+// without having to hit "Save" (uncovered API keys still need Save).
+function onSoundsToggleChanged(on) {
+  Sounds.setEnabled(!!on);
+  // Tiny audible confirmation that toggle works (only when turning ON)
+  if (on) {
+    try { Sounds.playSuccess(); } catch (e) {}
+  }
+}
+
 async function openSettings() {
   const cfg = await api.get('/api/config');
   setVal('settings-rtl-key', cfg.reteller_key || '');
   setVal('settings-anthropic-key', cfg.anthropic_key || '');
+  const soundsCb = document.getElementById('settings-sounds-enabled');
+  if (soundsCb) soundsCb.checked = Sounds.isEnabled();
+  const voiceCb = document.getElementById('settings-voice-enabled');
+  if (voiceCb) voiceCb.checked = Sounds.isVoiceEnabled();
   openModal('modal-settings');
 }
 
@@ -4991,6 +6260,11 @@ async function saveSettings() {
     reteller_key: val('settings-rtl-key'),
     anthropic_key: val('settings-anthropic-key'),
   });
+  // Local-only settings (no server roundtrip needed)
+  const soundsCb = document.getElementById('settings-sounds-enabled');
+  if (soundsCb) Sounds.setEnabled(!!soundsCb.checked);
+  const voiceCb = document.getElementById('settings-voice-enabled');
+  if (voiceCb) Sounds.setVoiceEnabled(!!voiceCb.checked);
   closeModal('modal-settings');
   loadBalance();
 }
@@ -5031,10 +6305,140 @@ function showToast(msg) {
   setTimeout(() => t.remove(), 2000);
 }
 
+// ── Sound effects ───────────────────────────────────────────────────────────
+// Synthesized via Web Audio API — no external assets to bundle/serve.
+// User toggle stored in localStorage as 'sounds_enabled' (default ON).
+const Sounds = (() => {
+  let ctx = null;
+  function _ensureCtx() {
+    if (ctx) return ctx;
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return null;
+    ctx = new Ctx();
+    return ctx;
+  }
+  function isEnabled() {
+    // Default ON: only OFF when user explicitly stored 'false'
+    return localStorage.getItem('sounds_enabled') !== 'false';
+  }
+  function setEnabled(on) {
+    localStorage.setItem('sounds_enabled', on ? 'true' : 'false');
+  }
+  // Schedule a tone at offset `t0`, freq, duration (sec), gain.
+  // Sine + small attack/release envelope so it doesn't click.
+  function _tone(t0, freq, dur, gain = 0.18) {
+    const c = _ensureCtx();
+    if (!c) return;
+    const osc = c.createOscillator();
+    const g = c.createGain();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(freq, t0);
+    g.gain.setValueAtTime(0, t0);
+    g.gain.linearRampToValueAtTime(gain, t0 + 0.015);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    osc.connect(g).connect(c.destination);
+    osc.start(t0);
+    osc.stop(t0 + dur + 0.05);
+  }
+  // Pleasant ascending major-third — used on completion of a generation
+  function playSuccess() {
+    if (!isEnabled()) return;
+    const c = _ensureCtx();
+    if (!c) return;
+    if (c.state === 'suspended') c.resume().catch(() => {});
+    const t = c.currentTime;
+    _tone(t,        523.25, 0.18, 0.20); // C5
+    _tone(t + 0.10, 659.25, 0.18, 0.20); // E5
+    _tone(t + 0.20, 783.99, 0.32, 0.22); // G5
+  }
+  // Lower descending dissonant pair — used on generation failure
+  function playError() {
+    if (!isEnabled()) return;
+    const c = _ensureCtx();
+    if (!c) return;
+    if (c.state === 'suspended') c.resume().catch(() => {});
+    const t = c.currentTime;
+    _tone(t,        311.13, 0.22, 0.22); // Eb4
+    _tone(t + 0.14, 233.08, 0.40, 0.22); // Bb3
+  }
+  // Distinct 6-note fanfare for whole-episode completion (auto-mode all-done).
+  // Differentiates from per-chunk playSuccess so user knows the BIG finish vs
+  // a single segment finishing.
+  function playFanfare() {
+    if (!isEnabled()) return;
+    const c = _ensureCtx();
+    if (!c) return;
+    if (c.state === 'suspended') c.resume().catch(() => {});
+    const t = c.currentTime;
+    _tone(t,        523.25, 0.14, 0.20); // C5
+    _tone(t + 0.08, 659.25, 0.14, 0.20); // E5
+    _tone(t + 0.16, 783.99, 0.14, 0.20); // G5
+    _tone(t + 0.24, 1046.5, 0.14, 0.22); // C6
+    _tone(t + 0.40, 783.99, 0.14, 0.20); // G5
+    _tone(t + 0.48, 1046.5, 0.55, 0.26); // C6 — long
+  }
+  // Speak a phrase via the browser's SpeechSynthesis API (free, offline,
+  // works in Chrome/Safari/Firefox). Voice is picked by language; falls
+  // back to default if no English voice available. Independent of the
+  // chime-sounds toggle — has its own setting.
+  function isVoiceEnabled() {
+    return localStorage.getItem('voice_announce_enabled') !== 'false';
+  }
+  function setVoiceEnabled(on) {
+    localStorage.setItem('voice_announce_enabled', on ? 'true' : 'false');
+  }
+  function speak(text, opts = {}) {
+    if (!isVoiceEnabled()) return;
+    if (!('speechSynthesis' in window)) return;
+    try {
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = opts.lang || 'en-US';
+      u.rate = opts.rate || 1.0;
+      u.pitch = opts.pitch || 1.0;
+      u.volume = opts.volume != null ? opts.volume : 0.9;
+      // Pick an English voice when available
+      const voices = window.speechSynthesis.getVoices();
+      const en = voices.find(v => /^en[-_]/i.test(v.lang)) || voices[0];
+      if (en) u.voice = en;
+      window.speechSynthesis.speak(u);
+    } catch (e) { /* ignore */ }
+  }
+  return { playSuccess, playError, playFanfare, speak,
+           isEnabled, setEnabled, isVoiceEnabled, setVoiceEnabled };
+})();
+
 // ════════════════════════════════════════════════════════════════════════════
 // SEEDANCE — video generation panel
 // ════════════════════════════════════════════════════════════════════════════
-const SD = { refs: [], pollTimer: null };
+const SD = { refs: [], pollTimer: null, lastStatuses: {} /* idx → status, used to detect transitions */, selected: new Set() };
+
+// Detect status transitions (anything → completed/failed) and play sound + toast.
+// Called from sdRenderList AND from poll tick.
+function _sdNotifyTransitions(chunks) {
+  if (!Array.isArray(chunks)) return;
+  const fresh = {};
+  let newCompleted = 0;
+  let newFailed = 0;
+  for (const c of chunks) {
+    const idx = c.idx;
+    if (idx == null) continue;
+    fresh[idx] = c.status;
+    const was = SD.lastStatuses[idx];
+    if (was != null && was !== c.status) {
+      if (c.status === 'completed') newCompleted++;
+      else if (c.status === 'failed') newFailed++;
+    }
+  }
+  SD.lastStatuses = fresh;
+  if (newCompleted > 0) {
+    Sounds.playSuccess();
+    showToast(`✓ Готово видео: ${newCompleted} чанк${newCompleted > 1 ? 'а' : ''}`);
+  }
+  if (newFailed > 0) {
+    Sounds.playError();
+    showToast(`✗ Ошибка генерации: ${newFailed} чанк${newFailed > 1 ? 'а' : ''}`);
+  }
+}
 
 function sdLocDragStart(ev, locId) {
   const l = (S.series.locations || []).find(x => x.id === locId);
@@ -5072,8 +6476,18 @@ async function sdHandleDrop(ev) {
   catch { return; }
   if (!payload.kind || !payload.id) return;
   if (SD.refs.some(r => r.kind === payload.kind && r.id === payload.id && r.outfit === payload.outfit)) return;
-  SD.refs.push(payload);
+  SD.refs.push({ ...payload, tag: _sdNextFreeTag() });
   sdRenderRefs();
+}
+
+// Pick the smallest 1-9 integer not currently used as a `tag` on SD.refs.
+// Stable tags decouple the visible @ImageN label from the array position so
+// removing a middle ref doesn't renumber the survivors (user's mental model
+// breaks when @Image3 silently becomes @Image2 after deleting @Image2).
+function _sdNextFreeTag() {
+  const used = new Set((SD.refs || []).map(r => r && r.tag).filter(Boolean));
+  for (let n = 1; n <= 9; n++) if (!used.has(n)) return n;
+  return null;
 }
 
 async function sdUploadCustomFile(file) {
@@ -5091,7 +6505,8 @@ async function sdUploadCustomFile(file) {
     if (!res.url) throw new Error(res.error || 'no url');
     SD.refs.push({
       kind: 'url', id: 'custom-' + Date.now(),
-      name: res.name || file.name, photoUrl: res.url, url: res.url
+      name: res.name || file.name, photoUrl: res.url, url: res.url,
+      tag: _sdNextFreeTag(),
     });
   } catch (e) {
     showToast('✗ загрузка: ' + (e.message || e));
@@ -5115,7 +6530,8 @@ async function sdUploadCustomUrl(srcUrl) {
     if (!res.url) throw new Error(res.error || 'no url');
     SD.refs.push({
       kind: 'url', id: 'custom-' + Date.now(),
-      name: res.name || 'custom', photoUrl: res.url, url: res.url
+      name: res.name || 'custom', photoUrl: res.url, url: res.url,
+      tag: _sdNextFreeTag(),
     });
   } catch (e) {
     showToast('✗ загрузка: ' + (e.message || e));
@@ -5128,7 +6544,12 @@ async function sdUploadCustomUrl(srcUrl) {
 function sdRenderRefs() {
   const slot = document.getElementById('sd-ref-slots');
   if (!slot) return;
+  // Backfill `tag` for refs loaded from older state (chunks reused via "Reuse"
+  // or sdComposeFill paths that don't go through sdSlotDrop). Use array
+  // position +1 only when no stable tag exists yet — preserves backwards-compat.
+  SD.refs.forEach((r, i) => { if (r && !r.tag) r.tag = i + 1; });
   slot.innerHTML = SD.refs.map((r, i) => {
+    const tag = r.tag || (i + 1);
     const subtitle = r.outfit ? `<div class="ref-sub">${esc(r.outfit)}</div>` : '';
     const kindIcon = r.kind === 'loc' ? '🏛'
                   : r.kind === 'lastframe' ? '🎞'
@@ -5138,8 +6559,8 @@ function sdRenderRefs() {
          ondragover="sdSlotDragOver(event)"
          ondragleave="sdSlotDragLeave(event)"
          ondrop="sdSlotDrop(event,${i})"
-         title="@Image${i+1}: ${esc(r.name)}${r.outfit ? ' / '+esc(r.outfit) : ''} — перетащи сюда другую карточку чтобы заменить">
-      <div class="ref-top">@Image${i+1}</div>
+         title="@Image${tag}: ${esc(r.name)}${r.outfit ? ' / '+esc(r.outfit) : ''} — перетащи сюда другую карточку чтобы заменить">
+      <div class="ref-top">@Image${tag}</div>
       ${r.photoUrl
         ? `<img src="${r.photoUrl}" alt="">`
         : '<div class="ref-noimg">no photo</div>'}
@@ -5237,6 +6658,127 @@ function sdRemoveRef(i) {
   sdRenderRefs();
 }
 
+// Remap @ImageN tags in `promptText` so they reference refs by their CURRENT
+// positional order (Seedance API is positional), while the UI shows STABLE
+// tags. Removes any @ImageN entries whose tag has no surviving ref.
+//
+// e.g. user has refs [A(tag=1), C(tag=3)] (after deleting tag=2) and prompt:
+//   "@Image1=A, @Image2=B, @Image3=C. A talks to C."
+// Returns:
+//   "@Image1=A, @Image2=C. A talks to C."  (B's BINDING entry dropped, C
+//   renumbered from @Image3 to @Image2 to match positional order in refs[])
+function _sdRemapPromptForSubmit(promptText, refs) {
+  if (!promptText) return promptText;
+  // tag → newPos (1-based)
+  const tagToPos = new Map();
+  refs.forEach((r, i) => {
+    if (r && r.tag) tagToPos.set(r.tag, i + 1);
+  });
+  // Sentinel-based two-pass to avoid double-rewriting (e.g. 1→2 then 2→3).
+  let out = promptText;
+  // Pass 1: original @ImageN → \x01IMG\x01N
+  out = out.replace(/@Image(\d+)/g, (m, n) => `\x01IMG\x01${n}`);
+  // Pass 2: \x01IMG\x01N → @ImageK (remap or drop)
+  // For each placeholder, look up tag → new pos. If tag has no pos (ref deleted),
+  // we want to strip the WHOLE BINDING entry like `@Image2=Name (description),`
+  // — handle that with a separate pass first.
+  // First strip BINDING entries for orphan tags:
+  for (const [origTag] of [...new Set([...promptText.matchAll(/@Image(\d+)/g)].map(m => parseInt(m[1])))].entries()) {
+    // unused — replaced by simpler strip below
+  }
+  // Simpler: scan all @ImageN occurrences in original prompt; for each unique N
+  // that is NOT in tagToPos, strip its binding entry from the post-sentinel text.
+  const allTags = [...new Set([...promptText.matchAll(/@Image(\d+)/g)].map(m => parseInt(m[1])))];
+  for (const t of allTags) {
+    if (!tagToPos.has(t)) {
+      // Drop binding-style entry: optional leading comma/space, @ImageT=Name (...) up to next comma/period/newline
+      const bindingRe = new RegExp(`,?\\s*\\x01IMG\\x01${t}\\s*[=\\-—]\\s*[^,.\\n]*`, 'g');
+      out = out.replace(bindingRe, '');
+      // Drop standalone @ImageT mentions
+      const standaloneRe = new RegExp(`\\s*\\x01IMG\\x01${t}\\b`, 'g');
+      out = out.replace(standaloneRe, '');
+    }
+  }
+  // Now remap surviving \x01IMG\x01N → @ImageK
+  out = out.replace(/\x01IMG\x01(\d+)/g, (m, n) => {
+    const pos = tagToPos.get(parseInt(n));
+    return pos != null ? `@Image${pos}` : '';
+  });
+  // Tidy: empty parens left from inline tag removal "Kyle (@Image2) listens" → "Kyle  listens",
+  // double commas, leading commas after BINDING strips.
+  out = out.replace(/\(\s*\)/g, '');
+  out = out.replace(/[ \t]+/g, ' ');
+  out = out.replace(/,\s*,/g, ',').replace(/(:\s*),/g, '$1').replace(/\(\s*,/g, '(');
+  return out;
+}
+
+// Recompose the prompt via Claude USING ONLY the refs currently in the SD panel.
+// Use case: user manually removed redundant char refs (e.g. extras hanging in
+// the corner) and wants the prompt rewritten to focus on who's left, instead
+// of editing tokens by hand. Server-side `locked_refs` instructs Claude to use
+// EXACTLY these — no auto-detection of missing chars from chunk text.
+async function sdRecomposeWithCurrentRefs() {
+  const chunk = document.getElementById('sd-chunk-text').value.trim();
+  if (!chunk) { showToast('Вставь кусок сценария'); return; }
+  if (!SD.refs.length) { showToast('Нет рефов — сначала добавь хотя бы один'); return; }
+  const st = document.getElementById('sd-compose-status');
+  if (st) st.textContent = '🔄 перекомпоную с текущими рефами...';
+  const useLastframe = !!document.getElementById('sd-use-lastframe')?.checked;
+  const useCutframes = !!document.getElementById('sd-use-cutframes')?.checked;
+  const useStyle     = !!document.getElementById('sd-use-style')?.checked;
+  const styleVal     = (document.getElementById('sd-style')?.value || '').trim();
+  const baseOnly     = !!document.getElementById('sd-base-only')?.checked;
+  const closeUpOnly  = !!document.getElementById('sd-close-up-only')?.checked;
+  // Snapshot tags so we restore stable labels after the recompose returns
+  // (server returns refs without `tag`, so we re-attach them by id+kind+outfit).
+  const tagSnapshot = SD.refs.map(r => ({ kind: r.kind, id: r.id, outfit: r.outfit || null, tag: r.tag }));
+  try {
+    const res = await api.post(
+      `/api/series/${S.seriesId}/episodes/${S.episode.number}/seedance/compose`,
+      {
+        chunk_text: chunk,
+        use_prev_lastframe: useLastframe,
+        use_prev_cutframes: useCutframes,
+        style: useStyle ? styleVal : '',
+        base_outfits_only: baseOnly,
+        close_up_only: closeUpOnly,
+        locked_refs: SD.refs.map(r => ({ kind: r.kind, id: r.id, outfit: r.outfit || null })),
+      }
+    );
+    document.getElementById('sd-prompt').value = res.prompt || '';
+    SD.refs = (res.refs || []).map(r => {
+      let name = '', photoUrl = '';
+      if (r.kind === 'char') {
+        const c = (S.series.characters || []).find(x => x.id === r.id);
+        if (c) {
+          name = c.name;
+          if (r.outfit) {
+            const o = (c.outfits || []).find(o => o.label === r.outfit);
+            if (o?.photo) photoUrl = `/assets/${S.seriesId}/${o.photo}`;
+          }
+          if (!photoUrl && c.ref_images?.[0]) photoUrl = `/assets/${S.seriesId}/${c.ref_images[0]}`;
+        }
+      } else if (r.kind === 'loc') {
+        const l = (S.series.locations || []).find(x => x.id === r.id);
+        if (l) {
+          name = l.name;
+          if (l.ref_images?.[0]) photoUrl = `/assets/${S.seriesId}/${l.ref_images[0]}`;
+        }
+      } else if (r.kind === 'lastframe' || r.kind === 'cutframe') {
+        name = r.name || (r.kind === 'lastframe' ? 'last frame' : 'pre-cut frame');
+        photoUrl = r.url || '';
+      }
+      // Restore stable tag from pre-recompose snapshot
+      const snap = tagSnapshot.find(s => s.kind === r.kind && s.id === r.id && (s.outfit || null) === (r.outfit || null));
+      return { ...r, name, photoUrl, tag: snap?.tag };
+    });
+    sdRenderRefs();
+    if (st) st.textContent = '✓ перекомпоновано с пинн-рефами';
+  } catch (e) {
+    if (st) st.textContent = '✗ ' + (e.message || e);
+  }
+}
+
 async function sdCompose() {
   const chunk = document.getElementById('sd-chunk-text').value.trim();
   if (!chunk) { showToast('Вставь кусок сценария'); return; }
@@ -5247,6 +6789,7 @@ async function sdCompose() {
   const useStyle     = !!document.getElementById('sd-use-style')?.checked;
   const styleVal     = (document.getElementById('sd-style')?.value || '').trim();
   const baseOnly     = !!document.getElementById('sd-base-only')?.checked;
+  const closeUpOnly  = !!document.getElementById('sd-close-up-only')?.checked;
   try {
     const res = await api.post(
       `/api/series/${S.seriesId}/episodes/${S.episode.number}/seedance/compose`,
@@ -5256,6 +6799,7 @@ async function sdCompose() {
         use_prev_cutframes: useCutframes,
         style: useStyle ? styleVal : '',
         base_outfits_only: baseOnly,
+        close_up_only: closeUpOnly,
       }
     );
     document.getElementById('sd-prompt').value = res.prompt || '';
@@ -5329,6 +6873,15 @@ async function sdCompose() {
         7000
       );
     }
+    if ((res.closeup_dropped || []).length) {
+      const dropped = res.closeup_dropped;
+      msg += ` · 🎯 close-up: дроп ${dropped.length} перс`;
+      const names = dropped.map(d => d.char_name).join(', ');
+      showToast(`🎯 Close-up only: оставлен один перс + локация. Дропнуты из refs: ${names}.`, 5000);
+    }
+    if (res.auto_close_up_detected) {
+      msg += ' · 🎯 auto-close-up hint';
+    }
     st.textContent = msg;
   } catch (e) {
     st.textContent = '✗ ' + (e.message || e);
@@ -5355,6 +6908,8 @@ function sdSavePrefs() {
       use_style: !!document.getElementById('sd-use-style')?.checked,
       style: (document.getElementById('sd-style')?.value || '').trim(),
       base_outfits_only: !!document.getElementById('sd-base-only')?.checked,
+      close_up_only: !!document.getElementById('sd-close-up-only')?.checked,
+      establishing_shot: !!document.getElementById('sd-establishing-shot')?.checked,
     }));
   } catch (e) {}
 }
@@ -5376,6 +6931,10 @@ function sdLoadPrefs() {
     if (si && sc) si.classList.toggle('hidden', !sc.checked);
     const bo = document.getElementById('sd-base-only');
     if (bo && typeof p.base_outfits_only === 'boolean') bo.checked = p.base_outfits_only;
+    const cu = document.getElementById('sd-close-up-only');
+    if (cu && typeof p.close_up_only === 'boolean') cu.checked = p.close_up_only;
+    const es = document.getElementById('sd-establishing-shot');
+    if (es && typeof p.establishing_shot === 'boolean') es.checked = p.establishing_shot;
   } catch (e) {}
 }
 
@@ -5413,10 +6972,15 @@ async function sdGenerate() {
   }
 
   try {
+    // Remap @ImageN tags in prompt to match positional order of refs[] before
+    // sending to API. UI keeps stable tags (so removing @Image2 leaves @Image3
+    // visible as @Image3), but Seedance is positional — we must renumber on
+    // submit. Also strips BINDING entries for tags whose ref was deleted.
+    const submitPrompt = _sdRemapPromptForSubmit(prompt, SD.refs);
     const res = await api.post(
       `/api/series/${S.seriesId}/episodes/${S.episode.number}/seedance/start`,
       {
-        prompt, chunk_text: chunk, duration, resolution, moderation_bypass,
+        prompt: submitPrompt, chunk_text: chunk, duration, resolution, moderation_bypass,
         refs: SD.refs.map(r => ({ kind: r.kind, id: r.id, outfit: r.outfit || null, url: r.url || null }))
       }
     );
@@ -5439,7 +7003,17 @@ async function sdRefreshList() {
     const res = await api.get(
       `/api/series/${S.seriesId}/episodes/${S.episode.number}/seedance/list`
     );
-    sdRenderList(res.chunks || []);
+    const chunks = (res.chunks || []).slice();
+    // Display order: prefer canonical script_order (set by parallel auto-mode);
+    // fall back to creation idx so legacy chunks without script_order keep
+    // their original ordering. Stable sort: chunks with order < chunks without.
+    chunks.sort((a, b) => {
+      const ao = (typeof a.script_order === 'number') ? a.script_order : Infinity;
+      const bo = (typeof b.script_order === 'number') ? b.script_order : Infinity;
+      if (ao !== bo) return ao - bo;
+      return (a.idx || 0) - (b.idx || 0);
+    });
+    sdRenderList(chunks);
   } catch (e) { /* ignore */ }
 }
 
@@ -5452,7 +7026,14 @@ function _sdCardHTML(c) {
   else if (c.status === 'submitting') placeholderText = '📤 отправляю...';
   else if (c.progress != null) placeholderText = c.progress + '%';
   else placeholderText = '⏳ генерируется';
+  const isSelected = SD.selected && SD.selected.has(c.idx);
+  // Retry only makes sense if we have stored prompt + refs
+  const canRetry = !!(c.prompt && (c.refs || []).length && c.status !== 'submitting');
   return `
+    <label class="sd-card-cb-wrap" title="Выбрать для bulk-действий">
+      <input type="checkbox" class="sd-card-cb" ${isSelected ? 'checked' : ''}
+        onclick="event.stopPropagation();sdToggleSelect(${c.idx})">
+    </label>
     ${videoUrl
       ? `<video src="${videoUrl}" controls preload="metadata"></video>`
       : `<div class="sd-placeholder">${placeholderText}</div>`}
@@ -5463,7 +7044,8 @@ function _sdCardHTML(c) {
       <div class="sd-gen-actions">
         ${videoUrl ? `<a class="btn-ghost btn-sm" href="${videoUrl}" download>⬇ Скачать</a>` : ''}
         ${videoUrl ? `<button class="btn-ghost btn-sm" onclick="sdAddToTimeline(${c.idx}, this)">➕ На таймлайн</button>` : ''}
-        <button class="btn-ghost btn-sm" onclick="sdReuse(${c.idx})">↻ Reuse</button>
+        ${canRetry ? `<button class="btn-ghost btn-sm" onclick="sdRetry(${c.idx}, this)" title="Перезапустить генерацию с тем же промптом и refs (без compose) — мгновенно создаёт новый чанк">🔁 Retry</button>` : ''}
+        <button class="btn-ghost btn-sm" onclick="sdReuse(${c.idx})" title="Подставить параметры этого чанка в форму выше — для ручной правки и повторной генерации">↻ Reuse</button>
         ${c.status === 'failed' ? `<button class="btn-ghost btn-sm" onclick="sdHealAndReuse(${c.idx}, this)" title="Переписать промпт чтобы прошёл модерацию + Reuse">🩹 Лечить</button>` : ''}
         <button class="btn-ghost btn-sm" onclick="sdDelete(${c.idx})">🗑</button>
       </div>
@@ -5514,6 +7096,9 @@ function sdRenderList(chunks) {
         node.setAttribute('data-sig', sig);
         node.innerHTML = _sdCardHTML(c);
       }
+      // Selection class survives polling re-renders
+      if (SD.selected && SD.selected.has(c.idx)) node.classList.add('sd-card-selected');
+      else node.classList.remove('sd-card-selected');
       // Place node at correct DOM slot
       if (prevNode) {
         if (node.previousSibling !== prevNode) prevNode.after(node);
@@ -5522,6 +7107,8 @@ function sdRenderList(chunks) {
       }
       prevNode = node;
     }
+    // Refresh bulk bar in case server removed/added chunks
+    _sdUpdateBulkBar();
   } catch (err) {
     console.error('[sdRenderList] diff failed, falling back to full render:', err);
     el.innerHTML = chunks.slice().reverse().map(c => {
@@ -5533,7 +7120,190 @@ function sdRenderList(chunks) {
 async function sdDelete(idx) {
   if (!confirm('Удалить эту генерацию?')) return;
   await api.del(`/api/series/${S.seriesId}/episodes/${S.episode.number}/seedance/${idx}`);
+  if (SD.selected) SD.selected.delete(idx);
+  _sdUpdateBulkBar();
   await sdRefreshList();
+}
+
+// Instant Retry — re-fire /seedance/start with the chunk's stored prompt + refs.
+// Creates a NEW chunk. Old one stays as-is (preserves history).
+// Throws on failure so bulk-retry can count failures.
+async function sdRetry(idx, btn) {
+  const list = SD._lastChunks || [];
+  const c = list.find(x => x.idx === idx);
+  if (!c) throw new Error(`Чанк #${idx} не найден`);
+  if (!c.prompt) throw new Error(`У чанка #${idx} нет сохранённого промпта — используй Reuse`);
+  const oldHtml = btn ? btn.innerHTML : '';
+  if (btn) { btn.disabled = true; btn.innerHTML = '⏳'; }
+  try {
+    const res = await api.post(
+      `/api/series/${S.seriesId}/episodes/${S.episode.number}/seedance/start`,
+      {
+        prompt: c.prompt,
+        chunk_text: c.chunk_text || '',
+        duration: c.duration || 15,
+        resolution: c.resolution || '720p',
+        moderation_bypass: c.moderation_bypass || 'collage_grid',
+        refs: (c.refs || []).map(r => ({
+          kind: r.kind, id: r.id, outfit: r.outfit || null, url: r.url || null,
+          source: r.source, prev_idx: r.prev_idx, name: r.name,
+          cut_index: r.cut_index, cut_time: r.cut_time,
+        })),
+      }
+    );
+    if (btn && !btn.dataset.bulk) {
+      showToast(`▶ Retry: новый чанк #${res.chunk?.idx} в очереди`, 3000);
+      await sdRefreshList();
+      sdEnsurePoll();
+    }
+    return res;
+  } catch (e) {
+    if (btn) { btn.disabled = false; btn.innerHTML = oldHtml; }
+    throw e;
+  }
+}
+
+// ── Bulk-select for chunk cards ────────────────────────────────────────────
+function sdToggleSelect(idx) {
+  if (!SD.selected) SD.selected = new Set();
+  if (SD.selected.has(idx)) SD.selected.delete(idx);
+  else SD.selected.add(idx);
+  // Toggle visual class on the card
+  const card = document.querySelector(`.sd-gen-card[data-idx="${idx}"]`);
+  if (card) card.classList.toggle('sd-card-selected', SD.selected.has(idx));
+  _sdUpdateBulkBar();
+}
+
+function sdBulkClearSelection() {
+  if (!SD.selected) return;
+  SD.selected.clear();
+  document.querySelectorAll('.sd-gen-card.sd-card-selected').forEach(c => c.classList.remove('sd-card-selected'));
+  document.querySelectorAll('input.sd-card-cb:checked').forEach(cb => { cb.checked = false; });
+  _sdUpdateBulkBar();
+}
+
+function sdBulkSelectAll() {
+  if (!SD.selected) SD.selected = new Set();
+  const list = SD._lastChunks || [];
+  for (const c of list) SD.selected.add(c.idx);
+  document.querySelectorAll('.sd-gen-card[data-idx]').forEach(card => {
+    card.classList.add('sd-card-selected');
+    const cb = card.querySelector('input.sd-card-cb');
+    if (cb) cb.checked = true;
+  });
+  _sdUpdateBulkBar();
+}
+
+function _sdUpdateBulkBar() {
+  let bar = document.getElementById('sd-bulk-bar');
+  const sel = SD.selected || new Set();
+  const count = sel.size;
+  const list = SD._lastChunks || [];
+  if (count === 0) {
+    if (bar) bar.classList.add('hidden');
+    return;
+  }
+  if (!bar) {
+    const listEl = document.getElementById('sd-gen-list');
+    if (!listEl) return;
+    bar = document.createElement('div');
+    bar.id = 'sd-bulk-bar';
+    bar.className = 'sd-bulk-bar';
+    listEl.parentNode.insertBefore(bar, listEl);
+  }
+  // Count what's actionable
+  const ready = [...sel].filter(idx => {
+    const c = list.find(x => x.idx === idx);
+    return c && c.video_path;
+  }).length;
+  const retryable = [...sel].filter(idx => {
+    const c = list.find(x => x.idx === idx);
+    return c && c.prompt && (c.refs || []).length;
+  }).length;
+  bar.classList.remove('hidden');
+  bar.innerHTML = `
+    <span class="sd-bulk-count">Выбрано: ${count}</span>
+    <button class="btn-ghost btn-sm" onclick="sdBulkRetry()" ${retryable === 0 ? 'disabled' : ''}
+      title="Перезапустить ${retryable} генерац(ий) с теми же промптами и refs">🔁 Retry · ${retryable}</button>
+    <button class="btn-ghost btn-sm" onclick="sdBulkAddToTimeline()" ${ready === 0 ? 'disabled' : ''}
+      title="${ready} готовых видео — добавить на таймлайн">➕ На таймлайн · ${ready}</button>
+    <button class="btn-ghost btn-sm" onclick="sdBulkDelete()" style="color:#e74c3c"
+      title="Удалить ${count} генерац(ий)">🗑 Удалить · ${count}</button>
+    <span style="flex:1"></span>
+    <button class="btn-ghost btn-sm" onclick="sdBulkSelectAll()">Все</button>
+    <button class="btn-ghost btn-sm" onclick="sdBulkClearSelection()">✕ Снять выбор</button>
+  `;
+}
+
+async function sdBulkRetry() {
+  const idxs = Array.from(SD.selected || []);
+  if (!idxs.length) return;
+  if (!confirm(`Перезапустить генерацию ${idxs.length} чанк(ов)?\n\nКаждый создаст НОВЫЙ чанк с тем же промптом и refs. Старые останутся (можешь удалить вручную).`)) return;
+  // Concurrency cap to avoid hammering Seedance API
+  const CAP = 5;
+  let ok = 0, failed = 0;
+  const queue = idxs.slice();
+  const fakeBtn = { dataset: { bulk: '1' }, innerHTML: '', disabled: false };
+  async function worker() {
+    while (queue.length) {
+      const idx = queue.shift();
+      try { await sdRetry(idx, fakeBtn); ok++; }
+      catch (e) { console.warn('bulk retry failed for', idx, e); failed++; }
+    }
+  }
+  const workers = [];
+  for (let i = 0; i < Math.min(CAP, idxs.length); i++) workers.push(worker());
+  await Promise.all(workers);
+  sdBulkClearSelection();
+  await sdRefreshList();
+  sdEnsurePoll();
+  if (failed > 0) {
+    Sounds.playError();
+    showToast(`⚠ Retry: ${ok} запущено, ${failed} ошибок`, 6000);
+  } else {
+    showToast(`✓ Retry: ${ok} новых чанк(ов) в очереди`, 4000);
+  }
+}
+
+async function sdBulkDelete() {
+  const idxs = Array.from(SD.selected || []);
+  if (!idxs.length) return;
+  if (!confirm(`Удалить ${idxs.length} генерац(ий)? Видео-файлы тоже удалятся с диска.`)) return;
+  let ok = 0, failed = 0;
+  for (const idx of idxs) {
+    try {
+      await api.del(`/api/series/${S.seriesId}/episodes/${S.episode.number}/seedance/${idx}`);
+      ok++;
+    } catch (e) { console.warn('bulk delete failed for', idx, e); failed++; }
+  }
+  sdBulkClearSelection();
+  await sdRefreshList();
+  showToast(`✓ Удалено: ${ok}${failed ? `, ошибок: ${failed}` : ''}`, 4000);
+}
+
+async function sdBulkAddToTimeline() {
+  const idxs = Array.from(SD.selected || []);
+  if (!idxs.length) return;
+  const list = SD._lastChunks || [];
+  const ready = idxs.filter(idx => {
+    const c = list.find(x => x.idx === idx);
+    return c && c.video_path;
+  });
+  if (!ready.length) {
+    showToast('⚠ Среди выбранных нет готовых видео', 4000);
+    return;
+  }
+  let ok = 0, failed = 0;
+  for (const idx of ready) {
+    try {
+      await api.post(`/api/series/${S.seriesId}/timeline/clips/add`, {
+        episode: S.episode.number, chunk_idx: idx,
+      });
+      ok++;
+    } catch (e) { console.warn('bulk add to timeline failed for', idx, e); failed++; }
+  }
+  sdBulkClearSelection();
+  showToast(`✓ На таймлайн: ${ok}${failed ? `, ошибок: ${failed}` : ''}`, 4000);
 }
 
 async function sdAddToTimeline(idx, btn) {
@@ -5627,8 +7397,10 @@ async function sdPollOnce() {
     const res = await api.post(
       `/api/series/${S.seriesId}/episodes/${S.episode.number}/seedance/poll`, {}
     );
-    sdRenderList(res.chunks || []);
-    return res.chunks || [];
+    const chunks = res.chunks || [];
+    _sdNotifyTransitions(chunks);  // beep + toast on completed/failed transitions
+    sdRenderList(chunks);
+    return chunks;
   } catch (e) { return null; }
 }
 

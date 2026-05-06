@@ -211,8 +211,27 @@ button { cursor: pointer; transition: all 0.15s; }
   width: 32px; height: 32px; border-radius: 50%; object-fit: cover;
   background: var(--surface3); flex-shrink: 0; display: flex; align-items: center;
   justify-content: center; font-size: 0.8rem; color: var(--muted); overflow: hidden;
+  position: relative;
 }
 .char-avatar img { width: 100%; height: 100%; object-fit: cover; object-position: center top; }
+.autogen-overlay {
+  position: absolute; inset: 0;
+  background: rgba(20, 20, 30, 0.75);
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 50%;
+  z-index: 2;
+}
+.autogen-overlay[hidden] { display: none; }
+.autogen-overlay .spinner { width: 14px; height: 14px; border-width: 2px; }
+.char-item.is-generating {
+  border-color: var(--accent, #6366f1) !important;
+  box-shadow: 0 0 0 1px var(--accent, #6366f1) inset;
+  animation: autogen-pulse 1.6s ease-in-out infinite;
+}
+@keyframes autogen-pulse {
+  0%, 100% { box-shadow: 0 0 0 1px var(--accent, #6366f1) inset, 0 0 0 0 rgba(99,102,241,0.4); }
+  50%      { box-shadow: 0 0 0 1px var(--accent, #6366f1) inset, 0 0 8px 2px rgba(99,102,241,0.5); }
+}
 .char-info { flex: 1; min-width: 0; }
 .char-info .char-name { font-size: 0.9rem; font-weight: 600; truncate: ellipsis; }
 .char-info .char-role { font-size: 0.78rem; color: var(--muted); }
@@ -571,6 +590,26 @@ button { cursor: pointer; transition: all 0.15s; }
 .lightbox-panel .btn-regen:hover:not(:disabled) { opacity: 0.9; transform: translateY(-1px); }
 .lightbox-panel .btn-regen:disabled { opacity: 0.5; cursor: not-allowed; }
 
+.lb-outfits-list { display: flex; flex-direction: column; gap: 8px; max-height: 280px; overflow-y: auto; }
+.lb-outfit-row {
+  display: flex; align-items: center; gap: 10px;
+  padding: 6px; border: 1px solid var(--border); border-radius: var(--radius-sm);
+  background: var(--surface2);
+}
+.lb-outfit-thumb {
+  width: 56px; height: 56px; flex-shrink: 0; border-radius: 6px; overflow: hidden;
+  background: var(--surface3); display: flex; align-items: center; justify-content: center;
+}
+.lb-outfit-thumb img { width: 100%; height: 100%; object-fit: cover; object-position: top; }
+.lb-outfit-thumb-empty { font-size: 1.6rem; opacity: 0.6; }
+.lb-outfit-info { flex: 1; min-width: 0; }
+.lb-outfit-label { font-weight: 600; font-size: 0.88rem; color: var(--text); }
+.lb-outfit-desc { font-size: 0.76rem; color: var(--muted); margin-top: 2px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lb-outfit-status { font-size: 0.74rem; color: var(--warning); margin-top: 2px; min-height: 0; }
+.lb-outfit-action { flex-shrink: 0; }
+.lb-outfit-action button { font-size: 0.78rem; padding: 6px 10px; }
+
 @media (max-width: 900px) {
   .lightbox-content { flex-direction: column; max-height: 92vh; overflow-y: auto; }
   .lightbox-panel { width: 100%; max-height: none; }
@@ -881,9 +920,13 @@ button { cursor: pointer; transition: all 0.15s; }
   border: 1px solid var(--border); border-radius: 999px;
   padding: 2px 8px; font-size: 0.68rem; line-height: 1.4;
   max-width: 100%;
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  display: inline-flex; align-items: center; gap: 4px;
   transition: all 0.12s;
 }
+.ep-outfit-chip-icon { flex-shrink: 0; font-size: 0.78rem; }
+.ep-outfit-chip-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.ep-outfit-chip.needs-gen { border-color: #f5a623; }
+.ep-outfit-chip.needs-gen .ep-outfit-chip-icon { color: #f5a623; }
 .ep-outfit-chip:hover { border-color: var(--primary); color: var(--text); }
 .ep-outfit-chip.on {
   background: rgba(99, 179, 237, 0.18);
@@ -1364,7 +1407,43 @@ body:not(.seedance-mode) .seedance-only { display: none !important; }
 .sd-gen-card {
   display: flex; gap: 10px; padding: 8px; border: 1px solid var(--border, #2a2a30);
   border-radius: 8px; background: var(--surface, #0f0f12);
+  position: relative;                        /* anchor for absolutely-positioned checkbox */
+  transition: outline 0.15s, background 0.15s;
 }
+.sd-gen-card.sd-card-selected {
+  outline: 2px solid var(--accent, #00d4aa);
+  outline-offset: -2px;
+  background: rgba(0,212,170,0.06);
+}
+.sd-card-cb-wrap {
+  position: absolute; top: 6px; left: 6px;
+  z-index: 3;
+  width: 20px; height: 20px;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(0,0,0,0.55); border-radius: 4px;
+  cursor: pointer;
+  user-select: none;
+}
+.sd-card-cb {
+  width: 14px; height: 14px;
+  margin: 0; cursor: pointer;
+  accent-color: var(--accent, #00d4aa);
+}
+/* Bulk-action bar appears when ≥1 card is selected */
+.sd-bulk-bar {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 8px 12px;
+  background: rgba(0,212,170,0.10);
+  border: 1px solid var(--accent, #00d4aa);
+  border-radius: 6px;
+  position: sticky; top: 50px; z-index: 6;
+}
+.sd-bulk-bar.hidden { display: none; }
+.sd-bulk-count {
+  font-weight: 700; color: var(--accent, #00d4aa);
+  font-size: 0.84rem;
+}
+.sd-bulk-bar button[disabled] { opacity: 0.4; cursor: not-allowed; }
 .sd-gen-card video, .sd-gen-card .sd-placeholder {
   width: 220px; height: 124px; background: #000; border-radius: 4px; flex-shrink: 0;
   display: flex; align-items: center; justify-content: center; color: var(--muted, #888); font-size: 0.85rem;
@@ -1656,6 +1735,157 @@ body.seedance-mode .ep-loc-card:active { cursor: grabbing; }
 }
 .ep-seg-body { flex: 1; min-width: 0; }
 .ep-line { white-space: pre-wrap; word-break: break-word; }
+
+/* ── Scene-view: per-segment toolbar (always visible) ───────── */
+.ep-seg-toolbar {
+  display: flex; align-items: center; gap: 8px;
+  margin: 0 0 6px; padding: 0 0 4px;
+  border-bottom: 1px dashed rgba(255,255,255,0.06);
+  font-size: 0.75rem;
+}
+.ep-seg-send {
+  background: rgba(0,212,170,0.12);
+  border: 1px solid rgba(0,212,170,0.4);
+  color: var(--accent);
+  padding: 3px 10px; border-radius: 6px;
+  font-size: 0.74rem; font-weight: 600; cursor: pointer;
+  transition: background 0.15s;
+}
+.ep-seg-send:hover { background: rgba(0,212,170,0.22); }
+.ep-seg-mini {
+  background: transparent; color: var(--muted);
+  border: 1px dashed var(--border);
+  padding: 2px 8px; border-radius: 5px;
+  font-size: 0.72rem; cursor: pointer; font-weight: 500;
+  transition: color 0.15s, border-color 0.15s;
+}
+.ep-seg-mini:hover { color: var(--text); border-color: var(--text); }
+.ep-seg-dur, .ep-seg-warn {
+  font-family: 'SF Mono', Menlo, monospace; font-size: 0.72rem;
+  color: var(--muted);
+}
+.ep-seg-warn { color: #ffa502; }
+
+.ep-seg-auto-cb {
+  display: inline-flex; align-items: center; gap: 4px;
+  font-size: 0.72rem; color: var(--muted);
+  cursor: pointer;
+  padding: 2px 6px; border-radius: 4px;
+  border: 1px dashed transparent;
+  user-select: none;
+}
+.ep-seg-auto-cb:hover { border-color: var(--border); }
+.ep-seg-auto-cb input { margin: 0; }
+
+/* Visually dim segments excluded from auto-mode */
+.ep-seg.auto-skipped {
+  opacity: 0.55;
+}
+.ep-seg.auto-skipped .ep-seg-bracket {
+  color: var(--muted);
+  border-left-color: var(--muted);
+  background: transparent;
+}
+
+/* ── Scene-view: edit-mode UI (split handle between lines) ─── */
+.ep-split-handle {
+  margin: 4px 0; padding: 3px 8px;
+  font-size: 0.7rem; font-family: 'SF Mono', Menlo, monospace;
+  color: var(--muted);
+  background: transparent; border: 1px dashed var(--border);
+  border-radius: 4px; cursor: pointer; text-align: center;
+  transition: all 0.15s;
+  user-select: none;
+}
+.ep-split-handle:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: rgba(0,212,170,0.08);
+}
+.ep-split-handle.ovr {
+  color: #ffa502;
+  border-color: #ffa502;
+  border-style: solid;
+  background: rgba(255,165,2,0.10);
+}
+.ep-split-handle.ovr:hover {
+  background: rgba(255,165,2,0.20);
+}
+.ep-line.ovr-break  { border-left: 2px solid #ffa502; padding-left: 6px; }
+.ep-line.ovr-merge  { border-left: 2px dashed var(--muted); padding-left: 6px; opacity: 0.92; }
+.ep-line.line-close-up {
+  border-left: 2px solid #00d4aa;
+  background: linear-gradient(to right, rgba(0,212,170,0.10) 0, rgba(0,212,170,0.02) 80%, transparent 100%);
+  padding-left: 8px;
+}
+
+/* Per-line close-up toggle button (always visible on dialogue lines).
+   Tiny, low-attention by default; bright when active. */
+.ep-line-cu-btn {
+  display: inline-block;
+  width: 22px; height: 18px;
+  margin-right: 6px; padding: 0;
+  font-size: 0.78rem; line-height: 16px;
+  background: transparent; border: 1px dashed transparent;
+  color: var(--muted);
+  cursor: pointer;
+  border-radius: 3px;
+  transition: all 0.12s;
+  vertical-align: middle;
+  user-select: none;
+}
+.ep-line-cu-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: rgba(0,212,170,0.08);
+}
+.ep-line-cu-btn.active {
+  background: rgba(0,212,170,0.18);
+  border-color: var(--accent);
+  border-style: solid;
+  color: var(--accent);
+}
+.ep-line-cu-btn.active:hover {
+  background: rgba(0,212,170,0.28);
+}
+/* Hide split handles when not in edit mode (they're already gated in JS, but as safety net) */
+.ep-scene:not(.edit-mode) .ep-split-handle { display: none; }
+.ep-scene:not(.edit-mode) .ep-seg-mini { display: none; }
+
+/* ── Scene-toolbar: auto-mode controls ─────────────────────── */
+.ep-tb-separator {
+  width: 1px; height: 22px;
+  background: var(--border);
+  margin: 0 8px;
+}
+.auto-err-mode {
+  display: inline-flex; align-items: center; gap: 12px;
+  font-size: 0.78rem; color: var(--muted);
+}
+.auto-err-mode label {
+  display: inline-flex; align-items: center; gap: 4px; cursor: pointer;
+}
+.auto-err-mode input[type="radio"] { margin: 0; }
+.auto-status {
+  font-family: 'SF Mono', Menlo, monospace;
+  font-size: 0.76rem;
+  white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis;
+  max-width: 360px;
+}
+#auto-mode-btn {
+  font-size: 0.82rem; font-weight: 600;
+  padding: 5px 12px; border-radius: 6px;
+  border: none; cursor: pointer;
+  transition: filter 0.15s;
+}
+#auto-mode-btn:hover { filter: brightness(1.12); }
+#auto-mode-btn.btn-accent {
+  background: var(--accent); color: #fff;
+}
+#auto-mode-btn.btn-danger {
+  background: #e74c3c; color: #fff;
+}
 
 #ep-scenes-btn.active { background: var(--primary); color: #fff; border-color: var(--primary); }
 

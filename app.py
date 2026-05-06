@@ -104,11 +104,6 @@ def is_scene_heading(line: str) -> bool:
 app = Flask(__name__, static_folder='static', template_folder='templates')
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB
 
-# Behind Traefik / Caddy / nginx — trust X-Forwarded-* so url_for(_external=True)
-# generates correct https://<public-host>/... URLs (critical for OAuth redirect_uri).
-from werkzeug.middleware.proxy_fix import ProxyFix
-app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
-
 BASE = Path(__file__).parent
 # DATA_ROOT holds per-user subfolders: <DATA_ROOT>/<email>/projects/<sid>/...
 # Override via env (DATA_ROOT=/var/lib/series-writer on the server).
@@ -408,6 +403,19 @@ def claude_ask(prompt: str, system: str = '', model: str = '', timeout: int = 12
     kwargs = {'model': sdk_model, 'max_tokens': max_tokens, 'messages': [{'role': 'user', 'content': prompt}]}
     if system:
         kwargs['system'] = system
+    # SDK requires streaming for any request that may exceed 10min — kick in for large max_tokens
+    if max_tokens >= 16000:
+        text_parts = []
+        stop_reason = None
+        with client.messages.stream(**kwargs) as stream:
+            for chunk in stream.text_stream:
+                text_parts.append(chunk)
+            final = stream.get_final_message()
+            stop_reason = getattr(final, 'stop_reason', None)
+        text = ''.join(text_parts).strip()
+        out_kb = len(text.encode('utf-8')) / 1024
+        print(f'[claude_ask] done(stream) in {time.time()-t0:.1f}s ({prompt_kb:.1f}KB→{out_kb:.1f}KB, stop={stop_reason})', flush=True)
+        return text
     msg = client.messages.create(**kwargs)
     text = ''.join(b.text for b in msg.content if getattr(b, 'type', '') == 'text').strip()
     out_kb = len(text.encode('utf-8')) / 1024
@@ -455,6 +463,508 @@ def claude_ask_vision(prompt: str, image_urls, system: str = '',
     print(f'[claude_vision] done in {time.time()-t0:.1f}s', flush=True)
     return text
 
+
+def _describe_outfit_visual(image_url: str) -> str:
+    """Vision-extract a tight clothing description from a character/outfit photo.
+    Returns short string like 'navy medical scrubs, ID badge on chest, hair in
+    messy bun'. Used as a TEXT REINFORCEMENT alongside the @Image-ref so Seedance
+    gets aligned signals (visual + textual say the same thing) — fixes outfit
+    drift that the visual ref alone doesn't prevent."""
+    if not image_url or not image_url.lower().startswith(('http://', 'https://')):
+        return ''
+    prompt = (
+        "Describe ONLY what this person is wearing and their immediate look "
+        "(hair styling, makeup if striking) in 8-15 words. English. Comma-separated.\n\n"
+        "Format: '<garment top>, <garment bottom or accessories>, <hair>'\n"
+        "Examples:\n"
+        "  navy blue medical scrubs, hospital ID badge on chest, hair in messy bun\n"
+        "  charcoal three-piece suit, white shirt, slicked-back hair\n"
+        "  cream silk blouse, dark fitted skirt, hair in loose waves\n"
+        "  denim jacket, white tee, dark blue jeans, short tousled hair\n\n"
+        "DO NOT describe face features, age, gender, expression, body, "
+        "background, or pose. ONLY clothing + hair styling. Under 15 words. "
+        "No quotes, no leading 'The person is wearing' — just the description."
+    )
+    try:
+        text = claude_ask_vision(prompt, [image_url]).strip()
+        text = text.replace('\n', ' ').strip().strip('"').strip("'").rstrip('.')
+        return text[:200]
+    except Exception as e:
+        print(f'[outfit_vision] failed for {image_url}: {e}', flush=True)
+        return ''
+
+
+def _remap_image_tags(prompt_text: str, old_to_new: dict) -> str:
+    """After server-side ref filtering (close-up / de-dup / unresolved drops),
+    the composer's prompt still contains @ImageN references for ALL refs it
+    originally chose. If we filter refs[] but leave the prompt alone, Seedance
+    gets a prompt mentioning @ImageN with no actual reference image at slot N
+    → it hallucinates a random face for that 'character'. Real bug seen in
+    production: chunk had refs=[Adrian, Lobby] but prompt said @Image2=Vivian,
+    @Image3=Sophie, @Image4=Clara → those positions had no images and Seedance
+    drew arbitrary people.
+
+    `old_to_new` maps composer's original 1-based @ImageN index → new index
+    in the filtered refs[] (None = dropped). This function:
+      • Renumbers kept @ImageN to their new positions.
+      • Strips entire `@ImageN=Name (clothing)` clauses for dropped N (BINDING).
+      • Strips bare `@ImageN` tokens for dropped N (DIALOGUE / ACTION).
+      • Tries to clean up dangling commas / empty parens left behind.
+    """
+    if not prompt_text or not old_to_new:
+        return prompt_text or ''
+    has_drops = any(v is None for v in old_to_new.values())
+    needs_renumber = any(k != v for k, v in old_to_new.items() if v is not None)
+    if not has_drops and not needs_renumber:
+        return prompt_text
+
+    # We use a placeholder string \x01IMG\x01<n> for renumbered tokens so
+    # Pass 2's `@Image\d+` regex doesn't accidentally rewrite them again.
+    KEPT_PRE = '\x01IMG\x01'
+    DROP_MARK = '\x02'
+
+    # Pass 1: BINDING-style clauses '@ImageN=Name (description)' or '@ImageN=Name'
+    # Stops at next comma / period / newline / @Image so adjacent BINDING entries
+    # don't bleed together.
+    binding_re = re.compile(
+        r'@Image(\d+)\s*[=—\-]\s*[^,.@\n]+?(?:\s*\([^)]*\))?(?=\s*(?:,|\.|\n|@Image|$))'
+    )
+    def _replace_binding(m):
+        oldN = int(m.group(1))
+        newN = old_to_new.get(oldN)
+        if newN is None:
+            return DROP_MARK
+        # Renumber the @ImageN at the start; placeholder so Pass 2 ignores
+        return re.sub(r'^@Image\d+', f'{KEPT_PRE}{newN}', m.group(0), count=1)
+    prompt_text = binding_re.sub(_replace_binding, prompt_text)
+
+    # Pass 2: bare @ImageN remaining (DIALOGUE shot-bits, parens). Placeholder
+    # tokens from pass 1 are \x01IMG\x01N — don't match @Image\d+ pattern.
+    def _replace_bare(m):
+        oldN = int(m.group(1))
+        newN = old_to_new.get(oldN)
+        return f'{KEPT_PRE}{newN}' if newN is not None else DROP_MARK
+    prompt_text = re.sub(r'@Image(\d+)', _replace_bare, prompt_text)
+
+    # Convert placeholders back to @Image
+    prompt_text = prompt_text.replace(KEPT_PRE, '@Image')
+
+    # Strip drop-marks plus any trailing punctuation/glue token that would
+    # leave dangling artefacts.
+    prompt_text = re.sub(rf'{DROP_MARK}\s*[,.]?\s*', '', prompt_text)
+
+    # Cleanup punctuation / spacing artefacts left by deletions
+    prompt_text = re.sub(r'\(\s*\)', '', prompt_text)             # empty parens
+    prompt_text = re.sub(r',\s*,+', ',', prompt_text)             # double commas
+    prompt_text = re.sub(r',\s*\.', '.', prompt_text)             # ", ." → "."
+    prompt_text = re.sub(r'\(\s*,', '(', prompt_text)             # "(," → "("
+    prompt_text = re.sub(r',\s*\)', ')', prompt_text)             # ",)" → ")"
+    prompt_text = re.sub(r' {2,}', ' ', prompt_text)              # multiple spaces
+    prompt_text = re.sub(r'\s*\n\s*\n\s*\n+', '\n\n', prompt_text)
+    return prompt_text.strip()
+
+
+def _build_image_tag_remap(original_refs: list, final_refs: list) -> dict:
+    """Build {original_1based_idx: final_1based_idx_or_None} from composer's
+    original ordered refs vs the filtered ordered refs."""
+    orig_pos = {}      # (kind, id) → original 1-based pos (first occurrence)
+    for i, r in enumerate(original_refs or []):
+        key = (r.get('kind'), r.get('id'))
+        if key not in orig_pos:
+            orig_pos[key] = i + 1
+    final_pos = {}
+    for i, r in enumerate(final_refs or []):
+        key = (r.get('kind'), r.get('id'))
+        if key not in final_pos:
+            final_pos[key] = i + 1
+    out = {}
+    for key, oldN in orig_pos.items():
+        out[oldN] = final_pos.get(key)
+    return out
+
+
+# ─── Reference-style validators / banlist / blocking-injection ─────────────
+# Ported from /tmp/shadow-founder/services/chunk-builder.ts. Goal: each segment's
+# final promptEn matches the reference's clean 6-block English structure with
+# spatially-consistent `episodeBlocking` injected, banlist replacements applied
+# for moderation, and validation warnings caught programmatically.
+
+# 21 replacements that catch Seedance moderation triggers without losing
+# narrative meaning. Kept in lock-step with reference (chunk-builder.ts:199-221).
+_SD_BANLIST = [
+    (re.compile(r'\b(shoots?|fires?|shooting|firing)\b', re.IGNORECASE), 'muzzle flash illuminates'),
+    (re.compile(r'\b(guns?|pistols?|rifles?|weapons?)\b', re.IGNORECASE), 'tactical equipment'),
+    (re.compile(r'\b(stabs?|slashes?|stabbing|slashing)\b', re.IGNORECASE), 'sharp impact'),
+    (re.compile(r'\b(knife|knives|blades?)\b', re.IGNORECASE), 'metallic object'),
+    (re.compile(r'\b(attacks?|attacking|attacked)\b', re.IGNORECASE), 'closes distance'),
+    (re.compile(r'\b(fights?|fighting|fought|punch(?:es|ed|ing)?|kick(?:s|ed|ing)?|strikes?|hits?|beats?)\b', re.IGNORECASE), 'impact'),
+    (re.compile(r'\b(kills?|killing|killed|murders?|murdered)\b', re.IGNORECASE), 'falls still'),
+    (re.compile(r'\b(dies?|dying|dead|death)\b', re.IGNORECASE), 'final moment'),
+    (re.compile(r'\b(corpse|corpses|dead body|dead bodies)\b', re.IGNORECASE), 'motionless figure on the ground'),
+    (re.compile(r'\b(blood|bleeds?|bleeding|bled)\b', re.IGNORECASE), 'crimson liquid'),
+    (re.compile(r'\b(wounds?|wounded|injuries|injured|hurt)\b', re.IGNORECASE), 'surface damage'),
+    (re.compile(r'\b(explodes?|exploded|exploding|explosions?)\b', re.IGNORECASE), 'rapid expansion'),
+    (re.compile(r'\b(destroys?|destroyed|destroying|smashes?|smashed|smashing)\b', re.IGNORECASE), 'structural failure'),
+    (re.compile(r'\b(crashes?|crashed|crashing)\b', re.IGNORECASE), 'sudden impact'),
+    (re.compile(r'\bscreams?\b', re.IGNORECASE), 'open mouth'),
+    (re.compile(r'\b(cries in pain|cried in pain|crying in pain)\b', re.IGNORECASE), 'contorted expression'),
+    (re.compile(r'\b(child|kid|boy|girl|teen|teenager|baby|infant|minor|schoolgirl|schoolboy)\b', re.IGNORECASE), 'young person'),
+    (re.compile(r'\b(violent|violence|brutal|graphic|gore|horror|torture|abuse|terrorist)\b', re.IGNORECASE), 'dramatic confrontation'),
+    (re.compile(r'\b(victim|suicide)\b', re.IGNORECASE), 'figure in distress'),
+    (re.compile(r'\b(nude|naked|sexy|seductive|erotic|intimate|undressed|lingerie)\b', re.IGNORECASE), 'composed appearance'),
+    (re.compile(r'\b(passionate kisses?|passionate kissing)\b', re.IGNORECASE), 'close embrace'),
+]
+
+def _seedance_apply_banlist(text):
+    """Run all 21 banlist replacements on the prompt text. Returns
+    (replaced_text, list_of_applied_matches). Mirrors reference applyBanlist."""
+    if not text:
+        return text or '', []
+    applied = []
+    out = text
+    for pattern, replacement in _SD_BANLIST:
+        def _repl(m, _r=replacement):
+            applied.append({'original': m.group(0), 'replaced': _r})
+            return _r
+        out = pattern.sub(_repl, out)
+    return out, applied
+
+
+# Forbidden cross-chunk references — kill autonomy. Mirrors reference FORBIDDEN_REFS.
+_SD_FORBIDDEN_AUTONOMY_RE = [
+    re.compile(r'\bsame\b', re.IGNORECASE),
+    re.compile(r'\bstill\b', re.IGNORECASE),
+    re.compile(r'\bas before\b', re.IGNORECASE),
+    re.compile(r'\bas previous\b', re.IGNORECASE),
+    re.compile(r'\bcontinues\b', re.IGNORECASE),
+    re.compile(r'\bпрежний\b', re.IGNORECASE),
+    re.compile(r'\bтот же\b', re.IGNORECASE),
+]
+
+def _seedance_validate_autonomy(segments_data):
+    """Each segment's promptEn must NOT reference prior chunks ("same/still/as
+    before/continues") — Seedance has no memory across chunks, so any reference
+    to "earlier" content causes drift. Returns list of {code, message, anchor}."""
+    warnings = []
+    for spec, plan, prompt_text in segments_data:
+        if not prompt_text:
+            continue
+        for rx in _SD_FORBIDDEN_AUTONOMY_RE:
+            m = rx.search(prompt_text)
+            if m:
+                warnings.append({
+                    'code': 'autonomy-violation',
+                    'message': f'Сегмент sc{spec["sceneIdx"]}.seg{spec["segIdx"]}: запрещённое слово "{m.group(0)}" в promptEn — нарушает автономность.',
+                    'anchor': spec['anchor'],
+                })
+    return warnings
+
+
+def _seedance_validate_durations(segments_data):
+    """Sum of shot lengths in actionTimeline must equal durationSec. Also flag
+    monotone rhythm (all shots equal length)."""
+    warnings = []
+    for spec, plan, prompt_text in segments_data:
+        if not isinstance(plan, dict):
+            continue
+        timeline = plan.get('actionTimeline') or []
+        duration = plan.get('durationSec') or 0
+        if not timeline or not duration:
+            continue
+        try:
+            sum_shots = sum(int(s.get('toSec', 0)) - int(s.get('fromSec', 0)) for s in timeline)
+        except Exception:
+            sum_shots = -1
+        if sum_shots != duration:
+            warnings.append({
+                'code': 'shot-sum-mismatch',
+                'message': f'Сегмент sc{spec["sceneIdx"]}.seg{spec["segIdx"]}: сумма шотов {sum_shots}с ≠ durationSec={duration}с',
+                'anchor': spec['anchor'],
+            })
+        # Monotone check — only when ≥2 shots
+        if len(timeline) >= 2:
+            try:
+                lens = [int(s.get('toSec', 0)) - int(s.get('fromSec', 0)) for s in timeline]
+                if all(l == lens[0] for l in lens):
+                    warnings.append({
+                        'code': 'monotone-rhythm',
+                        'message': f'Сегмент sc{spec["sceneIdx"]}.seg{spec["segIdx"]}: все шоты {lens[0]}с — однообразная нарезка.',
+                        'anchor': spec['anchor'],
+                    })
+            except Exception:
+                pass
+    return warnings
+
+
+# Wardrobe-fidelity guard: items often hallucinated by AI even when not in
+# canonical char description. If a word from this list appears in actionTimeline
+# but is NOT in the character's wardrobe text → warning.
+_SD_WARDROBE_WORDS = [
+    'jacket', 'blazer', 'coat', 'overcoat', 'tie', 'scarf', 'hat', 'cap',
+    'beanie', 'gloves', 'boots', 'sunglasses', 'glasses', 'watch', 'belt',
+    'vest', 'hoodie', 'sweater'
+]
+
+def _seedance_validate_wardrobe(segments_data, wardrobe_by_tag):
+    """If a segment's actionTimeline mentions a wardrobe word that's not in any
+    of the segment's characters' canonical wardrobe descriptions — warn."""
+    warnings = []
+    for spec, plan, prompt_text in segments_data:
+        if not isinstance(plan, dict):
+            continue
+        chars_in_scene = plan.get('charactersInSegment') or []
+        tags_in_scene = [c.get('tag') for c in chars_in_scene if c.get('tag')]
+        allowed_text = ' '.join(
+            (wardrobe_by_tag.get(tag) or '').lower()
+            for tag in tags_in_scene
+        )
+        timeline = plan.get('actionTimeline') or []
+        for i, shot in enumerate(timeline):
+            desc = (shot.get('description') or '').lower()
+            for word in _SD_WARDROBE_WORDS:
+                if re.search(r'\b' + re.escape(word) + r'\b', desc) and not re.search(r'\b' + re.escape(word) + r'\b', allowed_text):
+                    warnings.append({
+                        'code': 'wardrobe-mismatch',
+                        'message': f'Сегмент sc{spec["sceneIdx"]}.seg{spec["segIdx"]}, шот {i+1}: упомянут "{word}", но ни у одного персонажа в сцене его нет в wardrobe.',
+                        'anchor': spec['anchor'],
+                    })
+    return warnings
+
+
+def _seedance_filter_blocking_for_chunk(blocking_text, tags_in_chunk):
+    """Drop sentences in blocking that mention @ImageN tags NOT used by this
+    chunk — otherwise blocking text leaks descriptions of off-frame chars into
+    the chunk's prompt and Seedance tries to render them.
+    Mirrors reference filterBlockingForChunk."""
+    if not blocking_text:
+        return ''
+    used_set = set(tags_in_chunk or [])
+    parts = re.split(r'(?<=\.)\s+', blocking_text)
+    kept = []
+    for p in parts:
+        matches = re.findall(r'@[Ii]mage(\d+)', p)
+        if not matches:
+            kept.append(p.strip())
+            continue
+        all_tags_in_part = {f'@Image{n}' for n in matches}
+        if all_tags_in_part.issubset(used_set):
+            kept.append(p.strip())
+    return ' '.join(kept).strip()
+
+
+def _seedance_inject_blocking(prompt_text, blocking_text, chunk_tags_used):
+    """Insert filtered blocking BEFORE 'Constraints:' in the 6-block promptEn.
+    Falls back to append if Constraints not found. Mirrors reference injectBlocking."""
+    if not blocking_text or not blocking_text.strip():
+        return prompt_text
+    filtered = _seedance_filter_blocking_for_chunk(blocking_text, chunk_tags_used)
+    if not filtered or len(filtered) < 30:
+        return prompt_text
+    trimmed = re.sub(r'\s+', ' ', filtered).strip()
+    idx = prompt_text.rfind('Constraints:')
+    if idx < 0:
+        return prompt_text + f'\n\nScene blocking: {trimmed}'
+    return (
+        prompt_text[:idx]
+        + f'Scene blocking (consistent across all chunks of this episode): {trimmed}\n\n'
+        + prompt_text[idx:]
+    )
+
+
+_SD_HARD_CUTS_CLAUSE = (
+    'hard cuts between shots with different camera angles, no fade transitions, '
+    'no dissolves, no cross-fades, sharp instant edits between framings'
+)
+
+def _seedance_inject_hard_cuts(prompt_text):
+    """Append hard-cuts directive to Constraints. Mirrors reference injectHardCuts.
+    Programmatic — more reliable than asking AI to write it."""
+    if not prompt_text or 'hard cuts between shots' in prompt_text:
+        return prompt_text
+    idx = prompt_text.rfind('Constraints:')
+    if idx < 0:
+        return prompt_text + f'\n\nConstraints: {_SD_HARD_CUTS_CLAUSE}'
+    # Append at end of the last (Constraints) line
+    return re.sub(
+        r'(Constraints:[^\n]*?)(\s*)$',
+        lambda m: f'{m.group(1)}, {_SD_HARD_CUTS_CLAUSE}',
+        prompt_text, count=1, flags=re.DOTALL
+    )
+
+
+def _prev_episode_ending_context(sid, num):
+    """Build a multi-section text describing how episode N-1 ended — used as
+    continuity context when generating scene_blocking / batch-compose for N.
+    TikTok-format episodes often pick up immediately where N-1 left off, so
+    character positions must be inherited (Adrian still at the door, Clara
+    still at the desk) instead of reset.
+
+    Returns None when there's no prev episode or no useful context.
+    Sections (concat'd with blank lines):
+      1. Last scene heading of N-1's script
+      2. Last 6 non-empty lines of N-1's script
+      3. N-1's batch_episode_blocking (whole-episode geometry from last build)
+      4. Last completed seedance chunk's ending_state (if poll captured it)
+    """
+    try:
+        n = int(num)
+    except Exception:
+        return None
+    if n <= 1:
+        return None
+    prev_ep = load_episode(sid, n - 1)
+    if not prev_ep:
+        return None
+    parts = []
+
+    prev_script = (prev_ep.get('script') or '').strip()
+    if prev_script:
+        last_heading = None
+        for line in prev_script.split('\n'):
+            t = line.strip()
+            if is_scene_heading(t):
+                last_heading = t
+        if last_heading:
+            parts.append(f"PREV EP {n-1} — last scene heading:\n{last_heading[:160]}")
+
+        non_empty = [l.strip() for l in prev_script.split('\n') if l.strip()]
+        clean = [l for l in non_empty
+                 if not l.startswith('- **')
+                 and not l.startswith('**КРАТКОЕ')
+                 and not l.startswith('## ')]
+        tail = clean[-6:] if len(clean) > 6 else clean
+        if tail:
+            parts.append("PREV EP — last 6 lines (immediate beats before cut):\n" + '\n'.join(tail))
+
+    prev_blocking = (prev_ep.get('batch_episode_blocking') or prev_ep.get('scene_blocking') or '').strip()
+    if prev_blocking:
+        parts.append(f"PREV EP — episodeBlocking (whole-episode geometry):\n{prev_blocking[:1500]}")
+
+    chunks = prev_ep.get('seedance_chunks') or []
+    last_completed = None
+    for c in reversed(chunks):
+        if c.get('status') == 'completed' and (c.get('ending_state') or '').strip():
+            last_completed = c
+            break
+    if last_completed:
+        es = (last_completed.get('ending_state') or '').strip()
+        parts.append(f"PREV EP — last generated chunk ending state (final tableau before cut):\n{es[:400]}")
+
+    if not parts:
+        return None
+    return '\n\n'.join(parts)
+
+
+def _build_episode_tag_mapping(script_text, active_chars, active_locs):
+    """Deterministic tag mapping `@Image1=name1, @Image2=name2, ...` based on
+    first-appearance order in the script. Run BEFORE the AI call so Claude
+    receives a fixed mapping and can't shuffle indices between segments.
+
+    Strategy:
+      1. Find first occurrence of each active character's name in script.
+      2. Find first occurrence of each active location's name (or scene
+         heading slug) in script.
+      3. Sort by position; assign @Image1, @Image2, ...
+    Returns list of {tag, kind: 'char'|'loc', id, name}.
+    """
+    if not script_text:
+        return []
+    lower = script_text.lower()
+    entries = []
+    seen_ids = set()
+    for c in active_chars or []:
+        nm = (c.get('name') or '').strip()
+        if not nm or c['id'] in seen_ids: continue
+        # Find first appearance — prefer line-start "Name:" cue, fall back to any mention
+        pat_cue = re.compile(r'^\s*' + re.escape(nm) + r'\s*[:：]', re.MULTILINE | re.IGNORECASE)
+        m = pat_cue.search(script_text)
+        pos = m.start() if m else lower.find(nm.lower())
+        if pos >= 0:
+            entries.append({'kind': 'char', 'id': c['id'], 'name': nm, 'pos': pos})
+            seen_ids.add(c['id'])
+    for l in active_locs or []:
+        nm = (l.get('name') or '').strip()
+        if not nm: continue
+        pos = lower.find(nm.lower())
+        if pos < 0:
+            # Try scene-heading style (INT./EXT. NAME — TIME)
+            pat = re.compile(
+                r'(?:INT\.|EXT\.|ИНТ\.|ИНТА\.|ЭКСТ\.|ЭКС\.|НАТ\.|ВНУТР\.|ИНТЕРЬЕР|Локация\s*:)\s*' +
+                re.escape(nm), re.IGNORECASE
+            )
+            m = pat.search(script_text)
+            pos = m.start() if m else -1
+        if pos >= 0:
+            entries.append({'kind': 'loc', 'id': l['id'], 'name': nm, 'pos': pos})
+    entries.sort(key=lambda e: e['pos'])
+    out = []
+    for i, e in enumerate(entries):
+        out.append({
+            'tag': f'@Image{i+1}',
+            'kind': e['kind'],
+            'id': e['id'],
+            'name': e['name'],
+        })
+    return out
+
+
+def _canonical_char_description(s, char_id, outfit_label):
+    """Canonical description used BOTH for image generation AND for Seedance
+    BINDING — same text in both places guarantees visual+textual alignment.
+
+    Composition:
+      - char.appearance (face/body/hair/etc.) — the same text the image-gen
+        prompt used to render the photo.
+      - + chosen outfit description (if outfit_label given and matches),
+        else the base outfit's description.
+
+    This REPLACES the older Vision-extracted approach (which re-analyzed the
+    photo and could drift from the original prompt). The canonical text always
+    matches the artist's intent, never re-interpreted from pixels.
+    """
+    char = next((c for c in (s.get('characters') or []) if c['id'] == char_id), None)
+    if not char:
+        return ''
+    appearance = (char.get('appearance') or '').strip()
+    outfit_desc = ''
+    outfits = char.get('outfits') or []
+    is_base_request = (not outfit_label) or outfit_label.lower() in ('base', '')
+    using_non_base_outfit = False
+    if outfit_label and not is_base_request:
+        chosen = next((o for o in outfits if o.get('label') == outfit_label), None)
+        if chosen:
+            outfit_desc = (chosen.get('description') or '').strip()
+            using_non_base_outfit = True
+    if not outfit_desc:
+        # Look ONLY for an explicitly-flagged base outfit. Do NOT fall back to
+        # `outfits[0]` — that's whichever scene-specific outfit happened to be
+        # listed first (e.g. "morning_aftermath: silk slip dress, bare shoulders").
+        # If we appended that to a character's base appearance ("wearing wool coat"),
+        # the model saw two conflicting outfits in one description and rendered
+        # a torn-sleeve hybrid (May 2026 Lydia incident).
+        base = next((o for o in outfits if o.get('is_base')), None)
+        if base:
+            outfit_desc = (base.get('description') or '').strip()
+        # If no IS_BASE outfit exists, the appearance text itself usually contains
+        # the base outfit description (cast-block parser embeds "wearing X" into
+        # appearance when IS_BASE is set without a separate outfit entry). Trust
+        # appearance as-is — don't pollute with a random outfit.
+    # When switching to a NON-base outfit (hospital_gown for an episode where
+    # the character is in hospital), strip the embedded "wearing <base outfit>"
+    # tail from appearance so we don't end up with two outfits at once. Without
+    # this, BINDING would say "Claire wearing charcoal grey blazer; pale blue
+    # hospital gown" — Seedance renders a hybrid (May 2026 Claire incident).
+    if using_non_base_outfit and appearance:
+        appearance = re.sub(
+            r'\s*,?\s*wearing\b[^.;]*$', '', appearance, flags=re.IGNORECASE
+        ).rstrip(' ,;.').strip()
+    parts = [p for p in (appearance, outfit_desc) if p]
+    full = '; '.join(parts)
+    # Strip stray newlines and cap length to keep BINDING manageable
+    full = re.sub(r'\s+', ' ', full).strip()
+    return full[:300]
+
+
 def strip_json(raw: str) -> str:
     """Extract a JSON object/array from a model response.
     Handles: bare JSON, ```json fenced blocks, JSON with trailing summary text after the closing brace.
@@ -492,6 +1002,26 @@ def strip_json(raw: str) -> str:
         if end != -1:
             raw = raw[:end]
     return raw.strip()
+
+def _repair_llm_json(s: str) -> str:
+    """Best-effort repair of common LLM JSON mistakes: trailing commas,
+    unquoted property keys, single-quoted keys/strings."""
+    import re
+    # Remove trailing commas before } or ]
+    s = re.sub(r',(\s*[}\]])', r'\1', s)
+    # Quote unquoted object keys: {  foo: ...  -> {"foo": ...
+    # Match {/, then whitespace, then identifier followed by :
+    s = re.sub(r'([{,])(\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*):', r'\1\2"\3"\4:', s)
+    # Convert single-quoted keys to double: 'foo': -> "foo":
+    s = re.sub(r"([{,])(\s*)'([^'\n]*)'(\s*):", r'\1\2"\3"\4:', s)
+    return s
+
+def loads_lenient(raw: str):
+    """json.loads with one-shot repair fallback."""
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return json.loads(_repair_llm_json(raw))
 
 def save_config(cfg):
     CONFIG_FILE.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
@@ -1322,14 +1852,81 @@ def get_series(sid):
     if 'finale' not in s:
         s['finale'] = None
         healed = True
+    # Heal mis-gendered characters — STRICT version. Only flips when:
+    #   1) appearance text embeds wrong sex tag ("young man" vs "young woman"),
+    #   2) inference comes from speaker-attribution lines ("she said", "he replied")
+    #      DIRECTLY tied to this character — NOT bare pronouns in surrounding text
+    #      (which leak from other characters in the same scene),
+    #   3) signal is unambiguous (≥4 attributed hits, ratio >3:1 against the embed).
+    # Earlier loose version flipped MARCUS to female because pronouns near his
+    # name were mostly Lydia's ("she lifted her hand to Marcus's chest").
+    try:
+        all_scripts = '\n'.join((ep.get('script') or '') for ep in list_episodes(sid))
+        for c in (s.get('characters') or []):
+            app_lower = (c.get('appearance') or '').lower()
+            embeds_male   = 'young man'   in app_lower
+            embeds_female = 'young woman' in app_lower
+            if not (embeds_male or embeds_female):
+                continue
+            name = (c.get('name') or '').strip()
+            if not name:
+                continue
+            # Speaker-attributed pronouns ONLY: '<Name>, she said', '<Name>, he replied'.
+            # This is far more reliable than "pronouns near the name in any context".
+            attrib_re = re.compile(
+                r'\b' + re.escape(name) + r'\b[^\.\n]{0,40}\b(he|she|он|она)\b',
+                re.IGNORECASE,
+            )
+            he_attrib = 0
+            she_attrib = 0
+            for m in attrib_re.finditer(all_scripts):
+                tok = m.group(1).lower()
+                if tok in ('he', 'он'):
+                    he_attrib += 1
+                else:
+                    she_attrib += 1
+            confident_female = she_attrib >= 4 and she_attrib > he_attrib * 3
+            confident_male   = he_attrib  >= 4 and he_attrib  > she_attrib * 3
+            should_flip = (confident_female and embeds_male) or (confident_male and embeds_female)
+            if not should_flip:
+                continue
+            new_gender = 'female' if confident_female else 'male'
+            old_gender = c.get('gender')
+            c['gender'] = new_gender
+            if new_gender == 'female':
+                c['appearance'] = re.sub(r'young man\b', 'young woman', c.get('appearance') or '', flags=re.IGNORECASE)
+            else:
+                c['appearance'] = re.sub(r'young woman\b', 'young man', c.get('appearance') or '', flags=re.IGNORECASE)
+            c['ref_images'] = []
+            c.pop('avai_base_url', None)
+            for o in (c.get('outfits') or []):
+                o['photo'] = ''
+                o.pop('avai_url', None)
+            print(f'[heal {sid}] flipped {name}: gender {old_gender}→{new_gender} '
+                  f'(she-attrib={she_attrib}, he-attrib={he_attrib}), portraits cleared', flush=True)
+            healed = True
+    except Exception as e:
+        print(f'[heal {sid}] gender-heal failed: {e}', flush=True)
     if healed:
         save_series(sid, s)
+        # If we cleared portraits (gender heal flipped a character), trigger
+        # autogen so the user doesn't have to remember to click "Сгенерить".
+        try:
+            trigger_autogen_if_enabled(sid)
+        except Exception as e:
+            print(f'[heal {sid}] autogen trigger after heal failed: {e}', flush=True)
     # Heal episode refs against current series state (idempotent, cheap).
     # Catches the failure mode where chars/outfits in scripts aren't reflected in series.json.
+    # Skip episodes where the user hasn't yet clicked "Извлечь персонажей и локации"
+    # — auto-creating chars/outfits/locations behind their back is what we're trying to avoid.
     try:
         for ep in list_episodes(sid):
-            if (ep.get('script') or '').strip():
-                sync_episode_with_cast_block(sid, ep['number'])
+            if not (ep.get('script') or '').strip():
+                continue
+            # Default True for legacy episodes (they were already extracted before this gate).
+            if ep.get('cast_extracted', True) is False:
+                continue
+            sync_episode_with_cast_block(sid, ep['number'])
     except Exception as e:
         print(f'[get_series {sid}] heal failed: {e}')
     # Re-load post-heal so client gets the fresh state
@@ -2379,13 +2976,19 @@ def regenerate_item(sid, item_id):
 # ── Auto-generate missing assets (background sweep) ──────────────────────────
 
 import threading
+import concurrent.futures
 
 # Per-series lock so a sweep doesn't run twice in parallel for the same series
 _AUTOGEN_LOCKS = {}
-_AUTOGEN_STATUS = {}  # sid -> {'running': bool, 'queue': int, 'done': int, 'errors': []}
+_AUTOGEN_STATUS = {}  # sid -> {'running': bool, 'queue': int, 'done': int, 'errors': [], 'in_progress': [...]}
 
 def _autogen_status(sid):
-    return _AUTOGEN_STATUS.setdefault(sid, {'running': False, 'queue': 0, 'done': 0, 'errors': []})
+    return _AUTOGEN_STATUS.setdefault(sid, {
+        'running': False, 'queue': 0, 'done': 0, 'errors': [],
+        # in_progress: list of {kind, parent_id, child_id?, name} entries currently
+        # being generated. Frontend uses this to show spinners on specific cards.
+        'in_progress': [],
+    })
 
 def _gen_char_base_inline(s, sid, char):
     """Generate base ref for character. Mutates s, saves at end."""
@@ -2458,10 +3061,18 @@ def _gen_loc_inline(s, sid, loc):
     loc.setdefault('ref_images', []).insert(0, str(out_path.relative_to(series_path(sid))))
 
 
+_AUTOGEN_SAVE_LOCKS: dict[str, threading.Lock] = {}
+_AUTOGEN_PARALLELISM = 4
+
 def auto_generate_missing_assets(sid):
     """Background sweep: generate base photos for chars without refs,
     outfit photos for outfits without photos, location refs for locations without refs.
-    Order: char-bases first (so outfit i2i has a reference), then outfits, then locations.
+    Pipeline:
+      Phase 1 — char-bases in parallel (outfits need them as i2i refs)
+      Phase 2 — outfits + locations in parallel (independent of each other)
+    Each worker calls the slow avai_generate API outside any lock; only the
+    final read-modify-write of series.json runs under a per-series save-lock,
+    so 4 concurrent workers can image-gen at once without trashing the file.
     Idempotent — skips anything already generated.
     Also pre-syncs every episode's cast block so chars/outfits referenced in scripts
     but missing from series.json get created before the sweep runs."""
@@ -2469,12 +3080,18 @@ def auto_generate_missing_assets(sid):
     if not lock.acquire(blocking=False):
         print(f'[autogen {sid}] already running, skipping')
         return
+    save_lock = _AUTOGEN_SAVE_LOCKS.setdefault(sid, threading.Lock())
     st = _autogen_status(sid)
-    st.update({'running': True, 'queue': 0, 'done': 0, 'errors': []})
+    st.update({'running': True, 'queue': 0, 'done': 0, 'errors': [], 'in_progress': []})
     try:
         # ─── Pre-sweep: ensure every episode's cast block is reflected in series.json
+        # Skip episodes where extraction hasn't been confirmed by the user yet.
         for ep in list_episodes(sid):
-            if (ep.get('script') or '').strip():
+            if not (ep.get('script') or '').strip():
+                continue
+            if ep.get('cast_extracted', True) is False:
+                continue
+            if True:
                 try:
                     sync_episode_with_cast_block(sid, ep['number'])
                 except Exception as e:
@@ -2482,49 +3099,120 @@ def auto_generate_missing_assets(sid):
 
         s = load_series(sid)
         if not s: return
-        # Build task list
-        tasks = []
+        # Build task list — phased
+        char_tasks = []
+        outfit_tasks = []
+        loc_tasks = []
         for c in s.get('characters', []):
             if not c.get('ref_images'):
-                tasks.append(('char', c['id'], None))
+                char_tasks.append(('char', c['id'], None))
         for c in s.get('characters', []):
             for o in c.get('outfits', []):
                 if not o.get('photo') and not o.get('is_base'):
-                    tasks.append(('outfit', c['id'], o['id']))
+                    outfit_tasks.append(('outfit', c['id'], o['id']))
         for l in s.get('locations', []):
             if not l.get('ref_images'):
-                tasks.append(('loc', l['id'], None))
-        st['queue'] = len(tasks)
-        print(f'[autogen {sid}] {len(tasks)} assets to generate')
-        for kind, parent_id, child_id in tasks:
+                loc_tasks.append(('loc', l['id'], None))
+        total_tasks = len(char_tasks) + len(outfit_tasks) + len(loc_tasks)
+        st['queue'] = total_tasks
+        print(f'[autogen {sid}] {total_tasks} assets to generate '
+              f'(chars={len(char_tasks)}, outfits={len(outfit_tasks)}, locs={len(loc_tasks)}, parallel={_AUTOGEN_PARALLELISM})',
+              flush=True)
+
+        def _ip_add(entry):
+            # status['in_progress'] is a plain list — protect with the save_lock
+            with save_lock:
+                st['in_progress'].append(entry)
+
+        def _ip_remove(parent_id, child_id):
+            with save_lock:
+                st['in_progress'] = [e for e in st['in_progress']
+                                      if not (e.get('parent_id') == parent_id and e.get('child_id') == child_id)]
+
+        def _run_task(kind, parent_id, child_id):
+            ip_entry = None
             try:
-                # Re-load each iteration so we don't clobber concurrent edits
-                s = load_series(sid)
-                if not s: break
+                # Re-load LOCALLY so each worker has a fresh read for its mutation
+                s_local = load_series(sid)
+                if not s_local:
+                    return
                 if kind == 'char':
-                    char = next((c for c in s['characters'] if c['id'] == parent_id), None)
-                    if char and not char.get('ref_images'):
-                        _gen_char_base_inline(s, sid, char)
-                        save_series(sid, s)
+                    char = next((c for c in s_local.get('characters', []) if c['id'] == parent_id), None)
+                    if not char or char.get('ref_images'):
+                        st['done'] += 1
+                        return
+                    ip_entry = {'kind': 'char', 'parent_id': parent_id, 'child_id': None, 'name': char.get('name', '')}
+                    _ip_add(ip_entry)
+                    _gen_char_base_inline(s_local, sid, char)  # SLOW: avai API call
+                    new_refs = char.get('ref_images') or []
+                    new_url  = char.get('avai_base_url') or ''
+                    with save_lock:
+                        s_disk = load_series(sid)
+                        if not s_disk: return
+                        c_disk = next((c for c in s_disk.get('characters', []) if c['id'] == parent_id), None)
+                        if c_disk and not c_disk.get('ref_images'):
+                            c_disk['ref_images'] = new_refs
+                            c_disk['avai_base_url'] = new_url
+                            save_series(sid, s_disk)
                 elif kind == 'outfit':
-                    char = next((c for c in s['characters'] if c['id'] == parent_id), None)
-                    if char:
-                        outfit = next((o for o in char.get('outfits', []) if o['id'] == child_id), None)
-                        if outfit and not outfit.get('photo'):
-                            _gen_outfit_inline(s, sid, char, outfit)
-                            save_series(sid, s)
+                    char = next((c for c in s_local.get('characters', []) if c['id'] == parent_id), None)
+                    if not char: return
+                    outfit = next((o for o in char.get('outfits', []) if o['id'] == child_id), None)
+                    if not outfit or outfit.get('photo'):
+                        st['done'] += 1
+                        return
+                    ip_entry = {'kind': 'outfit', 'parent_id': parent_id, 'child_id': child_id,
+                                'name': f"{char.get('name','')}/{outfit.get('label','')}"}
+                    _ip_add(ip_entry)
+                    _gen_outfit_inline(s_local, sid, char, outfit)  # SLOW: avai i2i call
+                    new_photo = outfit.get('photo') or ''
+                    new_url   = outfit.get('avai_url') or ''
+                    with save_lock:
+                        s_disk = load_series(sid)
+                        if not s_disk: return
+                        c_disk = next((c for c in s_disk.get('characters', []) if c['id'] == parent_id), None)
+                        if not c_disk: return
+                        o_disk = next((o for o in c_disk.get('outfits', []) if o['id'] == child_id), None)
+                        if o_disk and not o_disk.get('photo'):
+                            o_disk['photo'] = new_photo
+                            o_disk['avai_url'] = new_url
+                            save_series(sid, s_disk)
                 elif kind == 'loc':
-                    loc = next((l for l in s.get('locations', []) if l['id'] == parent_id), None)
-                    if loc and not loc.get('ref_images'):
-                        _gen_loc_inline(s, sid, loc)
-                        save_series(sid, s)
+                    loc = next((l for l in s_local.get('locations', []) if l['id'] == parent_id), None)
+                    if not loc or loc.get('ref_images'):
+                        st['done'] += 1
+                        return
+                    ip_entry = {'kind': 'loc', 'parent_id': parent_id, 'child_id': None, 'name': loc.get('name', '')}
+                    _ip_add(ip_entry)
+                    _gen_loc_inline(s_local, sid, loc)  # SLOW: avai API call
+                    new_refs = loc.get('ref_images') or []
+                    with save_lock:
+                        s_disk = load_series(sid)
+                        if not s_disk: return
+                        l_disk = next((l for l in s_disk.get('locations', []) if l['id'] == parent_id), None)
+                        if l_disk and not l_disk.get('ref_images'):
+                            l_disk['ref_images'] = new_refs
+                            save_series(sid, s_disk)
                 st['done'] += 1
             except Exception as e:
                 err_msg = f'{kind}/{parent_id}: {str(e)[:200]}'
                 st['errors'].append(err_msg)
-                print(f'[autogen {sid}] FAILED {err_msg}')
+                print(f'[autogen {sid}] FAILED {err_msg}', flush=True)
+            finally:
+                _ip_remove(parent_id, child_id)
+
+        # Phase 1: char bases — outfits depend on these
+        if char_tasks:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=_AUTOGEN_PARALLELISM) as pool:
+                list(pool.map(lambda t: _run_task(*t), char_tasks))
+        # Phase 2: outfits + locations together (locations don't depend on chars)
+        phase2 = outfit_tasks + loc_tasks
+        if phase2:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=_AUTOGEN_PARALLELISM) as pool:
+                list(pool.map(lambda t: _run_task(*t), phase2))
     finally:
         st['running'] = False
+        st['in_progress'] = []
         lock.release()
         print(f'[autogen {sid}] done — {st["done"]}/{st["queue"]} ok, {len(st["errors"])} errors')
         # Re-check: if new chars/outfits/locs appeared during the sweep (e.g. a parallel
@@ -3632,8 +4320,10 @@ LANGUAGE RULES — NON-NEGOTIABLE:
 MANDATORY — start every script with this EXACT cast block. Pipe-separated KEY: VALUE fields.
 
 === EPISODE CAST ===
-CHARACTER: [name] | OUTFIT: [outfit_label] | OUTFIT_DESC: [garments + colors, what they're wearing this scene]
+CHARACTER: [name] | GENDER: [male|female] | LOOK: [age, build, hair, eyes, distinguishing features] | OUTFIT: [outfit_label] | OUTFIT_DESC: [garments + colors, what they're wearing this scene]
 === END CAST ===
+
+CRITICAL — `GENDER` and `LOOK` are REQUIRED on EVERY character line, including protagonists from the SERIES CHARACTERS list above. Do NOT omit them assuming the system "already knows" — the cast block is the single source of truth that builds reference portraits. If GENDER is missing, the parser falls back to a name-heuristic which has historically gendered female protagonists (Lydia, Sarah, etc.) as male, producing male portraits and chunks where the heroine appears as a man. Always emit `GENDER: female` or `GENDER: male` explicitly. `LOOK` should be 1 short phrase: age + build + hair + eyes + 1 distinguishing trait.
 
 CAST BLOCK RULES — MANDATORY:
 
@@ -3698,6 +4388,8 @@ CAST BLOCK RULES — MANDATORY:
    - The character's series description says they wear this look by default (e.g. Claire's base IS field uniform; James's base IS dress uniform; a CEO's base is suit)
    - The outfit description matches the character's appearance field
    Do NOT use IS_BASE for scene-specific costumes (sleepwear, formal gala, towel, etc.) — those need separate generation.
+
+   FIRST APPEARANCE = ALWAYS BASE: when introducing a brand-new character (not in the SERIES CHARACTERS list above), their cast-block line MUST have `IS_BASE: true`. Whatever they're wearing on their first appearance IS their default look. A bear-builder introduced wearing construction gear has construction gear as his base — not as a costume change. A nurse introduced in scrubs has scrubs as her base. The system auto-flags first-appearance outfits as base anyway, but write `IS_BASE: true` explicitly for clarity. Only mark a SUBSEQUENT outfit as non-base when the character literally changes clothes between scenes.
 
 Example of a valid cast block where a hotel-morning scene introduces sleepwear and a brand-new character:
 === EPISODE CAST ===
@@ -4598,6 +5290,9 @@ def extract_characters_from_script(sid, num):
     prev_locs  = set(ep.get('locations_used')  or [])
     ep['characters_used'] = final_chars
     ep['locations_used']  = final_locs
+    # Mark cast extraction as user-confirmed — auto-heal paths can now safely
+    # re-sync this episode's cast block (gated until user pressed the button).
+    ep['cast_extracted'] = True
     save_episode(sid, num, ep)
 
     if added_chars or added_locs or appearance_updates:
@@ -4795,7 +5490,8 @@ def generate_next_episode_synopsis(sid):
                 f'{script_block}'
                 f'{milestone_block}\n'
                 f'BATCH MODE: write the synopsis for CHUNK {next_num} — sub-episodes {a}–{b} (~{bs*60} sec total).\n'
-                f'Pick up from the previous chunk\'s cliffhanger. 4–6 sentences outlining: (1) chunk hook, (2) all {bs} mini-cliffhangers in order, (3) chunk midpoint reversal, (4) chunk-end cliffhanger.\n'
+                f'Pick up FROM THE NEXT BEAT after the previous chunk\'s cliffhanger, NOT from the cliffhanger itself. NO PLOT-RECAP: events already shown in CHUNK {prev_ep["number"]} are DONE — describe what happens NEXT, do NOT have characters re-issue the same ultimatums / re-state the same threats / re-deliver the same revelations from the previous chunk. '
+                f'4–6 sentences outlining: (1) chunk hook, (2) all {bs} mini-cliffhangers in order, (3) chunk midpoint reversal, (4) chunk-end cliffhanger.\n'
                 f'TIMELINE — also output `days_since_previous` (integer in-world days from prev chunk\'s end). 0 = same-day continuation.\n'
                 'Return JSON: {"synopsis": "...", "days_since_previous": int}'
             )
@@ -4808,7 +5504,8 @@ def generate_next_episode_synopsis(sid):
                 f'{script_block}'
                 f'{milestone_block}\n'
                 f'Write a synopsis (2-3 sentences) for EPISODE {next_num}.\n'
-                f'Continue naturally from where episode {prev_ep["number"]} left off — pick up from the cliffhanger. '
+                f'Continue naturally from where episode {prev_ep["number"]} left off — pick up FROM THE NEXT BEAT after the cliffhanger, NOT from the cliffhanger itself. '
+                f'NO PLOT-RECAP: events that already happened in Ep {prev_ep["number"]} (ultimatums delivered, threats made, revelations, decisions announced) are DONE. The Ep {next_num} synopsis must describe what happens NEXT (the response, the counter-move, the consequence) — NOT the same ultimatum being re-issued or the same threat being re-stated. If Ep {prev_ep["number"]} ended with "Character X demands Y or else Z" — Ep {next_num} synopsis describes the OTHER side\'s reaction / a twist / a new arrival, not Character X repeating the demand. '
                 f'Include: an immediate-stakes opening (no warm-up), a mid-episode reversal, and end on a new cliffhanger. '
                 f'TIMELINE — also output `days_since_previous` (integer): in-world days between Ep {prev_ep["number"]} and Ep {next_num}. '
                 f'Use real-world biology (pregnancy test 10+ days post conception, undercover ops 30+ days setup). 0 = same-day continuation. '
@@ -4819,20 +5516,18 @@ def generate_next_episode_synopsis(sid):
         data = json.loads(strip_json(claude_ask(prompt, system=_WRITER_SYSTEM)))
         syn = data.get('synopsis', '')
         dsp = data.get('days_since_previous')
-        # Persist the synopsis + timeline metadata onto the episode (create if missing)
+        # If the episode ALREADY exists (user pre-created it), just patch its
+        # synopsis / days metadata in-place. Do NOT auto-create a new episode here:
+        # this endpoint is called from the "Создать эпизод" modal's "✨ Сгенерить
+        # синопсис" button, where actual episode creation happens later via
+        # POST /episodes when the user confirms. Side-effect creation here led
+        # to phantom episodes when users generated a synopsis and then closed
+        # the modal — the episode was silently committed to disk.
         ep = load_episode(sid, next_num)
-        if ep is None:
-            ep = {
-                'number': next_num, 'title': f'Эпизод {next_num}', 'synopsis': syn,
-                'script': '', 'characters_used': [], 'character_outfits': {},
-                'days_since_previous': int(dsp) if dsp is not None else (0 if next_num == 1 else 1),
-                'notes': '', 'status': 'draft',
-                'reteller': {'project_id': None, 'status': None, 'video_url': None, 'submitted_at': None},
-            }
-        else:
+        if ep is not None:
             if not ep.get('synopsis'): ep['synopsis'] = syn
             if dsp is not None: ep['days_since_previous'] = int(dsp)
-        save_episode(sid, next_num, ep)
+            save_episode(sid, next_num, ep)
         return jsonify({'synopsis': syn, 'days_since_previous': dsp, 'episode_number': next_num})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -5075,6 +5770,24 @@ def generate_episode_script(sid, num):
             if stop_kw in prev_lines:
                 prev_lines = prev_lines[:prev_lines.index(stop_kw)]
         tail = '\n'.join(prev_lines[-25:])
+        # Last ~10 dialogue lines specifically — these are most likely to be re-staged
+        # by a writer who treats "continuation" as "rewind the climax".
+        recent_dialogue = []
+        for ln in reversed(prev_lines):
+            if re.match(r'^\s*[A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё\s\-\']{0,30}:\s', ln.strip()):
+                recent_dialogue.insert(0, ln.strip())
+                if len(recent_dialogue) >= 10:
+                    break
+        forbidden_dialogue_block = ''
+        if recent_dialogue:
+            forbidden_dialogue_block = (
+                f'\n═══ FORBIDDEN — DO NOT REPEAT OR PARAPHRASE THESE LINES ═══\n'
+                f'These dialogue beats already happened in {prev_label}. The viewer SAW them. '
+                f'You may NOT have any character say them again, paraphrase them, or re-deliver '
+                f'the same threat / ultimatum / revelation in different words.\n'
+                + '\n'.join(recent_dialogue)
+                + f'\n═══════════════════════════════════════════════════\n'
+            )
         prev_block = (
             f'{prev_label} SCRIPT (FULL — read it all):\n{prev_script}\n\n'
             f'═══ ENDING STATE OF {prev_label} — read this carefully ═══\n'
@@ -5084,6 +5797,19 @@ def generate_episode_script(sid, num):
             f'location, SAME characters present, continuing dialogue from the very next beat. '
             f'Do NOT teleport to a new room or "later that day".\n'
             f'{tail}\n'
+            f'═══════════════════════════════════════════════════\n'
+            f'{forbidden_dialogue_block}\n'
+            f'═══ NO PLOT-RECAP — HARD RULE ═══\n'
+            f'"Continue from the next beat" means PUSH FORWARD, not REWIND. Events that '
+            f'happened in {prev_label} (ultimatums delivered, threats made, revelations, '
+            f'character entrances/exits, decisions stated out loud) are DONE. Do NOT have a '
+            f'character re-issue the same ultimatum, re-state the same threat, or re-deliver '
+            f'the same key line in slightly different words just to "remind" the audience. '
+            f'A short drama viewer just watched {prev_label} 3 seconds ago — they remember. '
+            f'If the cliffhanger of {prev_label} was "Claire demands he confess on camera or '
+            f'she releases the files", THIS unit must show what happens NEXT — Cross\'s '
+            f'reaction, Melissa\'s move, an arrival, a counter-twist — NOT Claire saying the '
+            f'same demand again. RECAP-AS-OPENING IS A FAILURE STATE.\n'
             f'═══════════════════════════════════════════════════\n\n'
         )
     else:
@@ -5187,15 +5913,18 @@ def generate_episode_script(sid, num):
         ep['audit_report'] = audit_report
         save_episode(sid, num, ep)
 
-        # ─── Reconcile cast block → series chars/outfits → episode refs.
-        # This is idempotent: re-parses from a fresh series load, persists chars/outfits,
-        # rewrites episode IDs to point to valid series entries, drops stale refs.
-        sync_result = sync_episode_with_cast_block(sid, num)
-        print(f'[script-gen {sid}/ep{num}] sync: created_chars={sync_result.get("created_characters")} '
-              f'created_outfits={sync_result.get("created_outfits")} '
-              f'created_locations={sync_result.get("created_locations")} '
-              f'detected_locations={sync_result.get("detected_locations")} '
-              f'healed={sync_result.get("healed_refs")}')
+        # NOTE: cast-block sync is INTENTIONALLY NOT run after script-gen.
+        # User wants explicit control — they'll click "🤖 Извлечь персонажей и локации"
+        # to trigger /extract-characters when ready. Mark the episode so the auto-heal
+        # paths (get_series, autogen pre-sweep) skip it until extraction happens.
+        ep['cast_extracted'] = False
+        save_episode(sid, num, ep)
+        sync_result = {'created_characters': [], 'created_outfits': [], 'created_locations': [],
+                       'detected_locations': [], 'healed_refs': 0,
+                       'characters_used': ep.get('characters_used', []),
+                       'character_outfits': ep.get('character_outfits', {}),
+                       'locations_used': ep.get('locations_used', [])}
+        print(f'[script-gen {sid}/ep{num}] script saved, cast extraction pending — user must click extract', flush=True)
 
         # Fallback: scan script text for location names (flexible match)
         s = load_series(sid)  # reload to get the synced state
@@ -5394,6 +6123,37 @@ def sync_episode_with_cast_block(sid, num):
     }
 
 
+def _infer_gender_from_script(name, script):
+    """Count gendered pronouns within ±3 lines of any line mentioning `name`.
+    Returns 'female' / 'male' / None. Handles English + Russian.
+    Used as a robust fallback when the cast block omits GENDER for a character —
+    the previous tiny hardcoded female-name whitelist defaulted everyone-not-listed
+    to 'male', which silently turned protagonists like LYDIA into men."""
+    if not name or not script:
+        return None
+    import re as _re
+    name_lower = name.lower()
+    lines = script.splitlines()
+    he_count = 0
+    she_count = 0
+    EN_HE  = _re.compile(r"\b(he|his|him|himself|he's|he'd|he'll)\b", _re.IGNORECASE)
+    EN_SHE = _re.compile(r"\b(she|her|hers|herself|she's|she'd|she'll)\b", _re.IGNORECASE)
+    RU_HE  = _re.compile(r"\b(он|его|ему|им|нём|него)\b", _re.IGNORECASE)
+    RU_SHE = _re.compile(r"\b(она|её|ее|ей|ней|неё)\b", _re.IGNORECASE)
+    for i, line in enumerate(lines):
+        if name_lower not in line.lower():
+            continue
+        window = ' '.join(lines[max(0, i-3): min(len(lines), i+4)])
+        he_count  += len(EN_HE.findall(window))  + len(RU_HE.findall(window))
+        she_count += len(EN_SHE.findall(window)) + len(RU_SHE.findall(window))
+    # Require a meaningful margin to avoid noise from generic "he was talking to her"
+    if she_count >= 3 and she_count > he_count * 1.3:
+        return 'female'
+    if he_count >= 3 and he_count > she_count * 1.3:
+        return 'male'
+    return None
+
+
 def _parse_cast_block(script, chars):
     """Parse === EPISODE CAST === block, auto-create new characters & outfits.
     Mutates `chars` (the series characters list) — caller must save_series afterwards.
@@ -5442,23 +6202,40 @@ def _parse_cast_block(script, chars):
         raw_name = _re.sub(r'\s*\(.*?\)\s*$', '', raw_name).strip()
 
         char = _find_char(raw_name, chars)
+        char_was_just_created = False
 
         # Auto-create unknown character
         if not char:
+            char_was_just_created = True
             gender = fields.get('GENDER', '').lower()
             if gender not in ('male', 'female'):
-                gender = 'female' if any(t in raw_name.lower() for t in ['claire','elena','victoria','anna','maria','lina']) else 'male'
+                # Robust fallback: scan the script for gendered pronouns near this
+                # character's name. Beats the old tiny female-name whitelist which
+                # silently defaulted everyone (Lydia, Sarah, Emma, etc.) to male.
+                inferred = _infer_gender_from_script(raw_name, script)
+                if inferred:
+                    gender = inferred
+                else:
+                    gender = 'female' if any(t in raw_name.lower() for t in [
+                        'claire','elena','victoria','anna','maria','lina','lydia','sarah',
+                        'emma','sophia','olivia','ava','isabella','mia','charlotte',
+                        'amelia','harper','evelyn','abigail','grace','chloe','luna',
+                        'ella','aurora','clara','rose','ruby','hazel','lily',
+                    ]) else 'male'
             look = fields.get('LOOK', '') or fields.get('APPEARANCE', '')
-            # Fallback: if writer omitted LOOK, synthesize a baseline appearance from OUTFIT_DESC
-            # so the autogen sweep has *something* to feed the image model — otherwise the base
-            # portrait would be a generic empty-prompt result.
+            od = fields.get('OUTFIT_DESC', '') or fields.get('OUTFITDESC', '')
+            # Fallback: if writer omitted LOOK, synthesize a baseline appearance.
             if not look:
-                od = fields.get('OUTFIT_DESC', '') or fields.get('OUTFITDESC', '')
                 gword = 'woman' if gender == 'female' else 'man'
-                look = (
-                    f"young {gword}, photogenic, neutral attractive features, mid-20s to mid-30s"
-                    + (f", wearing {od[:140]}" if od else "")
-                )
+                look = f"young {gword}, photogenic, neutral attractive features, mid-20s to mid-30s"
+            # First appearance defines the BASE outfit. Whatever this character is
+            # wearing on their introduction — that's their default look (a bear-builder
+            # IS in construction gear by default; he doesn't have separate "regular"
+            # clothes hidden somewhere). Embed OUTFIT_DESC into appearance so the base
+            # portrait gen has the clothing description; the outfit entry below will
+            # also be flagged is_base so we never duplicate-generate it as a costume change.
+            if od and 'wearing' not in look.lower():
+                look = look.rstrip(' ,;') + f", wearing {od[:200]}"
             char = {
                 'id': str(uuid.uuid4())[:8],
                 'name': raw_name,
@@ -5567,15 +6344,24 @@ def _parse_cast_block(script, chars):
                 }
                 char.setdefault('outfits', []).append(outfit)
 
-        # Apply IS_BASE: link photo/avai_url to character's base ref, mark is_base
-        if outfit and is_base_flag and char.get('ref_images'):
+        # Apply IS_BASE: link photo/avai_url to character's base ref, mark is_base.
+        # AUTO-BASE for freshly-created characters — their first cast-block outfit
+        # IS their base (a bear builder defaults to construction gear; that's not a
+        # costume change, that's their canonical look). Without this, autogen would
+        # try to i2i "construction_gear" from a base portrait that has no clothing
+        # description embedded → garbage hybrid. With it: outfit.is_base=true tells
+        # autogen "reuse the base photo, no separate gen needed".
+        auto_base = char_was_just_created and outfit and not any(
+            o.get('is_base') for o in char.get('outfits', []) if o['id'] != outfit['id']
+        )
+        if outfit and (is_base_flag or auto_base):
             # Unmark other outfits as base (only one base per char)
             for o in char.get('outfits', []):
                 if o['id'] != outfit['id'] and o.get('is_base'):
                     o['is_base'] = False
-            if not outfit.get('photo'):
+            if char.get('ref_images') and not outfit.get('photo'):
                 outfit['photo'] = char['ref_images'][0]
-            if not outfit.get('avai_url'):
+            if char.get('avai_base_url') and not outfit.get('avai_url'):
                 outfit['avai_url'] = char.get('avai_base_url', '')
             outfit['is_base'] = True
 
@@ -5983,6 +6769,30 @@ def get_episodes(sid):
     return jsonify(list_episodes(sid))
 
 _CREATE_EP_LOCKS = {}
+# Per-episode lock for serializing seedance chunks mutations (start / submit /
+# poll / delete / heal). Critical because Flask is threaded=True and parallel
+# auto-mode fires multiple /seedance/start calls in the same second — without
+# locking they all read-modify-write the same episode JSON and last-writer-
+# wins erases all but one chunk. Real bug: parallel batch fired 4 starts at
+# 20:13:35, only 1 chunk record survived on disk.
+_EPISODE_LOCKS = {}
+_EPISODE_LOCKS_GUARD = threading.Lock()
+
+def _episode_lock(sid, num):
+    """Get-or-create the lock for (sid, episode_num). Used to serialize
+    read-modify-write of an episode's JSON file."""
+    key = (sid, int(num))
+    with _EPISODE_LOCKS_GUARD:
+        lock = _EPISODE_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _EPISODE_LOCKS[key] = lock
+    return lock
+# Idempotency cache for POST /episodes — avoids duplicate creation when the
+# same POST fires twice (browser retry, ext, double-handler). Keyed by
+# (sid, idempotency_key); value = (timestamp, response_dict). TTL 60s.
+_CREATE_EP_IDEMPOTENCY = {}
+_CREATE_EP_IDEMPOTENCY_TTL = 60
 
 @app.route('/api/series/<sid>/episodes', methods=['POST'])
 def create_episode(sid):
@@ -5992,8 +6802,24 @@ def create_episode(sid):
     # Critical section: list_episodes → number-assign → save must be atomic per series.
     # Without this, two near-simultaneous POSTs racing on a slow disk produce
     # duplicate episodes (first grabs N, second sees N taken and falls to N+1).
+    # PLUS idempotency — if client sends same Idempotency-Key twice (network
+    # retry, double-handler), we replay the original response instead of
+    # creating a second episode. Both layers protect against duplicates.
+    idempotency_key = (request.headers.get('Idempotency-Key') or '').strip()
     lock = _CREATE_EP_LOCKS.setdefault(sid, threading.Lock())
     with lock:
+        # Check idempotency cache inside the lock so we serialize the read+write
+        if idempotency_key:
+            now = time.time()
+            # GC stale entries opportunistically
+            stale = [k for k, (t, _) in list(_CREATE_EP_IDEMPOTENCY.items())
+                     if now - t > _CREATE_EP_IDEMPOTENCY_TTL]
+            for k in stale:
+                _CREATE_EP_IDEMPOTENCY.pop(k, None)
+            cached = _CREATE_EP_IDEMPOTENCY.get((sid, idempotency_key))
+            if cached:
+                return jsonify(cached[1]), 201
+
         episodes = list_episodes(sid)
         data = request.json or {}
         # Use requested number if provided and not already taken, otherwise auto-assign
@@ -6020,6 +6846,8 @@ def create_episode(sid):
             },
         }
         save_episode(sid, num, ep)
+        if idempotency_key:
+            _CREATE_EP_IDEMPOTENCY[(sid, idempotency_key)] = (time.time(), ep)
     return jsonify(ep), 201
 
 @app.route('/api/series/<sid>/episodes/<int:num>', methods=['GET'])
@@ -6040,6 +6868,91 @@ def update_episode(sid, num):
     ep.update(data)
     save_episode(sid, num, ep)
     return jsonify(ep)
+
+@app.route('/api/series/<sid>/episodes/<int:num>/segment-auto-skips', methods=['PUT'])
+def update_segment_auto_skips(sid, num):
+    """Per-segment auto-mode skip flags. Body: {"skips": ["anchor1", ...]}.
+    Anchors here = first dialogue/action line of segment, first ~60 chars trimmed.
+    Segments with anchors in this list are SKIPPED during auto-mode generation.
+    Default = empty list = all segments included."""
+    ep = load_episode(sid, num)
+    if not ep:
+        return jsonify({'error': 'not found'}), 404
+    body = request.json or {}
+    skips = body.get('skips') or []
+    cleaned = []
+    seen = set()
+    for s in skips:
+        if not isinstance(s, str): continue
+        anchor = s.strip()[:60]
+        if not anchor or anchor in seen: continue
+        seen.add(anchor)
+        cleaned.append(anchor)
+    ep['segment_auto_skips'] = cleaned
+    save_episode(sid, num, ep)
+    return jsonify({'ok': True, 'count': len(cleaned)})
+
+
+@app.route('/api/series/<sid>/episodes/<int:num>/line-overrides', methods=['PUT'])
+def update_line_overrides(sid, num):
+    """Per-line override flags for the scene-view (currently only 'close_up').
+    Body: {"overrides": [{"anchor": "first ~60 chars of trimmed line", "flags": ["close_up"]}]}
+    Anchors are matched against the trimmed line text at parse time. If the line
+    is later edited, the override silently drops."""
+    ep = load_episode(sid, num)
+    if not ep:
+        return jsonify({'error': 'not found'}), 404
+    body = request.json or {}
+    overrides = body.get('overrides') or []
+    cleaned = []
+    seen = set()
+    for o in overrides:
+        if not isinstance(o, dict):
+            continue
+        anchor = (o.get('anchor') or '').strip()
+        flags = o.get('flags') or []
+        if not anchor:
+            continue
+        valid_flags = [f for f in flags if f in ('close_up',)]
+        if not valid_flags:
+            continue
+        if anchor in seen:
+            continue
+        seen.add(anchor)
+        cleaned.append({'anchor': anchor[:60], 'flags': valid_flags})
+    ep['line_overrides'] = cleaned
+    save_episode(sid, num, ep)
+    return jsonify({'ok': True, 'count': len(cleaned)})
+
+
+@app.route('/api/series/<sid>/episodes/<int:num>/segment-overrides', methods=['PUT'])
+def update_segment_overrides(sid, num):
+    """Persist user's manual segment-split corrections for the scene-view.
+    Body: {"overrides": [{"anchor": "first ~60 chars of line", "action": "break"|"merge"}]}
+    Anchors are matched against the trimmed line text at parse time. If the line
+    is later edited, the override silently drops (anchor no longer matches)."""
+    ep = load_episode(sid, num)
+    if not ep:
+        return jsonify({'error': 'not found'}), 404
+    body = request.json or {}
+    overrides = body.get('overrides') or []
+    cleaned = []
+    seen_anchors = set()
+    for o in overrides:
+        if not isinstance(o, dict):
+            continue
+        anchor = (o.get('anchor') or '').strip()
+        action = o.get('action')
+        if not anchor or action not in ('break', 'merge'):
+            continue
+        if anchor in seen_anchors:
+            continue           # dedupe — keep first
+        seen_anchors.add(anchor)
+        cleaned.append({'anchor': anchor[:60], 'action': action})
+    ep['segment_overrides'] = cleaned
+    save_episode(sid, num, ep)
+    return jsonify({'ok': True, 'count': len(cleaned)})
+
 
 @app.route('/api/series/<sid>/episodes/<int:num>/clear', methods=['POST'])
 def clear_episode(sid, num):
@@ -6575,17 +7488,22 @@ def _extract_last_frame(sid, video_relpath):
     src = series_path(sid) / video_relpath
     if not src.exists():
         return None
-    out = src.with_name(src.stem + '_lastframe.jpg')
+    out = src.with_name(src.stem + '_lastframe.png')
     if out.exists() and out.stat().st_size > 0:
         return (str(out.relative_to(series_path(sid))), out)
     ffmpeg_bin = shutil.which('ffmpeg')
     if not ffmpeg_bin:
         return None
     try:
-        # -sseof -0.1 → seek to 0.1s before end (works without re-encode)
+        # -sseof -0.1 → seek to 0.1s before end (works without re-encode).
+        # PNG = lossless. Seedance uses these as input refs, so any JPEG
+        # compression artifacts get amplified in the next chunk's first frame
+        # (visible as quality drop at chunk transitions). PNG eliminates that.
+        # `-pred mixed -compression_level 1` = fast PNG encode (~50ms vs 200ms default).
         subprocess.run(
             [ffmpeg_bin, '-y', '-sseof', '-0.1', '-i', str(src),
-             '-frames:v', '1', '-q:v', '3', str(out)],
+             '-frames:v', '1', '-c:v', 'png', '-pred', 'mixed', '-compression_level', '1',
+             str(out)],
             capture_output=True, timeout=30, check=True
         )
         if out.exists() and out.stat().st_size > 0:
@@ -6638,8 +7556,10 @@ def _extract_keyframes_at_cuts(sid, video_relpath, cut_timestamps, max_frames=2,
                                pre_offset=0.05):
     """For each cut timestamp T, extract the frame at T-pre_offset (i.e. the
     LAST frame of the OUTGOING shot, just before the cut). Cached on disk as
-    <stem>_cutframe_<i>.jpg. Caps at max_frames (oldest cuts first → most context)
-    to keep ref budget under control. Returns list of (relpath, abs_path)."""
+    <stem>_cutframe_<i>.png (lossless — Seedance uses these as input refs and
+    JPEG artifacts compound at chunk boundaries). Caps at max_frames (oldest
+    cuts first → most context) to keep ref budget under control. Returns list
+    of (relpath, abs_path)."""
     src = series_path(sid) / video_relpath
     if not src.exists() or not cut_timestamps:
         return []
@@ -6650,14 +7570,15 @@ def _extract_keyframes_at_cuts(sid, video_relpath, cut_timestamps, max_frames=2,
     out_paths = []
     for i, t in enumerate(selected):
         seek_t = max(0.0, t - pre_offset)
-        out = src.with_name(f'{src.stem}_cutframe_{i}.jpg')
+        out = src.with_name(f'{src.stem}_cutframe_{i}.png')
         if out.exists() and out.stat().st_size > 0:
             out_paths.append((str(out.relative_to(series_path(sid))), out))
             continue
         try:
             subprocess.run(
                 [ffmpeg_bin, '-y', '-ss', f'{seek_t:.3f}', '-i', str(src),
-                 '-frames:v', '1', '-q:v', '3', str(out)],
+                 '-frames:v', '1', '-c:v', 'png', '-pred', 'mixed', '-compression_level', '1',
+                 str(out)],
                 capture_output=True, timeout=30, check=True
             )
             if out.exists() and out.stat().st_size > 0:
@@ -6939,6 +7860,704 @@ def seedance_list(sid, num):
         return jsonify({'error': 'not found'}), 404
     return jsonify({'chunks': _seedance_chunks(ep)})
 
+@app.route('/api/series/<sid>/episodes/<int:num>/generate-scene-blocking', methods=['POST'])
+def generate_scene_blocking(sid, num):
+    """Single Claude call → 60-120 word English SCENE BLOCKING text describing
+    geometry of the location and where each character is positioned across the
+    whole episode. Used as shared context in batch-compose so all segments stay
+    spatially consistent (no character teleporting between chunks)."""
+    s = load_series(sid)
+    ep = load_episode(sid, num)
+    if not s or not ep:
+        return jsonify({'error': 'not found'}), 404
+    script = (ep.get('script') or '').strip()
+    if not script:
+        return jsonify({'error': 'Сценарий пустой — заполни сначала'}), 400
+
+    active_char_ids = set(ep.get('characters_used') or [])
+    active_loc_ids  = set(ep.get('locations_used') or [])
+    active_chars = [c for c in (s.get('characters') or []) if c['id'] in active_char_ids]
+    active_locs  = [l for l in (s.get('locations') or []) if l['id'] in active_loc_ids]
+
+    tag_mapping = _build_episode_tag_mapping(script, active_chars, active_locs)
+    tag_lines = '\n'.join(
+        f"  {t['tag']} = {t['kind']}: {t['name']}"
+        for t in tag_mapping
+    ) or '  (no active chars/locs)'
+
+    sysprompt = (
+        "Ты — кинематографист. На вход — один эпизод сценария TikTok-драмы. "
+        "Твоя задача — описать ГЕОМЕТРИЮ сцены и расстановку персонажей одним коротким "
+        "английским абзацем 60-120 слов. Этот текст затем вшивается в Constraints каждого "
+        "Seedance-чанка чтобы Seedance видел одну и ту же расстановку во всех сегментах серии "
+        "и НЕ ломал spatial continuity.\n\n"
+        "ЧТО ВКЛЮЧАТЬ:\n"
+        "  • Геометрия локации: где стол / стулья / окна / двери / лестницы. Стороны: "
+        "    'long table runs left-right', 'glass wall on the back', 'door on the back-left'.\n"
+        "  • Где КАЖДЫЙ активный @ImageN-персонаж сидит/стоит относительно объектов и других: "
+        "    '@Image1 Maya stands at the LEFT side of the table, body angled camera-right toward Liam'.\n"
+        "  • Когда и откуда заходит/выходит персонаж: "
+        "    '@Image2 Liam enters from back-left door at start, walks to the FAR RIGHT head of the table'.\n"
+        "  • Реквизит и где лежит: 'leather folder placed at the centre-left of the table'.\n\n"
+        "CROSS-EPISODE CONTINUITY — критично:\n"
+        "  Если на вход дан блок 'PREV EPISODE CONTEXT' и первая сцена ЭТОГО эпизода "
+        "является ПРОДОЛЖЕНИЕМ последней сцены предыдущего (та же локация, нет явного scene "
+        "heading с другим местом, нет time-jump в первых 1-2 строках) — НАСЛЕДУЙ позиции "
+        "персонажей из prev episodeBlocking и ending state. Adrian остался у двери — он у "
+        "двери в начале нового эпизода. Clara сидела за столом — она там же.\n"
+        "  Если же сцена ЯВНО другая (новый scene heading с другой локацией, time-jump 'утром' / "
+        "'через час', явная смена места) — начинай blocking с нуля, prev контекст игнорируй.\n\n"
+        "ФОРМАТ:\n"
+        "  • Английский, 60-120 слов, ОДИН абзац.\n"
+        "  • Используй ТОЛЬКО @ImageN-теги из переданного TAG MAPPING.\n"
+        "  • Никаких 'same/still/as before/continues' (нарушает автономность).\n"
+        "  • Без markdown, без bullet-points.\n"
+        "  • Описание универсальное для всего эпизода — конкретные действия чанков НЕ упоминай."
+    )
+
+    prev_context = _prev_episode_ending_context(sid, num)
+    prev_block = ''
+    if prev_context:
+        prev_block = (
+            f"=== PREV EPISODE CONTEXT — для проверки continuity ===\n"
+            f"{prev_context}\n"
+            f"=== END PREV EPISODE CONTEXT ===\n\n"
+        )
+
+    userprompt = (
+        f"АКТИВНЫЕ ПЕРСОНАЖИ И ЛОКАЦИИ:\n{tag_lines}\n\n"
+        f"{prev_block}"
+        f"СЦЕНАРИЙ ЭПИЗОДА:\n```\n{script[:8000]}\n```\n\n"
+        f"Верни ТОЛЬКО абзац blocking. Без преамбулы, без 'Here is...', без markdown."
+    )
+    try:
+        text = claude_ask(userprompt, system=sysprompt).strip()
+        text = text.replace('\n', ' ').strip()
+        text = re.sub(r'\s+', ' ', text)
+        text = text[:1500]
+        ep['scene_blocking'] = text
+        save_episode(sid, num, ep)
+        return jsonify({'blocking': text, 'tag_mapping': tag_mapping})
+    except Exception as e:
+        return jsonify({'error': f'generate failed: {e}'}), 500
+
+
+# Reference-style batch-compose rules — adapted from
+# /tmp/shadow-founder/services/chunk-builder.ts EPISODE_PLAN_RULES.
+# Adapted: variable segment count (not fixed 4+1+1), English promptEn output.
+_SD_BATCH_RULES = """
+You are breaking ONE episode of a TikTok-style short drama into a sequence of segments for Seedance 2.0. Each segment is its own Seedance generation, autonomous, with its own ready-to-render promptEn.
+
+═══ THE GOLDEN RULE — AUTONOMY ═══
+Seedance does NOT remember previous prompts. Each segment is described as if it's the only one the model will see.
+In every segment's promptEn re-describe from scratch:
+- the full location (no "as before")
+- which characters are in frame and their @ImageN tag bindings
+- props and where they are placed
+- character poses and positions
+- time of day, weather, lighting
+
+FORBIDDEN words in promptEn: "same", "still", "as before", "as previous", "continues", "прежний", "тот же" — any reference to what the model "saw earlier". Server validates this and warns on violations.
+
+If a location stays the same across segments → COPY the description verbatim, do NOT shorten or refer back.
+
+═══ DIALOGUE ═══
+- Take dialogue lines VERBATIM from the script's `Name: text` format. Translate to English LITERALLY (no creative paraphrase) — preserve meaning, emotion, length.
+- In Action timeline insert dialogue as: `{Name} says: "..."` or `{Name} whispers: "..."` or `{Name} shouts: "..."`.
+- ALL dialogues from script chunk_text must be covered across the segment(s) where they appear. Don't drop lines.
+- Story sequence must match the script — order of who-says-what is sacred.
+
+═══ @Image TAG NUMBERING ═══
+EPISODE-LEVEL — fixed by the server BEFORE you see the input. The TAG MAPPING input gives you `@Image1`, `@Image2`, ... mapped to specific characters and locations by first-appearance order in the script. Use ONLY these tags. Locations get tags too.
+
+═══ WARDROBE FIDELITY ═══
+Each character in TAG MAPPING has a `wardrobe` field — the canonical description of what they're wearing in this episode. This is a CLOSED list. No other clothing exists on them.
+
+Rules for actionTimeline.description:
+1. NEVER mention clothing/footwear/headwear/outerwear/accessories that aren't in the character's `wardrobe`. Specifically, before writing words like: jacket, blazer, coat, overcoat, suit jacket, tie, scarf, hat, cap, beanie, gloves, boots, sunglasses, glasses, watch, belt, vest, hoodie, sweater — verify they appear in `wardrobe`. If not — DO NOT write them.
+2. Pockets and clothing-interaction: when a character pulls something from a pocket, pick a pocket consistent with what they actually have on. Safe defaults: `trouser pocket`. `inside breast pocket of the jacket` ONLY if jacket is in wardrobe.
+3. Pose, dirt, blood, tears, hair state, expression, flushed cheeks, trembling hands — describe freely. The ban is ONLY about wardrobe items / accessories.
+4. Before submitting, re-check each `description` and verify that every clothing/accessory word appears in the wardrobe of one of `charactersInSegment`. If not — rephrase (use a safe pocket / drop the mention / describe via posture instead).
+
+═══ SHOT RHYTHM ═══
+- A 15-second segment is split into 2-4 shots, each 2-7 seconds. Sum of shot lengths = durationSec.
+- Shorter segments (5-12s) split into 1-3 shots proportionally.
+- FORBIDDEN: monotone equal-length cuts (e.g. 0-3/3-7/7-11/11-15 or 0-5/5-10/10-15). Vary the rhythm: 2/5/4/4 or 6/4/5 or 3/7/5 — real cinematic pacing.
+
+═══ ESTABLISHING SHOT — when seg_specs has `establishing_shot: true` ═══
+This segment is the FIRST chunk of a new location (scene change). Open it with a 2-second establishing shot of the location's exterior/facade BEFORE any dialogue or character action.
+- First shot in actionTimeline: `0-2s: wide shot, static frame, exterior facade of <Location>, no people in frame, no dialogue.`
+- Second shot onward (2s → durationSec): regular dialogue/action as usual, with characters now inside.
+- The 2-second beat counts toward the segment's total durationSec (NOT a separate Seedance call).
+- Constraints block must say `no people in establishing shot 0-2s`.
+- Refs: keep ALL refs (location + characters); the model needs character refs for shots after the 2s mark.
+- For non-establishing segments (`establishing_shot: false` or missing), ignore this section entirely.
+
+═══ CAMERA — embedded in each shot ═══
+Format: "[shot size] [movement or static], [angle], [action]"
+Example: "0-5s: medium slow push-in, eye-level, Lina opens the leather folder and looks down at the document."
+2-3 camera attributes per shot, camera before action.
+
+Camera movement — ONLY when the shot benefits. If stillness serves better → use "static frame" / "locked-off". DON'T add motion to every shot.
+
+Vocabulary: wide shot, medium shot, close-up, extreme close-up, low angle, high angle, eye-level, over-the-shoulder, tracking shot, slow push-in, handheld drift, orbit, pan, tilt, rack focus, whip pan, static frame, forward drift, pull-back.
+
+═══ EYELINE — gaze direction of the speaker ═══
+MANDATORY in every shot description with dialogue:
+- Speaker's body is turned toward addressee (per blocking).
+- Speaker's eyes look at addressee, NOT at camera, NOT at floor.
+- Write directly: "Kyle on the right side of frame turns his head to face Hale who stands on the left, eyes locked on Hale. Kyle says: \\"...\\"".
+- FORBIDDEN: speaker facing camera while addressee is behind their back — eyeline violation. Even if only the speaker is in frame, describe where they're looking ("sideways toward Hale's offscreen-left position").
+
+═══ CONTINUITY between segments (within the same scene) ═══
+- Pose at end of segment N → start of segment N+1 matches or shows the transition.
+- Position relative to props is preserved.
+- Props remain where left (unless used / removed in frame).
+- Physical state preserved (blood, dirt, tears) once established.
+- Don't change without reason: pose, costume, appearance, props, interior.
+- Change only when the script demands.
+
+═══ CROSS-EPISODE CONTINUITY ═══
+TikTok-format episodes often pick up immediately where the previous episode left off — same scene, same characters, same positions. Server may pass you a `PREV EPISODE CONTEXT` block with: (1) prev episode's last scene heading, (2) prev episode's last 6 lines, (3) prev episodeBlocking, (4) prev last chunk's ending_state.
+
+If THIS episode's first segment is a CONTINUATION of the same scene (same location, no new INT./EXT. heading change at script top, no explicit time-jump in opening lines like "утром" / "next day" / "через час") — INHERIT positions from PREV EP. Adrian at the door → he's still at the door. Clara at the desk → still there. Reflect this in `episodeBlocking` of THIS episode.
+
+If the scene CLEARLY changed (new location heading, time-jump phrase, fresh setup) — start positioning from scratch and IGNORE PREV EP context.
+
+═══ SCENE BLOCKING (top-level field — REQUIRED) ═══
+You return a top-level `episodeBlocking` field — a single English paragraph 60-120 words describing the episode's spatial setup. Server automatically injects this into the Constraints of every segment that uses overlapping @ImageN tags.
+
+If the user provided SCENE BLOCKING (you'll see it in input) — copy it VERBATIM into `episodeBlocking`. Do NOT paraphrase.
+If not provided — generate it yourself: where does the table/chairs/window/door sit; where does each @ImageN character stand or sit relative to props and to each other; when does each character enter/exit; what props are on stage and where.
+
+Example: `"@Image2 Kyle seated at the FAR RIGHT head of the long table, body angled camera-left toward Hale; laptop closed in front of him. @Image1 Hale enters from back-left door at start of segment 1, walks to LEFT side of the table, body angled camera-right toward Kyle. Leather folder at centre-left of the table from segment 3 onward."`
+
+═══ promptEn STRUCTURE — STRICT 6 BLOCKS, ENGLISH ═══
+```
+Location: <full English description from scratch — no "as before">
+
+Characters in this segment: Name @Image1, Name @Image2
+
+Action timeline:
+0-5s: medium slow push-in, eye-level, <action>. <Name> says: "<dialogue verbatim>"
+5-12s: close-up, static frame, <reaction>.
+12-15s: pull-back, eye-level, <final action>.
+
+Lighting and atmosphere: <light + atmosphere>
+
+Style: <cinematic / documentary / dramatic + 1-2 specifics>
+
+Constraints: use <Name1> as @Image1, use <Name2> as @Image2, keep exact facial identity and outfit from each reference image, <positions/poses>, <props>, no extra characters, no text, no watermark, maintain environment consistency
+```
+
+═══ OUTPUT JSON SCHEMA — STRICT ═══
+{
+  "totalDurationSec": <integer sum of all durationSecs>,
+  "scriptDialogueCount": <number of Name: lines in the script>,
+  "episodeBlocking": "60-120 word English geometry paragraph (verbatim from input if provided)",
+  "segments": [
+    {
+      "anchor": "<COPY EXACTLY from input — this is the segment ID>",
+      "plan": {
+        "chunkIndex": <0-based or sceneIdx.segIdx — copy from input>,
+        "kind": "main",
+        "durationSec": <copy from input>,
+        "summaryRu": "1-2 sentence Russian description of what happens",
+        "locationDescription": "<full English location description>",
+        "charactersInSegment": [
+          { "tag": "@Image1", "name": "Lina", "slug": "<id from tag mapping>", "variantId": "base" }
+        ],
+        "actionTimeline": [
+          {
+            "fromSec": 0, "toSec": 5,
+            "description": "medium slow push-in, eye-level, Lina opens the folder. Lina says: \\"Open the folder.\\"",
+            "dialogue": {
+              "speakerTag": "@Image1", "speakerName": "Lina",
+              "en": "Open the folder.",
+              "ruOriginal": "Откройте папку.",
+              "scriptLineNumber": 1
+            }
+          }
+        ],
+        "lightingAndAtmosphere": "Cold morning light...",
+        "style": "cinematic film tone, 35mm grain",
+        "constraintsExtra": ["specific positional constraint 1", "..."],
+        "dialogues": [
+          { "speakerTag": "@Image1", "speakerName": "Lina", "ru": "...", "en": "...", "scriptLineNumber": 1 }
+        ],
+        "riskFlags": [],
+        "close_up": false
+      },
+      "prompt": {
+        "promptEn": "Location: <full description>\\n\\nCharacters in this segment: Lina @Image1\\n\\nAction timeline:\\n0-5s: ...\\n\\nLighting and atmosphere: ...\\n\\nStyle: ...\\n\\nConstraints: use Lina as @Image1, keep exact facial identity and outfit from each reference image, no extra characters, no text, no watermark, maintain environment consistency",
+        "tagsUsed": ["@Image1", "@Image2"],
+        "appliedReplacements": [],
+        "riskLevel": "low",
+        "aspectRatio": "9:16"
+      }
+    }
+  ]
+}
+
+═══ MANDATORY CHECKLIST — verify before output ═══
+1. `segments[]` length matches input segments count exactly.
+2. Each `anchor` copied verbatim from input — server matches by anchor.
+3. Each `plan.charactersInSegment` uses ONLY tags from TAG MAPPING.
+4. Each `prompt.promptEn` follows the 6-block structure with `\\n\\n` between blocks.
+5. No "same/still/as before/continues" anywhere in any promptEn.
+6. Each `actionTimeline` shot's (toSec - fromSec) sums equal `durationSec`.
+7. No clothing/accessory words outside the character's `wardrobe`.
+8. `episodeBlocking` populated (verbatim from input if provided, else generated).
+9. Constraints block of every promptEn ends with: `no extra characters, no text, no watermark, maintain environment consistency`.
+
+Return ONLY valid JSON. No markdown fences. No commentary.
+"""
+
+@app.route('/api/series/<sid>/episodes/<int:num>/seedance/batch-compose', methods=['POST'])
+def seedance_batch_compose(sid, num):
+    """Reference-style episode plan builder. ONE Claude call produces a strict
+    JSON with `episodeBlocking` + per-segment `plan{}` + `prompt.promptEn`.
+    Server then runs the same post-processing pipeline as the Shadow Founder
+    reference: filtered scene-blocking inject → hard-cuts inject → banlist
+    replacements → 4 validators (autonomy / durations / dialogue coverage /
+    wardrobe). Final `prompt` field is the ready-for-Seedance English text.
+
+    Body: {
+      segments: [{anchor, sceneIdx, segIdx, text, has_close_up, durationSec?}],
+      base_outfits_only: bool,
+      style: str,
+    }
+    """
+    import hashlib
+    s = load_series(sid)
+    ep = load_episode(sid, num)
+    if not s or not ep:
+        return jsonify({'error': 'not found'}), 404
+    body = request.json or {}
+    segments = body.get('segments') or []
+    if not segments:
+        return jsonify({'error': 'no segments'}), 400
+    base_outfits_only = bool(body.get('base_outfits_only', False))
+    style_override = (body.get('style') or '').strip() or (s.get('visual_style') or '').strip()
+
+    script = (ep.get('script') or '').strip()
+    if not script:
+        return jsonify({'error': 'script empty'}), 400
+
+    active_char_ids = set(ep.get('characters_used') or [])
+    active_loc_ids  = set(ep.get('locations_used') or [])
+    active_chars = [c for c in (s.get('characters') or []) if c['id'] in active_char_ids]
+    active_locs  = [l for l in (s.get('locations') or []) if l['id'] in active_loc_ids]
+
+    tag_mapping = _build_episode_tag_mapping(script, active_chars, active_locs)
+    valid_tags = {t['tag'] for t in tag_mapping}
+    tag_for = {(t['kind'], t['id']): t['tag'] for t in tag_mapping}
+
+    # Build descriptors per tag — fed to Claude with canonical wardrobe
+    tag_descriptors = []
+    wardrobe_by_tag = {}
+    for t in tag_mapping:
+        if t['kind'] == 'char':
+            ch = next((c for c in active_chars if c['id'] == t['id']), None)
+            if not ch: continue
+            base_outfit = next((o for o in (ch.get('outfits') or []) if o.get('is_base')), None)
+            if not base_outfit and (ch.get('outfits') or []):
+                base_outfit = ch['outfits'][0]
+            base_label = (base_outfit or {}).get('label')
+            canonical = _canonical_char_description(s, ch['id'], base_label)
+            outfit_options = [o.get('label') for o in (ch.get('outfits') or []) if o.get('avai_url') and o.get('label')]
+            wardrobe_by_tag[t['tag']] = canonical
+            tag_descriptors.append({
+                'tag': t['tag'],
+                'kind': 'character',
+                'slug': ch['id'],
+                'name': ch['name'],
+                'gender': ch.get('gender', ''),
+                'appearance': (ch.get('appearance') or '')[:300],
+                'wardrobe': canonical,                  # canonical: appearance + outfit
+                'outfit_options': outfit_options,
+            })
+        else:
+            lc = next((x for x in active_locs if x['id'] == t['id']), None)
+            if not lc: continue
+            tag_descriptors.append({
+                'tag': t['tag'],
+                'kind': 'location',
+                'slug': lc['id'],
+                'name': lc['name'],
+                'description': (lc.get('description') or '')[:300],
+            })
+
+    scene_blocking_input = (ep.get('scene_blocking') or '').strip()
+    prev_context = _prev_episode_ending_context(sid, num)
+
+    # Segments specs for Claude — anchor + actual computed durationSec
+    seg_specs = []
+    for seg in segments:
+        seg_specs.append({
+            'anchor': (seg.get('anchor') or '')[:60],
+            'sceneIdx': seg.get('sceneIdx', 0),
+            'segIdx': seg.get('segIdx', 0),
+            'has_close_up': bool(seg.get('has_close_up')),
+            'durationSec': int(seg.get('durationSec') or 15),
+            'establishing_shot': bool(seg.get('establishing_shot')),
+            'text': (seg.get('text') or '')[:1500],
+        })
+
+    # System prompt — reference EPISODE_PLAN_RULES adapted to our case (variable
+    # segments instead of fixed 4+1+1; English promptEn output; 6-block strict).
+    sysprompt = _SD_BATCH_RULES
+
+    style_block = ''
+    if style_override:
+        style_block = (
+            f"\n=== STYLE OVERRIDE ===\n"
+            f"Final visual style: «{style_override}». Inject this style into "
+            f"every segment's Style block, plus subtle markers in Subject and "
+            f"Scene blocks. Keep dialogue verbatim from the script.\n"
+        )
+    base_only_block = ''
+    if base_outfits_only:
+        base_only_block = (
+            "\n=== BASE OUTFITS ONLY — STRICT ===\n"
+            "For EVERY char-ref across ALL segments set \"outfit\": null. "
+            "Do not pick alternative outfit variants — use base portraits only.\n"
+        )
+    blocking_block = ''
+    if scene_blocking_input:
+        blocking_block = (
+            f"\n=== SCENE BLOCKING — USER-PROVIDED (do not rewrite) ===\n"
+            f"```\n{scene_blocking_input}\n```\n"
+            f"Copy this VERBATIM as `episodeBlocking` in your response. The "
+            f"server will then filter and inject it into each segment's Constraints.\n"
+        )
+
+    prev_block = ''
+    if prev_context:
+        prev_block = (
+            f"\n=== PREV EPISODE CONTEXT — for cross-episode continuity ===\n"
+            f"```\n{prev_context}\n```\n"
+            f"CRITICAL: if the FIRST segment of THIS episode picks up from the same scene "
+            f"as PREV EP last lines (same location, no time-jump, no new scene heading) — "
+            f"INHERIT the spatial positioning from PREV EP's episodeBlocking and ending state. "
+            f"Adrian was at the door at end of PREV EP → he's still at the door at start of THIS one. "
+            f"Clara was at the desk → she's still there. Don't reset positions on a continuous scene.\n"
+            f"If THIS episode's script clearly opens a new scene (different location heading, "
+            f"explicit time-jump like 'утром' / 'next day' / 'через час'), ignore PREV EP context "
+            f"and start fresh.\n"
+            f"=== END PREV EPISODE CONTEXT ===\n"
+        )
+
+    userprompt = (
+        f"EPISODE TAG MAPPING (deterministic — do not invent new tags):\n"
+        f"{json.dumps(tag_descriptors, ensure_ascii=False, indent=2)}\n\n"
+        f"FULL EPISODE SCRIPT:\n```\n{script[:10000]}\n```\n\n"
+        f"SEGMENTS (N={len(seg_specs)}, in script-position order):\n"
+        f"{json.dumps(seg_specs, ensure_ascii=False, indent=2)}\n\n"
+        f"{prev_block}{blocking_block}{style_block}{base_only_block}\n"
+        f"=== HARD COUNT REQUIREMENT ===\n"
+        f"Return EXACTLY {len(seg_specs)} elements in segments[]. Not {len(seg_specs)-1}, "
+        f"not {len(seg_specs)+1}. Each input anchor maps to one output segment with the "
+        f"same `anchor` string copied verbatim (it's the ID).\n"
+        f"Do NOT merge, skip, or duplicate segments. One input → one output.\n"
+        f"Before submitting JSON, count segments[] — it MUST be exactly {len(seg_specs)}.\n\n"
+        f"Return ONLY JSON (no markdown fences, no preamble)."
+    )
+
+    try:
+        # 32k max_tokens — full episode batch JSON can exceed default 8k easily
+        raw = claude_ask(userprompt, system=sysprompt, max_tokens=32000)
+        cleaned = strip_json(raw)
+        # Detect truncation: a valid JSON top-level object/array must end with } or ]
+        looks_truncated = bool(cleaned) and cleaned[-1] not in '}]'
+        if looks_truncated:
+            print(f'[batch-compose] response looks truncated (ends with {cleaned[-50:]!r}); raising max_tokens and retrying', flush=True)
+            raw = claude_ask(userprompt, system=sysprompt, max_tokens=64000)
+            cleaned = strip_json(raw)
+        try:
+            data = loads_lenient(cleaned)
+        except Exception as parse_err:
+            # Last-resort: ask Claude to repair the JSON it just emitted
+            print(f'[batch-compose] initial JSON parse failed ({parse_err}); asking Claude to repair', flush=True)
+            repair_prompt = (
+                "The following text is supposed to be valid JSON but has a syntax error. "
+                "Return ONLY the corrected JSON — no commentary, no markdown fences, no explanation. "
+                "Preserve all content verbatim; fix ONLY syntax (trailing commas, unquoted keys, "
+                "unescaped quotes inside strings, missing closing braces if truncated, etc.).\n\n"
+                f"```\n{cleaned}\n```"
+            )
+            repaired = claude_ask(repair_prompt, system="You are a JSON repair tool. Return only valid JSON.", max_tokens=64000)
+            data = loads_lenient(strip_json(repaired))
+    except Exception as e:
+        return jsonify({'error': f'batch-compose failed: {e}'}), 500
+
+    episode_blocking = (data.get('episodeBlocking') or scene_blocking_input or '').strip()
+    out_segments = data.get('segments') or []
+    by_anchor = {}
+    for so in out_segments:
+        a = (so.get('anchor') or '').strip()[:60]
+        if a:
+            by_anchor[a] = so
+
+    # Pipeline per segment: get plan+promptEn → filter+inject blocking →
+    # inject hard-cuts → banlist → resolve refs → store.
+    final_prompts = {}
+    unresolved_anchors = []
+    segments_for_validation = []  # list of (spec, plan, finalized_promptEn)
+
+    for spec in seg_specs:
+        anchor = spec['anchor']
+        out = by_anchor.get(anchor)
+        if not out:
+            unresolved_anchors.append(anchor)
+            continue
+        plan = out.get('plan') or {}
+        prompt_obj = out.get('prompt') or {}
+        prompt_en = (prompt_obj.get('promptEn') or '').strip()
+        if not prompt_en:
+            unresolved_anchors.append(anchor)
+            continue
+
+        # Defensive defaults
+        plan.setdefault('charactersInSegment', [])
+        plan.setdefault('actionTimeline', [])
+        plan.setdefault('dialogues', [])
+        plan.setdefault('constraintsExtra', [])
+        plan.setdefault('riskFlags', [])
+        plan.setdefault('durationSec', spec['durationSec'])
+
+        # Tags Claude says are used — fall back to chars-in-segment tags
+        tags_used = prompt_obj.get('tagsUsed') or []
+        if not tags_used:
+            tags_used = [c.get('tag') for c in plan.get('charactersInSegment', []) if c.get('tag')]
+        tags_used = [t for t in tags_used if t in valid_tags]
+
+        # Inject filtered blocking, then hard-cuts (multi-shot only), then banlist
+        with_blocking = _seedance_inject_blocking(prompt_en, episode_blocking, tags_used)
+        with_hardcuts = (_seedance_inject_hard_cuts(with_blocking)
+                         if len(plan.get('actionTimeline') or []) > 1
+                         else with_blocking)
+        finalized, applied = _seedance_apply_banlist(with_hardcuts)
+
+        # Build refs from plan.charactersInSegment (Claude already chose them)
+        refs = []
+        if base_outfits_only:
+            for c in plan.get('charactersInSegment', []):
+                if c.get('slug'):
+                    refs.append({'kind': 'char', 'id': c['slug'], 'outfit': None})
+        else:
+            for c in plan.get('charactersInSegment', []):
+                if c.get('slug'):
+                    refs.append({
+                        'kind': 'char',
+                        'id': c['slug'],
+                        'outfit': c.get('variantId') if c.get('variantId') and c.get('variantId') != 'base' else None,
+                    })
+        # Always add the location ref last if there's an active loc tag in mapping
+        loc_tag = next((t for t in tag_mapping if t['kind'] == 'loc'), None)
+        if loc_tag:
+            refs.append({'kind': 'loc', 'id': loc_tag['id']})
+
+        # CLOSE-UP filter (mirrors compose endpoint)
+        is_close_up = bool(plan.get('close_up')) or spec.get('has_close_up') or bool(out.get('close_up'))
+        if is_close_up:
+            chunk_lower = spec['text'].lower()
+            chars_in_chunk = []
+            for r in refs:
+                if r.get('kind') != 'char': continue
+                ch = next((c for c in (s.get('characters') or []) if c['id'] == r.get('id')), None)
+                if not ch: continue
+                pos = chunk_lower.find(ch['name'].lower())
+                if pos >= 0: chars_in_chunk.append((r.get('id'), pos))
+            chars_in_chunk.sort(key=lambda x: x[1])
+            keep_id = chars_in_chunk[0][0] if chars_in_chunk else next(
+                (r.get('id') for r in refs if r.get('kind') == 'char'), None
+            )
+            refs = [r for r in refs if r.get('kind') != 'char' or r.get('id') == keep_id]
+
+        # De-dup char refs
+        seen_char = set(); deduped = []
+        for r in refs:
+            if r.get('kind') == 'char':
+                if r.get('id') in seen_char: continue
+                seen_char.add(r.get('id'))
+            deduped.append(r)
+        refs = deduped
+
+        # Resolve URLs (drop unresolvable)
+        original_refs_for_remap = list(refs)
+        resolved_refs = []
+        ref_urls = []
+        for r in refs:
+            url = _resolve_ref_url(s, r, sid=sid)
+            if not url: continue
+            clean = {k: v for k, v in r.items() if not k.startswith('_')}
+            ref_urls.append(url)
+            resolved_refs.append({**clean, 'url': url})
+
+        # If filtering changed refs[] (close-up / dedup / unresolved drops),
+        # remap @ImageN tokens in finalized to match the new ref ordering. The
+        # plan's @ImageN are positional per Claude's response — server's filter
+        # may have shifted them. Keep prompt and refs in sync.
+        _tag_remap = _build_image_tag_remap(original_refs_for_remap, resolved_refs)
+        if any(v is None for v in _tag_remap.values()) or any(k != v for k, v in _tag_remap.items() if v is not None):
+            finalized = _remap_image_tags(finalized, _tag_remap)
+
+        final_prompts[anchor] = {
+            'prompt': finalized,                                # ready-for-Seedance English promptEn
+            'refs': resolved_refs,
+            'ref_urls': ref_urls,
+            'plan': plan,                                       # structured (for UI / debug)
+            'tagsUsed': tags_used,
+            'appliedReplacements': applied,
+            'close_up': is_close_up,
+            'shot_type': out.get('shot_type', ''),
+            'sceneIdx': spec['sceneIdx'],
+            'segIdx': spec['segIdx'],
+        }
+        segments_for_validation.append((spec, plan, finalized))
+
+    # Per-anchor fallback for what Claude skipped → call /seedance/compose-style
+    # mini AI for each missing anchor. Always converges to 100% anchor coverage.
+    fallback_succeeded = []
+    fallback_failed = []
+    if unresolved_anchors:
+        print(f'[batch-compose] Claude skipped {len(unresolved_anchors)} anchors — running per-chunk fallback', flush=True)
+        for missed_anchor in unresolved_anchors:
+            spec = next((s for s in seg_specs if s['anchor'] == missed_anchor), None)
+            if not spec:
+                continue
+            try:
+                mini_sys = (
+                    "You are a Seedance 2.0 shot composer. The user gives ONE script segment. "
+                    "Return strict JSON with the same plan{} + prompt.promptEn structure as the "
+                    "main batch (English 6-block: Location / Characters in this segment / Action timeline / "
+                    "Lighting and atmosphere / Style / Constraints). NO 'same/still/as before' refs.\n\n"
+                    "Output: {\"plan\":{...},\"prompt\":{\"promptEn\":\"...\",\"tagsUsed\":[...]}}"
+                )
+                mini_user = (
+                    f"TAG MAPPING:\n{json.dumps(tag_descriptors, ensure_ascii=False)}\n\n"
+                    f"SCENE BLOCKING:\n{episode_blocking[:600] if episode_blocking else '(none)'}\n\n"
+                    f"SEGMENT TEXT:\n```\n{spec['text']}\n```\n\n"
+                    f"durationSec={spec['durationSec']}, has_close_up={spec['has_close_up']}\n"
+                    f"Return JSON for this single segment."
+                )
+                mini_raw = claude_ask(mini_user, system=mini_sys)
+                mini_data = json.loads(strip_json(mini_raw))
+                m_plan = mini_data.get('plan') or {}
+                m_prompt = mini_data.get('prompt') or {}
+                m_promptEn = (m_prompt.get('promptEn') or '').strip()
+                if not m_promptEn:
+                    fallback_failed.append(missed_anchor); continue
+
+                m_plan.setdefault('charactersInSegment', [])
+                m_plan.setdefault('actionTimeline', [])
+                m_plan.setdefault('dialogues', [])
+                m_plan.setdefault('durationSec', spec['durationSec'])
+                m_tags = m_prompt.get('tagsUsed') or [c.get('tag') for c in m_plan['charactersInSegment'] if c.get('tag')]
+                m_tags = [t for t in m_tags if t in valid_tags]
+
+                m_with_blocking = _seedance_inject_blocking(m_promptEn, episode_blocking, m_tags)
+                m_with_hardcuts = (_seedance_inject_hard_cuts(m_with_blocking)
+                                   if len(m_plan['actionTimeline']) > 1
+                                   else m_with_blocking)
+                m_finalized, m_applied = _seedance_apply_banlist(m_with_hardcuts)
+
+                m_refs = []
+                if base_outfits_only:
+                    for c in m_plan['charactersInSegment']:
+                        if c.get('slug'):
+                            m_refs.append({'kind': 'char', 'id': c['slug'], 'outfit': None})
+                else:
+                    for c in m_plan['charactersInSegment']:
+                        if c.get('slug'):
+                            m_refs.append({'kind': 'char', 'id': c['slug'],
+                                           'outfit': c.get('variantId') if c.get('variantId') and c.get('variantId') != 'base' else None})
+                if loc_tag:
+                    m_refs.append({'kind': 'loc', 'id': loc_tag['id']})
+
+                m_orig_for_remap = list(m_refs)
+                m_resolved = []; m_urls = []
+                for r in m_refs:
+                    url = _resolve_ref_url(s, r, sid=sid)
+                    if not url: continue
+                    clean = {k: v for k, v in r.items() if not k.startswith('_')}
+                    m_urls.append(url); m_resolved.append({**clean, 'url': url})
+                m_remap = _build_image_tag_remap(m_orig_for_remap, m_resolved)
+                if any(v is None for v in m_remap.values()) or any(k != v for k, v in m_remap.items() if v is not None):
+                    m_finalized = _remap_image_tags(m_finalized, m_remap)
+
+                final_prompts[missed_anchor] = {
+                    'prompt': m_finalized,
+                    'refs': m_resolved,
+                    'ref_urls': m_urls,
+                    'plan': m_plan,
+                    'tagsUsed': m_tags,
+                    'appliedReplacements': m_applied,
+                    'close_up': bool(m_plan.get('close_up')) or spec['has_close_up'],
+                    'shot_type': '',
+                    'sceneIdx': spec['sceneIdx'],
+                    'segIdx': spec['segIdx'],
+                    '_via_fallback': True,
+                }
+                segments_for_validation.append((spec, m_plan, m_finalized))
+                fallback_succeeded.append(missed_anchor)
+            except Exception as e:
+                print(f'[batch-compose] fallback failed for {missed_anchor[:30]}: {e}', flush=True)
+                fallback_failed.append(missed_anchor)
+
+    # Run all 4 reference validators
+    warnings = []
+    warnings.extend(_seedance_validate_autonomy(segments_for_validation))
+    warnings.extend(_seedance_validate_durations(segments_for_validation))
+    warnings.extend(_seedance_validate_wardrobe(segments_for_validation, wardrobe_by_tag))
+    # Dialogue coverage — check that every Name:dialogue line in script is
+    # represented in some segment's plan.dialogues
+    script_dialogues = re.findall(r'^[A-Za-zА-Яа-яЁё][^:\n]{0,30}:\s*(.+)$', script, re.MULTILINE)
+    expected_dialogues = len(script_dialogues)
+    covered = 0
+    for spec, plan, _pe in segments_for_validation:
+        covered += len(plan.get('dialogues') or [])
+    if expected_dialogues > 0 and covered < int(expected_dialogues * 0.8):
+        warnings.append({
+            'code': 'dialogues-missing',
+            'message': f'Покрыто диалогов: {covered}, в скрипте: {expected_dialogues} (<80%). Возможны пропуски реплик.',
+            'anchor': '',
+        })
+
+    if warnings:
+        print(f'[batch-compose] {len(warnings)} validator warnings:', flush=True)
+        for w in warnings[:8]:
+            print(f'  [{w["code"]}] {w["message"]}', flush=True)
+
+    # Persist (locked to avoid clobbering parallel /start mutations)
+    with _episode_lock(sid, num):
+        ep_fresh = load_episode(sid, num) or ep
+        ep_fresh['batch_prompts'] = final_prompts
+        ep_fresh['batch_episode_blocking'] = episode_blocking
+        ep_fresh['batch_script_hash'] = hashlib.sha256(script.encode('utf-8')).hexdigest()[:16]
+        ep_fresh['batch_built_at'] = datetime.datetime.utcnow().isoformat()
+        ep_fresh['batch_warnings'] = warnings
+        ep_fresh['batch_tag_mapping'] = tag_mapping
+        if episode_blocking and not ep_fresh.get('scene_blocking'):
+            ep_fresh['scene_blocking'] = episode_blocking
+        save_episode(sid, num, ep_fresh)
+        ep = ep_fresh
+
+    return jsonify({
+        'ok': True,
+        'count': len(final_prompts),
+        'requested_count': len(seg_specs),
+        'unresolved_anchors': fallback_failed,
+        'fallback_filled': fallback_succeeded,
+        'claude_skipped': unresolved_anchors,
+        'episode_blocking': episode_blocking,
+        'tag_mapping': tag_mapping,
+        'warnings': warnings,
+        'script_hash': ep['batch_script_hash'],
+    })
+
+
 @app.route('/api/series/<sid>/episodes/<int:num>/seedance/compose', methods=['POST'])
 def seedance_compose(sid, num):
     """Claude composes prompt + picks refs from a script chunk."""
@@ -6953,6 +8572,12 @@ def seedance_compose(sid, num):
     use_prev_lastframe = bool(body.get('use_prev_lastframe', True))
     use_prev_cutframes = bool(body.get('use_prev_cutframes', False))
     base_outfits_only  = bool(body.get('base_outfits_only', False))
+    close_up_only      = bool(body.get('close_up_only', False))
+    # Optional: caller hands in a FIXED list of refs (kind/id/outfit) — Claude
+    # must use ONLY these as the visible roster. Used by "🔄 Перекомпоновать
+    # с текущими рефами" — user manually pruned some refs and wants the prompt
+    # rewritten without the removed ones.
+    locked_refs = body.get('locked_refs') or []
     style_override = (body.get('style') or '').strip()
     # Fall back to project's visual_style (default = realistic — no special handling needed)
     if not style_override:
@@ -7260,9 +8885,26 @@ def seedance_compose(sid, num):
         "Алгоритм:\n"
         "  1. Определи: соседний чанк (PREVIOUS) — это ТА ЖЕ СЦЕНА что и текущий CHUNK? "
         "Та же сцена = одна и та же локация + нет смены времени суток + нет скачка дня + действие непрерывно.\n"
-        "     • Та же сцена → ВСЕ персонажи из 'IN FRAME' предыдущего чанка ДОЛЖНЫ быть в твоих refs, "
-        "если в сценарии (между предыдущим чанком и текущим) НЕТ явного указания что они ушли/убежали/вышли. "
-        "Если предыдущий кончился на 'Liam держит Leo за горло' — Leo в твоём кадре. Не выкидывать тихо.\n"
+        "     • Та же сцена → персонажи остаются В СЦЕНЕ (в той же комнате, не вышли). НО это НЕ значит "
+        "что они автоматически попадают в твои refs[]. refs[] = кто В КАДРЕ ИМЕННО ЭТОГО чанка, не вся сцена.\n"
+        "     • КТО В КАДРЕ — определяется CHUNK TEXT'ом (не предыдущим чанком). Алгоритм:\n"
+        "         A. Добавь в refs всех СПИКЕРОВ этого CHUNK'а (тех у кого Name: реплика).\n"
+        "         B. Добавь персов явно упомянутых в action-ремарках ВНУТРИ chunk'а с физическим действием "
+        "('Liam stares at her', 'Sophie steps closer', 'Adrian frowns at the letter') — у них есть on-screen действие.\n"
+        "         C. Если в чанке есть физическое взаимодействие нескольких ('Liam держит Leo за горло', "
+        "'Maya обнимает Sophie') — оба/все в refs. Continuity по позам ('Leo на коленях') — обязательна.\n"
+        "         D. Просто 'присутствует в той же комнате' (молча, без действия в этом chunk'е) → "
+        "НЕ В RREFS. Ему place в фоне Seedance может нарисовать сам как обобщённый силуэт, "
+        "но без отдельного @Image-ref'а ты НЕ заставишь Seedance рендерить его лицо.\n"
+        "     • CLOSE-UP кейс — самый частый и самый ломаемый:\n"
+        "         CHUNK = 1 короткая реплика ОДНОГО спикера ИЛИ длинный монолог ОДНОГО спикера, без action "
+        "на других в этом chunk'е → CLOSE-UP/MEDIUM single-subject.\n"
+        "         refs = [тот спикер + локация]. Других НЕ ВКЛЮЧАЙ даже если они присутствуют в сцене. "
+        "В тексте промпта (CAMERA): 'крупный план / средний план Maya, остальные за пределами кадра'.\n"
+        "         Camera-cues 'крупный план X', 'close-up of X', 'tight on X', 'lens on Y' — "
+        "STRICT single-subject mode, refs только X/Y + локация.\n"
+        "     • GROUP/WIDE кейс: 3+ реплик от разных персов или явная wide-cue ('все собрались', "
+        "'wide shot', 'establishing') → refs все участники + локация.\n"
         "     • ФИЗИЧЕСКИЕ ПОЗИЦИИ — ХРАНИТЬ. Если в PREVIOUS Leo стоял рядом с Liam — он РЯДОМ С LIAM, "
         "а не телепортируется к маме. Если Selena была в правом углу — она остаётся в правом углу. "
         "В ACTION прямо пиши конкретные позиции ИМЕНАМИ (без @Image): "
@@ -7313,19 +8955,24 @@ def seedance_compose(sid, num):
         "('Maya видит себя в отражении', 'два разных временных Maya'). В этом случае пиши явно: "
         "'@Image1 — настоящая Maya у окна, отражение в зеркале справа дублирует её' — и это всё равно "
         "ОДИН char-ref.\n\n"
-        "ЗАПРЕТ ОПИСЫВАТЬ ОДЕЖДУ ТЕКСТОМ — КРИТИЧНО:\n"
-        "Одежда персонажей поступает В МОДЕЛЬ ТОЛЬКО через @Image-ref. Любое описание одежды в тексте "
-        "промпта (SUBJECT/ACTION/SCENE) КОНФЛИКТУЕТ с ref-изображением и заставляет Seedance дрейфовать. "
-        "ПРАВИЛА:\n"
-        "  • НЕ пиши 'в красном платье', 'in black suit', 'медицинская форма', 'hoodie', 'jeans', "
-        "'tie', 'белая рубашка', цвета одежды, тип одежды — НИЧЕГО про костюм словами.\n"
-        "  • Описывай в SUBJECT/ACTION ТОЛЬКО: лицо/выражение, причёску (если ремарка её обсуждает), "
-        "позу, физическое действие, эмоцию.\n"
-        "  • Если в continuity-кадрах видно изменение СОСТОЯНИЯ одежды (порвана, мокрая, в крови) — "
-        "это можно и нужно отметить ('разорванная блузка', 'мокрая одежда', 'кровавое пятно'), "
-        "но БЕЗ описания исходной одежды ('разорванная блузка' — ок; 'разорванная белая блузка' — нет).\n"
-        "  • Hair/makeup тоже частично через ref. Описывай словами только если меняется состояние "
-        "(растрёпанные волосы, размазанная помада) — не сам стиль причёски/макияжа."
+        "ОПИСАНИЕ ПЕРСОНАЖА И ОДЕЖДЫ — ТОЛЬКО В BINDING, БОЛЬШЕ НИГДЕ:\n"
+        "Сервер автоматически вставит в BINDING-строку каноническое описание каждого персонажа, "
+        "вшитое в его карточку (то же самое, по которому генерилось ref-изображение). Это appearance "
+        "+ описание текущего outfit'а. Текст совпадает с тем что Seedance видит на @Image — поэтому "
+        "он УСИЛИВАЕТ ref, а не конфликтует.\n"
+        "  • BINDING после серверной обработки выглядит так:\n"
+        "    'В refs: @Image1=Ethan (charcoal three-piece suit, white shirt, slicked-back hair), "
+        "@Image2=Maya (navy medical scrubs, hospital ID badge on chest, hair in messy bun), @Image3=Lobby.'\n"
+        "    ТЕБЕ его писать с одеждой не нужно — пиши '@Image1=Ethan, @Image2=Maya, @Image3=Lobby', "
+        "сервер дополнит. Главное оставь корректные '=' разделители и реальные имена.\n"
+        "  • В SUBJECT/ACTION/SCENE одежду НЕ описывай. Никаких 'в красном платье', 'in suit', "
+        "'медицинская форма', цветов, тканей, типов — иначе ты дашь альтернативное описание которое "
+        "противоречит тому что вшил в BINDING сервер. Описывай только лицо/поза/действие/эмоция.\n"
+        "  • ИЗМЕНЁННОЕ СОСТОЯНИЕ одежды (порвана, мокрая, в крови, потеряна пуговица) — "
+        "можно и нужно ('разорванная блузка'), но БЕЗ исходного описания ('разорванная белая блузка' — нет, "
+        "цвет уже в BINDING). Используй родовое слово: 'блузка', 'рубашка', 'пиджак'.\n"
+        "  • Hair/makeup: описывай только если меняется состояние (растрёпанные волосы, "
+        "размазанная помада). Базовый стиль причёски уже в BINDING."
     )
     # Active episode cast & locations (already checked off in sidebar)
     active_char_ids = set(ep.get('characters_used') or [])
@@ -7345,6 +8992,49 @@ def seedance_compose(sid, num):
         for l in active_locs
     ) or '(не отмечены)'
 
+    # ── LOCKED-REFS mode ─────────────────────────────────────────────────────
+    # When caller passes `locked_refs`, Claude must use EXACTLY those — no extra
+    # auto-detection. Used by manual "Перекомпоновать с текущими рефами" after
+    # the user pruned the ref list.
+    locked_refs_block = ''
+    if locked_refs:
+        # Build a human-readable summary of the locked roster + a strict directive.
+        char_lookup = {c['id']: c for c in (s.get('characters') or [])}
+        loc_lookup  = {l['id']: l for l in (s.get('locations') or [])}
+        locked_lines = []
+        for r in locked_refs:
+            kind = (r.get('kind') or '').lower()
+            rid = r.get('id') or ''
+            outfit = r.get('outfit') or ''
+            if kind == 'char':
+                ch = char_lookup.get(rid)
+                if ch:
+                    appearance = (ch.get('appearance') or '')[:120]
+                    suffix = f' / outfit="{outfit}"' if outfit and outfit != 'base' else ''
+                    locked_lines.append(f'- char "{ch["name"]}" (id={rid}{suffix}): {appearance}')
+            elif kind == 'loc':
+                lc = loc_lookup.get(rid)
+                if lc:
+                    locked_lines.append(f'- loc "{lc["name"]}" (id={rid}): {(lc.get("description") or "")[:120]}')
+            elif kind == 'lastframe':
+                locked_lines.append('- lastframe (continuity reference — not a character)')
+            elif kind == 'cutframe':
+                locked_lines.append('- cutframe (continuity reference — not a character)')
+            elif kind == 'url':
+                locked_lines.append(f'- custom image url ref ({rid}) — treat as a fixed visual element')
+        locked_refs_block = (
+            '\n=== LOCKED REFS — STRICT MODE ═══\n'
+            'Caller pinned the EXACT refs[] for this composition. Do NOT pick anything else, '
+            'do NOT auto-detect missing characters from the chunk, do NOT add the location '
+            'unless it is in the list below. Your refs[] output MUST match this list 1-to-1 '
+            'in the same order, with the same `outfit` value for each char.\n'
+            'PINNED ROSTER:\n' + '\n'.join(locked_lines) + '\n'
+            'If the chunk text mentions characters NOT in this roster — DO NOT bind them to @ImageN, '
+            'DO NOT describe them in SUBJECT/SCENE. Treat them as off-screen. The viewer will not see '
+            'them in this shot. Rewrite the prompt to focus on the pinned roster only.\n'
+            '=== END LOCKED REFS ═══\n'
+        )
+
     full_script = (ep.get('script') or '').strip()
     full_script_block = full_script[:8000]  # safety cap
 
@@ -7359,6 +9049,111 @@ def seedance_compose(sid, num):
             "В тексте промпта тоже не описывай специфическую одежду которая отличается от базы — "
             "только то что видно на базовом референсе.\n"
             "=== END BASE OUTFITS ONLY ===\n"
+        )
+
+    # Heuristic auto-detection of single-speaker chunks → soft hint to composer.
+    # Looks for: (a) exactly 1 unique speaker in chunk, (b) ZERO bracketed/prose
+    # action remarks (those almost always involve a 2nd actor or physical
+    # interaction), (c) no other char names in non-dialogue text — checked via
+    # canonical name AND first-name-token (e.g. "WOLF" matches both WOLF and
+    # WOLF_SON), and we DEFER the hint when any uppercase Cyrillic name-like
+    # token appears in action text (likely a Russian declension of a character
+    # name not covered by our English aliases — e.g. "Волчонка" → WOLF_SON).
+    # Was burning composer in the wolf-bull warehouse scene where Bull pushes
+    # WOLF_SON forward in a bracketed remark — heuristic fired single-speaker,
+    # composer dropped the cub from refs.
+    auto_close_up_block = ''
+    if not close_up_only:
+        active_char_names = [c['name'] for c in active_chars]
+        # Build alias set per active char: canonical name + first-name-token +
+        # last-name-token (e.g. "WOLF_SON" → {"wolf_son", "wolf"}; "DR OLIVER
+        # CROSS" → {"dr oliver cross", "dr", "cross", "dr cross"}). Helps match
+        # both stems and abbreviated forms (script writes "DR CROSS:" while
+        # series stores "DR OLIVER CROSS").
+        def _aliases(name):
+            al = {name.lower()}
+            tokens = re.split(r'[\s_]+', name.strip())
+            tokens = [t for t in tokens if t]
+            if tokens:
+                al.add(tokens[0].lower())
+                if len(tokens) > 1:
+                    al.add(tokens[-1].lower())
+                # First + last token combined ("DR CROSS" from "DR OLIVER CROSS")
+                if len(tokens) >= 3:
+                    al.add(f'{tokens[0]} {tokens[-1]}'.lower())
+            return al
+        if active_char_names and chunk_text:
+            # Find speakers — "Name:" at line start (Name matches an alias of active char)
+            speakers_found = set()
+            for line in chunk_text.split('\n'):
+                stripped = line.lstrip()
+                m = re.match(r'^([A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё\s\-\']{0,30}):\s', stripped)
+                if not m: continue
+                nm = m.group(1).strip().lower()
+                for cn in active_char_names:
+                    if nm in _aliases(cn):
+                        speakers_found.add(cn)
+                        break
+            if len(speakers_found) == 1:
+                sole = next(iter(speakers_found))
+                # Strip quoted strings + dialogue cue tails so we only check action-text
+                action_only = re.sub(r'"[^"]*"', '', chunk_text)
+                action_only = re.sub(r'^[A-Za-zА-Яа-яЁё][^:\n]{0,30}:.*$', '', action_only, flags=re.MULTILINE)
+                action_only_stripped = action_only.strip()
+                others_in_action = []
+                for cn in active_char_names:
+                    if cn.lower() == sole.lower():
+                        continue
+                    for alias in _aliases(cn):
+                        if re.search(r'\b' + re.escape(alias) + r'\b', action_only, re.IGNORECASE):
+                            others_in_action.append(cn)
+                            break
+                # Tripwire: ANY bracketed [...] action-prose or substantial
+                # parenthesized prose almost always involves a 2nd actor.
+                # Don't risk dropping refs in those cases.
+                bracketed_action = bool(re.search(r'\[[^\]]{8,}\]', action_only))
+                paren_action = bool(re.search(r'\([^\)]{12,}\)', action_only))
+                has_action_prose = bool(action_only_stripped) and (bracketed_action or paren_action or len(action_only_stripped) > 30)
+                # Tripwire: any Cyrillic capitalized word in action text — almost
+                # certainly a Russian-declined character name not in our alias set.
+                has_cyrillic_proper = bool(re.search(r'[А-ЯЁ][а-яё]{2,}', action_only))
+                trigger_close_up = (
+                    not others_in_action
+                    and not has_action_prose
+                    and not has_cyrillic_proper
+                )
+                if trigger_close_up:
+                    auto_close_up_block = (
+                        f"\n=== AUTO-DETECTED: SINGLE-SPEAKER CHUNK ===\n"
+                        f"В этом CHUNK'е говорит ровно ОДИН персонаж ({sole}) и нет упоминаний "
+                        f"других персов в action-ремарках. Это сильный сигнал на CLOSE-UP / single-subject шот.\n"
+                        f"DEFAULT: refs = [{sole} + локация]. НЕ ДОБАВЛЯЙ других персов даже если они "
+                        f"были в IN FRAME предыдущего чанка — для ЭТОГО кадра они вне фрейма.\n"
+                        f"В CAMERA пиши 'крупный план {sole}' или 'medium close-up {sole}', НЕ 'over-the-shoulder', "
+                        f"НЕ 'wide', НЕ группу.\n"
+                        f"Исключение: если в continuity-кадрах ENDING STATE предыдущего чанка явно описывает "
+                        f"физическое взаимодействие (держат за горло, обнимают и т.п.) И это продолжается "
+                        f"на текущем CHUNK'е — тогда необходимый второй перс остаётся.\n"
+                        f"=== END AUTO-DETECTED ===\n"
+                    )
+
+    close_up_block = ''
+    if close_up_only:
+        close_up_block = (
+            "\n=== CLOSE-UP ONLY MODE — STRICT ===\n"
+            "Это CLOSE-UP / single-subject шот. Жёсткие правила:\n"
+            "  1. refs[] = МАКСИМУМ ОДИН char-ref (тот кто говорит больше всего слов в CHUNK'е "
+            "или единственный спикер) + локация. ВСЁ.\n"
+            "  2. Игнорируй persons из 'IN FRAME' предыдущего чанка — они присутствуют в сцене "
+            "но НЕ в этом кадре. Не добавляй их в refs.\n"
+            "  3. Continuity-кадры (lastframe / cutframes) тоже могут принести лица других персов в кадр. "
+            "Они всё ещё прицепятся как композиционные референсы, НО в тексте промпта явно скажи: "
+            "'tight close-up на лицо <Имя>, остальные вне кадра, размытый/тёмный фон'.\n"
+            "  4. В CAMERA блоке промпта: 'tight close-up', 'extreme close-up' или 'medium close-up' — "
+            "не 'wide', не 'two-shot', не 'group'.\n"
+            "  5. SCENE: упомяни локацию через @Image, но добавь 'фон вне фокуса / приглушён' "
+            "чтобы Seedance не пытался прорисовать остальных людей в задних планах.\n"
+            "=== END CLOSE-UP ONLY ===\n"
         )
 
     style_block = ''
@@ -7381,6 +9176,9 @@ def seedance_compose(sid, num):
         f"  Characters:\n{active_chars_block}\n"
         f"  Locations:\n{active_locs_block}\n"
         f"{base_only_block}"
+        f"{close_up_block}"
+        f"{auto_close_up_block}"
+        f"{locked_refs_block}"
         f"{style_block}"
         f"{prev_block}\n"
         f"FULL EPISODE SCRIPT (читай ВЕСЬ — тут scene headings, ремарки, кто где находится):\n"
@@ -7408,8 +9206,9 @@ def seedance_compose(sid, num):
         "- В prompt нет 'no <X>'? Замени на позитив.\n"
         "- ВЫБОР OUTFIT: для каждого char-ref значение outfit либо ровно из списка под этим персом в roster, либо null. "
         "Если PREVIOUS CHUNK той же сцены — outfit совпадает с PREVIOUS дословно (см. IN FRAME).\n"
-        "- В prompt НЕТ описания одежды словами (цвет/тип костюма, fabric, типы рубашек/платьев). "
-        "Если нашёл — удали. Допустимо только описание ИЗМЕНЁННОГО состояния одежды (порвана, мокрая, в крови).\n"
+        "- В SUBJECT/ACTION/SCENE НЕТ описания одежды (цвета/типы костюма/ткани). Сервер сам вставит "
+        "описание в BINDING из Vision-анализа ref'а. Если нашёл клозет-описание вне BINDING — удали. "
+        "Допустимо только описание ИЗМЕНЁННОГО состояния (порвана, мокрая, в крови) родовыми словами.\n"
         "- АНТИ-ДУБЛЬ: каждый персонаж в refs[] ОДИН раз (по id). Никаких повторов одного перса с разными outfit'ами. "
         "Каждый @ImageN в тексте промпта тоже привязан к ровно одному персу."
     )
@@ -7425,6 +9224,38 @@ def seedance_compose(sid, num):
         for r in refs:
             if r.get('kind') == 'char':
                 r['outfit'] = None
+    # CLOSE-UP ONLY post-filter: drop all char-refs except the one whose name
+    # actually appears in CHUNK text (tightest single-subject framing). Keeps
+    # location refs untouched. Belt-and-suspenders insurance — composer prompt
+    # should already produce single-char refs, but if it carried over prev-chunk
+    # bystanders we strip them here.
+    closeup_dropped = []
+    if close_up_only:
+        # Build name → first chunk-text appearance position for each char in roster
+        chars_in_chunk = []  # list of (id, position-in-chunk) for chars whose name appears
+        ct_lower = chunk_text.lower()
+        for r in refs:
+            if r.get('kind') != 'char':
+                continue
+            ch = next((c for c in (s.get('characters') or []) if c['id'] == r.get('id')), None)
+            if not ch:
+                continue
+            pos = ct_lower.find(ch['name'].lower())
+            if pos >= 0:
+                chars_in_chunk.append((r.get('id'), pos))
+        chars_in_chunk.sort(key=lambda x: x[1])
+        keep_id = chars_in_chunk[0][0] if chars_in_chunk else (
+            # No char names found in chunk — keep first char ref the composer chose
+            next((r.get('id') for r in refs if r.get('kind') == 'char'), None)
+        )
+        filtered = []
+        for r in refs:
+            if r.get('kind') == 'char' and r.get('id') != keep_id:
+                ch = next((c for c in (s.get('characters') or []) if c['id'] == r.get('id')), None)
+                closeup_dropped.append({'char_id': r.get('id'), 'char_name': ch['name'] if ch else r.get('id')})
+                continue
+            filtered.append(r)
+        refs = filtered
     # Hard de-dup: never let the same character go in twice (a frequent cause
     # of "two Mayas in one frame"). Keep the FIRST occurrence — usually that's
     # the composer's preferred (often outfit-specific) one. Any subsequent
@@ -7463,6 +9294,63 @@ def seedance_compose(sid, num):
             ref_meta.append({**clean, 'url': url})
         else:
             unresolved.append({**r, 'reason': 'нет фото / avai_url не получился'})
+
+    # CRITICAL: server-side filtering (close-up, dedup, unresolved) may have
+    # dropped refs that the composer's prompt still references via @ImageN.
+    # If we don't sync the prompt with the final refs[], Seedance will see
+    # @ImageN tokens with no matching reference image and hallucinate a random
+    # face for that 'character'. Real bug from production: refs=[Adrian, Lobby]
+    # but prompt said @Image2=Vivian, @Image3=Sophie, @Image4=Clara → garbage.
+    _tag_remap = _build_image_tag_remap(data.get('refs') or [], ref_meta)
+    if any(v is None for v in _tag_remap.values()) or any(k != v for k, v in _tag_remap.items() if v is not None):
+        data['prompt'] = _remap_image_tags(data.get('prompt') or '', _tag_remap)
+
+    # CANONICAL char description for BINDING — uses the SAME text that was fed
+    # to the image generator (appearance + outfit description). Visual ref and
+    # textual description are guaranteed aligned.
+    name_to_clothing = {}
+    for r in ref_meta:
+        if r.get('kind') != 'char':
+            continue
+        desc = _canonical_char_description(s, r.get('id'), r.get('outfit'))
+        if not desc:
+            continue
+        ch = next((c for c in (s.get('characters') or []) if c['id'] == r.get('id')), None)
+        if ch:
+            name_to_clothing[ch['name']] = desc
+            r['clothing'] = desc          # surface in response so UI can show it
+    # Inject descriptions into the BINDING line. Pattern: '@Image1=Maya' →
+    # '@Image1=Maya (navy scrubs, hair in bun)'. Only the first occurrence per
+    # name so we don't duplicate inside DIALOGUE shot-bits.
+    if name_to_clothing:
+        prompt_text = data.get('prompt') or ''
+        already_injected = set()
+        def _inject_clothing(m):
+            num = m.group(1)
+            name = m.group(2).strip()
+            if name in already_injected:
+                return m.group(0)
+            desc = name_to_clothing.get(name)
+            if not desc:
+                return m.group(0)
+            already_injected.add(name)
+            return f'@Image{num}={name} ({desc})'
+        # Match `@Image<N>=<Name>` with `=` or `—` or `-` separator
+        prompt_text = re.sub(
+            r'@Image(\d+)\s*[=—\-]\s*([A-Za-zА-яЁё][A-Za-zА-яЁё\d _\-]{0,30})',
+            _inject_clothing, prompt_text
+        )
+        # Fallback: composer didn't write a BINDING line at all → prepend one
+        if not already_injected:
+            binding_parts = []
+            for nm, desc in name_to_clothing.items():
+                binding_parts.append(f'{nm} ({desc})')
+            prompt_text = (
+                f'Note: одежда из refs — ' + ', '.join(binding_parts) + '. '
+                'Используй эти описания если упоминаешь одежду; больше ничего о ней не пиши.\n\n'
+                + prompt_text
+            )
+        data['prompt'] = prompt_text
 
     # Optional: attach previous chunk's LAST FRAME as a continuity reference
     lastframe_attached = False
@@ -7671,6 +9559,8 @@ def seedance_compose(sid, num):
         'unresolved_refs': unresolved,
         'outfit_fallbacks': outfit_fallbacks,
         'duplicate_chars_dropped': duplicate_chars,
+        'closeup_dropped': closeup_dropped if close_up_only else [],
+        'auto_close_up_detected': bool(auto_close_up_block),
         'scene_continuity': data.get('scene_continuity'),
         'reasoning': data.get('reasoning', ''),
         'lastframe_attached': lastframe_attached,
@@ -7706,30 +9596,44 @@ def seedance_start(sid, num):
         mod = 'collage_grid'
     aspect = body.get('aspect_ratio') or '9:16'
     gen_audio = bool(body.get('generate_audio', True))
+    # Optional canonical script order — set by auto-mode parallel so the UI
+    # can sort chunks by script position regardless of network arrival order.
+    script_order_raw = body.get('script_order')
+    try:
+        script_order = int(script_order_raw) if script_order_raw is not None else None
+    except (TypeError, ValueError):
+        script_order = None
 
-    chunks = _seedance_chunks(ep)
-    idx = _next_chunk_idx(ep)
-    chunk = {
-        'idx': idx,
-        'job_id': '',
-        'status_url': '',
-        'status': 'submitting',
-        'prompt': prompt,
-        'chunk_text': body.get('chunk_text', ''),
-        'ref_urls': ref_urls,
-        'refs': body.get('refs') or [],
-        'duration': duration,
-        'resolution': resolution,
-        'moderation_bypass': mod,
-        'aspect_ratio': aspect,
-        'created_at': int(time.time()),
-        'video_url': '',
-        'video_path': '',
-        'ending_state': '',
-        'cost': None,
-    }
-    chunks.append(chunk)
-    save_episode(sid, num, ep)
+    # Per-episode lock — serializes the read-load-mutate-save cycle so parallel
+    # /start calls don't race and erase each other's chunks (Flask threaded=True
+    # would otherwise let 4 parallel callers all read [], all add their chunk,
+    # all save → only the last write survives).
+    with _episode_lock(sid, num):
+        ep = load_episode(sid, num)            # re-read inside lock for freshness
+        chunks = _seedance_chunks(ep)
+        idx = _next_chunk_idx(ep)
+        chunk = {
+            'idx': idx,
+            'job_id': '',
+            'status_url': '',
+            'status': 'submitting',
+            'prompt': prompt,
+            'chunk_text': body.get('chunk_text', ''),
+            'ref_urls': ref_urls,
+            'refs': body.get('refs') or [],
+            'duration': duration,
+            'resolution': resolution,
+            'moderation_bypass': mod,
+            'aspect_ratio': aspect,
+            'created_at': int(time.time()),
+            'video_url': '',
+            'video_path': '',
+            'ending_state': '',
+            'cost': None,
+            'script_order': script_order,
+        }
+        chunks.append(chunk)
+        save_episode(sid, num, ep)
 
     # Kick off the AVAI call in a background thread so the UI gets the chunk
     # card instantly. The poll endpoint will then track job_id/status as soon
@@ -7742,138 +9646,141 @@ def seedance_start(sid, num):
                 moderation_bypass=mod, aspect_ratio=aspect,
                 generate_audio=gen_audio,
             )
-            ep2 = load_episode(sid, num)
-            for c in _seedance_chunks(ep2):
-                if c.get('idx') == idx:
-                    # Reaper may have already marked us 'failed' (slow AVAI).
-                    # Still record job_id so user/admin can find/cancel it,
-                    # but don't resurrect to 'pending' — respect reaper.
-                    c['job_id'] = job['job_id']
-                    c['status_url'] = job['status_url']
-                    if c.get('status') == 'submitting':
-                        c['status'] = 'pending'
-                    else:
-                        # Late arrival — leave status alone, mark in error
-                        prev_err = c.get('error') or ''
-                        c['error'] = (prev_err + ' | late submit returned job_id=' + str(job.get('job_id', ''))).strip(' |')
-                    break
-            save_episode(sid, num, ep2)
+            with _episode_lock(sid, num):
+                ep2 = load_episode(sid, num)
+                for c in _seedance_chunks(ep2):
+                    if c.get('idx') == idx:
+                        # Reaper may have already marked us 'failed' (slow AVAI).
+                        # Still record job_id so user/admin can find/cancel it,
+                        # but don't resurrect to 'pending' — respect reaper.
+                        c['job_id'] = job['job_id']
+                        c['status_url'] = job['status_url']
+                        if c.get('status') == 'submitting':
+                            c['status'] = 'pending'
+                        else:
+                            # Late arrival — leave status alone, mark in error
+                            prev_err = c.get('error') or ''
+                            c['error'] = (prev_err + ' | late submit returned job_id=' + str(job.get('job_id', ''))).strip(' |')
+                        break
+                save_episode(sid, num, ep2)
         except Exception as e:
-            ep2 = load_episode(sid, num)
-            for c in _seedance_chunks(ep2):
-                if c.get('idx') == idx:
-                    # Don't overwrite a more specific reaper message
-                    if c.get('status') != 'failed':
-                        c['status'] = 'failed'
-                        c['error'] = f'submit failed: {e}'
-                    break
-            save_episode(sid, num, ep2)
+            with _episode_lock(sid, num):
+                ep2 = load_episode(sid, num)
+                for c in _seedance_chunks(ep2):
+                    if c.get('idx') == idx:
+                        # Don't overwrite a more specific reaper message
+                        if c.get('status') != 'failed':
+                            c['status'] = 'failed'
+                            c['error'] = f'submit failed: {e}'
+                        break
+                save_episode(sid, num, ep2)
 
     threading.Thread(target=_submit, daemon=True).start()
     return jsonify({'chunk': chunk})
 
 @app.route('/api/series/<sid>/episodes/<int:num>/seedance/poll', methods=['POST'])
 def seedance_poll(sid, num):
-    """Poll all non-final chunks; download finished mp4s; extract ending_state."""
+    """Poll all non-final chunks; download finished mp4s; extract ending_state.
+    Holds the per-episode lock so concurrent polls / starts / deletes don't
+    clobber each other's writes."""
     s = load_series(sid)
-    ep = load_episode(sid, num)
-    if not s or not ep:
+    if not s:
         return jsonify({'error': 'not found'}), 404
-    chunks = _seedance_chunks(ep)
-    changed = False
-    now = int(time.time())
-    for c in chunks:
-        if c.get('status') in ('completed', 'failed'):
-            continue
-        if not c.get('job_id'):
-            # Reap stale 'submitting' rows whose background submit thread
-            # died silently (network hang etc). Lets the user retry.
-            if c.get('status') == 'submitting':
-                age = now - int(c.get('created_at') or now)
-                if age > _SUBMITTING_TIMEOUT_RUNTIME_SEC:
-                    c['status'] = 'failed'
-                    c['error'] = f'submit timed out after {age}s — нажми ↻ Reuse и попробуй снова'
-                    changed = True
-            continue
-        try:
-            st = _avai_seedance_status(c['job_id'], c.get('status_url'))
-        except Exception as e:
-            c['status'] = 'failed'
-            c['error'] = str(e)
-            changed = True
-            continue
-        c['status'] = st.get('status') or c['status']
-        if st.get('progress') is not None:
-            c['progress'] = st['progress']
-        if st.get('cost') is not None:
-            c['cost'] = st['cost']
-        if st.get('error'):
-            c['error'] = st['error']
-        if st.get('status') == 'completed' and st.get('video_url') and not c.get('video_path'):
-            vurl = (st.get('video_url') or '').strip()
-            # Detect AVAI moderation rejection: they return a placeholder
-            # image path like "/moderation.jpg" instead of a real mp4 URL.
-            vurl_lower = vurl.lower()
-            is_moderation = (
-                'moderation' in vurl_lower
-                or vurl.startswith('/')                # relative — not a real video host
-                or not vurl_lower.startswith(('http://', 'https://'))
-                or not (vurl_lower.endswith('.mp4') or '.mp4?' in vurl_lower or '/video' in vurl_lower)
-            )
-            if is_moderation:
-                c['status'] = 'failed'
-                c['error'] = (
-                    f'Заблокировано модерацией Seedance (вернул "{vurl[:60]}"). '
-                    'Перепиши промпт мягче — убери: царапины/раны/кровь, удары в лицо, '
-                    'обнажение, оружие, явное насилие. Попробуй collage_grid bypass или '
-                    'переформулируй действие через эмоцию вместо физического урона.'
-                )
-                changed = True
+    with _episode_lock(sid, num):
+        ep = load_episode(sid, num)
+        if not ep:
+            return jsonify({'error': 'not found'}), 404
+        chunks = _seedance_chunks(ep)
+        changed = False
+        now = int(time.time())
+        for c in chunks:
+            if c.get('status') in ('completed', 'failed'):
+                continue
+            if not c.get('job_id'):
+                if c.get('status') == 'submitting':
+                    age = now - int(c.get('created_at') or now)
+                    if age > _SUBMITTING_TIMEOUT_RUNTIME_SEC:
+                        c['status'] = 'failed'
+                        c['error'] = f'submit timed out after {age}s — нажми ↻ Reuse и попробуй снова'
+                        changed = True
                 continue
             try:
-                vid_local = vid_dir(sid) / f'seedance_ep{int(num):03d}_chunk{c["idx"]:03d}.mp4'
-                _download_video(vurl, vid_local)
-                c['video_url'] = vurl
-                c['video_path'] = str(vid_local.relative_to(series_path(sid)))
-                # Extract ending state from chunk_text via Claude (best-effort)
-                if c.get('chunk_text'):
-                    try:
-                        es = claude_ask(
-                            f"Script chunk just rendered as a video clip:\n{c['chunk_text']}\n\n"
-                            "In ONE short sentence (≤25 words) describe the FINAL physical state at the end of this clip: "
-                            "where each character is, their pose (standing/sitting/lying), what they hold, who is in frame, "
-                            "and the location. No interpretation, just the final tableau.",
-                            system="You produce one short factual continuity note. No preamble."
-                        ).strip()
-                        c['ending_state'] = es[:400]
-                    except Exception:
-                        pass
+                st = _avai_seedance_status(c['job_id'], c.get('status_url'))
             except Exception as e:
                 c['status'] = 'failed'
-                c['error'] = f'download failed: {e}'
-        changed = True
-    if changed:
-        save_episode(sid, num, ep)
-    return jsonify({'chunks': chunks})
+                c['error'] = str(e)
+                changed = True
+                continue
+            c['status'] = st.get('status') or c['status']
+            if st.get('progress') is not None:
+                c['progress'] = st['progress']
+            if st.get('cost') is not None:
+                c['cost'] = st['cost']
+            if st.get('error'):
+                c['error'] = st['error']
+            if st.get('status') == 'completed' and st.get('video_url') and not c.get('video_path'):
+                vurl = (st.get('video_url') or '').strip()
+                vurl_lower = vurl.lower()
+                is_moderation = (
+                    'moderation' in vurl_lower
+                    or vurl.startswith('/')
+                    or not vurl_lower.startswith(('http://', 'https://'))
+                    or not (vurl_lower.endswith('.mp4') or '.mp4?' in vurl_lower or '/video' in vurl_lower)
+                )
+                if is_moderation:
+                    c['status'] = 'failed'
+                    c['error'] = (
+                        f'Заблокировано модерацией Seedance (вернул "{vurl[:60]}"). '
+                        'Перепиши промпт мягче — убери: царапины/раны/кровь, удары в лицо, '
+                        'обнажение, оружие, явное насилие. Попробуй collage_grid bypass или '
+                        'переформулируй действие через эмоцию вместо физического урона.'
+                    )
+                    changed = True
+                    continue
+                try:
+                    vid_local = vid_dir(sid) / f'seedance_ep{int(num):03d}_chunk{c["idx"]:03d}.mp4'
+                    _download_video(vurl, vid_local)
+                    c['video_url'] = vurl
+                    c['video_path'] = str(vid_local.relative_to(series_path(sid)))
+                    if c.get('chunk_text'):
+                        try:
+                            es = claude_ask(
+                                f"Script chunk just rendered as a video clip:\n{c['chunk_text']}\n\n"
+                                "In ONE short sentence (≤25 words) describe the FINAL physical state at the end of this clip: "
+                                "where each character is, their pose (standing/sitting/lying), what they hold, who is in frame, "
+                                "and the location. No interpretation, just the final tableau.",
+                                system="You produce one short factual continuity note. No preamble."
+                            ).strip()
+                            c['ending_state'] = es[:400]
+                        except Exception:
+                            pass
+                except Exception as e:
+                    c['status'] = 'failed'
+                    c['error'] = f'download failed: {e}'
+            changed = True
+        if changed:
+            save_episode(sid, num, ep)
+        return jsonify({'chunks': chunks})
 
 @app.route('/api/series/<sid>/episodes/<int:num>/seedance/<int:idx>', methods=['DELETE'])
 def seedance_delete(sid, num, idx):
-    ep = load_episode(sid, num)
-    if not ep:
-        return jsonify({'error': 'not found'}), 404
-    chunks = _seedance_chunks(ep)
-    chunk = next((c for c in chunks if c.get('idx') == idx), None)
-    if not chunk:
-        return jsonify({'error': 'chunk not found'}), 404
-    # Delete local mp4 if exists
-    if chunk.get('video_path'):
-        p = series_path(sid) / chunk['video_path']
-        try:
-            if p.exists(): p.unlink()
-        except Exception: pass
-    chunks[:] = [c for c in chunks if c.get('idx') != idx]
-    save_episode(sid, num, ep)
-    return jsonify({'ok': True})
+    with _episode_lock(sid, num):
+        ep = load_episode(sid, num)
+        if not ep:
+            return jsonify({'error': 'not found'}), 404
+        chunks = _seedance_chunks(ep)
+        chunk = next((c for c in chunks if c.get('idx') == idx), None)
+        if not chunk:
+            return jsonify({'error': 'chunk not found'}), 404
+        # Delete local mp4 if exists
+        if chunk.get('video_path'):
+            p = series_path(sid) / chunk['video_path']
+            try:
+                if p.exists(): p.unlink()
+            except Exception: pass
+        chunks[:] = [c for c in chunks if c.get('idx') != idx]
+        save_episode(sid, num, ep)
+        return jsonify({'ok': True})
 
 @app.route('/api/series/<sid>/episodes/<int:num>/seedance/<int:idx>/heal-prompt', methods=['POST'])
 def seedance_heal_prompt(sid, num, idx):
