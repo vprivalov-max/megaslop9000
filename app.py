@@ -7177,6 +7177,14 @@ def _parse_cast_block(script, chars):
             # also be flagged is_base so we never duplicate-generate it as a costume change.
             if od and 'wearing' not in look.lower():
                 look = look.rstrip(' ,;') + f", wearing {od[:200]}"
+            # Remember the OUTFIT label this character was introduced wearing.
+            # Subsequent scenes that mention the SAME label are NOT a costume
+            # change — they're just the character in their default look. Stored
+            # on the character so the outfit-attachment logic below can skip
+            # creating a redundant separate outfit entry. A real costume change
+            # = a NEW label appearing in a later scene; only THEN do we create
+            # an outfit (and never auto-flag it is_base — the base IS implicit).
+            base_label_intro = (fields.get('OUTFIT', 'base').split('(')[0].strip().lower() or 'base')
             char = {
                 'id': str(uuid.uuid4())[:8],
                 'name': raw_name,
@@ -7186,6 +7194,7 @@ def _parse_cast_block(script, chars):
                 'voice_id':    '',
                 'ref_images':  [],
                 'outfits':     [],
+                'base_outfit_label': base_label_intro,  # implicit-base marker
             }
             chars.append(char)
 
@@ -7265,6 +7274,17 @@ def _parse_cast_block(script, chars):
                       f'→ standalone character "{spawned["name"]}" (od_excerpt="{outfit_desc_for_check[:60]}")')
                 continue  # skip the outfit-attachment below
 
+        # Skip outfit machinery entirely when this scene's OUTFIT matches the
+        # character's IMPLICIT BASE LABEL — i.e. the look they were first
+        # introduced wearing. That's not a costume change, it's the default
+        # appearance, already baked into char.appearance. Creating a separate
+        # outfit entry here would clutter the UI with a fake "outfit" chip on
+        # the character card. The scene gets no outfit_map entry → renderers
+        # fall back to the base ref photo automatically.
+        base_label = (char.get('base_outfit_label') or '').lower()
+        if base_label and raw_outfit.lower() == base_label:
+            continue
+
         # Find existing outfit by label
         outfit = next((o for o in char.get('outfits', [])
                        if o.get('label','').lower() == raw_outfit.lower()), None)
@@ -7272,7 +7292,13 @@ def _parse_cast_block(script, chars):
         # IS_BASE marker: this outfit IS the character's base look — link to ref_images, no separate gen
         is_base_flag = fields.get('IS_BASE', '').lower() in ('true', 'yes', '1')
 
-        # Auto-create new outfit if scene declares one with description
+        # Auto-create new outfit if scene declares one with description.
+        # NOTE: previously we auto-flagged the FIRST outfit of a freshly-created
+        # character as is_base ("AUTO-BASE"). That's now obsolete — the implicit
+        # base look is captured via base_outfit_label on the character itself
+        # (see new-character creation block above), and matching scenes are
+        # short-circuited via the `continue` above. Anything reaching this point
+        # is a REAL costume change and gets a normal (non-base) outfit entry.
         if not outfit:
             outfit_desc = fields.get('OUTFIT_DESC', '') or fields.get('OUTFITDESC', '')
             if outfit_desc or raw_outfit.lower() != 'base':
@@ -7285,17 +7311,8 @@ def _parse_cast_block(script, chars):
                 }
                 char.setdefault('outfits', []).append(outfit)
 
-        # Apply IS_BASE: link photo/avai_url to character's base ref, mark is_base.
-        # AUTO-BASE for freshly-created characters — their first cast-block outfit
-        # IS their base (a bear builder defaults to construction gear; that's not a
-        # costume change, that's their canonical look). Without this, autogen would
-        # try to i2i "construction_gear" from a base portrait that has no clothing
-        # description embedded → garbage hybrid. With it: outfit.is_base=true tells
-        # autogen "reuse the base photo, no separate gen needed".
-        auto_base = char_was_just_created and outfit and not any(
-            o.get('is_base') for o in char.get('outfits', []) if o['id'] != outfit['id']
-        )
-        if outfit and (is_base_flag or auto_base):
+        # Apply explicit IS_BASE flag from the cast block (writer override).
+        if outfit and is_base_flag:
             # Unmark other outfits as base (only one base per char)
             for o in char.get('outfits', []):
                 if o['id'] != outfit['id'] and o.get('is_base'):
@@ -7305,6 +7322,9 @@ def _parse_cast_block(script, chars):
             if char.get('avai_base_url') and not outfit.get('avai_url'):
                 outfit['avai_url'] = char.get('avai_base_url', '')
             outfit['is_base'] = True
+            # Keep base_outfit_label in sync so subsequent scenes with this label
+            # also short-circuit instead of re-creating.
+            char['base_outfit_label'] = outfit.get('label', '').lower()
 
         if outfit:
             lst = outfit_map.setdefault(char['id'], [])
