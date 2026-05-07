@@ -234,27 +234,48 @@ def _get_user_reteller_key():
     return ''
 
 def _capture_user_keys():
-    """Snapshot the current user's keys so a background thread can use them
-    after the Flask request context is gone. MUST be called inside a request
-    handler (or another already-thread-local-scoped worker)."""
+    """Snapshot the current user's identity + keys so a background thread can
+    use them after the Flask request context is gone. MUST be called inside a
+    request handler (or another already-thread-local-scoped worker).
+
+    `email` is captured separately because file-system helpers (user_root,
+    series_path, load/save_episode) call current_user_email(), which without
+    this override crashes on `session.get(...)` outside request context.
+    Without it, a thread that writes back state (e.g. seedance submit storing
+    job_id after AVAI returns 202) silently dies and leaves chunks stranded
+    in 'submitting' forever — exactly the prod bug we hit."""
+    try:
+        email = current_user_email() or ''
+    except Exception:
+        email = ''
     return {
+        'email': email,
         'avai_key': _get_user_avai_key(),
         'reteller_key': _get_user_reteller_key(),
     }
 
 def _spawn_with_keys(target, *args, **kwargs):
     """Spawn a daemon thread that runs `target(*args, **kwargs)` with the current
-    user's AVAI/Reteller keys propagated into thread-local storage. Returns the
-    Thread object. Use this anywhere you'd previously do
+    user's identity + AVAI/Reteller keys propagated into thread-local storage.
+    Returns the Thread object. Use this anywhere you'd previously do
     `threading.Thread(target=..., daemon=True).start()` for work that calls
-    AVAI/Reteller helpers."""
-    keys = _capture_user_keys()
+    AVAI/Reteller helpers OR file-system helpers (load/save_episode etc.).
+    Logs and re-raises worker exceptions so daemon threads don't die silently."""
+    ctx = _capture_user_keys()
     def _runner():
-        _thread_keys.avai_key = keys['avai_key']
-        _thread_keys.reteller_key = keys['reteller_key']
+        _thread_keys.email = ctx['email']
+        _thread_keys.avai_key = ctx['avai_key']
+        _thread_keys.reteller_key = ctx['reteller_key']
         try:
             target(*args, **kwargs)
+        except Exception as e:
+            import traceback
+            print(f'[_spawn_with_keys] worker {getattr(target, "__name__", target)} '
+                  f'crashed: {type(e).__name__}: {e}', flush=True)
+            traceback.print_exc()
+            raise
         finally:
+            _thread_keys.email = None
             _thread_keys.avai_key = None
             _thread_keys.reteller_key = None
     t = threading.Thread(target=_runner, daemon=True)
@@ -404,7 +425,17 @@ if AUTH_ENABLED:
     )
 
 def current_user_email():
-    """Returns the logged-in user's email, or None if not authenticated."""
+    """Returns the logged-in user's email, or None if not authenticated.
+
+    Background workers spawned via _spawn_with_keys() set `_thread_keys.email`
+    so file-system helpers (user_root → series_path → episodes_dir → load/save_episode)
+    can resolve the right user directory after the Flask request context tears
+    down. Without this, a daemon thread that writes back state (e.g. seedance
+    submit storing job_id) crashes with `RuntimeError: Working outside of
+    request context` and the chunk is stranded in 'submitting' forever."""
+    override = getattr(_thread_keys, 'email', None)
+    if override is not None:
+        return override
     if not AUTH_ENABLED:
         return DEV_USER_EMAIL
     return (session.get('user') or {}).get('email')
