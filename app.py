@@ -7666,6 +7666,101 @@ def serve_asset(sid, filepath):
     return send_from_directory(str(asset_path.parent), asset_path.name)
 
 
+@app.route('/api/series/<sid>/relink-assets', methods=['POST'])
+def relink_assets(sid):
+    """Walks the assets/ folder and re-attaches orphaned files back into
+    series.json. Use case: a character/loc/item has a photo on disk in
+    assets/characters/<slug>/<NAME>_BASE.{jpg,png,webp} but its `ref_images`
+    list is empty — this happens when a corrupted save_series wiped the refs
+    (the atomic-write fix prevents NEW occurrences but doesn't heal old data).
+
+    For every char/loc/item whose ref_images is empty:
+      - look in assets/<kind>/<slug>/ for files matching `<NAME_STEM>_BASE.*`
+        or `<NAME_STEM>.*` (loc/item) ignoring `._*` and `.tmp.*`
+      - if found, prepend the relative path to ref_images and update
+        outfit.photo / avai_url where applicable
+      - if multiple candidates, pick the freshest mtime
+
+    Returns {'relinked': [{kind, id, name, files: [...]}, ...]}.
+    Idempotent — running twice does nothing the second time."""
+    s = load_series(sid)
+    if not s:
+        return jsonify({'error': 'not found'}), 404
+    base = series_path(sid)
+    relinked = []
+
+    def _scan_dir(d, name_stem):
+        """Find files in dir whose stem matches name_stem (case-insensitive),
+        sorted by mtime descending. Skip hidden / tmp."""
+        if not d.exists():
+            return []
+        out = []
+        target = name_stem.upper()
+        for p in d.iterdir():
+            if not p.is_file():
+                continue
+            if p.name.startswith('._') or '.tmp.' in p.name:
+                continue
+            if p.suffix.lower() not in ('.jpg', '.jpeg', '.png', '.webp'):
+                continue
+            stem_upper = p.stem.upper()
+            if stem_upper == target or stem_upper.startswith(target + '_') or stem_upper == target + '_BASE':
+                out.append(p)
+        out.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        return out
+
+    # Characters
+    for c in s.get('characters', []):
+        if c.get('ref_images'):
+            continue
+        slug = slugify(c['name'])
+        char_dir = base / 'assets' / 'characters' / slug
+        stem = asset_name(c['name'], 'BASE')  # canonical
+        # Try BASE first, then bare name.
+        cands = _scan_dir(char_dir, stem)
+        if not cands:
+            cands = _scan_dir(char_dir, asset_name(c['name']))
+        if not cands:
+            continue
+        rels = [str(p.relative_to(base)) for p in cands]
+        c['ref_images'] = rels
+        # Restore base outfit photo if it's marked is_base and empty.
+        for o in c.get('outfits', []) or []:
+            if o.get('is_base') and not o.get('photo'):
+                o['photo'] = rels[0]
+        relinked.append({'kind': 'char', 'id': c['id'], 'name': c['name'], 'files': rels})
+
+    # Locations
+    for l in s.get('locations', []):
+        if l.get('ref_images'):
+            continue
+        slug = slugify(l['name'])
+        loc_dir = base / 'assets' / 'locations' / slug
+        cands = _scan_dir(loc_dir, asset_name(l['name']))
+        if not cands:
+            continue
+        rels = [str(p.relative_to(base)) for p in cands]
+        l['ref_images'] = rels
+        relinked.append({'kind': 'loc', 'id': l['id'], 'name': l['name'], 'files': rels})
+
+    # Items
+    for it in s.get('items', []):
+        if it.get('ref_images'):
+            continue
+        slug = slugify(it['name'])
+        item_dir = base / 'assets' / 'items' / slug
+        cands = _scan_dir(item_dir, asset_name(it['name']))
+        if not cands:
+            continue
+        rels = [str(p.relative_to(base)) for p in cands]
+        it['ref_images'] = rels
+        relinked.append({'kind': 'item', 'id': it['id'], 'name': it['name'], 'files': rels})
+
+    if relinked:
+        save_series(sid, s)
+    return jsonify({'relinked': relinked, 'count': len(relinked)})
+
+
 @app.route('/api/series/<sid>/debug-asset')
 def debug_asset(sid):
     """Diagnostic for the broken-image placeholder. Reports filesystem state

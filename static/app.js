@@ -2710,13 +2710,52 @@ async function debugAsset(url) {
           <h3>🔍 Дебаг ассета</h3>
           <div style="font-size:0.78rem;color:var(--muted);word-break:break-all">${esc(url)}</div>
           <textarea readonly rows="18" style="width:100%;font-family:monospace;font-size:0.78rem">${esc(dump)}</textarea>
-          <button class="btn-regen" onclick="navigator.clipboard.writeText(this.previousElementSibling.value);this.textContent='✓ Скопировано'">📋 Скопировать дебаг</button>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:6px">
+            <button class="btn-regen" onclick="navigator.clipboard.writeText(this.parentElement.previousElementSibling.value);this.textContent='✓ Скопировано'">📋 Скопировать дебаг</button>
+            <button class="btn-regen" style="background:linear-gradient(135deg,#10b981,#059669)" onclick="relinkOrphanedAssets(this)">🔗 Найти и привязать потерянные</button>
+          </div>
+          <div id="relink-result" style="font-size:0.82rem;color:var(--muted);margin-top:8px;white-space:pre-wrap"></div>
         </div>
       </div>`;
     overlay.onclick = (e) => { if (e.target === overlay) overlay.remove(); };
     document.body.appendChild(overlay);
   } catch (e) {
     alert('Дебаг не удался: ' + (e?.message || e));
+  }
+}
+
+// Calls /relink-assets which scans the assets/ folder and re-attaches orphan
+// files to characters/locations/items whose ref_images is empty. Runs from
+// the broken-image debug modal so the user can self-heal a series after a
+// JSON-corruption incident wiped refs.
+async function relinkOrphanedAssets(btn) {
+  if (!S.seriesId) { alert('Открой сериал сначала'); return; }
+  const orig = btn.textContent;
+  btn.disabled = true; btn.textContent = '⏳ Сканирую...';
+  const out = document.getElementById('relink-result');
+  if (out) out.textContent = '';
+  try {
+    const r = await api.post(`/api/series/${S.seriesId}/relink-assets`, {});
+    if (r?.error) throw new Error(r.error);
+    const lines = (r.relinked || []).map(x =>
+      `✓ ${x.kind} «${x.name}» → ${x.files.join(', ')}`
+    ).join('\n');
+    if (out) out.textContent = r.count
+      ? `Привязано: ${r.count}\n${lines}`
+      : 'Орфанов не найдено — все ассеты на местах.';
+    // Refresh series state and re-render lists.
+    const fresh = await api.get(`/api/series/${S.seriesId}`);
+    if (fresh) S.series = fresh;
+    renderCharactersList && renderCharactersList();
+    renderLocationsList && renderLocationsList();
+    renderItemsList && renderItemsList();
+    renderEpCharacters && renderEpCharacters();
+    renderEpLocations && renderEpLocations();
+    renderEpItems && renderEpItems();
+    btn.textContent = '✓ Готово';
+  } catch (e) {
+    if (out) out.textContent = '✗ ' + (e?.message || e);
+    btn.disabled = false; btn.textContent = orig;
   }
 }
 
