@@ -1258,12 +1258,30 @@ def _repair_llm_json(s: str) -> str:
     s = re.sub(r"([{,])(\s*)'([^'\n]*)'(\s*):", r'\1\2"\3"\4:', s)
     return s
 
+def _strip_markdown_fence(raw: str) -> str:
+    """Remove ```json ... ``` (or just ``` ... ```) wrappers that some Claude
+    responses bring back even when the system prompt says strict JSON. Cheap
+    pre-clean before json.loads."""
+    s = (raw or '').strip()
+    # Leading ```json\n or ```\n
+    s = re.sub(r'^```(?:json|JSON)?[ \t]*\n?', '', s)
+    # Trailing ``` (with optional preceding newline)
+    s = re.sub(r'\n?```[ \t]*$', '', s)
+    return s
+
 def loads_lenient(raw: str):
-    """json.loads with one-shot repair fallback."""
+    """json.loads with markdown-fence strip + repair fallback."""
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
-        return json.loads(_repair_llm_json(raw))
+        pass
+    # Try after stripping ```json fences (Claude sometimes wraps JSON in them
+    # despite the prompt asking for strict JSON).
+    s = _strip_markdown_fence(raw)
+    try:
+        return json.loads(s)
+    except json.JSONDecodeError:
+        return json.loads(_repair_llm_json(s))
 
 def save_config(cfg):
     CONFIG_FILE.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
@@ -2461,6 +2479,38 @@ def import_from_script():
 @app.route('/api/series/<sid>/import-status')
 def import_status(sid):
     return jsonify(_import_status(sid))
+
+
+@app.route('/api/series/<sid>/reextract', methods=['POST'])
+def reextract_series(sid):
+    """Re-runs the per-episode entity extractor on an already-imported series.
+    Use case: an earlier import partially failed (LLM JSON parse error,
+    server restart killed the worker, etc.) and chars/items are missing.
+    Walks every existing episode that has a script and queues the same worker
+    used by /import-from-script. Skips episodes that already have ALL three
+    of (characters_used, locations_used, items_used) populated unless
+    body.force is true."""
+    s = load_series(sid)
+    if not s:
+        return jsonify({'error': 'not found'}), 404
+    body = request.get_json(silent=True) or {}
+    force = bool(body.get('force', False))
+    eps = list_episodes(sid)
+    targets = []
+    for ep in sorted(eps, key=lambda e: e['number']):
+        if not (ep.get('script') or '').strip():
+            continue
+        if not force:
+            has_chars = bool(ep.get('characters_used'))
+            has_locs  = bool(ep.get('locations_used'))
+            has_items = bool(ep.get('items_used'))
+            if has_chars and has_locs and has_items:
+                continue
+        targets.append({'number': ep['number']})
+    if not targets:
+        return jsonify({'queued': 0, 'message': 'all episodes already have entities (use force=true to redo)'}), 200
+    _spawn_with_keys(_import_worker, sid, targets)
+    return jsonify({'queued': len(targets), 'started': True}), 202
 
 
 @app.route('/api/series', methods=['POST'])
