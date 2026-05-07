@@ -7983,7 +7983,33 @@ function _spawnMlgFlash(opts) {
   const tilt = (Math.random() * 12 - 6).toFixed(1);
   wrap.style.setProperty('--mlg-tilt', `${tilt}deg`);
   document.body.appendChild(wrap);
+  // Spawn a rainbow vignette around the screen edges for the same lifetime
+  // as the popup. Multiple stacked popups → one shared vignette (re-uses the
+  // existing DOM node and bumps its expiry timestamp). CSS handles the
+  // rainbow hue-rotation animation on the inset box-shadow.
+  _spawnMlgVignette(2400);
   setTimeout(() => wrap.remove(), 2400);
+}
+
+let _mlgVignetteTimer = null;
+function _spawnMlgVignette(durationMs) {
+  let v = document.getElementById('mlg-vignette');
+  if (!v) {
+    v = document.createElement('div');
+    v.id = 'mlg-vignette';
+    v.className = 'mlg-vignette';
+    document.body.appendChild(v);
+  }
+  // Restart the animation by force-reflowing (so new popups extend the show).
+  v.classList.remove('on');
+  // eslint-disable-next-line no-unused-expressions
+  v.offsetWidth;  // reflow
+  v.classList.add('on');
+  if (_mlgVignetteTimer) clearTimeout(_mlgVignetteTimer);
+  _mlgVignetteTimer = setTimeout(() => {
+    v.classList.remove('on');
+    _mlgVignetteTimer = null;
+  }, durationMs);
 }
 // Round-number kill milestone — shown every 5 kills.
 function _spawnMlgMilestone(killCount) {

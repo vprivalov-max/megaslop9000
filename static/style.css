@@ -2156,3 +2156,51 @@ body.seedance-mode .ep-loc-card:active { cursor: grabbing; }
   100% { opacity: 0;
          transform: translate(-50%, -65%) rotate(var(--mlg-tilt, 0deg)) scale(1.1); }
 }
+
+/* ── MLG vignette — rainbow inset glow around screen edges during popups ── */
+.mlg-vignette {
+  position: fixed; inset: 0;
+  pointer-events: none;
+  z-index: 9998;     /* below popups (which sit at 9999) */
+  opacity: 0;
+  transition: opacity 0.18s ease-out;
+  /* Inset box-shadow draws a thick coloured halo on the inside of the
+     viewport edges. The hue rotates over the popup lifetime for the
+     "all-rainbow-colours" effect the user asked for. */
+  box-shadow:
+    inset 0  0 220px 60px hsl(var(--mlgv-hue, 0), 100%, 55%),
+    inset 0  0 80px  30px hsl(calc(var(--mlgv-hue, 0) + 60deg), 100%, 60%);
+  mix-blend-mode: screen;
+}
+.mlg-vignette.on {
+  opacity: 0.85;
+  animation: mlg-vignette-rainbow 2.4s linear forwards,
+             mlg-vignette-pulse  0.45s ease-in-out infinite alternate;
+}
+@property --mlgv-hue {
+  syntax: '<angle>';
+  inherits: false;
+  initial-value: 0deg;
+}
+@keyframes mlg-vignette-rainbow {
+  0%   { --mlgv-hue: 0deg; }
+  100% { --mlgv-hue: 720deg; }
+}
+@keyframes mlg-vignette-pulse {
+  from { filter: brightness(1) saturate(1.1); }
+  to   { filter: brightness(1.25) saturate(1.4); }
+}
+/* Fallback for browsers without @property — fixed cyan-magenta loop via JS-less hue. */
+@supports not (background: paint(something)) {
+  .mlg-vignette.on {
+    box-shadow:
+      inset 0  0 220px 60px #ff00d4,
+      inset 0  0 80px  30px #00f0ff;
+    animation: mlg-vignette-fallback 2.4s linear forwards,
+               mlg-vignette-pulse 0.45s ease-in-out infinite alternate;
+  }
+  @keyframes mlg-vignette-fallback {
+    0%   { filter: hue-rotate(0deg) brightness(1); }
+    100% { filter: hue-rotate(720deg) brightness(1); }
+  }
+}
