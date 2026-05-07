@@ -617,6 +617,45 @@ button { cursor: pointer; transition: all 0.15s; }
   font-size: 0.95rem; color: #fff;
 }
 
+/* ── Series-create mode picker (Generate vs Import) ── */
+.btn-mode-pill {
+  flex: 1; background: transparent; border: none; cursor: pointer;
+  padding: 12px 14px; border-radius: 8px; color: var(--muted);
+  font-size: 0.95rem; font-weight: 600; text-align: left;
+  transition: all 0.15s;
+}
+.btn-mode-pill:hover { color: var(--text); background: var(--surface); }
+.btn-mode-pill.active {
+  background: linear-gradient(135deg, rgba(168,85,247,0.16), rgba(236,72,153,0.16));
+  color: var(--text);
+  box-shadow: inset 0 0 0 1px rgba(168,85,247,0.45);
+}
+
+/* Import-from-script: progress banner shown on series page during extraction */
+.import-progress-banner {
+  margin: 10px 0; padding: 12px 14px;
+  background: linear-gradient(135deg, rgba(132,94,247,0.10), rgba(236,72,153,0.06));
+  border: 1px solid rgba(132,94,247,0.45);
+  border-radius: 10px;
+}
+.import-progress-banner.hidden { display: none; }
+.import-progress-banner .ipb-row {
+  display: flex; align-items: center; gap: 10px; font-size: 0.92rem;
+}
+.import-progress-banner .ipb-spinner {
+  width: 16px; height: 16px;
+  border: 2px solid rgba(132,94,247,0.5); border-top-color: #845ef7;
+  border-radius: 50%; animation: spin 0.9s linear infinite;
+}
+.import-progress-banner .ipb-bar {
+  margin-top: 8px; height: 6px; background: rgba(255,255,255,0.08);
+  border-radius: 3px; overflow: hidden;
+}
+.import-progress-banner .ipb-bar-fill {
+  height: 100%; background: linear-gradient(90deg, #845ef7, #ec4899);
+  width: 0%; transition: width 0.4s ease;
+}
+
 /* ── Episode-editor neighbour-strip nav ── */
 .ep-neighbours {
   display: flex; align-items: center; gap: 4px;

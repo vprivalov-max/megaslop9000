@@ -707,6 +707,55 @@
     </div>
     <div class="modal-body">
 
+      <!-- Mode picker: Generate via AI vs Import existing script -->
+      <div id="series-mode-picker" style="display:flex;gap:10px;margin-bottom:16px;background:var(--surface2);border-radius:10px;padding:6px">
+        <button type="button" class="btn-mode-pill active" id="series-mode-generate-btn" onclick="setSeriesCreateMode('generate')">
+          ✨ Сгенерировать
+          <div style="font-size:0.74rem;color:var(--muted);font-weight:400;margin-top:2px">AI напишет идею с нуля</div>
+        </button>
+        <button type="button" class="btn-mode-pill" id="series-mode-import-btn" onclick="setSeriesCreateMode('import')">
+          📜 Из готового сценария
+          <div style="font-size:0.74rem;color:var(--muted);font-weight:400;margin-top:2px">Загрузить .txt / paste — серии и персонажи извлекутся сами</div>
+        </button>
+      </div>
+
+      <!-- ─── IMPORT MODE ─── (hidden by default; toggled by setSeriesCreateMode) -->
+      <div id="series-import-block" style="display:none">
+        <div class="field-group">
+          <label>Название сериала *</label>
+          <input id="import-series-title" type="text" placeholder="Например: Месть в стенах империи моей сестры">
+        </div>
+        <div class="field-group">
+          <label>Сценарий (текст или drag &amp; drop файла .txt / .md)</label>
+          <textarea id="import-series-script" rows="14" placeholder="Вставь весь сценарий целиком. Поддерживаемые разделители эпизодов:&#10;  === ЭПИЗОД 5 ===&#10;  ## Episode 5&#10;  Серия 5: Заголовок&#10;  5.&#10;Если разделителей нет — будет один эпизод.&#10;&#10;После создания сериал появится в списке, и в фоне запустится извлечение персонажей, локаций и предметов из каждой серии."
+            ondragover="event.preventDefault();this.style.borderColor='var(--accent)'"
+            ondragleave="this.style.borderColor=''"
+            ondrop="event.preventDefault();this.style.borderColor='';importDropFile(event)"></textarea>
+          <input type="file" id="import-series-file" accept=".txt,.md,.markdown,text/plain" style="display:none" onchange="importPickFile(this)">
+          <div style="display:flex;gap:6px;align-items:center;justify-content:space-between;margin-top:4px">
+            <button type="button" class="btn-ghost btn-sm" onclick="document.getElementById('import-series-file').click()">📁 Выбрать файл</button>
+            <span id="import-series-script-stats" style="font-size:0.78rem;color:var(--muted)">0 символов</span>
+          </div>
+        </div>
+        <div class="field-group">
+          <button type="button" class="btn-ghost btn-sm" onclick="importPreviewSplit()">👁 Превью разбивки на серии</button>
+          <div id="import-series-preview" style="margin-top:8px"></div>
+        </div>
+        <label class="cb" style="display:flex;align-items:flex-start;gap:8px;background:rgba(132,94,247,0.06);border:1px solid rgba(132,94,247,0.2);border-radius:8px;padding:10px 12px">
+          <input type="checkbox" id="import-extract-entities" checked style="margin-top:3px">
+          <div style="flex:1">
+            <div style="font-weight:600;color:var(--text)">🤖 Извлечь персонажей, локации, предметы</div>
+            <div style="font-size:0.78rem;color:var(--muted)">Запустится в фоне после создания. На 70 серий ≈ 5-15 минут (зависит от длины каждой серии). Можно сразу заходить в созданный сериал — будет видно прогресс.</div>
+          </div>
+        </label>
+        <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:14px">
+          <button class="btn-primary" onclick="importCreateSeries()" id="import-create-btn" style="background:linear-gradient(135deg,#10b981,#059669)">📜 Создать из сценария</button>
+        </div>
+      </div>
+
+      <!-- ─── GENERATE MODE ─── (existing UI wrapped) -->
+      <div id="series-generate-block">
+
       <!-- AI idea block -->
       <div class="idea-gen-block">
         <div class="field-group" style="margin-bottom:0">
@@ -774,10 +823,12 @@
         <label>Синопсис</label>
         <textarea id="new-series-synopsis" rows="3" placeholder="Краткое описание основного конфликта и арки сериала..."></textarea>
       </div>
+
+      </div><!-- /#series-generate-block -->
     </div>
     <div class="modal-footer">
       <button class="btn-ghost" onclick="closeModal('modal-create-series')">Отмена</button>
-      <button class="btn-primary" onclick="createSeries()" data-mlg-action="gunshot">Создать</button>
+      <button class="btn-primary" id="series-generate-create-btn" onclick="createSeries()" data-mlg-action="gunshot">Создать</button>
     </div>
   </div>
 </div>

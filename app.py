@@ -2114,6 +2114,343 @@ def toggle_pin(sid):
     save_series(sid, s)
     return jsonify({'pinned': s['pinned']})
 
+# ── Import series from existing script ───────────────────────────────────────
+# Lets the user paste / upload a 70-episode script and get a fully populated
+# series in one shot: episodes split + chars/locs/items extracted per-episode.
+# Two-step UX: (1) preview boundaries before commit, (2) bulk create + start
+# background extraction worker. Status polled via /import-status.
+
+# Regex matchers for episode-boundary detection. Tried in order; first that
+# yields ≥2 matches wins. Without this fallback chain a script that uses an
+# unusual marker (just "5." at the start of a line) would land in episode 1
+# alone.
+# NOTE: leading whitespace is `[ \t]*` (NOT `\s*`) on purpose. `\s` matches
+# newlines too — with multiline `^`, a `\s*` quantifier can consume entire
+# lines BETWEEN the boundary markers, swallowing actual episode body into the
+# next match. Restricting to spaces/tabs keeps each match anchored to a single
+# line.
+_EPISODE_BOUNDARY_PATTERNS = [
+    # Triple-equals fenced: === ЭПИЗОД 5 === / === EPISODE 5 ===
+    r'(?im)^[ \t]*={2,}[ \t]*(?:эпизод|серия|episode|ep\.?)[ \t]*(\d+)[^\n]*$',
+    # Markdown headers: ## ЭПИЗОД 5 / # Episode 5
+    r'(?im)^#{1,6}[ \t]*(?:эпизод|серия|episode|ep\.?)[ \t]*(\d+)[^\n]*$',
+    # Plain bare line: ЭПИЗОД 5 / Episode 5 / Серия 5
+    r'(?im)^[ \t]*(?:эпизод|серия|episode|ep\.?)[ \t]+(\d+)[ \t]*[:\-—]?[ \t]*[^\n]*$',
+    # Numbered with period only: 5. (when on its own line)
+    r'(?m)^[ \t]*(\d+)\.[ \t]*$',
+]
+
+def _split_script_into_episodes(text):
+    """Returns [{'number': int, 'title': str, 'body': str}, ...] or [] if
+    no boundaries could be found. Pattern chain tries the most-specific
+    markers first and falls back to looser ones."""
+    if not text or not text.strip():
+        return []
+    for pattern in _EPISODE_BOUNDARY_PATTERNS:
+        matches = list(re.finditer(pattern, text))
+        if len(matches) < 2:
+            continue
+        episodes = []
+        for i, m in enumerate(matches):
+            try:
+                num = int(m.group(1))
+            except (ValueError, IndexError):
+                num = i + 1
+            start = m.end()
+            end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+            body = text[start:end].strip()
+            # Title = the matched line (without the marker prefix and any
+            # trailing decorators), trimmed.
+            line = m.group(0).strip()
+            title = re.sub(r'^[#=\s]+', '', line)                                                # leading # / =
+            title = re.sub(r'[#=\s]+$', '', title)                                               # trailing # / =
+            title = re.sub(r'^(эпизод|серия|episode|ep\.?)\s*\d+\s*[:\-—]?\s*', '', title, flags=re.IGNORECASE)
+            episodes.append({'number': num, 'title': title.strip(), 'body': body})
+        if episodes:
+            # Renumber sequentially if numbers are dup or non-monotonic.
+            seen = set()
+            for ep in episodes:
+                if ep['number'] in seen or ep['number'] < 1:
+                    ep['number'] = max(seen, default=0) + 1
+                seen.add(ep['number'])
+            return episodes
+    # No boundaries found → treat whole text as a single episode.
+    return [{'number': 1, 'title': '', 'body': text.strip()}]
+
+
+# Per-series import status; UI polls /import-status. Lives in-memory only;
+# survives across requests in the same gunicorn worker (we run with workers=1
+# anyway). On restart the user just sees no in-flight job and can retry.
+_IMPORT_STATUS = {}  # sid -> {running, total, done, errors[], started_at, finished_at, current}
+_IMPORT_LOCKS = {}
+
+def _import_status(sid):
+    return _IMPORT_STATUS.setdefault(sid, {
+        'running': False, 'total': 0, 'done': 0, 'errors': [],
+        'started_at': None, 'finished_at': None, 'current': None,
+    })
+
+
+def _llm_extract_episode_entities(script_text, known_chars, known_locs, known_items):
+    """One LLM call per episode that returns chars + locs + items in JSON.
+    Faster than running /extract-characters + /detect-items separately. Passes
+    known names so the model can flag re-uses vs new entities."""
+    if not script_text or not script_text.strip():
+        return {'characters': [], 'locations': [], 'items': []}
+    known_section = ''
+    if known_chars or known_locs or known_items:
+        known_section = (
+            f"\n\nALREADY KNOWN ENTITIES (REUSE these names where the script mentions them):\n"
+            f"  characters: {', '.join(sorted(known_chars)) or '(none)'}\n"
+            f"  locations:  {', '.join(sorted(known_locs))  or '(none)'}\n"
+            f"  items:      {', '.join(sorted(known_items)) or '(none)'}\n"
+        )
+    system = (
+        "You extract structured cast/crew data from a single short-drama episode script. "
+        "Return STRICT JSON, no prose, no markdown.\n\n"
+        "Schema:\n"
+        '{\n'
+        '  "characters": [{"name": "...", "gender": "male|female", "appearance": "1 sentence visual description"}],\n'
+        '  "locations":  [{"name": "...", "description": "1 sentence about the place"}],\n'
+        '  "items":      [{"name": "...", "description": "1 sentence visual description"}]\n'
+        '}\n\n'
+        "Rules:\n"
+        "- characters: every named person who SPEAKS or ACTS. Skip extras and crowd ('официант', 'прохожий').\n"
+        "- locations: every distinct setting where action happens. Use INT/EXT slug as the name when present.\n"
+        "- items: ONLY plot-relevant objects (the locket revealed at climax, the USB stick with evidence,\n"
+        "  the stolen handbag). NOT random props (coffee cups, generic furniture).\n"
+        "- Names: prefer the canonical full-name as it first appears in the script.\n"
+        "- If an entity matches an already-known name (case-insensitive), use the EXACT known spelling so dedup works.\n"
+        "- Empty arrays are valid. No fields beyond schema."
+    )
+    raw = claude_ask(
+        f"Episode script:\n\n{script_text[:18000]}{known_section}",
+        system=system, model='', max_tokens=2500,
+    )
+    try:
+        return loads_lenient(raw)
+    except Exception as e:
+        print(f'[import-extract] LLM JSON parse failed: {e}; raw[:400]={raw[:400]!r}', flush=True)
+        return {'characters': [], 'locations': [], 'items': []}
+
+
+def _import_worker(sid, episode_records):
+    """Background worker: walks every episode, runs one LLM extraction per ep,
+    merges results into series.characters/locations/items + ep.characters_used /
+    locations_used / items_used. Updates _IMPORT_STATUS as it goes so the UI
+    can show progress."""
+    st = _import_status(sid)
+    st.update({
+        'running': True, 'total': len(episode_records), 'done': 0,
+        'errors': [], 'started_at': datetime.datetime.utcnow().isoformat(),
+        'finished_at': None, 'current': None,
+    })
+    try:
+        for ep_record in episode_records:
+            num = ep_record['number']
+            st['current'] = f'Эп. {num}'
+            try:
+                # Reload series each iteration so we get the freshest known set
+                # (other ticks may have added entities).
+                s = load_series(sid)
+                if not s:
+                    st['errors'].append({'episode': num, 'error': 'series vanished'})
+                    continue
+                ep = load_episode(sid, num)
+                if not ep:
+                    st['errors'].append({'episode': num, 'error': 'episode missing'})
+                    continue
+                known_chars = {c['name'] for c in s.get('characters', [])}
+                known_locs  = {l['name'] for l in s.get('locations', [])}
+                known_items = {it['name'] for it in s.get('items', [])}
+                extracted = _llm_extract_episode_entities(
+                    ep.get('script', ''), known_chars, known_locs, known_items
+                )
+
+                # Merge characters
+                ep_char_ids = []
+                for c in (extracted.get('characters') or [])[:30]:
+                    name = (c.get('name') or '').strip()
+                    if not name:
+                        continue
+                    existing = next((x for x in s['characters'] if x['name'].lower() == name.lower()), None)
+                    if existing:
+                        ep_char_ids.append(existing['id'])
+                    else:
+                        new_c = {
+                            'id': str(uuid.uuid4())[:8],
+                            'name': name,
+                            'description': '',
+                            'appearance': (c.get('appearance') or '').strip(),
+                            'gender': (c.get('gender') or 'female').lower(),
+                            'voice_id': '',
+                            'ref_images': [],
+                            'outfits': [],
+                            'base_outfit_label': 'base',
+                        }
+                        s['characters'].append(new_c)
+                        ep_char_ids.append(new_c['id'])
+
+                # Merge locations
+                ep_loc_ids = []
+                for l in (extracted.get('locations') or [])[:30]:
+                    name = (l.get('name') or '').strip()
+                    if not name:
+                        continue
+                    existing = next((x for x in s['locations'] if x['name'].lower() == name.lower()), None)
+                    if existing:
+                        ep_loc_ids.append(existing['id'])
+                    else:
+                        new_l = {
+                            'id': str(uuid.uuid4())[:8],
+                            'name': name,
+                            'description': (l.get('description') or '').strip(),
+                            'ref_images': [],
+                            'avai_url': '',
+                        }
+                        s['locations'].append(new_l)
+                        ep_loc_ids.append(new_l['id'])
+
+                # Merge items
+                ep_item_ids = []
+                for it in (extracted.get('items') or [])[:20]:
+                    name = (it.get('name') or '').strip()
+                    if not name:
+                        continue
+                    existing = next((x for x in s['items'] if x['name'].lower() == name.lower()), None)
+                    if existing:
+                        ep_item_ids.append(existing['id'])
+                    else:
+                        new_it = {
+                            'id': str(uuid.uuid4())[:8],
+                            'name': name,
+                            'description': (it.get('description') or '').strip(),
+                            'ref_images': [],
+                            'avai_url': '',
+                            'image_constraints': '',
+                        }
+                        s['items'].append(new_it)
+                        ep_item_ids.append(new_it['id'])
+
+                ep['characters_used'] = ep_char_ids
+                ep['locations_used']  = ep_loc_ids
+                ep['items_used']      = ep_item_ids
+                save_series(sid, s)
+                save_episode(sid, num, ep)
+            except Exception as e:
+                import traceback
+                print(f'[import-worker] ep {num} crashed: {e}', flush=True)
+                traceback.print_exc()
+                st['errors'].append({'episode': num, 'error': str(e)})
+            finally:
+                st['done'] += 1
+    finally:
+        st['running'] = False
+        st['current'] = None
+        st['finished_at'] = datetime.datetime.utcnow().isoformat()
+
+
+@app.route('/api/series/import-from-script/preview', methods=['POST'])
+def import_from_script_preview():
+    """Returns the proposed episode breakdown for a pasted script WITHOUT
+    creating anything. UI shows it as a confirmable preview. Cheap (regex-
+    only, no LLM)."""
+    data = request.json or {}
+    script = (data.get('script') or '').strip()
+    if not script:
+        return jsonify({'error': 'script required'}), 400
+    eps = _split_script_into_episodes(script)
+    return jsonify({
+        'episodes': [
+            {'number': e['number'], 'title': e['title'], 'preview': e['body'][:240], 'length': len(e['body'])}
+            for e in eps
+        ],
+        'total_chars': len(script),
+    })
+
+
+@app.route('/api/series/import-from-script', methods=['POST'])
+def import_from_script():
+    """Two-phase commit: create series + episodes (synchronous, fast),
+    then kick off background extraction. Returns immediately so UI can
+    redirect to the new series page and start polling /import-status."""
+    data = request.json or {}
+    title = (data.get('title') or '').strip()
+    script = (data.get('script') or '').strip()
+    if not title:
+        return jsonify({'error': 'title required'}), 400
+    if not script:
+        return jsonify({'error': 'script required'}), 400
+    do_extract = bool(data.get('extract_entities', True))
+
+    eps = _split_script_into_episodes(script)
+    if not eps:
+        return jsonify({'error': 'script split produced no episodes'}), 400
+
+    # Build the series shell — same defaults as create_series().
+    slug = slugify(title)
+    sid = slug if slug and not (user_root() / slug).exists() else f"{slug}-{str(uuid.uuid4())[:6]}"
+    series_data = {
+        'id': sid, 'title': title,
+        'genre': '', 'tone': '', 'target_audience': '', 'world_description': '',
+        'synopsis': data.get('synopsis', ''),
+        'auto_generate_assets': True, 'batch_mode': False, 'batch_size': 1,
+        'stage': 4, 'arc': None, 'milestone_synopses': {},
+        'checkpoints': [], 'finale': None,
+        'created_at': datetime.datetime.utcnow().isoformat(),
+        'video_provider': 'seedance',
+        'characters': [], 'locations': [], 'items': [],
+        'style': {'type': 'cinematic', 'custom_description': '', 'ref_images': []},
+        'settings': {
+            'voice': 'Enceladus', 'tts_provider': 'elevenlabs',
+            'image_provider': 'banana', 'aspect_ratio': '9:16',
+            'language': 'English', 'duration': 'auto-frames',
+            'enable_music': True, 'music_volume': 0.30,
+            'enable_animation': True, 'animation_speed': 'fast',
+            'animation_resolution': '480p', 'animation_model': 'seedance-2-ref',
+            'enable_grid': False, 'cinema': False, 'trim': True,
+            'no_fades': True, 'multi_voice': False, 'enable_subtitles': False,
+            'image_size': '1K',
+        },
+    }
+    save_series(sid, series_data)
+    scaffold_series_folders(sid, title)
+
+    # Create each episode with the script body pre-filled.
+    ep_records = []
+    for e in eps:
+        ep_dict = {
+            'number': e['number'],
+            'title':  e['title'],
+            'synopsis': '',
+            'script':   e['body'],
+            'characters_used': [],
+            'locations_used':  [],
+            'items_used':      [],
+            'notes': '', 'reteller_prompt': '',
+            'status': 'draft', 'ready': False,
+            'created_at': datetime.datetime.utcnow().isoformat(),
+        }
+        save_episode(sid, e['number'], ep_dict)
+        ep_records.append({'number': e['number']})
+
+    # Kick off the extraction worker in the background. _spawn_with_keys
+    # carries the user's auth context across the thread boundary.
+    if do_extract:
+        _spawn_with_keys(_import_worker, sid, ep_records)
+
+    return jsonify({
+        'sid': sid,
+        'episodes_created': len(eps),
+        'extraction_started': do_extract,
+    }), 201
+
+
+@app.route('/api/series/<sid>/import-status')
+def import_status(sid):
+    return jsonify(_import_status(sid))
+
+
 @app.route('/api/series', methods=['POST'])
 def create_series():
     data = request.json

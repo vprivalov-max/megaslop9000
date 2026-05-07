@@ -673,7 +673,192 @@ function openCreateSeries() {
   const singleMode = document.querySelector('input[name="new-series-mode"][value="single"]');
   if (singleMode) singleMode.checked = true;
   buildGenreFilters();
+  // Reset import-mode fields too.
+  setVal('import-series-title', '');
+  setVal('import-series-script', '');
+  document.getElementById('import-series-script-stats').textContent = '0 символов';
+  document.getElementById('import-series-preview').innerHTML = '';
+  setSeriesCreateMode('generate');
   openModal('modal-create-series');
+}
+
+// ── Series-create mode picker ────────────────────────────────────────────────
+// Two top-level modes inside the create-series modal:
+//   generate — existing AI-flow (idea → generate → fill fields)
+//   import   — paste/upload an existing script, split into episodes, extract
+//              chars/locs/items in the background
+// Each mode shows its own block + footer button; the unused parts are hidden.
+function setSeriesCreateMode(mode) {
+  const isImport = mode === 'import';
+  const genBlock = document.getElementById('series-generate-block');
+  const impBlock = document.getElementById('series-import-block');
+  if (genBlock) genBlock.style.display = isImport ? 'none' : '';
+  if (impBlock) impBlock.style.display = isImport ? '' : 'none';
+  const genBtn = document.getElementById('series-mode-generate-btn');
+  const impBtn = document.getElementById('series-mode-import-btn');
+  if (genBtn) genBtn.classList.toggle('active', !isImport);
+  if (impBtn) impBtn.classList.toggle('active', isImport);
+  // Footer "Создать" only relevant in generate mode (import has its own button).
+  const footerCreateBtn = document.getElementById('series-generate-create-btn');
+  if (footerCreateBtn) footerCreateBtn.style.display = isImport ? 'none' : '';
+}
+
+// ── Import-from-script flow ─────────────────────────────────────────────────
+function importDropFile(ev) {
+  const file = ev.dataTransfer?.files?.[0];
+  if (!file) return;
+  _importReadFile(file);
+}
+function importPickFile(input) {
+  const file = input.files?.[0];
+  if (!file) return;
+  _importReadFile(file);
+}
+function _importReadFile(file) {
+  const reader = new FileReader();
+  reader.onload = () => {
+    setVal('import-series-script', reader.result || '');
+    importUpdateStats();
+    // Auto-fill title from filename if empty.
+    const titleEl = document.getElementById('import-series-title');
+    if (titleEl && !titleEl.value.trim()) {
+      titleEl.value = (file.name || 'Imported series').replace(/\.[^.]+$/, '');
+    }
+  };
+  reader.readAsText(file);
+}
+function importUpdateStats() {
+  const txt = (document.getElementById('import-series-script')?.value || '');
+  const stats = document.getElementById('import-series-script-stats');
+  if (stats) stats.textContent = `${txt.length.toLocaleString('ru-RU')} символов`;
+}
+
+async function importPreviewSplit() {
+  const script = (document.getElementById('import-series-script')?.value || '').trim();
+  const previewEl = document.getElementById('import-series-preview');
+  if (!script) { previewEl.innerHTML = '<div style="color:var(--warning);font-size:0.85rem">Сценарий пустой</div>'; return; }
+  previewEl.innerHTML = '<div style="font-size:0.85rem;color:var(--muted)"><span class="spinner"></span> Анализирую разбивку...</div>';
+  try {
+    const r = await api.post('/api/series/import-from-script/preview', { script });
+    if (r.error) throw new Error(r.error);
+    const eps = r.episodes || [];
+    if (!eps.length) {
+      previewEl.innerHTML = '<div style="color:var(--warning);font-size:0.85rem">Не удалось разбить — будет создан 1 эпизод со всем текстом</div>';
+      return;
+    }
+    previewEl.innerHTML = `
+      <div style="font-size:0.85rem;color:var(--success);margin-bottom:6px">
+        ✓ Найдено эпизодов: <strong>${eps.length}</strong>
+      </div>
+      <div style="max-height:240px;overflow-y:auto;border:1px solid var(--border);border-radius:6px;padding:6px;background:var(--surface2)">
+        ${eps.map(e => `
+          <div style="padding:5px 4px;border-bottom:1px solid var(--border);font-size:0.82rem">
+            <strong>Эп. ${e.number}</strong>
+            ${e.title ? `<span style="color:var(--muted)"> · ${esc(e.title)}</span>` : ''}
+            <span style="color:var(--muted);margin-left:8px">(${e.length.toLocaleString('ru-RU')} симв.)</span>
+            <div style="color:var(--muted);font-size:0.75rem;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(e.preview)}</div>
+          </div>`).join('')}
+      </div>`;
+  } catch (e) {
+    previewEl.innerHTML = `<div style="color:var(--danger);font-size:0.85rem">Ошибка: ${esc(e?.message || e)}</div>`;
+  }
+}
+
+async function importCreateSeries() {
+  const title = (document.getElementById('import-series-title')?.value || '').trim();
+  const script = (document.getElementById('import-series-script')?.value || '').trim();
+  const extract = !!document.getElementById('import-extract-entities')?.checked;
+  if (!title) { alert('Введи название сериала'); return; }
+  if (!script) { alert('Сценарий пустой — вставь текст или подгрузи файл'); return; }
+  const btn = document.getElementById('import-create-btn');
+  const orig = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span> Создаю сериал...';
+  try {
+    const r = await api.post('/api/series/import-from-script', {
+      title, script, extract_entities: extract,
+    });
+    if (r.error) throw new Error(r.error);
+    closeModal('modal-create-series');
+    showToast(`✓ Создано: сериал + ${r.episodes_created} эпизодов${extract ? ' · извлечение запущено в фоне' : ''}`, 5000);
+    navigate('series', { seriesId: r.sid });
+    // The series view will pick up the import-status banner via pollImportStatus.
+    if (extract) setTimeout(() => pollImportStatus(r.sid), 600);
+  } catch (e) {
+    alert('Ошибка импорта: ' + (e?.message || e));
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = orig;
+  }
+}
+
+// Wire stats update on textarea typing.
+document.addEventListener('DOMContentLoaded', () => {
+  const ta = document.getElementById('import-series-script');
+  if (ta) ta.addEventListener('input', importUpdateStats);
+});
+
+// Polls /import-status while extraction is running. Renders a banner on the
+// series page (#import-progress-banner) with X/Y counter + progress bar +
+// current episode label.
+let _importStatusTimer = null;
+async function pollImportStatus(sid) {
+  if (_importStatusTimer) { clearInterval(_importStatusTimer); _importStatusTimer = null; }
+  const tick = async () => {
+    try {
+      const st = await fetch(`/api/series/${sid}/import-status`).then(r => r.json());
+      _renderImportBanner(st);
+      if (!st.running && st.done > 0) {
+        if (_importStatusTimer) { clearInterval(_importStatusTimer); _importStatusTimer = null; }
+        // Final refresh so chars/locs/items show up.
+        try {
+          const fresh = await api.get(`/api/series/${sid}`);
+          if (fresh && S.seriesId === sid) {
+            S.series = fresh;
+            renderCharactersList && renderCharactersList();
+            renderLocationsList && renderLocationsList();
+            renderItemsList && renderItemsList();
+          }
+        } catch {}
+        showToast(`🎉 Импорт завершён: ${st.done} серий · ошибок ${st.errors.length}`, 6000);
+      }
+    } catch {}
+  };
+  await tick();
+  _importStatusTimer = setInterval(tick, 3000);
+}
+
+function _renderImportBanner(st) {
+  // Banner lives at #import-progress-banner inside the series view. Created
+  // lazily on first poll if missing.
+  let el = document.getElementById('import-progress-banner');
+  if (!el) {
+    const host = document.querySelector('.series-main') || document.body;
+    if (!host) return;
+    el = document.createElement('div');
+    el.id = 'import-progress-banner';
+    el.className = 'import-progress-banner';
+    host.insertBefore(el, host.firstChild);
+  }
+  if (!st.running && st.done === 0) { el.classList.add('hidden'); return; }
+  el.classList.remove('hidden');
+  const pct = st.total ? Math.round(100 * st.done / st.total) : 0;
+  const errCount = (st.errors || []).length;
+  el.innerHTML = `
+    <div class="ipb-row">
+      ${st.running ? '<span class="ipb-spinner"></span>' : '<span>✓</span>'}
+      <span>
+        <strong>Импорт сценария:</strong>
+        ${st.done} / ${st.total} серий обработано
+        ${st.current ? `· сейчас: <span style="color:var(--muted)">${esc(st.current)}</span>` : ''}
+        ${errCount ? ` · <span style="color:var(--warning)">ошибок: ${errCount}</span>` : ''}
+      </span>
+    </div>
+    <div class="ipb-bar"><div class="ipb-bar-fill" style="width:${pct}%"></div></div>
+  `;
+  if (!st.running) {
+    setTimeout(() => { el.classList.add('hidden'); el.innerHTML = ''; }, 8000);
+  }
 }
 
 async function generateFromIdea() {
@@ -1576,6 +1761,15 @@ async function loadSeriesView() {
     { label: 'Сериалы', action: "navigate('projects')" },
     { label: S.series.title },
   ]);
+  // Resume the import-progress banner if a script-import job is still active
+  // (e.g. user closed the tab and reopened mid-import).
+  try {
+    const st = await fetch(`/api/series/${S.seriesId}/import-status`).then(r => r.json());
+    if (st && (st.running || (st.done > 0 && st.total > 0 && st.finished_at &&
+        (Date.now() - new Date(st.finished_at).getTime()) < 60000))) {
+      pollImportStatus(S.seriesId);
+    }
+  } catch {}
 }
 
 function applyVideoProviderMode() {
