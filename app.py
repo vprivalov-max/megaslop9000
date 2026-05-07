@@ -9017,6 +9017,21 @@ def _resolve_ref_url(s, ref, sid=None):
             if url:
                 save_series(sid, s)  # persist new avai_url
         return url
+    if kind == 'item':
+        # Plot-relevant items (locket, USB stick, bouquet, etc.). LLM picks
+        # them when the chunk text mentions the object visually — they go
+        # into Seedance refs as an extra @ImageN slot so the rendered video
+        # can carry the prop with consistent appearance.
+        it = next((x for x in s.get('items', []) if x['id'] == ref.get('id')), None)
+        if not it:
+            return None
+        url = it.get('avai_url')
+        if not url:
+            # Lazy-fallback: if avai_url is missing but we have a local ref_image,
+            # we can't upload it without _ensure_item_avai_url (which doesn't
+            # exist yet). Return None and let the caller log it.
+            pass
+        return url
     if kind == 'url':
         return ref.get('url')
     if kind == 'lastframe':
@@ -10111,6 +10126,15 @@ def seedance_compose(sid, num):
         if l.get('avai_url') or l.get('ref_images'):
             tag = '' if l.get('avai_url') else ' [NO_AVAI_URL — нужно перегенерировать]'
             locs_lines.append(f"- {l['name']} (id={l['id']}){tag}: {l.get('description','')[:120]}")
+    # Plot-relevant items roster (locket, USB stick, bouquet, etc.).
+    # Composer attaches them only when the chunk explicitly shows / mentions
+    # the object visually. Cap descriptions short — these only need to anchor
+    # the LLM's identification of "is this prop in the chunk?".
+    items_lines = []
+    for it in s.get('items', []) or []:
+        if not it.get('avai_url'):
+            continue   # need a public URL for Seedance to use it as ref
+        items_lines.append(f"- {it['name']} (id={it['id']}): {it.get('description','')[:100]}")
 
     sysprompt = (
         "Ты — режиссёр-композитор шотов для коротких драм TikTok, генерируемых через ByteDance Seedance 2.0 "
@@ -10164,13 +10188,19 @@ def seedance_compose(sid, num):
         "РЕФЕРЕНСЫ — ОБЯЗАТЕЛЬНЫЕ ПРАВИЛА:\n"
         "1. Сначала персонажи, в порядке важности в кадре → @Image1, @Image2, @Image3...\n"
         "   В refs включай ВСЕХ персов в кадре (не только говорящих). Молчащий перс рядом — это часть мизансцены.\n"
-        "2. ПОСЛЕДНИМ обязательно идёт ЛОКАЦИЯ → @Image<N+1>. ЭТО НЕ ОПЦИЯ.\n"
+        "2. СЮЖЕТНЫЕ ПРЕДМЕТЫ (items) — добавляй в refs ОБЯЗАТЕЛЬНО, если в CHUNK предмет ВИДЕН или ВРУЧАЕТСЯ:\n"
+        "   – персонаж держит/протягивает/вручает букет, конверт, локет, флешку, кольцо, документ → ДОБАВЬ в refs\n"
+        "   – предмет упомянут в action-ремарке как visible prop ('он сжимает локет', 'кладёт конверт на стол') → ДОБАВЬ\n"
+        "   – предмет лишь подразумевается / упоминается репликой без визуального присутствия → НЕ добавляй\n"
+        "   В refs items идут ПОСЛЕ персов, ДО локации. Без них Seedance нарисует обобщённый prop с другим цветом/формой.\n"
+        "   Используй имена items в SUBJECT/ACTION после BINDING ('Wolf протягивает Daisy Bouquet к Bunny').\n"
+        "3. ПОСЛЕДНИМ обязательно идёт ЛОКАЦИЯ → @Image<N+1>. ЭТО НЕ ОПЦИЯ.\n"
         "   Если в AVAILABLE LOCATIONS есть локация, совпадающая с местом действия (по сцен-хедеру или контексту) — "
         "   ОБЯЗАТЕЛЬНО прикрепи её последним @Image. Без локации фон будет рандомным и серия развалится визуально.\n"
         "   Если в roster нет идеально совпадающей локации — выбери максимально близкую по описанию (офис, лобби, спальня и т.п.).\n"
         "   Локацию НЕ ВКЛЮЧАЙ только если в roster вообще нет ни одной подходящей локации с фото.\n"
-        "3. В тексте промпта в блоке SCENE явно упомяни локацию ИМЕНЕМ (после BINDING): 'Действие в Lobby — стеклянное лобби корпорации, холодное освещение'.\n"
-        "4. Максимум 5 референсов (обычно 1–3 перса + 1 локация).\n\n"
+        "4. В тексте промпта в блоке SCENE явно упомяни локацию ИМЕНЕМ (после BINDING): 'Действие в Lobby — стеклянное лобби корпорации, холодное освещение'.\n"
+        "5. Максимум 9 референсов (Seedance hard cap). Обычно 1–3 перса + 0–2 предмета + 1 локация.\n\n"
         "CONTINUITY — КРИТИЧНО:\n"
         "Если в userprompt есть блок ADJACENT GENERATED CHUNKS — это твой главный источник кто физически в кадре.\n"
         "Алгоритм:\n"
@@ -10486,12 +10516,22 @@ def seedance_compose(sid, num):
             + f"=== END ОБЯЗАТЕЛЬНЫЕ СПИКЕРЫ ===\n\n"
         )
 
+    # Active items in THIS episode (for the prompt's "ACTIVE THIS EPISODE" section)
+    active_item_ids = set(ep.get('items_used') or [])
+    active_items_block = '\n'.join(
+        f"  - {it['name']} (id={it['id']})"
+        for it in (s.get('items', []) or [])
+        if it.get('id') in active_item_ids and it.get('avai_url')
+    ) or '  (none)'
+
     userprompt = (
         f"AVAILABLE CHARACTERS (весь roster серии):\n{chr(10).join(chars_lines) or '(none)'}\n\n"
         f"AVAILABLE LOCATIONS (весь roster серии):\n{chr(10).join(locs_lines) or '(none)'}\n\n"
+        f"AVAILABLE ITEMS (сюжетные предметы — букеты, конверты, локеты, флешки и т.п.):\n{chr(10).join(items_lines) or '(none)'}\n\n"
         f"ACTIVE THIS EPISODE (отмечены в эпизоде — приоритет при выборе):\n"
         f"  Characters:\n{active_chars_block}\n"
         f"  Locations:\n{active_locs_block}\n"
+        f"  Items:\n{active_items_block}\n"
         f"{base_only_block}"
         f"{close_up_block}"
         f"{auto_close_up_block}"
@@ -10509,7 +10549,7 @@ def seedance_compose(sid, num):
         "Верни JSON и НИЧЕГО кроме JSON:\n"
         "{\n"
         '  "prompt": "ru/en motion prompt, ~60-110 слов, по структуре выше, с эмоциями перед каждой репликой и финальным @Image<N> локации",\n'
-        '  "refs": [{"kind":"char","id":"...","outfit":"label_or_null"}, ..., {"kind":"loc","id":"..."}],\n'
+        '  "refs": [{"kind":"char","id":"...","outfit":"label_or_null"}, ..., {"kind":"item","id":"..."}, ..., {"kind":"loc","id":"..."}],\n'
         '  "scene_continuity": true|false,\n'
         '  "reasoning": "одно предложение — почему именно эти референсы и continuity"\n'
         "}\n\n"
