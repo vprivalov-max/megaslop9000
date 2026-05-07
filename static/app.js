@@ -8048,11 +8048,45 @@ function _sdNotifyTransitions(chunks) {
   if (newCompleted > 0) {
     Sounds.playSuccess();
     showToast(`✓ Готово видео: ${newCompleted} чанк${newCompleted > 1 ? 'а' : ''}`);
+    // Auto-mark episode "Готово" when every script-derived segment has a
+    // completed chunk. Fires only on the moment of completion (newCompleted>0)
+    // and only once per episode-load (sessionAutoReadyDone) so a user who
+    // manually un-checks the box doesn't get fought by the next poll tick.
+    _maybeAutoMarkEpisodeReady(chunks);
   }
   if (newFailed > 0) {
     Sounds.playError();
     showToast(`✗ Ошибка генерации: ${newFailed} чанк${newFailed > 1 ? 'а' : ''}`);
   }
+}
+
+let _autoReadyAppliedFor = null;  // remembers (seriesId, episodeNum) we auto-marked this session
+function _maybeAutoMarkEpisodeReady(chunks) {
+  if (!S.episode || S.episode.ready) return;          // already ready — nothing to do
+  const key = `${S.seriesId}::${S.episode.number}`;
+  if (_autoReadyAppliedFor === key) return;           // already auto-marked this session
+  // Count completed chunks (any chunk that finished its render).
+  const completed = chunks.filter(c => c.status === 'completed').length;
+  if (!completed) return;
+  // Expected segments = how many script-derived segments the current script
+  // would produce. Use _autoCollectSegments which mirrors the scene-view's
+  // per-segment math (handles establishing-shot toggle, scene heading split,
+  // etc.). If the script is empty / not in scene mode, skip — user is still
+  // editing, not done.
+  let expected = 0;
+  try { expected = (typeof _autoCollectSegments === 'function') ? _autoCollectSegments().length : 0; }
+  catch { return; }
+  if (expected <= 0) return;
+  if (completed < expected) return;
+  // All segments rendered — flip the toggle and persist.
+  _autoReadyAppliedFor = key;
+  const cb = document.getElementById('ep-ready-toggle');
+  if (cb) {
+    cb.checked = true;
+    // Trigger the existing onchange handler so the PUT fires + toast shows.
+    onReadyToggle();
+  }
+  showToast('🎉 Все сегменты сгенерированы — серия отмечена как готовая', 5000);
 }
 
 function sdLocDragStart(ev, locId) {
