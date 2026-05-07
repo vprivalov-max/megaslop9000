@@ -617,6 +617,37 @@ button { cursor: pointer; transition: all 0.15s; }
   font-size: 0.95rem; color: #fff;
 }
 
+/* ── Episode-editor neighbour-strip nav ── */
+.ep-neighbours {
+  display: flex; align-items: center; gap: 4px;
+  flex-wrap: nowrap; overflow-x: auto; max-width: 60vw;
+  padding: 2px 0;
+}
+.ep-neighbours::-webkit-scrollbar { height: 4px; }
+.ep-neighbours::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+.ep-neighbours .epn-pill {
+  flex: 0 0 auto;
+  background: var(--surface2); border: 1px solid var(--border);
+  color: var(--muted); padding: 4px 10px; border-radius: 999px;
+  font-size: 0.78rem; cursor: pointer; transition: all 0.12s;
+  text-decoration: none; line-height: 1.2;
+}
+.ep-neighbours .epn-pill:hover {
+  background: var(--surface); color: var(--text); border-color: var(--accent);
+}
+.ep-neighbours .epn-pill.current {
+  background: var(--accent); color: #fff; border-color: var(--accent);
+  font-weight: 700; cursor: default;
+}
+.ep-neighbours .epn-arrow {
+  color: var(--muted); padding: 0 2px; user-select: none; font-size: 0.9rem;
+}
+.ep-title-input--inline {
+  font-size: 0.88rem; padding: 4px 8px; opacity: 0.7;
+  max-width: 220px; min-width: 0;
+}
+.ep-title-input--inline:focus { opacity: 1; }
+
 /* ── Accept-script flow: progress banner + new-entities modal ── */
 .ep-accept-progress {
   margin-top: 10px; padding: 12px 14px;

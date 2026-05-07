@@ -3231,8 +3231,12 @@ async function saveStyle() {
 }
 
 // ── Episodes ──────────────────────────────────────────────────────────────────
-function openCreateEpisode() {
-  // Find first number that either doesn't exist OR exists without a synopsis
+// One-shot create-episode: skip the modal entirely. Pick the next free number
+// (or the first existing one with no synopsis), POST it, jump straight into
+// the episode view. Synopsis generation moved to be a button inside the
+// episode page next to the synopsis textarea.
+async function openCreateEpisode() {
+  if (_creatingEpisode) return;
   const existing = new Map(S.episodes.map(e => [e.number, e]));
   const maxNum = existing.size > 0 ? Math.max(...existing.keys()) : 0;
   let defaultNum = maxNum + 1;
@@ -3241,12 +3245,80 @@ function openCreateEpisode() {
     const ep = existing.get(n);
     if (!ep.synopsis || !ep.synopsis.trim()) { defaultNum = n; break; }
   }
-  document.getElementById('new-ep-number').value = defaultNum;
-  document.getElementById('new-ep-synopsis').value = '';
-  document.getElementById('new-ep-synopsis-status').textContent = '';
-  const titleEl = document.getElementById('new-ep-modal-title');
-  if (titleEl) titleEl.textContent = isBatchMode(S.series) ? `Новый чанк (${chunkLabel(S.series, defaultNum)})` : 'Новый эпизод';
-  openModal('modal-create-episode');
+  _creatingEpisode = true;
+  const idempotencyKey = (window.crypto && crypto.randomUUID && crypto.randomUUID())
+    || `ep-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  try {
+    const ep = await api.post(
+      `/api/series/${S.seriesId}/episodes`,
+      { synopsis: '', number: defaultNum },
+      { idempotencyKey }
+    );
+    if (!S.episodes.some(e => e.number === ep.number)) S.episodes.push(ep);
+    navigate('episode', { seriesId: S.seriesId, episodeNum: ep.number });
+  } catch (e) {
+    showToast('Ошибка: ' + (e?.message || e));
+  } finally {
+    _creatingEpisode = false;
+  }
+}
+
+// Renders a strip of clickable pills for the episodes immediately before
+// and after the current one. Replaces the old "Эпизод N" duplicate input
+// next to the "Эп. N" badge — gives the user one-click navigation between
+// neighbouring episodes without going back to the series view.
+function renderEpisodeNeighbours() {
+  const nav = document.getElementById('ep-neighbours');
+  if (!nav) return;
+  const eps = (S.episodes || []).slice().sort((a, b) => a.number - b.number);
+  if (!eps.length) { nav.innerHTML = ''; return; }
+  const cur = S.episode?.number;
+  const idx = eps.findIndex(e => e.number === cur);
+  if (idx < 0) { nav.innerHTML = ''; return; }
+  // Show ±3 around current (configurable). Stops at boundaries.
+  const window = 3;
+  const start = Math.max(0, idx - window);
+  const end   = Math.min(eps.length - 1, idx + window);
+  const parts = [];
+  if (start > 0) parts.push(`<span class="epn-arrow" title="Есть ещё эпизоды до этих">…</span>`);
+  for (let i = start; i <= end; i++) {
+    const ep = eps[i];
+    const isCur = ep.number === cur;
+    const label = isBatchMode(S.series) ? chunkLabel(S.series, ep.number, { short: true }) : `Эп. ${ep.number}`;
+    parts.push(`<a class="epn-pill ${isCur ? 'current' : ''}" ${isCur ? '' : `onclick="navigate('episode',{seriesId:'${S.seriesId}',episodeNum:${ep.number}})"`} title="${esc(ep.title || '')}">${label}</a>`);
+  }
+  if (end < eps.length - 1) parts.push(`<span class="epn-arrow" title="Есть ещё эпизоды после этих">…</span>`);
+  nav.innerHTML = parts.join('');
+}
+
+// Inline synopsis generation inside the episode page (replaces the
+// modal-based one that fired before the episode was created).
+async function generateEpisodeSynopsisInline() {
+  if (!S.episode) { alert('Открой эпизод'); return; }
+  const btn = document.getElementById('ep-syn-gen-btn');
+  const status = document.getElementById('ep-syn-gen-status');
+  const ta = document.getElementById('ep-synopsis');
+  const orig = btn?.innerHTML;
+  if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Генерирую...'; }
+  if (status) status.textContent = '';
+  try {
+    const ctx = { seriesId: S.seriesId, seriesTitle: S.series?.title, episodeNum: S.episode.number };
+    const res = await trackTask(`Синопсис Эп. ${S.episode.number}`, ctx, () =>
+      api.post(`/api/series/${S.seriesId}/generate-next-episode-synopsis`,
+               { episode_number: S.episode.number })
+    );
+    if (res?.synopsis) {
+      ta.value = res.synopsis;
+      S.episode.synopsis = res.synopsis;
+      // Persist immediately so the user doesn't lose the gen on accidental reload.
+      await api.put(`/api/series/${S.seriesId}/episodes/${S.episode.number}`, { synopsis: res.synopsis });
+      if (status) { status.textContent = '✓ Готово'; setTimeout(() => { if (status.textContent === '✓ Готово') status.textContent = ''; }, 4000); }
+    }
+  } catch (e) {
+    if (status) status.textContent = '✗ ' + (e?.message || e);
+  } finally {
+    if (btn) { btn.disabled = false; btn.innerHTML = orig; }
+  }
 }
 
 async function generateNewEpSynopsis() {
@@ -3338,6 +3410,7 @@ async function loadEpisodeView() {
   }
 
   document.getElementById('ep-number-badge').textContent = chunkLabel(S.series, S.episodeNum, { short: true });
+  renderEpisodeNeighbours();
   setVal('ep-title-input', S.episode.title);
   setVal('ep-synopsis', S.episode.synopsis);
   setVal('ep-script', S.episode.script);
@@ -8977,6 +9050,37 @@ function sdEnsurePoll() {
   tick();
 }
 
+// Recompute the duration the chunk_text would naturally need (sum of
+// per-line durations + 1.5s padding, clamped to Seedance's 5-15s window).
+// Mirrors the per-segment math in scriptToSegments() so manual chunks
+// auto-fit without the user having to count seconds in their head.
+function _sdRecommendedDurationFromChunkText(text) {
+  const lines = (text || '').split(/\r?\n/);
+  const contentSec = lines.reduce((s, ln) => s + (typeof _lineDuration === 'function' ? _lineDuration(ln) : 0), 0);
+  if (contentSec <= 0) return null;  // nothing to estimate from
+  const target = Math.ceil(contentSec + 1.5);
+  return Math.max(5, Math.min(15, target));
+}
+
+function _sdAutoSetDurationIfManual() {
+  const ta = document.getElementById('sd-chunk-text');
+  const dur = document.getElementById('sd-duration');
+  if (!ta || !dur) return;
+  const rec = _sdRecommendedDurationFromChunkText(ta.value);
+  if (rec == null) return;
+  // Respect user override: if they've manually changed the slider away from
+  // the prior auto-set value, don't fight them. Track the last auto value
+  // on the element via dataset.autoVal — only update if the slider STILL
+  // matches the previous auto-set (i.e. user hasn't touched it).
+  const prevAuto = parseInt(dur.dataset.autoVal || '0', 10) || 0;
+  const cur = parseInt(dur.value, 10) || 0;
+  if (prevAuto && cur !== prevAuto) return;  // user moved the slider — leave it alone
+  dur.value = String(rec);
+  dur.dataset.autoVal = String(rec);
+  dur.dispatchEvent(new Event('input'));   // refresh the "15с" label
+  dur.dispatchEvent(new Event('change'));  // persist via sdSavePrefs
+}
+
 function sdInitForEpisode() {
   // Called when an episode opens
   if (SD.pollTimer) { clearInterval(SD.pollTimer); SD.pollTimer = null; }
@@ -8988,6 +9092,25 @@ function sdInitForEpisode() {
     const el = document.getElementById(id);
     if (el && !el._sdBound) { el.addEventListener('change', sdSavePrefs); el._sdBound = true; }
   });
+  // Auto-set duration when user types/pastes a chunk into the manual textarea.
+  const chunkTa = document.getElementById('sd-chunk-text');
+  if (chunkTa && !chunkTa._sdAutoDurBound) {
+    chunkTa.addEventListener('input', _sdAutoSetDurationIfManual);
+    chunkTa.addEventListener('blur',  _sdAutoSetDurationIfManual);
+    chunkTa._sdAutoDurBound = true;
+  }
+  // Mark the slider's current value as "user override" if user moves it manually
+  // (so subsequent chunk-text changes don't clobber their choice).
+  const durEl = document.getElementById('sd-duration');
+  if (durEl && !durEl._sdManualBound) {
+    durEl.addEventListener('input', () => {
+      // If user dragged it away from the last auto value, clear the autoVal
+      // marker so further auto-sets won't fire.
+      const prev = parseInt(durEl.dataset.autoVal || '0', 10) || 0;
+      if (prev && parseInt(durEl.value, 10) !== prev) durEl.dataset.autoVal = '';
+    });
+    durEl._sdManualBound = true;
+  }
   // Live-update the slider value display
   const dur = document.getElementById('sd-duration');
   const durVal = document.getElementById('sd-duration-val');

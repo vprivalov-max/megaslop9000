@@ -288,7 +288,12 @@
       <div class="editor-toolbar">
         <div class="editor-meta">
           <span id="ep-number-badge" class="ep-badge"></span>
-          <input id="ep-title-input" class="ep-title-input" type="text" placeholder="Название эпизода">
+          <!-- Replaced "Эпизод X" duplicate input with a strip of clickable
+               neighbour episodes so the user can jump backwards/forwards
+               without going back to the series view. The title is still
+               editable but lives in its own subtle row below. -->
+          <nav id="ep-neighbours" class="ep-neighbours" aria-label="Соседние эпизоды"></nav>
+          <input id="ep-title-input" class="ep-title-input ep-title-input--inline" type="text" placeholder="Заголовок (опционально)" title="Подзаголовок этого эпизода — необязательно. Виден в списке эпизодов сериала.">
         </div>
         <div class="editor-actions">
           <span id="ep-status-badge" class="status-badge"></span>
@@ -302,9 +307,12 @@
 
       <div class="editor-body">
         <div class="field-group">
-          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;gap:8px">
             <label style="margin:0">Синопсис</label>
-            <button class="btn-ghost btn-sm" onclick="translateField('ep-synopsis','Синопсис')">🌐 Перевести</button>
+            <div style="display:flex;gap:6px;align-items:center">
+              <span id="ep-syn-gen-status" style="font-size:0.78rem;color:var(--muted)"></span>
+              <button class="btn-ghost btn-sm" id="ep-syn-gen-btn" onclick="generateEpisodeSynopsisInline()" title="Claude напишет синопсис исходя из предыдущих серий и канона">✨ Сгенерировать синопсис</button>
+            </div>
           </div>
           <textarea id="ep-synopsis" class="synopsis-area" placeholder="Краткое содержание эпизода..."></textarea>
         </div>
@@ -725,14 +733,9 @@
         <div id="series-gen-status" class="series-gen-status"></div>
       </div>
 
-      <!-- Auto-generate assets toggle -->
-      <div class="field-group" style="display:flex;align-items:flex-start;gap:10px;background:rgba(132,94,247,0.06);border:1px solid rgba(132,94,247,0.2);border-radius:8px;padding:10px 12px;margin:12px 0">
-        <input type="checkbox" id="new-series-autogen" checked style="margin-top:3px;width:18px;height:18px;flex-shrink:0">
-        <label for="new-series-autogen" style="cursor:pointer;flex:1">
-          <div style="font-weight:600;color:var(--text)">⚡ Авто-генерация всех картинок</div>
-          <div style="font-size:0.83rem;color:var(--muted);margin-top:2px">Все персонажи, их костюмы и локации будут генериться автоматически как только появятся в сюжете. Сними галочку, чтобы запускать вручную.</div>
-        </label>
-      </div>
+      <!-- Auto-generate is ON by default and hidden — user can toggle later
+           via the per-series UI button if they want manual control. -->
+      <input type="checkbox" id="new-series-autogen" checked hidden>
 
       <div class="idea-divider"><span>Поля сериала</span></div>
 

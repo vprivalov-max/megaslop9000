@@ -7435,7 +7435,7 @@ def create_episode(sid):
             num = max((e['number'] for e in episodes), default=0) + 1
         ep = {
             'number': num,
-            'title': data.get('title', f'Эпизод {num}'),
+            'title': data.get('title', ''),  # empty by default — UI shows "Эп. N" badge already
             'synopsis': data.get('synopsis', ''),
             'script': data.get('script', ''),
             'characters_used': data.get('characters_used', []),
