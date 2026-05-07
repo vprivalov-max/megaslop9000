@@ -3866,8 +3866,10 @@ function _renderScenesHTML(scenes, coverage = []) {
   const turboTip = 'ТУРБО — все чанки уходят в очередь Seedance параллельно через единый batch-JSON эпизода (один Claude-вызов на весь эпизод). Использует scene blocking для общей геометрии локации. Быстрее в N раз, но без видео-continuity между чанками — возможны мелкие drift-ы.';
   html += `<div class="ep-scene-toolbar">
     <button id="auto-mode-btn" class="${autoActive ? 'btn-danger' : 'btn-accent'}" onclick="_autoModeToggle()"
-      title="Запустить Auto-mode. Поведение зависит от режима справа: Последовательно (стабильно) или Турбо (быстро).">
-      ${autoActive ? '⏸ Стоп Auto-mode' : '▶ Auto-mode'}
+      title="Запустить генерацию ВСЕЙ серии в Seedance — пройдёт по всем сегментам сценария и отдаст каждый чанк в Seedance. Режим (последовательно / турбо) выбирается справа.">
+      ${autoActive
+        ? '⏸ Стоп — остановить генерацию серии'
+        : '🎬 Сгенерировать всю серию в Seedance'}
     </button>
     <span class="auto-mode-kind" title="Переключатель режима генерации. Наведи на ⓘ для подробностей.">
       <label title="${esc(seqTip)}"><input type="radio" name="auto-mode-kind" ${autoMode === 'sequential' ? 'checked' : ''} onchange="_autoSaveModeKind('sequential')"> 🐢 Последовательно</label>
@@ -5361,20 +5363,45 @@ async function acceptScript() {
   }
 }
 
+// Holds per-section "skip generation" flags during the accept modal lifecycle.
+// When user ticks "Не генерить" for a section, those entity ids land in
+// _acceptModalSkipIds[kind] and get filtered out when the autogen sweep
+// inspects "what's missing". Implementation: we set a sentinel field
+// `_skip_autogen=true` on the entity in series.json so the sweep skips it.
+// (Persisted so accidental refresh doesn't lose the choice; user can flip
+// it back later via the per-asset card.)
+let _acceptModalSkipKinds = new Set();
+
 function _showAcceptScriptModal({ newChars, newLocs, newItems }) {
   const sectionHtml = (title, kind, list) => list.length ? `
     <div class="accept-modal-section">
-      <h4>${esc(title)} (${list.length})</h4>
-      <div class="accept-modal-grid">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:10px">
+        <h4 style="margin:0">${esc(title)} (${list.length})</h4>
+        <label style="display:inline-flex;align-items:center;gap:6px;font-size:0.82rem;color:var(--muted);cursor:pointer"
+               title="Не запускать автоген для этой группы — карточки создадутся, но фото нужно будет сгенерировать вручную позже.">
+          <input type="checkbox" class="amc-skip-cb" data-kind="${kind}"
+                 onchange="_toggleAcceptSkip('${kind}', this.checked)">
+          🚫 Не генерить эту группу
+        </label>
+      </div>
+      <div class="accept-modal-grid" id="acc-grid-${kind}">
         ${list.map(e => _acceptCellHtml(kind, e)).join('')}
       </div>
     </div>` : '';
+
+  // Reset state from any previous open.
+  _acceptModalSkipKinds = new Set();
 
   closeLightbox();
   const overlay = document.createElement('div');
   overlay.id = 'lightbox-overlay';
   overlay.className = 'lightbox-overlay';
   overlay.style.zIndex = 99998;
+  overlay.dataset.acceptModal = '1';
+  // Stash the entity lists on the DOM so confirmAcceptModal can consult them.
+  overlay.dataset.newChars = JSON.stringify(newChars.map(c => c.id));
+  overlay.dataset.newLocs  = JSON.stringify(newLocs.map(l  => l.id));
+  overlay.dataset.newItems = JSON.stringify(newItems.map(it => it.id));
   overlay.innerHTML = `
     <button class="lb-close" onclick="closeAcceptModal()">✕</button>
     <div class="lightbox-content" onclick="event.stopPropagation()" style="max-width:880px;flex-direction:column">
@@ -5382,6 +5409,7 @@ function _showAcceptScriptModal({ newChars, newLocs, newItems }) {
         <h3>В сценарии нашлось новое</h3>
         <div class="hint">
           Можешь перетащить готовые фотки (drag &amp; drop) на любую карточку — те, на которые не закинешь, сгенерируются автоматически.
+          Поставь 🚫 «Не генерить эту группу» рядом с заголовком чтобы пропустить генерацию (карточки останутся пустыми, сгенеришь позже вручную).
         </div>
         ${sectionHtml('🧑 Персонажи', 'char', newChars)}
         ${sectionHtml('📍 Локации',   'loc',  newLocs)}
@@ -5394,6 +5422,14 @@ function _showAcceptScriptModal({ newChars, newLocs, newItems }) {
     </div>`;
   overlay.onclick = (e) => { if (e.target === overlay) closeAcceptModal(); };
   document.body.appendChild(overlay);
+}
+
+function _toggleAcceptSkip(kind, on) {
+  if (on) _acceptModalSkipKinds.add(kind);
+  else    _acceptModalSkipKinds.delete(kind);
+  // Visually dim the cells in this section so user sees the state.
+  const grid = document.getElementById(`acc-grid-${kind}`);
+  if (grid) grid.style.opacity = on ? '0.35' : '1';
 }
 
 function _acceptCellHtml(kind, entity) {
@@ -5450,6 +5486,25 @@ function closeAcceptModal() {
 }
 
 async function confirmAcceptModal() {
+  // Persist per-section skip flags onto the new entities BEFORE closing the
+  // modal — the autogen sweep reads `_skip_autogen=true` from series.json
+  // and silently bypasses those entities. The user can flip the flag back
+  // later via the per-asset "Сгенерировать" click (handled separately).
+  const overlay = document.getElementById('lightbox-overlay');
+  if (overlay && overlay.dataset.acceptModal === '1' && _acceptModalSkipKinds.size) {
+    const payload = { skip: true, chars: [], locs: [], items: [] };
+    if (_acceptModalSkipKinds.has('char')) payload.chars = JSON.parse(overlay.dataset.newChars || '[]');
+    if (_acceptModalSkipKinds.has('loc'))  payload.locs  = JSON.parse(overlay.dataset.newLocs  || '[]');
+    if (_acceptModalSkipKinds.has('item')) payload.items = JSON.parse(overlay.dataset.newItems || '[]');
+    try {
+      await api.post(`/api/series/${S.seriesId}/skip-autogen`, payload);
+      // Refresh series to pick up the persisted flags.
+      const fresh = await api.get(`/api/series/${S.seriesId}`);
+      if (fresh) S.series = fresh;
+    } catch (e) {
+      console.warn('[acceptScript] failed to persist skip flags', e);
+    }
+  }
   closeAcceptModal();
   await _proceedAfterAccept();
 }

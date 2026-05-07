@@ -3628,18 +3628,32 @@ def auto_generate_missing_assets(sid):
         char_tasks = []
         outfit_tasks = []
         loc_tasks = []
+        # `_skip_autogen=true` on a char/loc/item explicitly opts out of the
+        # sweep (set via the Accept-script modal's "🚫 Не генерить эту группу"
+        # checkbox). Honored at task-build time — the entity is never queued
+        # so it stays empty until the user clicks generate manually later.
         for c in s.get('characters', []):
+            if c.get('_skip_autogen'):
+                continue
             if not c.get('ref_images'):
                 char_tasks.append(('char', c['id'], None))
         for c in s.get('characters', []):
+            if c.get('_skip_autogen'):
+                continue
             for o in c.get('outfits', []):
+                if o.get('_skip_autogen'):
+                    continue
                 if not o.get('photo') and not o.get('is_base'):
                     outfit_tasks.append(('outfit', c['id'], o['id']))
         for l in s.get('locations', []):
+            if l.get('_skip_autogen'):
+                continue
             if not l.get('ref_images'):
                 loc_tasks.append(('loc', l['id'], None))
         item_tasks = []
         for it in s.get('items', []):
+            if it.get('_skip_autogen'):
+                continue
             if not it.get('ref_images'):
                 item_tasks.append(('item', it['id'], None))
         total_tasks = len(char_tasks) + len(outfit_tasks) + len(loc_tasks) + len(item_tasks)
@@ -7664,6 +7678,41 @@ def delete_style_asset(sid, filename):
 def serve_asset(sid, filepath):
     asset_path = series_path(sid) / filepath
     return send_from_directory(str(asset_path.parent), asset_path.name)
+
+
+@app.route('/api/series/<sid>/skip-autogen', methods=['POST'])
+def set_skip_autogen(sid):
+    """Marks specific entities (chars / locs / items) as opted-out of the
+    autogen sweep. Body: {chars: [id, ...], locs: [...], items: [...], skip: true}.
+    With skip=false → unsets the flag (re-includes them in future sweeps).
+    Used by the Accept-script modal's "🚫 Не генерить эту группу" checkbox."""
+    s = load_series(sid)
+    if not s:
+        return jsonify({'error': 'not found'}), 404
+    body = request.get_json(silent=True) or {}
+    skip = bool(body.get('skip', True))
+    char_ids = set(body.get('chars') or [])
+    loc_ids  = set(body.get('locs')  or [])
+    item_ids = set(body.get('items') or [])
+    touched = 0
+    for c in s.get('characters', []):
+        if c['id'] in char_ids:
+            if skip: c['_skip_autogen'] = True
+            else:    c.pop('_skip_autogen', None)
+            touched += 1
+    for l in s.get('locations', []):
+        if l['id'] in loc_ids:
+            if skip: l['_skip_autogen'] = True
+            else:    l.pop('_skip_autogen', None)
+            touched += 1
+    for it in s.get('items', []):
+        if it['id'] in item_ids:
+            if skip: it['_skip_autogen'] = True
+            else:    it.pop('_skip_autogen', None)
+            touched += 1
+    if touched:
+        save_series(sid, s)
+    return jsonify({'touched': touched, 'skip': skip})
 
 
 @app.route('/api/series/<sid>/relink-assets', methods=['POST'])
