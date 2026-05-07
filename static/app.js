@@ -3249,13 +3249,14 @@ const SCENE_BORDERS = [
 //   English: INT., EXT., INT./EXT., I/E.
 //   Russian: ИНТ., ИНТА. (typo seen in scripts), ЭКСТ., ЭКС., НАТ., НАТУРА.,
 //            ВНУТР., ИНТЕРЬЕР, ВНЕ, СНАРУЖИ
-const SCENE_HEADING_RE = /^\s*(INT\.|EXT\.|INT\.?\s*\/\s*EXT\.?|I\/E\.|ИНТ\.|ИНТА\.|ЭКСТ\.|ЭКС\.|НАТ\.|НАТУРА\.|ВНУТР\.|ИНТЕРЬЕР|ВНЕ\.|СНАРУЖИ)\s+/i;
+// `[\s*_#>]*` allows leading markdown decorators (**, __, #, >) before the cue
+const SCENE_HEADING_RE = /^[\s*_#>]*(INT\.|EXT\.|INT\.?\s*\/\s*EXT\.?|I\/E\.|ИНТ\.|ИНТА\.|ЭКСТ\.|ЭКС\.|НАТ\.|НАТУРА\.|ВНУТР\.|ИНТЕРЬЕР|ВНЕ\.|СНАРУЖИ)\s+/i;
 
 // Inferred scene heading: when the writer didn't bother with INT./EXT./ИНТ.
 // — but the line still clearly opens a new scene. Three sub-patterns:
 //   • "Локация: ..." or "LOCATION: ..." context preamble
 //   • Numbered: "СЦЕНА 5", "Сцена 5.", "SCENE 12"
-const SCENE_HEADING_INFER_RE = /^\s*(Локация\s*[:：]|Location\s*[:：]|СЦЕНА\s*\d|Сцена\s*\d|SCENE\s*\d)/i;
+const SCENE_HEADING_INFER_RE = /^[\s*_#>]*(Локация\s*[:：]|Location\s*[:：]|СЦЕНА\s*\d|Сцена\s*\d|SCENE\s*\d)/i;
 
 // Control / structural tokens that LOOK slug-ish but aren't scene starts.
 const _SLUG_BLOCKLIST_RE = /^(REVERSAL|END|FIN|КОНЕЦ|TBD|TBC|БИТ|BIT|HOOK|TWIST|CLIFFHANGER|КЛИФФХЭНГЕР|РАЗВОРОТ|ПАУЗА|ТИШИНА|FLASHBACK|FLASH BACK|MONTAGE|МОНТАЖ|VOICE OVER|V\.O\.|O\.S\.)$/i;
@@ -5594,14 +5595,8 @@ function buildEpCharCard(c, inEpisode) {
            ondrop="event.preventDefault();this.classList.remove('drop-hover');dropCharPhoto(event,'${c.id}')"
            title="${photoUrl ? 'Открыть фото крупно (можно перегенерировать)' : ''}">
         ${photoUrl
-          ? `<img src="${photoUrl}" alt="${esc(c.name)}" ${needsOutfitGen ? 'style="opacity:0.45;filter:grayscale(0.6)"' : ''}>`
+          ? `<img src="${photoUrl}" alt="${esc(c.name)}">`
           : `<div class="no-photo">${primaryOutfit ? '👗' : '👤'}</div>`}
-        ${needsOutfitGen ? `
-          <div class="outfit-gen-overlay" id="ep-outfit-overlay-${c.id}" onclick="event.stopPropagation();generateEpOutfit('${c.id}','${primaryOutfit.id}')"
-               title="Переодеть в образ «${esc(primaryOutfit.label)}» (i2i из базового фото)"
-               style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.6);color:#fff;cursor:pointer;font-size:1.2rem;font-weight:700;">
-            ⚡
-          </div>` : ''}
         <div class="ep-outfit-gen-status" id="ep-outfit-status-${c.id}" title=""
              style="position:absolute;bottom:0;left:0;right:0;max-height:32%;font-size:0.6rem;line-height:1.05;color:#fff;text-align:center;text-shadow:0 1px 2px rgba(0,0,0,0.9);background:rgba(0,0,0,0.55);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:1px 2px;"></div>
       </div>
@@ -5617,10 +5612,10 @@ function buildEpCharCard(c, inEpisode) {
               ${outfits.map(o => {
                 const on = selectedOutfitIds.includes(o.id);
                 const isPrimary = on && primaryOutfit && primaryOutfit.id === o.id;
-                const stateIcon = o.photo ? '✓' : (o.is_base ? '★' : '⚡');
+                const stateIcon = o.photo ? '✓' : (o.is_base ? '★' : '❗');
                 return `<button type="button"
                   class="ep-outfit-chip ${on ? 'on' : ''} ${isPrimary ? 'primary' : ''}"
-                  title="${on ? 'Снять выбор' : 'Добавить образ для этой серии'} — ${esc(o.label)}${o.photo ? ' (фото готово)' : (o.is_base ? ' (базовое фото)' : ' (фото не готово — кликни ⚡)')}"
+                  title="${on ? 'Снять выбор' : 'Добавить образ для этой серии'} — ${esc(o.label)}${o.photo ? ' (фото готово)' : (o.is_base ? ' (базовое фото)' : ' (фото не готово — кликни ❗)')}"
                   onclick="event.stopPropagation();toggleEpCharOutfit('${c.id}','${o.id}')">
                   ${esc(o.label)} ${stateIcon}
                 </button>`;

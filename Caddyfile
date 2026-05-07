@@ -1,4 +1,4 @@
-# Caddy 2 config for series.gamegears.online.
+# Caddy 2 config for series.gamegears.ai.
 # Replace the hostname below to match your real domain. Caddy will fetch a
 # Let's Encrypt cert automatically on first request.
 
@@ -12,7 +12,7 @@
     }
 }
 
-series.gamegears.online {
+series.gamegears.ai {
     encode gzip zstd
 
     # Larger uploads for image refs (50 MB).

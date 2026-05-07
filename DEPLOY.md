@@ -1,4 +1,4 @@
-# Deploy guide — series.gamegears.online
+# Deploy guide — series.gamegears.ai
 
 One-time server setup, then ongoing updates via `./deploy.sh`.
 
@@ -7,11 +7,11 @@ One-time server setup, then ongoing updates via `./deploy.sh`.
 ## 1. Prerequisites
 
 - VPS with Docker + Docker Compose v2 (`apt install docker.io docker-compose-plugin`)
-- DNS A record: `series.gamegears.online → <VPS IP>`
+- DNS A record: `series.gamegears.ai → <VPS IP>`
 - Google Cloud OAuth 2.0 Client ID
   ([console.cloud.google.com](https://console.cloud.google.com)):
   - Application type: Web application
-  - Authorized redirect URI: `https://series.gamegears.online/auth/google/callback`
+  - Authorized redirect URI: `https://series.gamegears.ai/auth/google/callback`
 - API keys: Anthropic, AVAI, Reteller
 
 ## 2. First-time setup on the server
@@ -25,7 +25,7 @@ cd series-writer
 cp .env.example .env
 nano .env
 
-# Edit Caddyfile — replace `series.gamegears.online` if you use a different host
+# Edit Caddyfile — replace `series.gamegears.ai` if you use a different host
 nano Caddyfile
 
 # Generate Flask session secret and paste it into .env (FLASK_SECRET_KEY=...)
@@ -39,7 +39,7 @@ docker compose logs -f
 ```
 
 Caddy fetches a Let's Encrypt cert on first request — give it ~30 sec, then
-open `https://series.gamegears.online`.
+open `https://series.gamegears.ai`.
 
 ## 3. Updates
 
@@ -72,14 +72,14 @@ docker run --rm -v app_data:/data -v $PWD:/backup busybox \
 | Tail logs | `docker compose logs -f app` |
 | Shell into container | `docker compose exec app bash` |
 | Restart app only | `docker compose restart app` |
-| Health check | `curl https://series.gamegears.online/healthz` |
+| Health check | `curl https://series.gamegears.ai/healthz` |
 | List users | `docker compose exec app ls /data` |
 | Free disk | `docker system prune -af` (be careful — also removes images) |
 
 ## 6. Adding a new employee
 
 Nothing to do server-side. The first time they visit
-`https://series.gamegears.online` and log in with their `@gamegears.online`
+`https://series.gamegears.ai` and log in with their `@gamegears.online`
 Google account, their personal `/data/<email>/projects/` directory is
 created automatically.
 
