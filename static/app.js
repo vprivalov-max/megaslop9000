@@ -173,6 +173,86 @@ async function trackTask(label, ctx, fn) {
 }
 
 // Wire up monitor controls once DOM is ready
+async function _checkApiKeysOnBoot() {
+  try {
+    const me = await fetch('/api/me').then(r => r.ok ? r.json() : null);
+    if (!me || !me.authenticated) return;
+    window._currentUser = me;
+    if (!me.has_avai_key) {
+      _showApiKeySetupModal('avai', { firstTime: true });
+    }
+  } catch {}
+}
+
+// Show modal demanding the user enter an API key. `kind` = 'avai' | 'reteller'.
+// firstTime=true is shown after first login; provider-switch case shows it on
+// demand with a different headline.
+function _showApiKeySetupModal(kind, opts = {}) {
+  const isAvai = kind === 'avai';
+  const title = isAvai
+    ? (opts.firstTime ? '👋 Добро пожаловать! Введи свой AVAI API ключ' : 'Нужен AVAI API ключ')
+    : 'Нужен Reteller API ключ';
+  const subtitle = isAvai
+    ? 'AVAI — провайдер для генерации видео и изображений (Seedance / Banana / Seedream). Ключ возьми на <a href="https://avai-gen.com" target="_blank" style="color:var(--accent)">avai-gen.com</a> в настройках своего аккаунта.'
+    : 'Reteller — альтернативный провайдер для генерации видео из сценариев. Ключ возьми в настройках аккаунта на <a href="https://reteller.ai" target="_blank" style="color:var(--accent)">reteller.ai</a>.';
+  const fieldId = isAvai ? 'apikey-modal-avai' : 'apikey-modal-reteller';
+  const placeholder = isAvai ? 'avai-...' : 'rtl_sk_...';
+  const existing = document.getElementById('modal-api-key-setup');
+  if (existing) existing.remove();
+  const div = document.createElement('div');
+  div.id = 'modal-api-key-setup';
+  div.className = 'modal';
+  div.innerHTML = `
+    <div class="modal-box" style="max-width:460px">
+      <div class="modal-header">
+        <h2 style="font-size:18px">${title}</h2>
+      </div>
+      <div class="modal-body" style="font-size:14px;line-height:1.55">
+        <p style="color:var(--muted);margin-top:0">${subtitle}</p>
+        <div class="field-group" style="margin-top:14px">
+          <label style="font-size:0.82rem">${isAvai ? 'AVAI' : 'Reteller'} API Key</label>
+          <input id="${fieldId}" type="password" placeholder="${placeholder}" style="font-family:monospace;font-size:0.9rem">
+        </div>
+        <div id="apikey-modal-status" style="font-size:0.8rem;margin-top:6px;min-height:18px"></div>
+      </div>
+      <div class="modal-footer">
+        ${opts.firstTime ? '' : `<button class="btn-ghost" onclick="_closeApiKeyModal()">Позже</button>`}
+        <button class="btn-primary" onclick="_saveApiKeyFromModal('${kind}')">Сохранить</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(div);
+  setTimeout(() => document.getElementById(fieldId)?.focus(), 50);
+}
+
+function _closeApiKeyModal() {
+  document.getElementById('modal-api-key-setup')?.remove();
+}
+
+async function _saveApiKeyFromModal(kind) {
+  const isAvai = kind === 'avai';
+  const fieldId = isAvai ? 'apikey-modal-avai' : 'apikey-modal-reteller';
+  const value = (document.getElementById(fieldId)?.value || '').trim();
+  const status = document.getElementById('apikey-modal-status');
+  if (!value) {
+    if (status) { status.textContent = '⚠ Ключ не может быть пустым'; status.style.color = 'var(--danger)'; }
+    return;
+  }
+  if (status) { status.textContent = '⏳ Сохраняю...'; status.style.color = 'var(--muted)'; }
+  try {
+    const payload = isAvai ? { avai_key: value } : { reteller_key: value };
+    await api.post('/api/config', payload);
+    if (status) { status.textContent = '✓ Сохранено'; status.style.color = 'var(--success)'; }
+    setTimeout(() => {
+      _closeApiKeyModal();
+      // Refresh /api/me state so subsequent gates see the new key
+      _checkApiKeysOnBoot();
+    }, 600);
+  } catch (e) {
+    if (status) { status.textContent = '✗ ' + (e.message || e); status.style.color = 'var(--danger)'; }
+  }
+}
+
 document.addEventListener('DOMContentLoaded', () => {
   // Random ironic slogan under the logo, picked fresh each page load
   const SLOGANS = [
@@ -181,9 +261,16 @@ document.addEventListener('DOMContentLoaded', () => {
     "Write it. Cut it. Deny responsibility.",
     "Making “somehow it works” a business model.",
     "Make dramas faster than you can regret them.",
+    "It's not perfect... Just like you.",
+    "Just think about money..",
   ];
   const slEl = document.getElementById('nav-slogan');
   if (slEl) slEl.textContent = SLOGANS[Math.floor(Math.random() * SLOGANS.length)];
+
+  // Bootstrap: check if logged-in user has set their API keys. Non-primary
+  // users without an AVAI key get a one-time setup modal — generation would
+  // fail otherwise with confusing 401s from AvAIGen.
+  _checkApiKeysOnBoot();
 
   const t = document.getElementById('task-monitor-toggle');
   const c = document.getElementById('task-monitor-clear');
@@ -868,9 +955,9 @@ function _autogenApplyInProgress(inProgress) {
   document.querySelectorAll('[data-autogen-kind].is-generating').forEach(el => {
     el.classList.remove('is-generating');
   });
-  // Apply current in-progress entries (char + loc only — outfits live in modal)
+  // Apply current in-progress entries (char + loc + item — outfits live in modal)
   for (const entry of (inProgress || [])) {
-    if (entry.kind !== 'char' && entry.kind !== 'loc') continue;
+    if (!['char', 'loc', 'item'].includes(entry.kind)) continue;
     const sel = `[data-autogen-kind="${entry.kind}"][data-autogen-id="${entry.parent_id}"]`;
     const card = document.querySelector(sel);
     if (!card) continue;
@@ -943,6 +1030,69 @@ async function pollAutogenStatus() {
   _autogenPollTimer = setInterval(tick, 2500);
 }
 
+// Pre-flight check before any video generation. Returns list of missing assets:
+//   { chars: [{name, missing}], outfits: [{char, label}], locs: [{name}] }
+// where `missing` is 'base' or 'outfit_label'. Empty arrays = all good.
+function _checkMissingAssets(scope = 'episode') {
+  const out = { chars: [], outfits: [], locs: [], running: false };
+  if (!S.series || !S.episode) return out;
+  const charById = Object.fromEntries((S.series.characters || []).map(c => [c.id, c]));
+  const locById = Object.fromEntries((S.series.locations || []).map(l => [l.id, l]));
+  const usedCharIds = new Set(S.episode.characters_used || []);
+  const usedLocIds  = new Set(S.episode.locations_used  || []);
+  const charOutfits = S.episode.character_outfits || {};
+  for (const cid of usedCharIds) {
+    const c = charById[cid];
+    if (!c) continue;
+    if (!c.ref_images || !c.ref_images.length) {
+      out.chars.push({ name: c.name, id: cid });
+    }
+    // Check requested outfits for this char
+    const requested = charOutfits[cid] || [];
+    const labels = Array.isArray(requested) ? requested : (requested ? [requested] : []);
+    for (const label of labels) {
+      if (!label || label === 'base') continue;
+      const outfit = (c.outfits || []).find(o => o.label === label);
+      if (!outfit || (!outfit.photo && !outfit.is_base)) {
+        out.outfits.push({ char: c.name, label });
+      }
+    }
+  }
+  for (const lid of usedLocIds) {
+    const l = locById[lid];
+    if (!l) continue;
+    if (!l.ref_images || !l.ref_images.length) {
+      out.locs.push({ name: l.name, id: lid });
+    }
+  }
+  return out;
+}
+
+// Confirm dialog returning a Promise<bool>. Returns false if user cancels.
+// Empty missing-list returns true without prompting.
+async function _confirmMissingAssetsBeforeGen(label = 'генерации') {
+  const missing = _checkMissingAssets();
+  const total = missing.chars.length + missing.outfits.length + missing.locs.length;
+  if (total === 0) return true;
+  // Check if autogen is currently running — friendlier message
+  let runningSuffix = '';
+  try {
+    const r = await fetch(`/api/series/${S.seriesId}/auto-generate/status`);
+    const st = await r.json();
+    if (st.running) {
+      runningSuffix = `\n\n⏳ Авто-генерация СЕЙЧАС идёт: ${st.done}/${st.queue}. Можешь подождать ~30-60с — оставшиеся ассеты доделаются.`;
+    } else {
+      runningSuffix = `\n\n⚠ Auto-generate не запущен. Нажми "🎨 Сгенерировать недостающее" в панели персонажей/локаций, или запусти видео-генерацию всё равно — но сцена будет с placeholder/неправильным видом для перечисленных выше.`;
+    }
+  } catch {}
+  const lines = [];
+  if (missing.chars.length) lines.push(`👤 Персонажи без портрета: ${missing.chars.map(c => c.name).join(', ')}`);
+  if (missing.outfits.length) lines.push(`👕 Аутфиты не сгенерены: ${missing.outfits.map(o => `${o.char}/${o.label}`).join(', ')}`);
+  if (missing.locs.length) lines.push(`🏛 Локации без фото: ${missing.locs.map(l => l.name).join(', ')}`);
+  const msg = `⚠ Не все ассеты этой сцены готовы:\n\n${lines.join('\n')}${runningSuffix}\n\nЗапустить ${label} всё равно?`;
+  return confirm(msg);
+}
+
 // Auto-resume polling if a sweep is running when the user opens the page
 async function checkAutogenOnLoad() {
   try {
@@ -950,6 +1100,38 @@ async function checkAutogenOnLoad() {
     const st = await r.json();
     if (st.running) pollAutogenStatus();
   } catch {}
+  // Always start the heartbeat — it watches for autogen runs that kick off
+  // AFTER the page loaded (e.g. server-side trigger from /extract-characters
+  // or get_series self-heal). Without this, the spinner overlay only appears
+  // for sweeps that were already running at page-load time.
+  _startAutogenHeartbeat();
+}
+
+// Lightweight heartbeat that polls autogen status every 4s while user is on
+// a series/episode view. When it sees `running=true` and no UI poller is
+// active, it attaches the live UI poller. When sweeps kick off in the
+// background (autogen sometimes triggers from the server side after script-gen
+// or get_series self-heal), this catches them automatically — without needing
+// a page refresh.
+let _autogenHeartbeatTimer = null;
+function _startAutogenHeartbeat() {
+  if (_autogenHeartbeatTimer) return;
+  _autogenHeartbeatTimer = setInterval(async () => {
+    if (!S.seriesId) return;
+    try {
+      const r = await fetch(`/api/series/${S.seriesId}/auto-generate/status`);
+      const st = await r.json();
+      // If sweep is running AND we don't have an active UI poller — attach.
+      if (st.running && !_autogenPollTimer) {
+        pollAutogenStatus();
+      }
+      // If sweep just finished (no longer running) AND we still see in_progress
+      // markers from a previous render — clear them.
+      if (!st.running && (!st.in_progress || !st.in_progress.length)) {
+        _autogenApplyInProgress([]);
+      }
+    } catch {}
+  }, 4000);
 }
 
 // ── Production pipeline ───────────────────────────────────────────────────────
@@ -1405,6 +1587,20 @@ function applyVideoProviderMode() {
 
 async function setVideoProvider(provider) {
   if (!S.series) return;
+  // Switching to Reteller requires a Reteller API key. Block + prompt if missing
+  // (primary user is grandfathered to global env, others must enter their own).
+  if (provider === 'reteller') {
+    try {
+      const me = await fetch('/api/me').then(r => r.ok ? r.json() : null);
+      if (me && me.authenticated && !me.has_reteller_key) {
+        // Roll back the dropdown UI so it reflects reality
+        const sel = document.getElementById('video-provider-select');
+        if (sel) sel.value = S.series.video_provider || 'seedance';
+        _showApiKeySetupModal('reteller');
+        return;
+      }
+    } catch {}
+  }
   S.series.video_provider = provider;
   applyVideoProviderMode();
   try {
@@ -2201,9 +2397,10 @@ function renderItemsList() {
     const hasRefs = it.ref_images && it.ref_images.length > 0;
     const imgUrl = hasRefs ? `/assets/${s.id}/${it.ref_images[0]}` : null;
     return `
-      <div class="char-item" onclick="openItemAssets('${it.id}')">
+      <div class="char-item" data-autogen-kind="item" data-autogen-id="${it.id}" onclick="openItemAssets('${it.id}')">
         <div class="char-avatar">
           ${imgUrl ? `<img src="${imgUrl}" alt="${esc(it.name)}">` : '🎒'}
+          <div class="autogen-overlay" hidden><span class="spinner"></span></div>
         </div>
         <div class="char-info">
           <div class="char-name">${esc(it.name)}</div>
@@ -2394,8 +2591,15 @@ async function regenerateItemFromLightbox() {
 // ── Character assets modal ────────────────────────────────────────────────────
 let currentCharId = null;
 
-function openCharAssets(charId) {
+async function openCharAssets(charId) {
   currentCharId = charId;
+  // Refresh series state so any outfits added by recent script-gen / autogen
+  // show up — without this, the modal renders stale `S.series.characters[i]`
+  // and "no other outfits" looks like a bug even when they exist on disk.
+  try {
+    const fresh = await api.get(`/api/series/${S.seriesId}`);
+    if (fresh && fresh.characters) S.series = fresh;
+  } catch {}
   const c = S.series.characters.find(x => x.id === charId);
   if (!c) return;
   document.getElementById('char-assets-title').textContent = `Фото: ${c.name}`;
@@ -4112,6 +4316,10 @@ async function startAutoMode() {
     showToast('⚠ Сначала открой эпизод');
     return;
   }
+  // Pre-flight: warn if any active char/loc lacks ref before kicking off N
+  // chunks of generation. User often regrets discovering missing assets only
+  // after burning compute on chunks with placeholder/random faces.
+  if (!await _confirmMissingAssetsBeforeGen('Auto-mode (видео-генерацию)')) return;
   // Auto-mode hard requirement: duration MUST be 15s. The whole segmentation
   // logic (TARGET=12s, SOFT_MAX=13s, MIN=5s) is calibrated assuming 15s
   // Seedance chunks. If user picked 5/10s clips, segments won't fit and the
@@ -6245,26 +6453,50 @@ function onSoundsToggleChanged(on) {
 }
 
 async function openSettings() {
+  // Server returns masked status — never the raw key. We show "•••••abcd" as
+  // placeholder; user types a fresh key only when rotating. Empty input on
+  // save = no change (we only POST non-empty fields).
   const cfg = await api.get('/api/config');
-  setVal('settings-rtl-key', cfg.reteller_key || '');
-  setVal('settings-anthropic-key', cfg.anthropic_key || '');
+  const rtlInp = document.getElementById('settings-rtl-key');
+  const avaiInp = document.getElementById('settings-avai-key');
+  if (rtlInp) {
+    rtlInp.value = '';
+    rtlInp.placeholder = cfg.reteller_key_masked
+      ? `Текущий: ${cfg.reteller_key_masked} (оставь пустым чтобы не менять)`
+      : (cfg.is_primary && cfg.has_reteller_key ? 'Используется глобальный env-ключ' : 'rtl_sk_...');
+  }
+  if (avaiInp) {
+    avaiInp.value = '';
+    avaiInp.placeholder = cfg.avai_key_masked
+      ? `Текущий: ${cfg.avai_key_masked} (оставь пустым чтобы не менять)`
+      : (cfg.is_primary && cfg.has_avai_key ? 'Используется глобальный env-ключ' : 'avai-...');
+  }
+  // Anthropic key стайс global — поле спрятано/не нужно (operator-only)
   const soundsCb = document.getElementById('settings-sounds-enabled');
   if (soundsCb) soundsCb.checked = Sounds.isEnabled();
   const voiceCb = document.getElementById('settings-voice-enabled');
   if (voiceCb) voiceCb.checked = Sounds.isVoiceEnabled();
+  const mlgCb = document.getElementById('settings-mlg-hitmarker');
+  if (mlgCb) mlgCb.checked = Sounds.isHitmarkerEnabled();
   openModal('modal-settings');
 }
 
 async function saveSettings() {
-  await api.post('/api/config', {
-    reteller_key: val('settings-rtl-key'),
-    anthropic_key: val('settings-anthropic-key'),
-  });
+  const payload = {};
+  const rtlVal = val('settings-rtl-key').trim();
+  const avaiVal = (val('settings-avai-key') || '').trim();
+  if (rtlVal) payload.reteller_key = rtlVal;
+  if (avaiVal) payload.avai_key = avaiVal;
+  if (Object.keys(payload).length) {
+    await api.post('/api/config', payload);
+  }
   // Local-only settings (no server roundtrip needed)
   const soundsCb = document.getElementById('settings-sounds-enabled');
   if (soundsCb) Sounds.setEnabled(!!soundsCb.checked);
   const voiceCb = document.getElementById('settings-voice-enabled');
   if (voiceCb) Sounds.setVoiceEnabled(!!voiceCb.checked);
+  const mlgCb = document.getElementById('settings-mlg-hitmarker');
+  if (mlgCb) Sounds.setHitmarkerEnabled(!!mlgCb.checked);
   closeModal('modal-settings');
   loadBalance();
 }
@@ -6403,9 +6635,316 @@ const Sounds = (() => {
       window.speechSynthesis.speak(u);
     } catch (e) { /* ignore */ }
   }
+  // MLG hitmarker — real CoD/Halo "tink!" sample. Pre-loaded on first call
+  // and reused for every click. Cloned per-play so rapid clicks overlap
+  // (HTMLAudio can only play one stream at a time per element).
+  // Audio sample loader — preloaded once, cloned per-play so rapid clicks
+  // don't restart a single shared element.
+  const _audioCache = {};
+  function _playSample(path, volume = 0.7) {
+    if (!_audioCache[path]) {
+      try {
+        _audioCache[path] = new Audio(path);
+        _audioCache[path].preload = 'auto';
+      } catch { return; }
+    }
+    try {
+      const clone = _audioCache[path].cloneNode(true);
+      clone.volume = volume;
+      clone.play().catch(() => {});
+    } catch {}
+  }
+  function playHitmarker() {
+    if (!isHitmarkerEnabled()) return;
+    _playSample('/static/sounds/hitmarker.mp3', 0.7);
+  }
+  function playGunshot() {
+    if (!isHitmarkerEnabled()) return;   // gated by same MLG toggle
+    _playSample('/static/sounds/gunshot.mp3', 0.85);
+  }
+  // "Oh baby a triple!" — plays on every 3rd Snoop kill. Louder than the
+  // others because the original sample is mixed quiet.
+  function playTriple() {
+    if (!isHitmarkerEnabled()) return;
+    _playSample('/static/sounds/triple.mp3', 1.0);
+  }
+  // "WOW" Owen Wilson — random chance on Snoop kills (when not a triple).
+  function playWow() {
+    if (!isHitmarkerEnabled()) return;
+    _playSample('/static/sounds/wow.mp3', 0.95);
+  }
+  // "DAMN SON! WHERE'D YOU FIND THIS!" — alternate random reaction.
+  function playDamnSon() {
+    if (!isHitmarkerEnabled()) return;
+    _playSample('/static/sounds/damnson.mp3', 0.95);
+  }
+  // "GET NO-SCOPED!" — alternate random reaction.
+  function playNoScoped() {
+    if (!isHitmarkerEnabled()) return;
+    _playSample('/static/sounds/noscoped.mp3', 0.95);
+  }
+  function isHitmarkerEnabled() {
+    return localStorage.getItem('mlg_hitmarker_enabled') === '1';
+  }
+  function setHitmarkerEnabled(on) {
+    localStorage.setItem('mlg_hitmarker_enabled', on ? '1' : '0');
+  }
   return { playSuccess, playError, playFanfare, speak,
-           isEnabled, setEnabled, isVoiceEnabled, setVoiceEnabled };
+           isEnabled, setEnabled, isVoiceEnabled, setVoiceEnabled,
+           playHitmarker, playGunshot, playTriple, playWow, playDamnSon, playNoScoped,
+           isHitmarkerEnabled, setHitmarkerEnabled };
 })();
+
+// ── MLG hitmarker — visual overlay + sound on button clicks ─────────────────
+// 4-line cross expanding from click point, fades over 220ms. Pure CSS
+// transform animation, no library. Only fires when toggle is on.
+(function _initHitmarker() {
+  document.addEventListener('click', (e) => {
+    if (!Sounds.isHitmarkerEnabled()) return;
+    // Catch all clickable controls — buttons, anything with onclick handler,
+    // common row-style cards (episode list, character/loc rows, breadcrumb
+    // crumb-links). The previous selector was buttons-only and missed
+    // navigation rows / breadcrumbs / cards.
+    const target = e.target.closest(
+      'button, [onclick], [role="button"], a, ' +
+      '.btn-primary, .btn-accent, .btn-ghost, .btn-icon, .btn-sm, .btn-danger, .btn-idea-gen, .btn-idea-random, ' +
+      '.episode-row, .char-item, .crumb.link, .nav-logo, .idea-card, .sd-card, .outfit-card'
+    );
+    if (!target || target.disabled) return;
+    // Exclude form inputs that bubble up clicks — clicking a checkbox shouldn't fire hitmarker
+    const tag = target.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || tag === 'LABEL') return;
+    // Big "create / open editor" actions get the gunshot sound; everything
+    // else gets the regular hitmarker tink. Visual X overlay always plays.
+    const action = target.getAttribute('data-mlg-action');
+    if (action === 'gunshot') {
+      Sounds.playGunshot();
+    } else {
+      Sounds.playHitmarker();
+    }
+    _spawnHitmarkerVisual(e.clientX, e.clientY);
+  }, true);
+}());
+
+function _spawnHitmarkerVisual(x, y) {
+  // PNG sprite — simpler and looks right (CoD/Halo X with rounded ends).
+  // CSS centers it on (x, y) via negative margins; pure animation does the rest.
+  const wrap = document.createElement('div');
+  wrap.className = 'mlg-hitmarker';
+  wrap.style.left = x + 'px';
+  wrap.style.top = y + 'px';
+  document.body.appendChild(wrap);
+  setTimeout(() => wrap.remove(), 360);
+}
+
+// ── MLG Snoop — random-spawn dancing target ──────────────────────────────
+// Pops in at a random screen position every ~25-60s (only when MLG 420 MODE
+// is on). Clicking him plays gunshot + hitmarker visual + despawns him.
+// Self-removes after ~12s if nobody shoots him.
+let _snoopSpawnTimer = null;
+function _scheduleSnoop() {
+  if (_snoopSpawnTimer) return;
+  const tick = () => {
+    if (!Sounds.isHitmarkerEnabled()) {
+      _snoopSpawnTimer = setTimeout(tick, 5000);  // re-check soon
+      return;
+    }
+    // Don't spawn if one is already on screen
+    if (!document.querySelector('.mlg-snoop')) _spawnSnoop();
+    const nextDelay = 25000 + Math.random() * 35000;   // 25-60s
+    _snoopSpawnTimer = setTimeout(tick, nextDelay);
+  };
+  // First spawn 8-15s after page load (only if MLG mode on)
+  _snoopSpawnTimer = setTimeout(tick, 8000 + Math.random() * 7000);
+}
+
+// Kill-streak counter for MLG targets (currently Snoop, more characters to
+// come). Every 3rd kill triggers "Triple!" voice. Stored both locally (for
+// instant streak math) AND server-side (per-user, drives the leaderboard).
+function _mlgKillCount() {
+  return parseInt(localStorage.getItem('mlg_kills') || '0', 10) || 0;
+}
+function _bumpMlgKill(targetKind = 'snoop') {
+  const next = _mlgKillCount() + 1;
+  localStorage.setItem('mlg_kills', String(next));
+  // Fire-and-forget POST — don't block the gunshot UI on network. Auth is
+  // implicit via session cookie. Failure is silent (kill still counts locally).
+  try {
+    fetch('/api/mlg/kill', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ target: targetKind }),
+    }).catch(() => {});
+  } catch {}
+  return next;
+}
+// Migrate legacy key (was 'mlg_snoop_kills' before character pool generalized).
+(function _migrateKillCounter() {
+  const old = localStorage.getItem('mlg_snoop_kills');
+  if (old != null && localStorage.getItem('mlg_kills') == null) {
+    localStorage.setItem('mlg_kills', old);
+  }
+})();
+
+// Pretty-print a slugged user dir back into something readable.
+// e.g. "v_privalov_gamegears_online" → "v.privalov@gamegears.online"
+// Best-effort — slug is irreversible, but for our org pattern it's close.
+function _prettifyUserSlug(slug) {
+  if (!slug) return '?';
+  // Replace last "_" group (domain) with "@"
+  // e.g. v_privalov_gamegears_online → v.privalov@gamegears.online
+  // Heuristic: find " _gamegears_online" or "_dev" suffix
+  const m = slug.match(/^(.+?)_([a-z0-9]+(?:_[a-z]{2,4})?)$/);
+  if (m && /^(gamegears|com|org|net|dev|ru|io)/.test(m[2])) {
+    return m[1].replace(/_/g, '.') + '@' + m[2].replace(/_/g, '.');
+  }
+  return slug.replace(/_/g, '.');
+}
+
+async function openMlgLeaderboard() {
+  const list = document.getElementById('mlg-leaderboard-list');
+  if (!list) return;
+  list.innerHTML = '<div style="color:var(--muted)">⏳ Загружаю...</div>';
+  openModal('modal-mlg-leaderboard');
+  try {
+    const r = await fetch('/api/mlg/leaderboard').then(r => r.json());
+    const rows = r.leaderboard || [];
+    if (!rows.length) {
+      list.innerHTML = `
+        <div style="text-align:center;color:var(--muted);padding:24px 0">
+          <div style="font-size:36px;margin-bottom:8px">🎯</div>
+          Пока никто не убил ни одного. Включи MLG 420 MODE в настройках и стреляй по Snoop'у — попадёшь в таблицу первым.
+        </div>`;
+      return;
+    }
+    const me = (window._currentUser && window._currentUser.email) || '';
+    const meSlug = me.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+    const medals = ['🥇', '🥈', '🥉'];
+    list.innerHTML = `
+      <table style="width:100%;border-collapse:collapse;font-size:0.92rem">
+        <thead>
+          <tr style="border-bottom:1px solid var(--border);color:var(--muted);text-align:left">
+            <th style="padding:6px 8px;width:40px"></th>
+            <th style="padding:6px 8px">Игрок</th>
+            <th style="padding:6px 8px;text-align:right">Киллы</th>
+            <th style="padding:6px 8px;color:var(--muted);font-weight:normal" title="Когда последний кил">когда</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${rows.map((row, i) => {
+            const isMe = row.user === meSlug;
+            const rank = medals[i] || `#${i + 1}`;
+            const when = row.last_kill
+              ? new Date(row.last_kill * 1000).toLocaleString('ru-RU', { dateStyle: 'short', timeStyle: 'short' })
+              : '—';
+            return `
+              <tr style="border-bottom:1px solid var(--border);${isMe ? 'background:rgba(124,92,252,0.10);font-weight:600' : ''}">
+                <td style="padding:8px;font-size:1.1rem">${rank}</td>
+                <td style="padding:8px;${isMe ? 'color:var(--accent)' : ''}">${esc(_prettifyUserSlug(row.user))}${isMe ? ' (это ты)' : ''}</td>
+                <td style="padding:8px;text-align:right;font-family:monospace">${row.kills}</td>
+                <td style="padding:8px;color:var(--muted);font-size:0.82rem">${when}</td>
+              </tr>`;
+          }).join('')}
+        </tbody>
+      </table>
+      <div style="margin-top:10px;font-size:0.78rem;color:var(--muted);text-align:center">
+        ${rows.length} игрок${rows.length === 1 ? '' : (rows.length < 5 ? 'а' : 'ов')} с убийствами
+      </div>`;
+  } catch (e) {
+    list.innerHTML = `<div style="color:var(--danger)">✗ ${e.message || e}</div>`;
+  }
+}
+
+// MLG target skins. Each entry is rolled at spawn time. To add another
+// character — drop GIF into static/img, append { kind, src, width? } here.
+const _MLG_SKINS = [
+  { kind: 'snoop', src: '/static/img/snoop.gif', width: 110 },
+  { kind: 'frog',  src: '/static/img/frog.gif',  width: 110 },
+];
+
+function _spawnSnoop() {
+  // Pick a random skin from the pool — same kill-logic for all of them.
+  const skin = _MLG_SKINS[Math.floor(Math.random() * _MLG_SKINS.length)];
+  const sn = document.createElement('img');
+  sn.src = skin.src;
+  sn.className = 'mlg-snoop';
+  sn.dataset.kind = skin.kind;
+  sn.alt = skin.kind;
+  sn.style.width = (skin.width || 110) + 'px';
+  // Random position — keep him fully on-screen, away from edges
+  const W = window.innerWidth, H = window.innerHeight;
+  const sw = skin.width || 110;
+  const sh = 160;
+  sn.style.left = (40 + Math.random() * (W - sw - 80)) + 'px';
+  sn.style.top  = (60 + Math.random() * (H - sh - 120)) + 'px';
+  sn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    Sounds.playGunshot();
+    _spawnHitmarkerVisual(e.clientX, e.clientY);
+    const kills = _bumpMlgKill(skin.kind);
+    // Kill announcer logic:
+    //   - kill #3 (first time player hits a triple): GUARANTEED TRIPLE
+    //   - subsequent 3-kill milestones (#6, #9, #12, ...): 35% chance of TRIPLE
+    //   - any other kill: 28% chance of a random voice line
+    //     (WOW / DAMN SON pool — picked uniformly when triggered)
+    //   TRIPLE and voice-line never stack on the same kill.
+    let played = false;
+    if (kills === 3) {
+      setTimeout(() => Sounds.playTriple(), 180);
+      played = true;
+    } else if (kills > 3 && kills % 3 === 0 && Math.random() < 0.35) {
+      setTimeout(() => Sounds.playTriple(), 180);
+      played = true;
+    }
+    if (!played && Math.random() < 0.32) {
+      const voiceLines = [Sounds.playWow, Sounds.playDamnSon, Sounds.playNoScoped];
+      const pick = voiceLines[Math.floor(Math.random() * voiceLines.length)];
+      setTimeout(() => pick(), 220);
+    }
+    // Round-number milestone overlay — every 10 kills, big rainbow text
+    // flashes "10 KILLS! OMG!!" etc. center-screen. Pure MLG aesthetic.
+    if (kills > 0 && kills % 10 === 0) {
+      _spawnMlgMilestone(kills);
+    }
+    sn.classList.add('mlg-snoop-shot');
+    setTimeout(() => sn.remove(), 280);
+  }, { once: false });
+  document.body.appendChild(sn);
+  // Auto-despawn after 12s if user ignores him
+  setTimeout(() => {
+    if (sn.parentNode) {
+      sn.classList.add('mlg-snoop-fade');
+      setTimeout(() => sn.remove(), 600);
+    }
+  }, 12000);
+}
+
+// Kick off the schedule once the page is interactive
+if (document.readyState !== 'loading') _scheduleSnoop();
+else document.addEventListener('DOMContentLoaded', _scheduleSnoop);
+
+// Big rainbow MLG milestone text. Appears center-screen, flashes through
+// the spectrum, slight tilt and shake, fades after ~2.2s.
+const _MLG_PHRASES = [
+  'OMG!!!', 'DAMN SON!!', 'NO SCOPED!!', 'WOW!!!',
+  '420 BLAZE IT', 'GET REKT', 'SAVAGE!!', 'OWNED!!',
+  'INSANE!!!', 'RAMPAGE!', 'UNREAL!!', 'FROGGED!!',
+  'YOU MAD?', 'GG EZ', 'GODLIKE', 'MLG PRO',
+];
+function _spawnMlgMilestone(killCount) {
+  const phrase = _MLG_PHRASES[Math.floor(Math.random() * _MLG_PHRASES.length)];
+  const wrap = document.createElement('div');
+  wrap.className = 'mlg-milestone';
+  wrap.innerHTML = `
+    <div class="mlg-milestone-num">${killCount} KILLS</div>
+    <div class="mlg-milestone-phrase">${phrase}</div>
+  `;
+  // Slight random tilt for chaos
+  const tilt = (Math.random() * 12 - 6).toFixed(1);
+  wrap.style.setProperty('--mlg-tilt', `${tilt}deg`);
+  document.body.appendChild(wrap);
+  setTimeout(() => wrap.remove(), 2400);
+}
 
 // ════════════════════════════════════════════════════════════════════════════
 // SEEDANCE — video generation panel
@@ -6897,12 +7436,19 @@ function sdToggleStyleField() {
   sdSavePrefs();
 }
 
+// Per-series localStorage key for moderation_bypass — keeps grid/cartoon/etc
+// scoped to one show. Switching series should NOT carry over the mod-bypass
+// setting (different shows have different moderation profiles, e.g. romantic
+// drama works fine with `grid` while a violent thriller needs `cartoon`).
+function _sdModKey(sid) { return `sd_mod_bypass_${sid || ''}`; }
+
 function sdSavePrefs() {
   try {
+    const modBypass = document.getElementById('sd-mod-bypass').value;
     localStorage.setItem('sd_prefs', JSON.stringify({
       duration: document.getElementById('sd-duration').value,
       resolution: document.getElementById('sd-resolution').value,
-      moderation_bypass: document.getElementById('sd-mod-bypass').value,
+      moderation_bypass: modBypass,    // also kept globally as fallback default for new series
       use_prev_lastframe: !!document.getElementById('sd-use-lastframe')?.checked,
       use_prev_cutframes: !!document.getElementById('sd-use-cutframes')?.checked,
       use_style: !!document.getElementById('sd-use-style')?.checked,
@@ -6911,6 +7457,10 @@ function sdSavePrefs() {
       close_up_only: !!document.getElementById('sd-close-up-only')?.checked,
       establishing_shot: !!document.getElementById('sd-establishing-shot')?.checked,
     }));
+    // Per-series override
+    if (S.seriesId) {
+      localStorage.setItem(_sdModKey(S.seriesId), modBypass);
+    }
   } catch (e) {}
 }
 
@@ -6919,7 +7469,10 @@ function sdLoadPrefs() {
     const p = JSON.parse(localStorage.getItem('sd_prefs') || '{}');
     if (p.duration) document.getElementById('sd-duration').value = p.duration;
     if (p.resolution) document.getElementById('sd-resolution').value = p.resolution;
-    if (p.moderation_bypass) document.getElementById('sd-mod-bypass').value = p.moderation_bypass;
+    // moderation_bypass: per-series override wins over global default
+    const seriesMod = S.seriesId ? localStorage.getItem(_sdModKey(S.seriesId)) : null;
+    const finalMod = seriesMod || p.moderation_bypass;
+    if (finalMod) document.getElementById('sd-mod-bypass').value = finalMod;
     const cb = document.getElementById('sd-use-lastframe');
     if (cb && typeof p.use_prev_lastframe === 'boolean') cb.checked = p.use_prev_lastframe;
     const cf = document.getElementById('sd-use-cutframes');
@@ -6940,6 +7493,9 @@ function sdLoadPrefs() {
 
 async function sdGenerate() {
   console.log('[sdGenerate] click');
+  // Pre-flight: warn if any active char/loc lacks a generated ref. Without
+  // this the user gets a video with random face/location for the missing one.
+  if (!await _confirmMissingAssetsBeforeGen('генерацию видео')) return;
   const promptEl = document.getElementById('sd-prompt');
   const prompt = (promptEl?.value || '').trim();
   if (!prompt) {
@@ -7227,6 +7783,8 @@ function _sdUpdateBulkBar() {
       title="Перезапустить ${retryable} генерац(ий) с теми же промптами и refs">🔁 Retry · ${retryable}</button>
     <button class="btn-ghost btn-sm" onclick="sdBulkAddToTimeline()" ${ready === 0 ? 'disabled' : ''}
       title="${ready} готовых видео — добавить на таймлайн">➕ На таймлайн · ${ready}</button>
+    <button class="btn-ghost btn-sm" onclick="sdBulkDownload()" ${ready === 0 ? 'disabled' : ''}
+      title="${ready} готовых видео — скачать ZIP-архивом">⬇ Скачать ZIP · ${ready}</button>
     <button class="btn-ghost btn-sm" onclick="sdBulkDelete()" style="color:#e74c3c"
       title="Удалить ${count} генерац(ий)">🗑 Удалить · ${count}</button>
     <span style="flex:1"></span>
@@ -7279,6 +7837,31 @@ async function sdBulkDelete() {
   sdBulkClearSelection();
   await sdRefreshList();
   showToast(`✓ Удалено: ${ok}${failed ? `, ошибок: ${failed}` : ''}`, 4000);
+}
+
+async function sdBulkDownload() {
+  const idxs = Array.from(SD.selected || []);
+  if (!idxs.length) return;
+  const list = SD._lastChunks || [];
+  const ready = idxs.filter(idx => {
+    const c = list.find(x => x.idx === idx);
+    return c && c.video_path;
+  });
+  if (!ready.length) {
+    showToast('⚠ Среди выбранных нет готовых видео', 4000);
+    return;
+  }
+  // Stream the zip via a server endpoint — browser handles the download.
+  // Idxs as query string (short enough even for 50+ chunks).
+  const url = `/api/series/${encodeURIComponent(S.seriesId)}/episodes/${S.episode.number}/seedance/download-zip?idxs=${ready.join(',')}`;
+  // Trigger a normal download (anchor click — preserves filename header)
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = '';   // let server set filename via Content-Disposition
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  showToast(`⬇ Архив с ${ready.length} видео формируется...`, 3500);
 }
 
 async function sdBulkAddToTimeline() {

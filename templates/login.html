@@ -38,5 +38,27 @@
     </a>
     <div class="footer">Доступ только для сотрудников GameGears</div>
   </div>
+  <audio id="auth-meme-sound" src="/static/sounds/wait-a-minute.mp3" preload="auto"></audio>
+  <script>
+    // "Wait a minute, who are you?" meme on login page.
+    // Many browsers block autoplay until user-gesture — first click anywhere
+    // triggers the play. If autoplay IS allowed (rare on desktop, common on
+    // muted page) it fires instantly.
+    (function () {
+      const el = document.getElementById('auth-meme-sound');
+      if (!el) return;
+      el.volume = 0.7;
+      el.play().catch(() => {
+        // Autoplay blocked — wait for first user interaction
+        const onFirstInteract = () => {
+          el.play().catch(() => {});
+          window.removeEventListener('click', onFirstInteract, true);
+          window.removeEventListener('keydown', onFirstInteract, true);
+        };
+        window.addEventListener('click', onFirstInteract, true);
+        window.addEventListener('keydown', onFirstInteract, true);
+      });
+    })();
+  </script>
 </body>
 </html>

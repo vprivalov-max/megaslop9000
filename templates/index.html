@@ -21,8 +21,9 @@
     <div id="breadcrumb" class="breadcrumb"></div>
   </div>
   <div class="nav-right">
-    <button id="nav-montage-btn" class="btn-primary nav-editor-btn hidden" onclick="openMontage()" title="Перейти в редактор монтажа">🎬 Редактор</button>
+    <button id="nav-montage-btn" class="btn-primary nav-editor-btn hidden" onclick="openMontage()" title="Перейти в редактор монтажа" data-mlg-action="gunshot">🎬 Редактор</button>
     <span id="balance-badge" class="badge"></span>
+    <button class="btn-icon" onclick="openMlgLeaderboard()" title="MLG Leaderboard — топ убийц">🏆</button>
     <button class="btn-icon" onclick="openSettings()" title="Настройки">⚙</button>
     <span id="user-pill" class="user-pill hidden" title="">
       <span id="user-pill-email"></span>
@@ -46,7 +47,7 @@
         <span class="dz-icon">🗑️</span>
         <span class="dz-label">Корзина</span>
       </button>
-      <button class="btn-primary" onclick="openCreateSeries()">+ Новый сериал</button>
+      <button class="btn-primary" onclick="openCreateSeries()" data-mlg-action="gunshot">+ Новый сериал</button>
     </div>
   </div>
   <div class="projects-filterbar" id="projects-filterbar">
@@ -149,7 +150,7 @@
           </label>
           <button class="btn-secondary reteller-only" onclick="openReteller()">🎬 Отправить в Reteller</button>
           <button class="btn-ghost" onclick="renameOutFiles()" title="Переименовать файлы в папке OUT по студийным требованиям">📁 Переименовать OUT</button>
-          <button class="btn-primary" onclick="openCreateEpisode()">+ Эпизод</button>
+          <button class="btn-primary" onclick="openCreateEpisode()" data-mlg-action="gunshot">+ Эпизод</button>
         </div>
       </div>
 
@@ -733,7 +734,7 @@
     </div>
     <div class="modal-footer">
       <button class="btn-ghost" onclick="closeModal('modal-create-series')">Отмена</button>
-      <button class="btn-primary" onclick="createSeries()">Создать</button>
+      <button class="btn-primary" onclick="createSeries()" data-mlg-action="gunshot">Создать</button>
     </div>
   </div>
 </div>
@@ -992,7 +993,7 @@
     </div>
     <div class="modal-footer">
       <button class="btn-ghost" onclick="closeModal('modal-create-episode')">Отмена</button>
-      <button class="btn-primary" onclick="createEpisode()">Создать</button>
+      <button class="btn-primary" onclick="createEpisode()" data-mlg-action="gunshot">Создать</button>
     </div>
   </div>
 </div>
@@ -1169,6 +1170,22 @@
   </div>
 </div>
 
+<!-- MLG Leaderboard Modal -->
+<div id="modal-mlg-leaderboard" class="modal hidden">
+  <div class="modal-box" style="max-width:520px">
+    <div class="modal-header">
+      <h2>🏆 MLG Leaderboard</h2>
+      <button class="btn-icon" onclick="closeModal('modal-mlg-leaderboard')">✕</button>
+    </div>
+    <div class="modal-body">
+      <div id="mlg-leaderboard-list" style="font-size:0.9rem"></div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn-ghost" onclick="closeModal('modal-mlg-leaderboard')">Закрыть</button>
+    </div>
+  </div>
+</div>
+
 <!-- Settings Modal -->
 <div id="modal-settings" class="modal hidden">
   <div class="modal-box">
@@ -1178,8 +1195,18 @@
     </div>
     <div class="modal-body">
       <div class="field-group">
+        <label>AVAI API Key</label>
+        <input id="settings-avai-key" type="password" placeholder="avai-...">
+        <div class="muted" style="font-size:0.78rem;margin-top:4px">
+          Твой ключ AvAIGen для генерации видео и изображений (Seedance / Banana / Seedream). Получи его на <a href="https://avai-gen.com" target="_blank" style="color:var(--accent)">avai-gen.com</a> в настройках аккаунта. Оставь пустым чтобы не менять текущий.
+        </div>
+      </div>
+      <div class="field-group">
         <label>Reteller API Key</label>
         <input id="settings-rtl-key" type="password" placeholder="rtl_sk_...">
+        <div class="muted" style="font-size:0.78rem;margin-top:4px">
+          Нужен только если работаешь в Reteller-режиме (альтернативный провайдер видео). Получи на <a href="https://reteller.ai" target="_blank" style="color:var(--accent)">reteller.ai</a>.
+        </div>
       </div>
       <div class="field-group">
         <label style="display:inline-flex;align-items:center;gap:8px;cursor:pointer;font-weight:500">
@@ -1210,6 +1237,19 @@
           Когда Auto-mode заканчивает все сегменты эпизода — браузерный TTS произносит фразу на английском. Использует встроенный SpeechSynthesis API (бесплатно, без сервера, работает оффлайн).
         </div>
         <button class="btn-ghost btn-sm" onclick="Sounds.speak('Episode generation finished.')" style="margin-top:6px">▶ test голос</button>
+      </div>
+      <div class="field-group">
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+          <input type="checkbox" id="settings-mlg-hitmarker" style="margin:0">
+          <span>🌿 MLG 420 MODE</span>
+        </label>
+        <div class="muted" style="font-size:0.78rem;margin-top:4px">
+          Дизайнерский прикол: при клике на любую кнопку — хитмаркер-крестик и звук «tink!» как в CoD/Halo. На «Создать сериал», «+ Эпизод» и «🎬 Редактор» — выстрел вместо хитмаркера. Чисто для атмосферы. Оффается этим чекбоксом.
+        </div>
+        <div style="display:flex;gap:6px;margin-top:6px">
+          <button class="btn-ghost btn-sm" onclick="Sounds.playHitmarker()">▶ hitmarker</button>
+          <button class="btn-ghost btn-sm" onclick="Sounds.playGunshot()">▶ gunshot</button>
+        </div>
       </div>
     </div>
     <div class="modal-footer">

@@ -136,6 +136,71 @@ def _load_secret(env_name, config_field=None):
         return _read_config_field(config_field)
     return ''
 
+# Email of the user whose AVAI/Reteller keys default to the global env (the
+# operator who set up the system). Other users must enter their own keys.
+PRIMARY_USER_EMAIL = (os.environ.get('PRIMARY_USER_EMAIL') or 'v.privalov@gamegears.online').lower()
+
+def _user_keys_path(email):
+    """Per-user keys file: <DATA_ROOT>/<email-slug>/keys.json"""
+    safe = re.sub(r'[^a-z0-9]+', '_', (email or '').lower()).strip('_') or 'anon'
+    return DATA_ROOT / safe / 'keys.json'
+
+def _load_user_keys(email):
+    """Returns dict {avai_key, reteller_key} for this user (empty strings if not set)."""
+    p = _user_keys_path(email)
+    if not p.exists():
+        return {'avai_key': '', 'reteller_key': ''}
+    try:
+        d = json.loads(p.read_text())
+        return {
+            'avai_key': (d.get('avai_key') or '').strip(),
+            'reteller_key': (d.get('reteller_key') or '').strip(),
+        }
+    except Exception:
+        return {'avai_key': '', 'reteller_key': ''}
+
+def _save_user_keys(email, keys):
+    """Persist per-user keys. Caller passes a dict — only known fields are kept."""
+    p = _user_keys_path(email)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    safe = {
+        'avai_key': (keys.get('avai_key') or '').strip(),
+        'reteller_key': (keys.get('reteller_key') or '').strip(),
+    }
+    p.write_text(json.dumps(safe, indent=2))
+
+def _get_user_avai_key():
+    """Returns AVAI key for the current request's user. Falls back to global env
+    only for the PRIMARY_USER_EMAIL (operator who set up the system) — every other
+    user must enter their own key on first login. In dev mode (AUTH_ENABLED=False)
+    the local user gets the global env too — local dev shouldn't be gated."""
+    try:
+        email = current_user_email() or ''
+    except Exception:
+        email = ''
+    if email:
+        user_key = _load_user_keys(email).get('avai_key')
+        if user_key:
+            return user_key
+        if email == PRIMARY_USER_EMAIL or not AUTH_ENABLED:
+            return AVAI_KEY  # grandfathered global default
+    return ''
+
+def _get_user_reteller_key():
+    """Returns Reteller key for the current request's user. Same fallback logic
+    as AVAI: PRIMARY_USER_EMAIL or dev mode falls back to global env."""
+    try:
+        email = current_user_email() or ''
+    except Exception:
+        email = ''
+    if email:
+        user_key = _load_user_keys(email).get('reteller_key')
+        if user_key:
+            return user_key
+        if email == PRIMARY_USER_EMAIL or not AUTH_ENABLED:
+            return RETELLER_KEY
+    return ''
+
 # All secrets are loaded once at startup. Env vars are the canonical source for
 # production; config.json is a dev-only convenience fallback.
 ANTHROPIC_KEY = _load_secret('ANTHROPIC_API_KEY', 'anthropic_key')
@@ -174,7 +239,7 @@ def _render_queue_depth():
 _RECOVERY_DONE = False
 _RECOVERY_LOCK = threading.Lock()
 _SUBMITTING_TIMEOUT_SEC = 5 * 60  # boot-time recovery: be conservative
-_SUBMITTING_TIMEOUT_RUNTIME_SEC = 180  # runtime poll: submit usually <10s, but AVAI sometimes lags w/ heavy prompts
+_SUBMITTING_TIMEOUT_RUNTIME_SEC = 300  # runtime poll: submit usually <10s, but AVAI sometimes lags w/ heavy prompts (esp. prod VPS egress)
 
 def _recover_inflight_chunks():
     """Sweep all per-user episode files once at startup."""
@@ -353,19 +418,105 @@ def auth_logout():
 def api_me():
     email = current_user_email()
     if not email:
-        return jsonify({'email': None}), 401
+        return jsonify({'email': None, 'authenticated': False}), 401
     info = (session.get('user') or {}) if AUTH_ENABLED else {'email': email, 'name': 'Local Dev'}
     return jsonify({
         'email': email,
+        'authenticated': True,
         'name': info.get('name') or email.split('@')[0],
         'picture': info.get('picture') or '',
         'auth_enabled': AUTH_ENABLED,
         'domain': AUTH_ALLOWED_DOMAIN,
+        # Per-user API key flags — FE uses these to gate generation + show
+        # setup modal on first login.
+        'is_primary': email == PRIMARY_USER_EMAIL,
+        'has_avai_key':     bool(_get_user_avai_key()),
+        'has_reteller_key': bool(_get_user_reteller_key()),
     })
 
 @app.route('/healthz')
 def healthz():
     return {'ok': True, 'auth': AUTH_ENABLED}
+
+
+# ── MLG kill leaderboard ─────────────────────────────────────────────────────
+# Per-user kill stats live in <DATA_ROOT>/<email-slug>/mlg_stats.json.
+# Schema: {"kills": int, "first_kill": ts, "last_kill": ts, "by_target": {kind: count}}
+def _mlg_stats_path(email):
+    safe = re.sub(r'[^a-z0-9]+', '_', (email or '').lower()).strip('_') or 'anon'
+    return DATA_ROOT / safe / 'mlg_stats.json'
+
+def _load_mlg_stats(email):
+    p = _mlg_stats_path(email)
+    if not p.exists():
+        return {'kills': 0, 'first_kill': None, 'last_kill': None, 'by_target': {}}
+    try:
+        return json.loads(p.read_text())
+    except Exception:
+        return {'kills': 0, 'first_kill': None, 'last_kill': None, 'by_target': {}}
+
+def _save_mlg_stats(email, stats):
+    p = _mlg_stats_path(email)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(stats, indent=2))
+
+
+@app.route('/api/mlg/kill', methods=['POST'])
+def api_mlg_kill():
+    """Increment current user's MLG kill counter. Idempotent on bad input —
+    body is optional ({"target": "snoop"} or empty)."""
+    email = current_user_email()
+    if not email:
+        return jsonify({'error': 'auth required'}), 401
+    body = request.json or {}
+    target = (body.get('target') or 'unknown').strip().lower()[:32] or 'unknown'
+    stats = _load_mlg_stats(email)
+    now = int(time.time())
+    stats['kills'] = int(stats.get('kills') or 0) + 1
+    if not stats.get('first_kill'):
+        stats['first_kill'] = now
+    stats['last_kill'] = now
+    by_target = stats.setdefault('by_target', {})
+    by_target[target] = int(by_target.get(target) or 0) + 1
+    _save_mlg_stats(email, stats)
+    return jsonify({'ok': True, 'total': stats['kills'], 'by_target': by_target})
+
+
+@app.route('/api/mlg/leaderboard', methods=['GET'])
+def api_mlg_leaderboard():
+    """Returns top users by kill count. No auth check (everyone in the org
+    can see the board) but 401 when not logged in.
+    Iterates user dirs under DATA_ROOT looking for mlg_stats.json — small
+    enough for our team that O(N) scan is fine."""
+    if not current_user_email():
+        return jsonify({'error': 'auth required'}), 401
+    rows = []
+    if DATA_ROOT.exists():
+        for user_dir in DATA_ROOT.iterdir():
+            if not user_dir.is_dir() or user_dir.name.startswith('.'):
+                continue
+            sf = user_dir / 'mlg_stats.json'
+            if not sf.exists():
+                continue
+            try:
+                s = json.loads(sf.read_text())
+            except Exception:
+                continue
+            kills = int(s.get('kills') or 0)
+            if kills <= 0:
+                continue
+            # Recover original email from slug — best-effort. Actual stored
+            # email isn't kept, but slug is reversible enough for display
+            # (replace _ with various punctuation guesses). For now, return
+            # the slug AS IS — operator-only data, clarity > prettiness.
+            rows.append({
+                'user': user_dir.name,
+                'kills': kills,
+                'last_kill': s.get('last_kill'),
+                'by_target': s.get('by_target') or {},
+            })
+    rows.sort(key=lambda r: (-r['kills'], r['last_kill'] or 0))
+    return jsonify({'leaderboard': rows[:50], 'total_users': len(rows)})
 
 
 # ── Config ──────────────────────────────────────────────────────────────────
@@ -1027,7 +1178,7 @@ def save_config(cfg):
     CONFIG_FILE.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
 
 def rtl_headers():
-    return {'Authorization': f'Bearer {RETELLER_KEY}'}
+    return {'Authorization': f'Bearer {_get_user_reteller_key()}'}
 
 def _avai_call(provider: str, prompt: str, reference_url: str = None, aspect_ratio: str = '9:16') -> str:
     """One AVAI call with the given provider. Returns image URL or raises."""
@@ -1043,7 +1194,7 @@ def _avai_call(provider: str, prompt: str, reference_url: str = None, aspect_rat
         payload['model'] = 'pro'
     if reference_url:
         payload['contextImages'] = [{'url': reference_url}]
-    headers = {'x-api-key': AVAI_KEY, 'content-type': 'application/json'}
+    headers = {'x-api-key': _get_user_avai_key(), 'content-type': 'application/json'}
     resp = requests.post(AVAI_API, json=payload, headers=headers, timeout=180)
     if not resp.ok:
         raise RuntimeError(f'AVAI {provider} error {resp.status_code}: {resp.text[:300]}')
@@ -1359,10 +1510,35 @@ def translate_text():
 
 @app.route('/api/config', methods=['GET', 'POST'])
 def config_route():
+    """Per-user API key storage. Anthropic stays global (operator's billing).
+    AVAI / Reteller are per-user — primary user falls back to global env so
+    nothing breaks for the operator. Other users must enter their own keys.
+    GET returns masked status (has_X flags) — never the actual key string."""
+    email = current_user_email()
+    if not email:
+        return jsonify({'error': 'auth required'}), 401
     if request.method == 'POST':
-        save_config(request.json)
-        return jsonify({'ok': True})
-    return jsonify(load_config())
+        body = request.json or {}
+        existing = _load_user_keys(email)
+        # Only update fields that were sent (non-empty); empty string = clear
+        if 'avai_key' in body:
+            existing['avai_key'] = (body.get('avai_key') or '').strip()
+        if 'reteller_key' in body:
+            existing['reteller_key'] = (body.get('reteller_key') or '').strip()
+        _save_user_keys(email, existing)
+        return jsonify({'ok': True,
+                        'has_avai_key': bool(existing['avai_key']) or email == PRIMARY_USER_EMAIL,
+                        'has_reteller_key': bool(existing['reteller_key']) or email == PRIMARY_USER_EMAIL})
+    keys = _load_user_keys(email)
+    return jsonify({
+        'email': email,
+        'is_primary': email == PRIMARY_USER_EMAIL,
+        # NEVER return raw keys to client — only presence flags
+        'has_avai_key': bool(_get_user_avai_key()),
+        'has_reteller_key': bool(_get_user_reteller_key()),
+        'avai_key_masked': ('•' * 6 + (keys['avai_key'][-4:] if keys.get('avai_key') else '')) if keys.get('avai_key') else '',
+        'reteller_key_masked': ('•' * 6 + (keys['reteller_key'][-4:] if keys.get('reteller_key') else '')) if keys.get('reteller_key') else '',
+    })
 
 
 # ── Series ───────────────────────────────────────────────────────────────────
@@ -1931,6 +2107,25 @@ def get_series(sid):
         print(f'[get_series {sid}] heal failed: {e}')
     # Re-load post-heal so client gets the fresh state
     s = load_series(sid)
+    # Self-healing: if anything has missing refs AND autogen is enabled AND no
+    # sweep is currently running — kick one off. Catches the rare case where a
+    # previous trigger failed silently and assets stay un-generated forever.
+    try:
+        if s and s.get('auto_generate_assets'):
+            st = _autogen_status(sid)
+            if not st.get('running'):
+                pending = (
+                    sum(1 for c in (s.get('characters') or []) if not c.get('ref_images'))
+                    + sum(1 for c in (s.get('characters') or []) for o in (c.get('outfits') or [])
+                          if not o.get('photo') and not o.get('is_base'))
+                    + sum(1 for l in (s.get('locations') or []) if not l.get('ref_images'))
+                    + sum(1 for it in (s.get('items') or []) if not it.get('ref_images'))
+                )
+                if pending > 0:
+                    print(f'[get_series {sid}] {pending} missing assets, kicking autogen', flush=True)
+                    trigger_autogen_if_enabled(sid)
+    except Exception as e:
+        print(f'[get_series {sid}] self-heal autogen kick failed: {e}', flush=True)
     return jsonify(s)
 
 @app.route('/api/series/<sid>', methods=['PUT'])
@@ -2994,16 +3189,41 @@ def _gen_char_base_inline(s, sid, char):
     """Generate base ref for character. Mutates s, saves at end."""
     if char.get('ref_images'):
         return
-    gender = 'woman' if char.get('gender') == 'female' else 'man'
     constraints = (char.get('image_constraints') or '').strip()
     constraints_clause = f" IMPORTANT — strictly follow these constraints: {constraints}." if constraints else ""
+    appearance = (char.get('appearance') or '').strip()
+    description = (char.get('description') or '').strip()
+    # Detect animal/anthropomorphic chars by appearance keywords — don't add
+    # "a man/woman" prefix when char has fur/muzzle/tail/etc, otherwise the
+    # model defaults to a HUMAN even though appearance says "grey wolf".
+    appearance_low = appearance.lower()
+    animal_words = ('fur', 'muzzle', 'snout', 'tail', 'paws', 'claws', 'whiskers',
+                    'mane', 'feathers', 'beak', 'horns', 'antlers', 'hooves', 'scales',
+                    'cub', 'pup', 'kitten', 'fang', 'fangs',
+                    'шерсть', 'мордa', 'морду', 'морды', 'хвост', 'лапы', 'когти',
+                    'клыки', 'грива', 'перья', 'клюв', 'рога', 'копыта')
+    is_animal = any(w in appearance_low for w in animal_words)
+    if is_animal:
+        kind_label = ''   # appearance describes the species — no "a man" prefix
+    else:
+        gender = 'woman' if char.get('gender') == 'female' else 'man'
+        kind_label = f', a {gender}'
+    # Style: project's visual_style overrides default photorealistic. Pixar/anime/etc
+    # require explicit style directive AND removal of "Photorealistic" suffix —
+    # otherwise model gets conflicting signals and renders human-looking realism.
+    style_clause = _series_style_clause(s)
+    visual_style = _series_visual_style(s)
+    is_stylised = bool(style_clause and 'strict' in style_clause.lower())
+    realism_suffix = '' if is_stylised else ' Photorealistic, cinematic quality, high detail on face and clothing.'
+    style_prefix = (style_clause + ' ') if style_clause else ''
     prompt = (
-        f"Full body portrait of {char['name']}, a {gender}. "
-        f"{char.get('appearance', '')}. {char.get('description', '')}.{constraints_clause} "
+        f"{style_prefix}"
+        f"Full body portrait of {char['name']}{kind_label}. "
+        f"{appearance}. {description}.{constraints_clause} "
         f"Standing facing camera, slight 3/4 angle. Neutral relaxed pose, arms at sides. "
         f"Uniform solid gray background, #808080. No shadows or reflections on background. "
-        f"Studio lighting, soft and even, no harsh shadows on face or body. "
-        f"Photorealistic, cinematic quality, high detail on face and clothing."
+        f"Studio lighting, soft and even, no harsh shadows on face or body."
+        f"{realism_suffix}"
     )
     prompt = re.sub(r'\s+', ' ', prompt).strip()
     char_slug = slugify(char['name'])
@@ -3024,17 +3244,37 @@ def _gen_outfit_inline(s, sid, char, outfit):
     if not char.get('ref_images'):
         raise RuntimeError(f'Char "{char["name"]}" has no base ref yet')
     reference_url = char.get('avai_base_url')
-    gender = 'woman' if char.get('gender') == 'female' else 'man'
     constraints = (char.get('image_constraints') or '').strip()
     constraints_clause = f' IMPORTANT — strictly follow these constraints: {constraints}. ' if constraints else ''
+    appearance = (char.get('appearance') or '').strip()
+    appearance_low = appearance.lower()
+    animal_words = ('fur', 'muzzle', 'snout', 'tail', 'paws', 'claws', 'whiskers',
+                    'mane', 'feathers', 'beak', 'horns', 'antlers', 'hooves', 'scales',
+                    'cub', 'pup', 'kitten', 'fang', 'fangs',
+                    'шерсть', 'мордa', 'морду', 'морды', 'хвост', 'лапы', 'когти',
+                    'клыки', 'грива', 'перья', 'клюв', 'рога', 'копыта')
+    is_animal = any(w in appearance_low for w in animal_words)
+    if is_animal:
+        same_clause = 'Same character as the reference image (same species, same fur/markings, same age). '
+        intro_clause = f'Full body portrait of {char["name"]}. {appearance}. '
+    else:
+        gender = 'woman' if char.get('gender') == 'female' else 'man'
+        same_clause = f'Same {gender} as the reference image. '
+        intro_clause = f'Full body portrait of {char["name"]}, a {gender}. {appearance}. '
+    style_clause = _series_style_clause(s)
+    is_stylised = bool(style_clause and 'strict' in style_clause.lower())
+    realism_suffix = '' if is_stylised else ' Photorealistic, cinematic quality.'
+    style_prefix = (style_clause + ' ') if style_clause else ''
     prompt = (
-        (f'Same {gender} as the reference image. ' if reference_url else f'Full body portrait of {char["name"]}, a {gender}. {char.get("appearance","")}. ')
+        f"{style_prefix}"
+        + (same_clause if reference_url else intro_clause)
         + f'Now wearing: {outfit["label"]}. {outfit.get("description", "")}. '
-        + ('Same face, same hair, same body — only the clothing changes. ' if reference_url else '')
+        + ('Same face, same body — only the clothing changes. ' if reference_url else '')
         + constraints_clause
         + 'Full body, front-facing, slight 3/4 angle. Neutral relaxed pose, arms at sides. '
           'Uniform solid gray background, #808080. No shadows on background. '
-          'Studio lighting, soft and even. Photorealistic, cinematic quality.'
+          'Studio lighting, soft and even.'
+        + realism_suffix
     )
     prompt = re.sub(r'\s+', ' ', prompt).strip()
     char_slug = slugify(char['name'])
@@ -3047,18 +3287,55 @@ def _gen_loc_inline(s, sid, loc):
     if loc.get('ref_images'):
         return
     tone = s.get('tone', '')
+    style_clause = _series_style_clause(s)
+    is_stylised = bool(style_clause and 'strict' in style_clause.lower())
+    realism_suffix = '' if is_stylised else ' Photorealistic, cinematic quality, high detail.'
+    style_prefix = (style_clause + ' ') if style_clause else ''
     prompt = (
+        f"{style_prefix}"
         f"{loc['name']}. {loc.get('description', '')}. "
         f"No people, no characters in frame. "
         f"{(tone + ' atmosphere. ') if tone else ''}"
         f"Cinematic wide establishing shot. Horizontal landscape composition, 16:9 framing. "
-        f"Photorealistic, cinematic quality, high detail. Atmospheric lighting."
+        f"Atmospheric lighting."
+        f"{realism_suffix}"
     )
     prompt = re.sub(r'\s+', ' ', prompt).strip()
     loc_slug = slugify(loc['name'])
     out_path = assets_dir(sid) / 'locations' / loc_slug / f'{asset_name(loc["name"])}.png'
     image_url = avai_generate(prompt, out_path, aspect_ratio='16:9')
     loc.setdefault('ref_images', []).insert(0, str(out_path.relative_to(series_path(sid))))
+
+
+def _gen_item_inline(s, sid, item):
+    """Generate ref image for a story-prop item. Mutates item, caller saves.
+    Uses square 1:1 product-still-life style — works as portable ref for both
+    Seedance (9:16) and Reteller (vertical) compositions.
+    Idempotent: skips if item already has refs."""
+    if item.get('ref_images'):
+        return
+    style_clause = _series_style_clause(s)
+    is_stylised = bool(style_clause and 'strict' in style_clause.lower())
+    realism_suffix = '' if is_stylised else ' Photorealistic, high detail.'
+    style_prefix = (style_clause + ' ') if style_clause else ''
+    constraints = (item.get('image_constraints') or '').strip()
+    constraints_clause = f" IMPORTANT — strictly follow these constraints: {constraints}." if constraints else ""
+    prompt = (
+        f"{style_prefix}"
+        f"{item['name']}. {item.get('description', '')}.{constraints_clause} "
+        f"Product-style still-life of the object alone. No people, no hands, no characters. "
+        f"Centered composition, neutral seamless background (#dadada), soft even studio lighting, "
+        f"subtle shadow on ground, sharp focus on object texture and details. "
+        f"Square 1:1 framing."
+        f"{realism_suffix}"
+    )
+    prompt = re.sub(r'\s+', ' ', prompt).strip()
+    item_slug = slugify(item['name'])
+    out_path = assets_dir(sid) / 'items' / item_slug / f'{asset_name(item["name"])}.png'
+    image_url = avai_generate(prompt, out_path, aspect_ratio='1:1')
+    rel_path = str(out_path.relative_to(series_path(sid)))
+    item.setdefault('ref_images', []).insert(0, rel_path)
+    item['avai_url'] = image_url
 
 
 _AUTOGEN_SAVE_LOCKS: dict[str, threading.Lock] = {}
@@ -3113,10 +3390,14 @@ def auto_generate_missing_assets(sid):
         for l in s.get('locations', []):
             if not l.get('ref_images'):
                 loc_tasks.append(('loc', l['id'], None))
-        total_tasks = len(char_tasks) + len(outfit_tasks) + len(loc_tasks)
+        item_tasks = []
+        for it in s.get('items', []):
+            if not it.get('ref_images'):
+                item_tasks.append(('item', it['id'], None))
+        total_tasks = len(char_tasks) + len(outfit_tasks) + len(loc_tasks) + len(item_tasks)
         st['queue'] = total_tasks
         print(f'[autogen {sid}] {total_tasks} assets to generate '
-              f'(chars={len(char_tasks)}, outfits={len(outfit_tasks)}, locs={len(loc_tasks)}, parallel={_AUTOGEN_PARALLELISM})',
+              f'(chars={len(char_tasks)}, outfits={len(outfit_tasks)}, locs={len(loc_tasks)}, items={len(item_tasks)}, parallel={_AUTOGEN_PARALLELISM})',
               flush=True)
 
         def _ip_add(entry):
@@ -3193,6 +3474,24 @@ def auto_generate_missing_assets(sid):
                         if l_disk and not l_disk.get('ref_images'):
                             l_disk['ref_images'] = new_refs
                             save_series(sid, s_disk)
+                elif kind == 'item':
+                    item = next((it for it in s_local.get('items', []) if it['id'] == parent_id), None)
+                    if not item or item.get('ref_images'):
+                        st['done'] += 1
+                        return
+                    ip_entry = {'kind': 'item', 'parent_id': parent_id, 'child_id': None, 'name': item.get('name', '')}
+                    _ip_add(ip_entry)
+                    _gen_item_inline(s_local, sid, item)  # SLOW: avai API call
+                    new_refs = item.get('ref_images') or []
+                    new_url = item.get('avai_url') or ''
+                    with save_lock:
+                        s_disk = load_series(sid)
+                        if not s_disk: return
+                        i_disk = next((it for it in s_disk.get('items', []) if it['id'] == parent_id), None)
+                        if i_disk and not i_disk.get('ref_images'):
+                            i_disk['ref_images'] = new_refs
+                            i_disk['avai_url'] = new_url
+                            save_series(sid, s_disk)
                 st['done'] += 1
             except Exception as e:
                 err_msg = f'{kind}/{parent_id}: {str(e)[:200]}'
@@ -3205,8 +3504,8 @@ def auto_generate_missing_assets(sid):
         if char_tasks:
             with concurrent.futures.ThreadPoolExecutor(max_workers=_AUTOGEN_PARALLELISM) as pool:
                 list(pool.map(lambda t: _run_task(*t), char_tasks))
-        # Phase 2: outfits + locations together (locations don't depend on chars)
-        phase2 = outfit_tasks + loc_tasks
+        # Phase 2: outfits + locations + items together (none depend on chars)
+        phase2 = outfit_tasks + loc_tasks + item_tasks
         if phase2:
             with concurrent.futures.ThreadPoolExecutor(max_workers=_AUTOGEN_PARALLELISM) as pool:
                 list(pool.map(lambda t: _run_task(*t), phase2))
@@ -3226,7 +3525,8 @@ def auto_generate_missing_assets(sid):
                     sum(1 for c in s2.get('characters', []) if not c.get('ref_images')) +
                     sum(1 for c in s2.get('characters', []) for o in c.get('outfits', [])
                         if not o.get('photo') and not o.get('is_base')) +
-                    sum(1 for l in s2.get('locations', []) if not l.get('ref_images'))
+                    sum(1 for l in s2.get('locations', []) if not l.get('ref_images')) +
+                    sum(1 for it in s2.get('items', []) if not it.get('ref_images'))
                 )
                 if pending > 0:
                     print(f'[autogen {sid}] {pending} new assets queued during sweep — re-running')
@@ -5158,7 +5458,10 @@ def extract_characters_from_script(sid, num):
         f'ALREADY KNOWN LOCATIONS in this series:\n{existing_loc_lines}\n\n'
         f'{notes_block}'
         f'EPISODE {num} SCRIPT:\n{script}\n\n'
-        'YOUR JOB — return five lists in JSON:\n\n'
+        f'ALREADY KNOWN ITEMS in this series (story-relevant props):\n'
+        + '\n'.join(f"  - {it.get('name')} (id={it.get('id')})" for it in (s.get('items') or []))
+        + ('\n  (none)\n' if not (s.get('items') or []) else '\n') + '\n'
+        + 'YOUR JOB — return six lists in JSON:\n\n'
         '1) `present_character_ids` — IDs of ALREADY KNOWN characters who actually appear in this script '
         '(speak or are explicitly on screen). Drop any known character not in the script.\n'
         '2) `present_location_ids` — IDs of ALREADY KNOWN locations actually used as scene settings in this script.\n'
@@ -5177,7 +5480,18 @@ def extract_characters_from_script(sid, num):
         '   in Russian (full physical description, since this REPLACES the old one — do NOT just describe the '
         '   change), and a 1-sentence `reason` in Russian explaining what the notes asked for. '
         '   When in doubt, leave this list empty. Do NOT update appearance based on script alone — only on '
-        '   explicit director\'s notes. The old portrait will be discarded and regenerated from this new text.\n\n'
+        '   explicit director\'s notes. The old portrait will be discarded and regenerated from this new text.\n'
+        '6) `new_items` — STORY-RELEVANT props that drive the plot and should have a generated reference image. '
+        'STRICT criteria — include ONLY:\n'
+        '   - Objects mentioned by name with PLOT significance (the murder weapon, the heroine\'s locket, '
+        '     the will document, the flash drive, the briefcase of money, the sword, the talisman, '
+        '     the blackmail letter, the photograph, the bottle of poison, evidence files)\n'
+        '   - Objects characters fight over, hide, exchange, destroy, or treat as evidence\n'
+        '   - Objects that recur across scenes/episodes\n'
+        '   EXCLUDE casual everyday objects (cup, phone, keys, glass, generic chair) UNLESS they have explicit plot weight.\n'
+        '   For each NEW ITEM infer:\n'
+        '   - name: short concrete English noun phrase (e.g. "Manila Folder", "Black Silver Shard", "Locket of Sarah")\n'
+        '   - description: 1 sentence in RUSSIAN — what it looks like + its narrative role\n\n'
         'For each NEW CHARACTER infer:\n'
         '  - name: exact label as it appears in the script (English / Latin letters)\n'
         '  - gender: "male" or "female"\n'
@@ -5193,7 +5507,8 @@ def extract_characters_from_script(sid, num):
         '  "present_location_ids":  ["id3"],\n'
         '  "new_characters": [{"name":"...","gender":"female","description":"...","appearance":"..."}],\n'
         '  "new_locations":  [{"name":"...","description":"..."}],\n'
-        '  "appearance_updates": [{"id":"existingId","appearance":"...","reason":"..."}]\n'
+        '  "appearance_updates": [{"id":"existingId","appearance":"...","reason":"..."}],\n'
+        '  "new_items":      [{"name":"...","description":"..."}]\n'
         '}'
     )
     try:
@@ -5245,6 +5560,24 @@ def extract_characters_from_script(sid, num):
         existing_loc_names.add(nm.lower())
         valid_loc_ids.add(new_id)
 
+    # 2.6) Add brand-new story-relevant items
+    existing_item_names = {(it.get('name') or '').lower() for it in (s.get('items') or [])}
+    added_items = []
+    for it in (data.get('new_items') or []):
+        nm = (it.get('name') or '').strip()
+        if not nm or nm.lower() in existing_item_names:
+            continue
+        new_id = str(uuid.uuid4())[:8]
+        item = {
+            'id': new_id,
+            'name': nm,
+            'description': it.get('description', ''),
+            'ref_images':  [],
+        }
+        s.setdefault('items', []).append(item)
+        added_items.append(nm)
+        existing_item_names.add(nm.lower())
+
     # 2.5) Appearance updates — director's notes asked to refresh an existing
     #      character's look (new face, recast, scar, etc.). We replace the
     #      `appearance` text and clear the generated portrait + outfit images so
@@ -5295,7 +5628,7 @@ def extract_characters_from_script(sid, num):
     ep['cast_extracted'] = True
     save_episode(sid, num, ep)
 
-    if added_chars or added_locs or appearance_updates:
+    if added_chars or added_locs or appearance_updates or added_items:
         trigger_autogen_if_enabled(sid)
 
     # Build dropped-name reports for nicer UI feedback
@@ -5384,6 +5717,7 @@ def extract_characters_from_script(sid, num):
     return jsonify({
         'added_characters':  added_chars,
         'added_locations':   added_locs,
+        'added_items':       added_items,
         'dropped_characters': dropped_chars,
         'dropped_locations':  dropped_locs,
         'characters_used':   final_chars,
@@ -7552,7 +7886,7 @@ def _detect_cuts(video_abs_path, threshold=0.35):
     return deduped
 
 
-def _extract_keyframes_at_cuts(sid, video_relpath, cut_timestamps, max_frames=2,
+def _extract_keyframes_at_cuts(sid, video_relpath, cut_timestamps, max_frames=3,
                                pre_offset=0.05):
     """For each cut timestamp T, extract the frame at T-pre_offset (i.e. the
     LAST frame of the OUTGOING shot, just before the cut). Cached on disk as
@@ -7608,10 +7942,10 @@ def _avai_seedance_start(prompt, ref_urls, duration, resolution, moderation_bypa
         payload['moderation_bypass'] = moderation_bypass
         if moderation_bypass_prompt:
             payload['moderation_bypass_prompt'] = moderation_bypass_prompt
-    headers = {'x-api-key': AVAI_KEY, 'content-type': 'application/json'}
+    headers = {'x-api-key': _get_user_avai_key(), 'content-type': 'application/json'}
     # Async mode: server returns 202 with job_id+status_url immediately
     resp = requests.post(
-        AVAI_API + '?async=true', json=payload, headers=headers, timeout=60
+        AVAI_API + '?async=true', json=payload, headers=headers, timeout=(15, 240)
     )
     if resp.status_code not in (200, 202):
         raise RuntimeError(f'AVAI seedance2 start error {resp.status_code}: {resp.text[:400]}')
@@ -7629,7 +7963,7 @@ def _avai_seedance_start(prompt, ref_urls, duration, resolution, moderation_bypa
 
 def _avai_seedance_status(job_id, status_url=None):
     """Poll job. Returns dict {status, progress, video_url, cost, error, raw}."""
-    headers = {'x-api-key': AVAI_KEY}
+    headers = {'x-api-key': _get_user_avai_key()}
     url = status_url or f'https://avai-gen.com/api/public/generate/jobs/{job_id}'
     if url.startswith('/'):
         url = 'https://avai-gen.com' + url
@@ -7678,7 +8012,7 @@ def _avai_upload_local_image(local_path: Path) -> str:
     if mime not in ('image/png', 'image/jpeg', 'image/webp'):
         mime = 'image/png'
     b64 = base64.b64encode(local_path.read_bytes()).decode('ascii')
-    headers = {'x-api-key': AVAI_KEY, 'content-type': 'application/json'}
+    headers = {'x-api-key': _get_user_avai_key(), 'content-type': 'application/json'}
     resp = requests.post(
         'https://avai-gen.com/api/public/upload-image',
         json={'image_base64': b64, 'mime_type': mime},
@@ -7806,7 +8140,7 @@ def seedance_upload_ref(sid, num):
         if mime not in ('image/png', 'image/jpeg', 'image/webp'):
             mime = 'image/png'
         try:
-            headers = {'x-api-key': AVAI_KEY, 'content-type': 'application/json'}
+            headers = {'x-api-key': _get_user_avai_key(), 'content-type': 'application/json'}
             resp = requests.post(
                 'https://avai-gen.com/api/public/upload-image',
                 json={'image_base64': base64.b64encode(data).decode('ascii'),
@@ -7838,7 +8172,7 @@ def seedance_upload_ref(sid, num):
         mime = r.headers.get('content-type', 'image/png').split(';')[0]
         if mime not in ('image/png', 'image/jpeg', 'image/webp'):
             mime = 'image/png'
-        headers = {'x-api-key': AVAI_KEY, 'content-type': 'application/json'}
+        headers = {'x-api-key': _get_user_avai_key(), 'content-type': 'application/json'}
         resp = requests.post(
             'https://avai-gen.com/api/public/upload-image',
             json={'image_base64': base64.b64encode(r.content).decode('ascii'),
@@ -7859,6 +8193,58 @@ def seedance_list(sid, num):
     if not ep:
         return jsonify({'error': 'not found'}), 404
     return jsonify({'chunks': _seedance_chunks(ep)})
+
+
+@app.route('/api/series/<sid>/episodes/<int:num>/seedance/download-zip')
+def seedance_download_zip(sid, num):
+    """Stream a ZIP archive of selected chunk video files.
+    Query: ?idxs=1,2,3,5  (comma-separated chunk indices)
+    Each entry inside the ZIP is named `chunk_NN.mp4` — sorted by idx.
+    Skips chunks without a stored video file (in-progress / failed)."""
+    import io, zipfile
+    from flask import Response
+    ep = load_episode(sid, num)
+    if not ep:
+        return jsonify({'error': 'not found'}), 404
+    raw = (request.args.get('idxs') or '').strip()
+    try:
+        wanted_idxs = sorted({int(x) for x in raw.split(',') if x.strip()})
+    except ValueError:
+        return jsonify({'error': 'bad idxs'}), 400
+    if not wanted_idxs:
+        return jsonify({'error': 'no idxs'}), 400
+    chunks = _seedance_chunks(ep)
+    base = series_path(sid)
+    # Build zip in-memory (chunk videos are small, ~5-10MB each; user typically
+    # picks 5-20 chunks). For huge selections we'd stream, but in-memory is
+    # simpler and avoids fancy chunked-encoding.
+    buf = io.BytesIO()
+    written = 0
+    with zipfile.ZipFile(buf, 'w', zipfile.ZIP_STORED) as zf:
+        for c in chunks:
+            if c.get('idx') not in wanted_idxs:
+                continue
+            vp = c.get('video_path')
+            if not vp:
+                continue
+            abs_path = base / vp
+            if not abs_path.exists():
+                continue
+            arcname = f'ep{int(num):03d}_chunk_{int(c.get("idx") or 0):02d}.mp4'
+            zf.write(abs_path, arcname=arcname)
+            written += 1
+    if not written:
+        return jsonify({'error': 'no completed videos in selection'}), 404
+    buf.seek(0)
+    fname = f'{slugify(sid)}_ep{int(num):03d}_{written}clips.zip'
+    return Response(
+        buf.getvalue(),
+        mimetype='application/zip',
+        headers={
+            'Content-Disposition': f'attachment; filename="{fname}"',
+            'Content-Length': str(buf.getbuffer().nbytes),
+        },
+    )
 
 @app.route('/api/series/<sid>/episodes/<int:num>/generate-scene-blocking', methods=['POST'])
 def generate_scene_blocking(sid, num):
@@ -9062,38 +9448,49 @@ def seedance_compose(sid, num):
     # Was burning composer in the wolf-bull warehouse scene where Bull pushes
     # WOLF_SON forward in a bracketed remark — heuristic fired single-speaker,
     # composer dropped the cub from refs.
+    active_char_names = [c['name'] for c in active_chars]
+    # Build alias set per active char: canonical name + first-name-token +
+    # last-name-token (e.g. "WOLF_SON" → {"wolf_son", "wolf"}; "DR OLIVER
+    # CROSS" → {"dr oliver cross", "dr", "cross", "dr cross"}). Helps match
+    # both stems and abbreviated forms (script writes "DR CROSS:" while
+    # series stores "DR OLIVER CROSS").
+    def _aliases(name):
+        al = {name.lower()}
+        tokens = re.split(r'[\s_]+', name.strip())
+        tokens = [t for t in tokens if t]
+        if tokens:
+            al.add(tokens[0].lower())
+            if len(tokens) > 1:
+                al.add(tokens[-1].lower())
+            # First + last token combined ("DR CROSS" from "DR OLIVER CROSS")
+            if len(tokens) >= 3:
+                al.add(f'{tokens[0]} {tokens[-1]}'.lower())
+        return al
+
+    # Detect ALL speakers in this chunk and surface them as a HARD directive in
+    # the composer prompt. Composer occasionally drops a speaker (especially on
+    # entrance shots where Vision-analyzed prev lastframe shows only one char
+    # and the Russian-declined name in [Дверь… Dr Cross входит] doesn't match
+    # the Vision state-analysis output). Forcing speakers into refs[] eliminates
+    # this whole class of "the second speaker isn't in the scene" failures.
+    chunk_speakers = []
+    if chunk_text and active_char_names:
+        seen_speakers = set()
+        for line in chunk_text.split('\n'):
+            stripped = line.lstrip()
+            m = re.match(r'^([A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё\s\-\']{0,30}):\s', stripped)
+            if not m: continue
+            nm = m.group(1).strip().lower()
+            for cn in active_char_names:
+                if nm in _aliases(cn) and cn not in seen_speakers:
+                    chunk_speakers.append(cn)
+                    seen_speakers.add(cn)
+                    break
+
     auto_close_up_block = ''
     if not close_up_only:
-        active_char_names = [c['name'] for c in active_chars]
-        # Build alias set per active char: canonical name + first-name-token +
-        # last-name-token (e.g. "WOLF_SON" → {"wolf_son", "wolf"}; "DR OLIVER
-        # CROSS" → {"dr oliver cross", "dr", "cross", "dr cross"}). Helps match
-        # both stems and abbreviated forms (script writes "DR CROSS:" while
-        # series stores "DR OLIVER CROSS").
-        def _aliases(name):
-            al = {name.lower()}
-            tokens = re.split(r'[\s_]+', name.strip())
-            tokens = [t for t in tokens if t]
-            if tokens:
-                al.add(tokens[0].lower())
-                if len(tokens) > 1:
-                    al.add(tokens[-1].lower())
-                # First + last token combined ("DR CROSS" from "DR OLIVER CROSS")
-                if len(tokens) >= 3:
-                    al.add(f'{tokens[0]} {tokens[-1]}'.lower())
-            return al
         if active_char_names and chunk_text:
-            # Find speakers — "Name:" at line start (Name matches an alias of active char)
-            speakers_found = set()
-            for line in chunk_text.split('\n'):
-                stripped = line.lstrip()
-                m = re.match(r'^([A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё\s\-\']{0,30}):\s', stripped)
-                if not m: continue
-                nm = m.group(1).strip().lower()
-                for cn in active_char_names:
-                    if nm in _aliases(cn):
-                        speakers_found.add(cn)
-                        break
+            speakers_found = set(chunk_speakers)
             if len(speakers_found) == 1:
                 sole = next(iter(speakers_found))
                 # Strip quoted strings + dialogue cue tails so we only check action-text
@@ -9169,6 +9566,21 @@ def seedance_compose(sid, num):
             "сохрани как обычно — стиль это только оболочка рендера, не сюжет.\n"
             "=== END STYLE ===\n"
         )
+    # Hard directive block — server-detected speakers in this chunk that
+    # composer must not drop from refs[]. Empty when chunk has no recognized
+    # dialogue lines (action-only or extras-only chunks).
+    mandatory_speakers_block = ''
+    if chunk_speakers:
+        mandatory_speakers_block = (
+            f"=== ОБЯЗАТЕЛЬНЫЕ СПИКЕРЫ (детектировано сервером в CHUNK) ===\n"
+            f"Эти персонажи ГОВОРЯТ в этом чанке (есть строки 'Name:' с их именем или алиасом). "
+            f"Они ВИДНЫ В КАДРЕ во время своей реплики (даже если на lastframe их не было — реплика "
+            f"это и есть момент их появления). ВКЛЮЧИ их в refs[] и в BINDING — невключение спикера "
+            f"= провал композиции:\n"
+            + '\n'.join(f"  - {nm}" for nm in chunk_speakers) + '\n'
+            + f"=== END ОБЯЗАТЕЛЬНЫЕ СПИКЕРЫ ===\n\n"
+        )
+
     userprompt = (
         f"AVAILABLE CHARACTERS (весь roster серии):\n{chr(10).join(chars_lines) or '(none)'}\n\n"
         f"AVAILABLE LOCATIONS (весь roster серии):\n{chr(10).join(locs_lines) or '(none)'}\n\n"
@@ -9188,6 +9600,7 @@ def seedance_compose(sid, num):
         f"Найди CHUNK внутри FULL SCRIPT, посмотри ближайший SCENE HEADING выше него — оттуда возьми локацию и время суток. "
         f"Посмотри ремарки/[действия] вокруг CHUNK — оттуда возьми кто физически в кадре (включая молчащих). "
         f"Эти персонажи ОБЯЗАТЕЛЬНО идут в refs, даже если в CHUNK у них нет реплик.\n\n"
+        f"{mandatory_speakers_block}"
         "Верни JSON и НИЧЕГО кроме JSON:\n"
         "{\n"
         '  "prompt": "ru/en motion prompt, ~60-110 слов, по структуре выше, с эмоциями перед каждой репликой и финальным @Image<N> локации",\n'
@@ -9418,8 +9831,10 @@ def seedance_compose(sid, num):
                 # Cache uploaded urls per-cut on the chunk to avoid re-uploading.
                 cf_urls = list(prev_neighbour.get('cutframes_avai_urls') or [])
                 budget = 9 - len(ref_urls)
-                # max 2 extra cut frames (continuity is one signal, not the show)
-                max_attach = min(2, budget)
+                # Up to 3 extra cut frames — gives the model full continuity for
+                # 3-shot prev chunks (most common in our pacing). Refs hard cap
+                # is 9 so we leave 6 slots for chars + locations + lastframe.
+                max_attach = min(3, budget)
                 wanted_cuts = cuts[:max_attach]
                 # Need to extract any frames not yet uploaded
                 if len(cf_urls) < len(wanted_cuts):
@@ -9650,17 +10065,20 @@ def seedance_start(sid, num):
                 ep2 = load_episode(sid, num)
                 for c in _seedance_chunks(ep2):
                     if c.get('idx') == idx:
-                        # Reaper may have already marked us 'failed' (slow AVAI).
-                        # Still record job_id so user/admin can find/cancel it,
-                        # but don't resurrect to 'pending' — respect reaper.
                         c['job_id'] = job['job_id']
                         c['status_url'] = job['status_url']
-                        if c.get('status') == 'submitting':
+                        # RESURRECT: even if reaper marked us 'failed' for being
+                        # slow, AVAI now confirms the job IS running and we have
+                        # a job_id. Wasteful to discard a working render — flip
+                        # back to pending so the poll loop tracks it to completion.
+                        # User pays for these jobs whether or not we track them.
+                        if c.get('status') in ('submitting', 'failed'):
+                            prev_status = c.get('status')
                             c['status'] = 'pending'
-                        else:
-                            # Late arrival — leave status alone, mark in error
-                            prev_err = c.get('error') or ''
-                            c['error'] = (prev_err + ' | late submit returned job_id=' + str(job.get('job_id', ''))).strip(' |')
+                            if prev_status == 'failed':
+                                c['error'] = ''   # clear stale "submit timed out" message
+                                print(f'[seedance {sid}/ep{num}/#{idx}] late submit returned '
+                                      f'job_id={job.get("job_id")}, resurrecting from failed → pending', flush=True)
                         break
                 save_episode(sid, num, ep2)
         except Exception as e:

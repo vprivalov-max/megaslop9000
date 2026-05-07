@@ -30,3 +30,7 @@ config.json
 # Temp ffmpeg artifacts
 *.tmp.mp4
 concat_*.txt
+
+# User data — never commit
+data/
+*.orig
