@@ -6801,26 +6801,73 @@ function _prettifyUserSlug(slug) {
   return slug.replace(/_/g, '.');
 }
 
+// Enable MLG mode from inside the leaderboard modal — flips the toggle, plays
+// a confirmation gunshot so the user immediately knows it's live, then
+// re-renders the leaderboard without the explainer.
+function _enableMlgFromLeaderboard() {
+  Sounds.setHitmarkerEnabled(true);
+  // Sync the Settings checkbox if it's been opened previously
+  const cb = document.getElementById('settings-mlg-hitmarker');
+  if (cb) cb.checked = true;
+  // Confirmation shot
+  Sounds.playGunshot();
+  // Re-render leaderboard sans explainer
+  setTimeout(openMlgLeaderboard, 200);
+}
+
 async function openMlgLeaderboard() {
   const list = document.getElementById('mlg-leaderboard-list');
   if (!list) return;
   list.innerHTML = '<div style="color:var(--muted)">⏳ Загружаю...</div>';
   openModal('modal-mlg-leaderboard');
+
+  // If MLG mode is OFF — show explainer + activation CTA above the table.
+  // Builds the user's understanding of what they're opting into without
+  // forcing them to dig through Settings.
+  const mlgOff = !Sounds.isHitmarkerEnabled();
+  const explainerHtml = mlgOff ? `
+    <div style="background:linear-gradient(135deg, rgba(124,92,252,0.18), rgba(0,212,170,0.12));
+                border:1px solid rgba(124,92,252,0.4); border-radius:8px;
+                padding:14px 16px; margin-bottom:14px; font-size:0.9rem; line-height:1.55">
+      <div style="font-weight:700;font-size:1rem;margin-bottom:6px">🌿 MLG 420 MODE — что это?</div>
+      <div style="color:var(--text)">
+        Дизайнерский прикол + анти-стресс во время работы. Когда включён:
+      </div>
+      <ul style="margin:8px 0 8px 18px;padding:0;color:var(--text)">
+        <li>На каждый клик по кнопке — хитмаркер «tink!» + крестик-вспышка (как в CoD/Halo)</li>
+        <li>На больших действиях («Создать сериал», «+ Эпизод», «🎬 Редактор») — звук выстрела</li>
+        <li>Иногда вылазит Snoop Dogg или MLG-лягушка в случайном углу — кликни их и стреляй</li>
+        <li>За убийства начисляются киллы. На каждом 10-м — большая радужная надпись OMG!!! / DAMN SON!!</li>
+        <li>Случайные голосовые комментарии: WOW / NO SCOPED / DAMN SON / TRIPLE на 3-м килле</li>
+        <li>Все киллы попадают в эту таблицу лидеров среди коллег</li>
+      </ul>
+      <div style="color:var(--muted);font-size:0.84rem;margin-bottom:10px">
+        Помогает разрядиться когда сценарий не пишется или генерация падает 5 раз подряд.
+        Можно выключить в любой момент в ⚙ Настройках.
+      </div>
+      <button class="btn-primary" onclick="_enableMlgFromLeaderboard()" style="width:100%">
+        🌿 Включить MLG 420 MODE и начать стрелять
+      </button>
+    </div>
+  ` : '';
+
   try {
     const r = await fetch('/api/mlg/leaderboard').then(r => r.json());
     const rows = r.leaderboard || [];
     if (!rows.length) {
-      list.innerHTML = `
+      list.innerHTML = explainerHtml + `
         <div style="text-align:center;color:var(--muted);padding:24px 0">
           <div style="font-size:36px;margin-bottom:8px">🎯</div>
-          Пока никто не убил ни одного. Включи MLG 420 MODE в настройках и стреляй по Snoop'у — попадёшь в таблицу первым.
+          ${mlgOff
+            ? 'В таблице пока пусто. Включи MLG MODE — будешь первым.'
+            : "Пока никто не убил ни одного. Стреляй по Snoop'у/лягушке — попадёшь в таблицу первым."}
         </div>`;
       return;
     }
     const me = (window._currentUser && window._currentUser.email) || '';
     const meSlug = me.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
     const medals = ['🥇', '🥈', '🥉'];
-    list.innerHTML = `
+    list.innerHTML = explainerHtml + `
       <table style="width:100%;border-collapse:collapse;font-size:0.92rem">
         <thead>
           <tr style="border-bottom:1px solid var(--border);color:var(--muted);text-align:left">
@@ -6882,28 +6929,31 @@ function _spawnSnoop() {
     Sounds.playGunshot();
     _spawnHitmarkerVisual(e.clientX, e.clientY);
     const kills = _bumpMlgKill(skin.kind);
-    // Kill announcer logic:
-    //   - kill #3 (first time player hits a triple): GUARANTEED TRIPLE
-    //   - subsequent 3-kill milestones (#6, #9, #12, ...): 35% chance of TRIPLE
-    //   - any other kill: 28% chance of a random voice line
-    //     (WOW / DAMN SON pool — picked uniformly when triggered)
-    //   TRIPLE and voice-line never stack on the same kill.
+    // Kill announcer logic — sound + matching text overlay:
+    //   - kill #3 (first triple in player's history): GUARANTEED TRIPLE
+    //   - subsequent 3-kill milestones (#6, #9, ...): 35% chance of TRIPLE
+    //   - otherwise: 32% chance of random voice line (WOW / DAMN SON / NO-SCOPED)
+    //   Each voice cue spawns matching big-text overlay so phrase is heard AND seen.
     let played = false;
     if (kills === 3) {
-      setTimeout(() => Sounds.playTriple(), 180);
+      setTimeout(() => { Sounds.playTriple(); _spawnMlgVoiceText('TRIPLE!!!'); }, 180);
       played = true;
     } else if (kills > 3 && kills % 3 === 0 && Math.random() < 0.35) {
-      setTimeout(() => Sounds.playTriple(), 180);
+      setTimeout(() => { Sounds.playTriple(); _spawnMlgVoiceText('TRIPLE!!!'); }, 180);
       played = true;
     }
     if (!played && Math.random() < 0.32) {
-      const voiceLines = [Sounds.playWow, Sounds.playDamnSon, Sounds.playNoScoped];
+      // Voice-line + matching text-overlay pairs (50/50 across pool).
+      const voiceLines = [
+        { play: Sounds.playWow,      text: 'WOW!!!' },
+        { play: Sounds.playDamnSon,  text: 'DAMN SON!!' },
+        { play: Sounds.playNoScoped, text: 'NO SCOPED!!' },
+      ];
       const pick = voiceLines[Math.floor(Math.random() * voiceLines.length)];
-      setTimeout(() => pick(), 220);
+      setTimeout(() => { pick.play(); _spawnMlgVoiceText(pick.text); }, 220);
     }
-    // Round-number milestone overlay — every 10 kills, big rainbow text
-    // flashes "10 KILLS! OMG!!" etc. center-screen. Pure MLG aesthetic.
-    if (kills > 0 && kills % 10 === 0) {
+    // Round-number milestone overlay — every 5 kills.
+    if (kills > 0 && kills % 5 === 0) {
       _spawnMlgMilestone(kills);
     }
     sn.classList.add('mlg-snoop-shot');
@@ -6923,27 +6973,36 @@ function _spawnSnoop() {
 if (document.readyState !== 'loading') _scheduleSnoop();
 else document.addEventListener('DOMContentLoaded', _scheduleSnoop);
 
-// Big rainbow MLG milestone text. Appears center-screen, flashes through
-// the spectrum, slight tilt and shake, fades after ~2.2s.
+// Big rainbow MLG text overlay — used for both round-number milestones
+// and voice-line reactions. `opts.big` is the top giant line, `opts.small`
+// (optional) is the secondary line. Random tilt + shake + 2.4s lifetime.
 const _MLG_PHRASES = [
   'OMG!!!', 'DAMN SON!!', 'NO SCOPED!!', 'WOW!!!',
   '420 BLAZE IT', 'GET REKT', 'SAVAGE!!', 'OWNED!!',
   'INSANE!!!', 'RAMPAGE!', 'UNREAL!!', 'FROGGED!!',
   'YOU MAD?', 'GG EZ', 'GODLIKE', 'MLG PRO',
 ];
-function _spawnMlgMilestone(killCount) {
-  const phrase = _MLG_PHRASES[Math.floor(Math.random() * _MLG_PHRASES.length)];
+function _spawnMlgFlash(opts) {
   const wrap = document.createElement('div');
   wrap.className = 'mlg-milestone';
-  wrap.innerHTML = `
-    <div class="mlg-milestone-num">${killCount} KILLS</div>
-    <div class="mlg-milestone-phrase">${phrase}</div>
-  `;
-  // Slight random tilt for chaos
+  // The big line is the headline; small (when present) sits below.
+  const bigHtml   = `<div class="mlg-milestone-num">${opts.big}</div>`;
+  const smallHtml = opts.small ? `<div class="mlg-milestone-phrase">${opts.small}</div>` : '';
+  wrap.innerHTML = bigHtml + smallHtml;
   const tilt = (Math.random() * 12 - 6).toFixed(1);
   wrap.style.setProperty('--mlg-tilt', `${tilt}deg`);
   document.body.appendChild(wrap);
   setTimeout(() => wrap.remove(), 2400);
+}
+// Round-number kill milestone — shown every 5 kills.
+function _spawnMlgMilestone(killCount) {
+  const phrase = _MLG_PHRASES[Math.floor(Math.random() * _MLG_PHRASES.length)];
+  _spawnMlgFlash({ big: `${killCount} KILLS`, small: phrase });
+}
+// Voice-line text overlay — shown together with the matching audio so the
+// phrase you hear is also the phrase you see flashing center-screen.
+function _spawnMlgVoiceText(label) {
+  _spawnMlgFlash({ big: label });
 }
 
 // ════════════════════════════════════════════════════════════════════════════
