@@ -8174,8 +8174,11 @@ function _onComboKill(combo, comboId) {
       combo.total = 3;
     }
     if (combo.kills >= 3) {
+      // Combo cleared: drop a chunky finish line overlay, then queue the next.
+      const finish = _DOUBLE_FINISH_LINES[Math.floor(Math.random() * _DOUBLE_FINISH_LINES.length)];
+      setTimeout(() => _spawnMlgFlash({ big: finish, small: 'DOUBLE COMBO COMPLETE' }), 300);
       delete _MLG_COMBOS[comboId];
-      _scheduleNextDoubleCombo();   // queue the next one
+      _scheduleNextDoubleCombo();
     }
   }
   // ── WOBO event: 3 → 2 → 1 ──────────────────────────────────────────────
@@ -8195,12 +8198,27 @@ function _onComboKill(combo, comboId) {
       setTimeout(() => _spawnMlgVoiceText('FINISH HIM!'), 100);
       setTimeout(() => _spawnSnoop({ comboId }), 300);
     } else if (combo.stage === 3 && combo.kills >= 1) {
-      _spawnMlgVoiceText('★ WOBO MASTER ★');
+      // Crown moment — chunky three-line overlay celebrates clearing the
+      // entire 3+2+1 chain. Comes in 250ms after the kill so it doesn't
+      // visually collide with the gunshot+hitmarker animation.
+      setTimeout(() => _spawnMlgFlash({
+        big: '★ WOBO COMBO MEISTER ★',
+        small: 'CHAIN CLEARED · 6 IN A ROW',
+      }), 250);
       delete _MLG_COMBOS[comboId];
-      _scheduleNextWoboCombo();   // queue the next one
+      _scheduleNextWoboCombo();
     }
   }
 }
+
+// Overlay headlines used when a DOUBLE combo finishes successfully. Each
+// completion picks one at random — variety so the user doesn't see the same
+// line every time.
+const _DOUBLE_FINISH_LINES = [
+  'TRIPLE THREAT', 'GG EZ', 'TOO EASY', 'GET REKT',
+  'NO MERCY', 'STAY DOWN', 'OWNED', '3X DOWN',
+  'CLEAN SWEEP', 'GODLIKE',
+];
 
 // ── Combo schedulers ────────────────────────────────────────────────────────
 // Independent timers per combo type. The same flow on each tick:
