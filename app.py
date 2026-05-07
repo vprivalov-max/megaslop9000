@@ -7581,6 +7581,82 @@ def serve_asset(sid, filepath):
     return send_from_directory(str(asset_path.parent), asset_path.name)
 
 
+@app.route('/api/series/<sid>/debug-asset')
+def debug_asset(sid):
+    """Diagnostic for the broken-image placeholder. Reports filesystem state
+    of an asset path the UI failed to load: existence, size, mtime, mime, and
+    whether the path appears in the parent series.json's ref lists. The user
+    pastes this back to support so we can tell whether the file vanished off
+    disk vs got dropped from refs vs was never there."""
+    rel_path = (request.args.get('path') or '').strip()
+    if not rel_path:
+        return jsonify({'error': 'path required'}), 400
+    base = series_path(sid).resolve()
+    full = (base / rel_path).resolve()
+    # Path traversal guard.
+    try:
+        full.relative_to(base)
+    except ValueError:
+        return jsonify({'error': 'path escapes series dir'}), 400
+    out = {
+        'sid': sid,
+        'rel_path': rel_path,
+        'absolute_path': str(full),
+        'exists': full.exists(),
+        'is_file': full.is_file() if full.exists() else False,
+        'parent_exists': full.parent.exists(),
+        'parent_listing': [],
+        'in_refs': [],
+    }
+    if full.exists() and full.is_file():
+        try:
+            st = full.stat()
+            import mimetypes
+            out['size_bytes'] = st.st_size
+            out['mtime_iso']  = datetime.datetime.fromtimestamp(st.st_mtime).isoformat()
+            out['mime_guess'] = mimetypes.guess_type(str(full))[0]
+            with open(full, 'rb') as f:
+                head = f.read(16)
+            out['magic_hex'] = head.hex()
+            out['magic_kind'] = (
+                'jpeg' if head[:3] == b'\xff\xd8\xff' else
+                'png'  if head[:8] == b'\x89PNG\r\n\x1a\n' else
+                'webp' if head[8:12] == b'WEBP' else
+                'unknown'
+            )
+        except Exception as e:
+            out['stat_error'] = str(e)
+    if full.parent.exists():
+        try:
+            out['parent_listing'] = sorted([
+                p.name for p in full.parent.iterdir()
+                if not p.name.startswith('._') and '.tmp.' not in p.name
+            ])[:50]
+        except Exception as e:
+            out['parent_listing_error'] = str(e)
+    # Look up the ref in series.json so we know whether the path is even valid
+    # from the data layer's POV.
+    try:
+        s = load_series(sid)
+        if s:
+            for c in s.get('characters', []):
+                if rel_path in (c.get('ref_images') or []):
+                    out['in_refs'].append({'kind': 'char', 'id': c.get('id'), 'name': c.get('name')})
+                for o in (c.get('outfits') or []):
+                    if o.get('photo') == rel_path:
+                        out['in_refs'].append({'kind': 'outfit', 'char_id': c.get('id'),
+                                               'outfit_id': o.get('id'), 'label': o.get('label')})
+            for l in s.get('locations', []):
+                if rel_path in (l.get('ref_images') or []):
+                    out['in_refs'].append({'kind': 'loc', 'id': l.get('id'), 'name': l.get('name')})
+            for it in s.get('items', []):
+                if rel_path in (it.get('ref_images') or []):
+                    out['in_refs'].append({'kind': 'item', 'id': it.get('id'), 'name': it.get('name')})
+    except Exception as e:
+        out['series_load_error'] = str(e)
+    return jsonify(out)
+
+
 # ── Reteller ─────────────────────────────────────────────────────────────────
 
 @app.route('/api/series/<sid>/reteller/preview', methods=['POST'])

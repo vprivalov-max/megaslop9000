@@ -1670,7 +1670,7 @@ function renderCharactersList() {
     return `
       <div class="char-item" data-autogen-kind="char" data-autogen-id="${c.id}" onclick="openCharAssets('${c.id}')">
         <div class="char-avatar">
-          ${imgUrl ? `<img src="${imgUrl}" alt="${esc(c.name)}">` : esc(c.name[0])}
+          ${imgUrl ? `<img src="${imgUrl}" alt="${esc(c.name)}" onerror="this.replaceWith(_brokenImagePlaceholder('${imgUrl}'))">` : esc(c.name[0])}
           <div class="autogen-overlay" hidden><span class="spinner"></span></div>
         </div>
         <div class="char-info">
@@ -1699,7 +1699,7 @@ function renderLocationsList() {
     return `
       <div class="char-item" data-autogen-kind="loc" data-autogen-id="${l.id}" onclick="openLocAssets('${l.id}')">
         <div class="char-avatar">
-          ${imgUrl ? `<img src="${imgUrl}" alt="${esc(l.name)}">` : '📍'}
+          ${imgUrl ? `<img src="${imgUrl}" alt="${esc(l.name)}" onerror="this.replaceWith(_brokenImagePlaceholder('${imgUrl}'))">` : '📍'}
           <div class="autogen-overlay" hidden><span class="spinner"></span></div>
         </div>
         <div class="char-info">
@@ -2399,7 +2399,7 @@ function renderItemsList() {
     return `
       <div class="char-item" data-autogen-kind="item" data-autogen-id="${it.id}" onclick="openItemAssets('${it.id}')">
         <div class="char-avatar">
-          ${imgUrl ? `<img src="${imgUrl}" alt="${esc(it.name)}">` : '🎒'}
+          ${imgUrl ? `<img src="${imgUrl}" alt="${esc(it.name)}" onerror="this.replaceWith(_brokenImagePlaceholder('${imgUrl}'))">` : '🎒'}
           <div class="autogen-overlay" hidden><span class="spinner"></span></div>
         </div>
         <div class="char-info">
@@ -2667,6 +2667,59 @@ function renderCharAssetsGrid(char) {
   if (!refs.length) grid.innerHTML = '<div style="color:var(--muted);font-size:0.85rem">Нет фото</div>';
 }
 
+// Builds an inline DOM node that replaces a broken <img>. Shows a clearly-
+// broken visual + click-to-debug. Used everywhere asset paths might point at
+// a file that vanished (concurrent-write JSON corruption used to do this; the
+// atomic-write fix should prevent it now, but the placeholder stays as a
+// safety net + diagnostic tool).
+function _brokenImagePlaceholder(url) {
+  const div = document.createElement('div');
+  div.className = 'broken-image-placeholder';
+  div.title = 'Картинка не загрузилась — кликни для дебага';
+  div.dataset.assetUrl = url;
+  div.innerHTML = `
+    <div class="bip-icon">🚫</div>
+    <div class="bip-label">Фото утеряно</div>
+    <div class="bip-hint">Клик — дебаг</div>`;
+  div.onclick = (e) => { e.stopPropagation(); debugAsset(url); };
+  return div;
+}
+
+// Click-handler for broken-image placeholders. Hits a debug endpoint that
+// reports filesystem state for the asset path so the user can paste the JSON
+// blob back to support / dev. Resilient: never throws into the UI.
+async function debugAsset(url) {
+  try {
+    // url looks like '/assets/<sid>/<rel_path>' — feed rel_path to the debug API
+    const m = url.match(/^\/assets\/([^/]+)\/(.+)$/);
+    if (!m) {
+      alert('Не разобрать путь к ассету: ' + url);
+      return;
+    }
+    const [, sid, relPath] = m;
+    const r = await api.get(`/api/series/${encodeURIComponent(sid)}/debug-asset?path=${encodeURIComponent(relPath)}`);
+    const dump = JSON.stringify(r, null, 2);
+    // Modal-ish: open a textarea-in-prompt so user can copy.
+    const overlay = document.createElement('div');
+    overlay.className = 'lightbox-overlay';
+    overlay.style.zIndex = 99999;
+    overlay.innerHTML = `
+      <button class="lb-close" onclick="this.parentElement.remove()">✕</button>
+      <div class="lightbox-content" onclick="event.stopPropagation()" style="max-width:720px">
+        <div class="lightbox-panel" style="width:100%">
+          <h3>🔍 Дебаг ассета</h3>
+          <div style="font-size:0.78rem;color:var(--muted);word-break:break-all">${esc(url)}</div>
+          <textarea readonly rows="18" style="width:100%;font-family:monospace;font-size:0.78rem">${esc(dump)}</textarea>
+          <button class="btn-regen" onclick="navigator.clipboard.writeText(this.previousElementSibling.value);this.textContent='✓ Скопировано'">📋 Скопировать дебаг</button>
+        </div>
+      </div>`;
+    overlay.onclick = (e) => { if (e.target === overlay) overlay.remove(); };
+    document.body.appendChild(overlay);
+  } catch (e) {
+    alert('Дебаг не удался: ' + (e?.message || e));
+  }
+}
+
 // Plain image lightbox (used for outfit photos — no regen panel)
 function openLightbox(url) {
   closeLightbox();
@@ -2680,6 +2733,146 @@ function openLightbox(url) {
     </div>`;
   div.onclick = (e) => { if (e.target === div) closeLightbox(); };
   document.body.appendChild(div);
+}
+
+// Outfit lightbox: shows the outfit photo with prev/next nav across ALL of the
+// character's photos (base portrait as item 0, then each outfit with a photo).
+// Lets the user browse the wardrobe full-size without closing the lightbox
+// between picks. Arrow keys + on-screen arrows + regenerate-with-wishes.
+let _outfitLightboxState = null;  // {charId, items: [{kind, id, label, photoUrl}], idx}
+
+function openOutfitLightbox(charId, outfitId) {
+  closeLightbox();
+  const c = S.series.characters.find(x => x.id === charId);
+  if (!c) return;
+  const items = [];
+  if (c.ref_images?.length) {
+    items.push({
+      kind: 'base', id: 'base', label: 'База',
+      photoUrl: `/assets/${S.seriesId}/${c.ref_images[0]}`,
+    });
+  }
+  for (const o of (c.outfits || [])) {
+    if (o.photo) {
+      items.push({
+        kind: 'outfit', id: o.id, label: o.label || '(без названия)',
+        photoUrl: `/assets/${S.seriesId}/${o.photo}`,
+      });
+    }
+  }
+  if (!items.length) { showToast('Нет фото для просмотра'); return; }
+  let idx = items.findIndex(it => it.kind === 'outfit' && it.id === outfitId);
+  if (idx < 0) idx = items.findIndex(it => it.kind === 'base' && outfitId === 'base');
+  if (idx < 0) idx = 0;
+  _outfitLightboxState = { charId, items, idx };
+  _renderOutfitLightbox();
+}
+
+function _renderOutfitLightbox() {
+  const st = _outfitLightboxState;
+  if (!st) return;
+  const cur = st.items[st.idx];
+  const c = S.series.characters.find(x => x.id === st.charId);
+  const total = st.items.length;
+  const prevDisabled = total < 2 ? 'disabled' : '';
+  const nextDisabled = total < 2 ? 'disabled' : '';
+  let div = document.getElementById('lightbox-overlay');
+  if (!div) {
+    div = document.createElement('div');
+    div.id = 'lightbox-overlay';
+    div.className = 'lightbox-overlay';
+    div.onclick = (e) => { if (e.target === div) closeLightbox(); };
+    document.body.appendChild(div);
+  }
+  // Re-render only the inner content; keep the overlay (avoids flicker on nav).
+  const isOutfit = cur.kind === 'outfit';
+  const outfitObj = isOutfit ? (c?.outfits || []).find(o => o.id === cur.id) : null;
+  const regenLabel = isOutfit
+    ? `↻ Перегенерировать образ «${esc(cur.label)}»`
+    : '↻ Перегенерировать базу персонажа';
+  const wishesPlaceholder = isOutfit
+    ? 'Например:\n«Цвет более тёмный»\n«Без сумки»\n«Длиннее юбка»'
+    : 'Например:\n«Без шрама на лице»\n«Глаза карие, не голубые»';
+  const initialWishes = isOutfit ? '' : (c?.image_constraints || '');
+  div.innerHTML = `
+    <button class="lb-close" onclick="closeLightbox()">✕</button>
+    <button class="lb-nav lb-prev" ${prevDisabled} onclick="event.stopPropagation();outfitLightboxNav(-1)" title="Предыдущий (←)">‹</button>
+    <button class="lb-nav lb-next" ${nextDisabled} onclick="event.stopPropagation();outfitLightboxNav(1)" title="Следующий (→)">›</button>
+    <div class="lightbox-content" onclick="event.stopPropagation()">
+      <div class="lb-img-wrap">
+        <img src="${cur.photoUrl}" alt="${esc(cur.label)}"
+             onerror="this.replaceWith(_brokenImagePlaceholder('${cur.photoUrl}'))">
+        <div class="lb-caption">
+          <strong>${esc(cur.label)}</strong>
+          <span style="color:var(--muted);margin-left:8px">${st.idx + 1} / ${total}</span>
+        </div>
+      </div>
+      <div class="lightbox-panel">
+        <h3>${regenLabel}</h3>
+        <div>
+          <label style="font-size:0.82rem;color:var(--muted);display:block;margin-bottom:4px">
+            Что учесть / исправить
+          </label>
+          <textarea id="lb-regen-wishes" rows="5"
+            placeholder="${esc(wishesPlaceholder)}">${esc(initialWishes)}</textarea>
+        </div>
+        ${!isOutfit ? `
+          <label class="cb">
+            <input type="checkbox" id="lb-regen-outfits" checked>
+            <span>Также перегенерировать все костюмы</span>
+          </label>
+        ` : ''}
+        <div id="lb-regen-status" class="lb-status"></div>
+        <button id="lb-regen-btn" class="btn-regen" onclick="${isOutfit
+            ? `regenerateOutfitFromLightbox('${cur.id}')`
+            : 'regenerateCharacterFromLightbox()'}">
+          ↻ Перегенерировать
+        </button>
+      </div>
+    </div>`;
+}
+
+function outfitLightboxNav(delta) {
+  const st = _outfitLightboxState;
+  if (!st || st.items.length < 2) return;
+  st.idx = (st.idx + delta + st.items.length) % st.items.length;
+  _renderOutfitLightbox();
+}
+
+async function regenerateOutfitFromLightbox(outfitId) {
+  const st = _outfitLightboxState;
+  if (!st) return;
+  const wishes = (document.getElementById('lb-regen-wishes')?.value || '').trim();
+  const btn = document.getElementById('lb-regen-btn');
+  const status = document.getElementById('lb-regen-status');
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ Генерирую...'; }
+  if (status) status.textContent = '';
+  try {
+    // Persist wishes onto the outfit's description so future i2i bakes them in.
+    if (wishes) {
+      await api.put(`/api/series/${S.seriesId}/characters/${st.charId}/outfits/${outfitId}`, {
+        description: wishes,
+      });
+    }
+    // Trigger generation (uses existing endpoint that the outfit row uses).
+    const r = await api.post(`/api/series/${S.seriesId}/characters/${st.charId}/outfits/${outfitId}/generate`, {});
+    if (r?.error) throw new Error(r.error);
+    // Refresh series state and re-render the lightbox with the new image.
+    const fresh = await api.get(`/api/series/${S.seriesId}`);
+    if (fresh) S.series = fresh;
+    if (typeof renderCharactersList === 'function') renderCharactersList();
+    if (typeof openCharAssets === 'function' && document.getElementById('modal-char-assets')?.classList.contains('open')) {
+      const c = S.series.characters.find(x => x.id === st.charId);
+      if (c) renderOutfitsList(c);
+    }
+    // Rebuild item list from fresh state and stay on the same outfit.
+    openOutfitLightbox(st.charId, outfitId);
+    if (status) status.textContent = '✓ Готово';
+  } catch (e) {
+    if (status) status.textContent = '✗ ' + (e?.message || e);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '↻ Перегенерировать'; }
+  }
 }
 
 // Character-photo lightbox: image + regenerate panel
@@ -2728,9 +2921,15 @@ function openCharLightbox(charId, url) {
 function closeLightbox() {
   const old = document.getElementById('lightbox-overlay');
   if (old) old.remove();
+  _outfitLightboxState = null;
 }
 document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape' && document.getElementById('lightbox-overlay')) closeLightbox();
+  if (!document.getElementById('lightbox-overlay')) return;
+  if (e.key === 'Escape') return closeLightbox();
+  if (_outfitLightboxState) {
+    if (e.key === 'ArrowLeft')  { e.preventDefault(); outfitLightboxNav(-1); }
+    if (e.key === 'ArrowRight') { e.preventDefault(); outfitLightboxNav(1);  }
+  }
 });
 
 async function regenerateCharacterFromLightbox() {
@@ -2823,7 +3022,7 @@ function renderOutfitsList(char) {
     const photoHtml = hasPhoto
       ? `<img src="${photoUrl}" alt="">`
       : `<div style="font-size:2.2rem">👗</div>`;
-    const photoClick = hasPhoto ? `onclick="openLightbox('${photoUrl}')"` : '';
+    const photoClick = hasPhoto ? `onclick="openOutfitLightbox('${char.id}','${o.id}')"` : '';
     return `
       <div class="outfit-card ${hasPhoto ? 'has-photo' : ''}" id="outfit-card-${o.id}">
         <div class="outfit-photo" ${photoClick}>${photoHtml}</div>
@@ -5451,7 +5650,7 @@ function renderEpLocations() {
            ondragleave="this.classList.remove('drop-hover')"
            ondrop="event.preventDefault();this.classList.remove('drop-hover');dropLocPhoto(event,'${l.id}')">
         <div class="ep-loc-thumb">
-          ${imgUrl ? `<img src="${imgUrl}" alt="">` : '📍'}
+          ${imgUrl ? `<img src="${imgUrl}" alt="" onerror="this.replaceWith(_brokenImagePlaceholder('${imgUrl}'))">` : '📍'}
         </div>
         <div class="ep-loc-name">
           <div class="ep-char-name-row">
@@ -5595,7 +5794,7 @@ function buildEpCharCard(c, inEpisode) {
            ondrop="event.preventDefault();this.classList.remove('drop-hover');dropCharPhoto(event,'${c.id}')"
            title="${photoUrl ? 'Открыть фото крупно (можно перегенерировать)' : ''}">
         ${photoUrl
-          ? `<img src="${photoUrl}" alt="${esc(c.name)}">`
+          ? `<img src="${photoUrl}" alt="${esc(c.name)}" onerror="this.replaceWith(_brokenImagePlaceholder('${photoUrl}'))">`
           : `<div class="no-photo">${primaryOutfit ? '👗' : '👤'}</div>`}
         <div class="ep-outfit-gen-status" id="ep-outfit-status-${c.id}" title=""
              style="position:absolute;bottom:0;left:0;right:0;max-height:32%;font-size:0.6rem;line-height:1.05;color:#fff;text-align:center;text-shadow:0 1px 2px rgba(0,0,0,0.9);background:rgba(0,0,0,0.55);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:1px 2px;"></div>
