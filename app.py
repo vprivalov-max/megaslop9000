@@ -53,12 +53,14 @@ def asset_name(*parts):
 # chunks in the script. Recognises BOTH formal (INT./EXT./ИНТ./...) AND inferred
 # headings (Локация:, СЦЕНА N, standalone ALL-CAPS slugs, [bracketed slugs])
 # so continuity logic survives in scripts that don't use INT./EXT.
+# `[\s*_#>]*` allows markdown decorators (**, __, #, >) before the cue.
+# Without it `**INT. RANCH HOUSE — MORNING**` silently fails detection.
 _SCENE_HEADING_FORMAL_RE = re.compile(
-    r'^\s*(INT\.|EXT\.|INT\.?\s*/\s*EXT\.?|I/E\.|ИНТ\.|ИНТА\.|ЭКСТ\.|ЭКС\.|НАТ\.|НАТУРА\.|ВНУТР\.|ИНТЕРЬЕР|ВНЕ\.|СНАРУЖИ)\s+',
+    r'^[\s*_#>]*(INT\.|EXT\.|INT\.?\s*/\s*EXT\.?|I/E\.|ИНТ\.|ИНТА\.|ЭКСТ\.|ЭКС\.|НАТ\.|НАТУРА\.|ВНУТР\.|ИНТЕРЬЕР|ВНЕ\.|СНАРУЖИ)\s+',
     re.IGNORECASE,
 )
 _SCENE_HEADING_INFER_RE = re.compile(
-    r'^\s*(Локация\s*[:：]|Location\s*[:：]|СЦЕНА\s*\d|Сцена\s*\d|SCENE\s*\d)',
+    r'^[\s*_#>]*(Локация\s*[:：]|Location\s*[:：]|СЦЕНА\s*\d|Сцена\s*\d|SCENE\s*\d)',
     re.IGNORECASE,
 )
 _SLUG_BLOCKLIST_RE = re.compile(
@@ -177,11 +179,29 @@ def _save_user_keys(email, keys):
     }
     p.write_text(json.dumps(safe, indent=2))
 
+# Thread-local override for background workers spawned outside Flask request
+# context. When a request handler spawns a daemon thread, Flask's `session` is
+# torn down by the time the thread runs, so `current_user_email()` raises and
+# `_get_user_*_key()` would silently return '' → AVAI/Reteller hit with empty
+# x-api-key → 401 or hang. The fix: capture the keys in the request handler
+# (where session IS alive) via `_capture_user_keys()` and run the thread body
+# through `_spawn_with_keys()`, which sets these thread-locals before invoking
+# the target. The getters below check the override first.
+_thread_keys = threading.local()
+
 def _get_user_avai_key():
     """Returns AVAI key for the current request's user. Falls back to global env
     only for the PRIMARY_USER_EMAIL (operator who set up the system) — every other
     user must enter their own key on first login. In dev mode (AUTH_ENABLED=False)
-    the local user gets the global env too — local dev shouldn't be gated."""
+    the local user gets the global env too — local dev shouldn't be gated.
+
+    Thread-local override: if a background worker was spawned via
+    `_spawn_with_keys()`, returns the captured key directly (any string,
+    including empty). This avoids touching `flask.session` outside request
+    context."""
+    override = getattr(_thread_keys, 'avai_key', None)
+    if override is not None:
+        return override
     try:
         email = current_user_email() or ''
     except Exception:
@@ -196,7 +216,11 @@ def _get_user_avai_key():
 
 def _get_user_reteller_key():
     """Returns Reteller key for the current request's user. Same fallback logic
-    as AVAI: PRIMARY_USER_EMAIL or dev mode falls back to global env."""
+    as AVAI: PRIMARY_USER_EMAIL or dev mode falls back to global env.
+    Honors `_thread_keys.reteller_key` for background workers."""
+    override = getattr(_thread_keys, 'reteller_key', None)
+    if override is not None:
+        return override
     try:
         email = current_user_email() or ''
     except Exception:
@@ -208,6 +232,34 @@ def _get_user_reteller_key():
         if email == PRIMARY_USER_EMAIL or not AUTH_ENABLED:
             return RETELLER_KEY
     return ''
+
+def _capture_user_keys():
+    """Snapshot the current user's keys so a background thread can use them
+    after the Flask request context is gone. MUST be called inside a request
+    handler (or another already-thread-local-scoped worker)."""
+    return {
+        'avai_key': _get_user_avai_key(),
+        'reteller_key': _get_user_reteller_key(),
+    }
+
+def _spawn_with_keys(target, *args, **kwargs):
+    """Spawn a daemon thread that runs `target(*args, **kwargs)` with the current
+    user's AVAI/Reteller keys propagated into thread-local storage. Returns the
+    Thread object. Use this anywhere you'd previously do
+    `threading.Thread(target=..., daemon=True).start()` for work that calls
+    AVAI/Reteller helpers."""
+    keys = _capture_user_keys()
+    def _runner():
+        _thread_keys.avai_key = keys['avai_key']
+        _thread_keys.reteller_key = keys['reteller_key']
+        try:
+            target(*args, **kwargs)
+        finally:
+            _thread_keys.avai_key = None
+            _thread_keys.reteller_key = None
+    t = threading.Thread(target=_runner, daemon=True)
+    t.start()
+    return t
 
 # All secrets are loaded once at startup. Env vars are the canonical source for
 # production; config.json is a dev-only convenience fallback.
@@ -3543,18 +3595,22 @@ def auto_generate_missing_assets(sid):
                 )
                 if pending > 0:
                     print(f'[autogen {sid}] {pending} new assets queued during sweep — re-running')
-                    threading.Thread(target=auto_generate_missing_assets, args=(sid,), daemon=True).start()
+                    # We're already inside a thread-local-scoped worker (spawned via
+                    # _spawn_with_keys), so _capture_user_keys() reads the propagated
+                    # keys and forwards them to the recursive sweep.
+                    _spawn_with_keys(auto_generate_missing_assets, sid)
         except Exception as e:
             print(f'[autogen {sid}] re-check failed: {e}')
 
 
 def trigger_autogen_if_enabled(sid):
-    """Public entry point: kick off background sweep if the series has auto_generate_assets on."""
+    """Public entry point: kick off background sweep if the series has auto_generate_assets on.
+    Uses _spawn_with_keys so AVAI calls inside the sweep have a valid x-api-key
+    after the request context tears down."""
     s = load_series(sid)
     if not s or not s.get('auto_generate_assets'):
         return False
-    t = threading.Thread(target=auto_generate_missing_assets, args=(sid,), daemon=True)
-    t.start()
+    _spawn_with_keys(auto_generate_missing_assets, sid)
     return True
 
 
@@ -3588,8 +3644,7 @@ def trigger_autogen_sweep(sid):
     if not s.get('auto_generate_assets'):
         s['auto_generate_assets'] = True
         save_series(sid, s)
-    t = threading.Thread(target=auto_generate_missing_assets, args=(sid,), daemon=True)
-    t.start()
+    _spawn_with_keys(auto_generate_missing_assets, sid)
     return jsonify({'started': True, 'status': _autogen_status(sid)})
 
 
@@ -6404,12 +6459,17 @@ def sync_episode_with_cast_block(sid, num):
     # We grab the middle slug (location name) and fuzzy-match against series.locations by name.
     locs = s.setdefault('locations', [])
     detected_loc_names = []
+    # Allow leading markdown decorators (**, __, #, >) before the INT./EXT. cue —
+    # writers sometimes emit `**INT. RANCH HOUSE — MORNING**` for visual emphasis,
+    # and the old regex silently dropped those whole headings, leaving the
+    # location un-tied to the episode.
     heading_re = re.compile(
-        r'^\s*(?:INT\.|EXT\.|ИНТА?\.|ЭКС?\.|INT/EXT\.|EXT/INT\.)\s*([^—\-\n]+?)\s*[—\-]',
+        r'^[\s*_#>]*(?:INT\.|EXT\.|ИНТА?\.|ЭКС?\.|INT/EXT\.|EXT/INT\.)\s*([^—\-\n]+?)\s*[—\-]',
         re.IGNORECASE | re.MULTILINE,
     )
     for m in heading_re.finditer(ep.get('script') or ''):
-        nm = m.group(1).strip().strip('"').strip("'")
+        # Strip trailing markdown closers (**, __) that may be on the last token
+        nm = m.group(1).strip().strip('"').strip("'").rstrip('*_').strip()
         # Strip leading time-of-day artefacts that sometimes leak into the name
         nm = re.sub(r'^(DAY|NIGHT|MORNING|EVENING|УТРО|НОЧЬ|ДЕНЬ|ВЕЧЕР)\s+', '', nm, flags=re.IGNORECASE).strip()
         if nm and nm.lower() not in (x.lower() for x in detected_loc_names):
@@ -7936,9 +7996,14 @@ def _extract_keyframes_at_cuts(sid, video_relpath, cut_timestamps, max_frames=3,
 
 def _avai_seedance_start(prompt, ref_urls, duration, resolution, moderation_bypass,
                           aspect_ratio='9:16', generate_audio=True,
-                          moderation_bypass_prompt=None):
+                          moderation_bypass_prompt=None, avai_key=None):
     """Kick off an async Seedance 2.0 reference-pro job.
-    Returns dict {job_id, status_url, raw}."""
+    Returns dict {job_id, status_url, raw}.
+
+    avai_key: REQUIRED when called from a background thread (no Flask request
+    context). Caller must resolve it via _get_user_avai_key() inside the request
+    handler and pass it explicitly. Falls back to _get_user_avai_key() only when
+    called inline from a request handler (image-style sync calls)."""
     payload = {
         'provider': 'seedance2',
         'model': 'reference-pro',
@@ -7955,7 +8020,10 @@ def _avai_seedance_start(prompt, ref_urls, duration, resolution, moderation_bypa
         payload['moderation_bypass'] = moderation_bypass
         if moderation_bypass_prompt:
             payload['moderation_bypass_prompt'] = moderation_bypass_prompt
-    headers = {'x-api-key': _get_user_avai_key(), 'content-type': 'application/json'}
+    key = avai_key if avai_key is not None else _get_user_avai_key()
+    if not key:
+        raise RuntimeError('AVAI seedance2 start: no API key (request context lost in background thread or user has no key configured)')
+    headers = {'x-api-key': key, 'content-type': 'application/json'}
     # Async mode: server returns 202 with job_id+status_url immediately
     resp = requests.post(
         AVAI_API + '?async=true', json=payload, headers=headers, timeout=(15, 240)
@@ -7974,9 +8042,11 @@ def _avai_seedance_start(prompt, ref_urls, duration, resolution, moderation_bypa
         raise RuntimeError(f'AVAI seedance2: no job_id in response: {str(data)[:300]}')
     return {'job_id': job_id, 'status_url': status_url, 'raw': data}
 
-def _avai_seedance_status(job_id, status_url=None):
-    """Poll job. Returns dict {status, progress, video_url, cost, error, raw}."""
-    headers = {'x-api-key': _get_user_avai_key()}
+def _avai_seedance_status(job_id, status_url=None, avai_key=None):
+    """Poll job. Returns dict {status, progress, video_url, cost, error, raw}.
+    avai_key: optional explicit override for callers outside request context."""
+    key = avai_key if avai_key is not None else _get_user_avai_key()
+    headers = {'x-api-key': key}
     url = status_url or f'https://avai-gen.com/api/public/generate/jobs/{job_id}'
     if url.startswith('/'):
         url = 'https://avai-gen.com' + url
@@ -10066,6 +10136,13 @@ def seedance_start(sid, num):
     # Kick off the AVAI call in a background thread so the UI gets the chunk
     # card instantly. The poll endpoint will then track job_id/status as soon
     # as the thread finishes the submission.
+    #
+    # CRITICAL: spawn via _spawn_with_keys so the per-user AVAI key is captured
+    # from the live Flask `session` and forwarded to the worker thread. Without
+    # this, _get_user_avai_key() inside the thread hits a torn-down request
+    # context, silently returns '', and AVAI gets `x-api-key: ` → on prod the
+    # request hangs until our 240s read timeout (videos die, images survive
+    # only because image calls are synchronous within the request handler).
     def _submit():
         try:
             job = _avai_seedance_start(
@@ -10106,7 +10183,7 @@ def seedance_start(sid, num):
                         break
                 save_episode(sid, num, ep2)
 
-    threading.Thread(target=_submit, daemon=True).start()
+    _spawn_with_keys(_submit)
     return jsonify({'chunk': chunk})
 
 @app.route('/api/series/<sid>/episodes/<int:num>/seedance/poll', methods=['POST'])
