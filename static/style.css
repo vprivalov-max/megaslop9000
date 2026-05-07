@@ -617,6 +617,69 @@ button { cursor: pointer; transition: all 0.15s; }
   font-size: 0.95rem; color: #fff;
 }
 
+/* ── Accept-script flow: progress banner + new-entities modal ── */
+.ep-accept-progress {
+  margin-top: 10px; padding: 12px 14px;
+  background: linear-gradient(135deg, rgba(16,185,129,0.12), rgba(5,150,105,0.06));
+  border: 1px solid rgba(16,185,129,0.45);
+  border-radius: 10px;
+}
+.ep-accept-progress.hidden { display: none; }
+.ep-accept-progress .eap-row {
+  display: flex; align-items: center; gap: 10px; font-size: 0.92rem;
+}
+.ep-accept-progress .eap-spinner {
+  width: 16px; height: 16px;
+  border: 2px solid rgba(16,185,129,0.5);
+  border-top-color: #10b981;
+  border-radius: 50%;
+  animation: spin 0.9s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+.ep-accept-progress .eap-now { color: var(--muted); margin-left: 6px; font-size: 0.85rem; }
+.ep-accept-progress .eap-hint {
+  margin-top: 6px; font-size: 0.78rem; color: #fbbf24;
+}
+.ep-accept-progress .eap-bar {
+  margin-top: 8px; height: 6px; background: rgba(255,255,255,0.08);
+  border-radius: 3px; overflow: hidden;
+}
+.ep-accept-progress .eap-bar-fill {
+  height: 100%; background: linear-gradient(90deg, #10b981, #34d399);
+  width: 0%; transition: width 0.4s ease;
+}
+
+/* New-entities modal grid: empty drop cards for chars/locs/items */
+.accept-modal-section {
+  margin-top: 14px;
+}
+.accept-modal-section h4 {
+  font-size: 0.92rem; margin: 0 0 8px 0; color: var(--text);
+}
+.accept-modal-grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 10px;
+}
+.accept-modal-cell {
+  border: 2px dashed var(--border); border-radius: 8px;
+  padding: 8px; min-height: 140px;
+  display: flex; flex-direction: column; align-items: center; gap: 6px;
+  background: var(--surface2);
+  transition: border-color 0.15s, background 0.15s;
+  cursor: pointer;
+}
+.accept-modal-cell.drop-hover { border-color: #10b981; background: rgba(16,185,129,0.08); }
+.accept-modal-cell .amc-thumb {
+  width: 100%; aspect-ratio: 9/16; background: var(--surface);
+  border-radius: 6px; display: flex; align-items: center; justify-content: center;
+  font-size: 1.8rem; overflow: hidden;
+}
+.accept-modal-cell .amc-thumb img { width: 100%; height: 100%; object-fit: cover; }
+.accept-modal-cell .amc-name { font-size: 0.82rem; text-align: center; word-break: break-word; }
+.accept-modal-cell .amc-status {
+  font-size: 0.72rem; color: var(--muted); text-align: center;
+}
+.accept-modal-cell.has-photo .amc-status { color: #10b981; }
+
 /* ── Broken-image placeholder (asset went missing) ── */
 .broken-image-placeholder {
   display: flex; flex-direction: column;

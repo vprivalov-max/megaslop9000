@@ -315,16 +315,31 @@
             <div style="display:flex;gap:6px;align-items:center">
               <button class="btn-ghost btn-sm" id="ep-history-btn" onclick="openScriptHistory()" title="Предыдущие версии сценария (после регенерации или Доктора)">↩ История</button>
               <button class="btn-ghost btn-sm" id="ep-doctor-btn" onclick="doctorScript()" title="Найти и исправить логические дыры в сценарии (статус персонажей, мотивации, enabling conditions)">🩺 Доктор сценария</button>
-              <button class="btn-ghost btn-sm" id="ep-extract-chars-btn" onclick="extractCharsFromScript()" title="Найти персонажей и локации в сценарии, добавить новые в сериал и пересверить активных в этой сцене">🤖 Извлечь персонажей и локации</button>
-              <button class="btn-ghost btn-sm" id="ep-scenes-btn" onclick="toggleSceneView()" title="Подсветить сцены и разбить на ~15-секундные сегменты для Seedance">🎬 Сцены</button>
+              <button class="btn-ghost btn-sm" id="ep-extract-chars-btn" onclick="extractCharsFromScript()" title="Только разбор без модалки: пересверить персонажей, локации, активные в сцене" style="opacity:0.6">🤖 Только разбор</button>
+              <button class="btn-ghost btn-sm" id="ep-scenes-btn" onclick="toggleSceneView()" title="Ручной переключатель в режим сцен (после Принять — открывается автоматом)" style="opacity:0.6">🎬 Сцены</button>
               <label style="display:inline-flex;align-items:center;gap:4px;font-size:0.78rem;color:var(--muted);cursor:pointer;margin-left:6px" title="Звуковой сигнал по завершению генерации сценария">
                 <input type="checkbox" id="ep-script-sounds" checked style="cursor:pointer;margin:0"> 🔔
               </label>
               <button class="ep-script-btn ready" id="ep-gen-script-btn" onclick="generateEpisodeScript()">⚡ Сгенерировать</button>
+              <button class="ep-script-btn ready" id="ep-accept-script-btn" onclick="acceptScript()" title="Сохранить сценарий, найти новых персонажей/локации/предметы, при необходимости показать модалку для drag-drop фоток, потом перейти в режим сцен и запустить автоген"
+                      style="background:linear-gradient(135deg,#10b981,#059669);color:#fff;font-weight:700">✅ Принять сценарий</button>
             </div>
           </div>
           <textarea id="ep-script" class="script-area" placeholder="Screenplay / Script..."></textarea>
           <div id="ep-script-scenes" class="ep-script-scenes hidden"></div>
+          <!-- Generation progress banner — appears during autogen sweep. -->
+          <div id="ep-accept-progress" class="ep-accept-progress hidden">
+            <div class="eap-row">
+              <span class="eap-spinner"></span>
+              <span class="eap-text">
+                <strong>Генерируем ассеты:</strong>
+                <span id="eap-counter">0 / 0</span>
+                <span class="eap-now" id="eap-now"></span>
+              </span>
+            </div>
+            <div class="eap-hint">⚠ Не запускай новые генерации (Reteller / Seedance / chars / locs) пока этот процесс не завершится — можно поломать ссылки.</div>
+            <div class="eap-bar"><div class="eap-bar-fill" id="eap-bar-fill"></div></div>
+          </div>
           <div class="char-counter" style="display:flex;justify-content:space-between;align-items:center;gap:8px">
             <span id="ep-script-gen-status" style="font-size:0.78rem;color:var(--warning);flex:1"></span>
             <button class="btn-ghost btn-sm" id="ep-script-apply-btn" onclick="applyScriptChanges()" title="Сохранить ручные правки сценария на диск" style="display:none">💾 Применить изменения</button>
