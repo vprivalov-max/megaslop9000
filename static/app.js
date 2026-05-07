@@ -3872,7 +3872,7 @@ function _renderScenesHTML(scenes, coverage = []) {
         : '🎬 Сгенерировать всю серию в Seedance'}
     </button>
     <span class="auto-mode-kind" title="Переключатель режима генерации. Наведи на ⓘ для подробностей.">
-      <label title="${esc(seqTip)}"><input type="radio" name="auto-mode-kind" ${autoMode === 'sequential' ? 'checked' : ''} onchange="_autoSaveModeKind('sequential')"> 🐢 Последовательно</label>
+      <label title="${esc(seqTip)}"><input type="radio" name="auto-mode-kind" ${autoMode === 'sequential' ? 'checked' : ''} onchange="_autoSaveModeKind('sequential')"> 🐢 Последовательно <span style="color:var(--success,#10b981);font-weight:600">(рекомендуется)</span></label>
       <label title="${esc(turboTip)}"><input type="radio" name="auto-mode-kind" ${autoMode === 'turbo' ? 'checked' : ''} onchange="_autoSaveModeKind('turbo')"> ⚡ Турбо</label>
     </span>
     <span class="auto-err-mode" title="Что делать если Seedance вернёт moderation error">
