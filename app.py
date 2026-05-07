@@ -1189,14 +1189,19 @@ def rtl_headers():
     return {'Authorization': f'Bearer {_get_user_reteller_key()}'}
 
 def _avai_call(provider: str, prompt: str, reference_url: str = None, aspect_ratio: str = '9:16') -> str:
-    """One AVAI call with the given provider. Returns image URL or raises."""
+    """One AVAI call with the given provider. Returns image URL or raises.
+    Generates at 1K JPEG instead of 2K PNG — character/location refs are
+    used by Seedance internally, which downscales them anyway. 2K PNG was
+    bloating each asset to 4-7MB, killing disk + bandwidth on the prod
+    volume. 1K JPEG ≈ 200-500KB with no visible quality loss for ref usage.
+    """
     payload = {
         'provider': provider,
         'prompt': prompt,
         'num_images': 1,
         'aspect_ratio': aspect_ratio,
-        'image_size': '2K',
-        'output_format': 'png',
+        'image_size': '1K',
+        'output_format': 'jpg',
     }
     if provider == 'banana':
         payload['model'] = 'pro'
@@ -2011,7 +2016,7 @@ def create_series():
             'no_fades':             True,
             'multi_voice':          False,
             'enable_subtitles':     False,
-            'image_size':           '2K'
+            'image_size':           '1K'
         }
     }
     save_series(sid, series_data)
@@ -7670,7 +7675,7 @@ def reteller_submit(sid):
             'ttsProvider':         merged.get('tts_provider', 'elevenlabs'),
             # Style block
             'style':               s['style'].get('type', 'cinematic'),
-            'imageSize':           merged.get('image_size', '2K'),
+            'imageSize':           merged.get('image_size', '1K'),
         }
         if merged.get('elevenlabs_voice_id'):
             settings_payload['elevenlabsVoiceId'] = merged['elevenlabs_voice_id']
