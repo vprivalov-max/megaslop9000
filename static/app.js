@@ -4142,8 +4142,15 @@ function _renderScenesHTML(scenes, coverage = []) {
         : '🎬 Сгенерировать всю серию в Seedance'}
     </button>
     <span class="auto-mode-kind" title="Переключатель режима генерации. Наведи на ⓘ для подробностей.">
-      <label title="${esc(seqTip)}"><input type="radio" name="auto-mode-kind" ${autoMode === 'sequential' ? 'checked' : ''} onchange="_autoSaveModeKind('sequential')"> 🐢 Последовательно <span style="color:var(--success,#10b981);font-weight:600">(рекомендуется)</span></label>
-      <label title="${esc(turboTip)}"><input type="radio" name="auto-mode-kind" ${autoMode === 'turbo' ? 'checked' : ''} onchange="_autoSaveModeKind('turbo')"> ⚡ Турбо</label>
+      <label class="auto-mode-radio recommended" title="${esc(seqTip)}">
+        <input type="radio" name="auto-mode-kind" ${autoMode === 'sequential' ? 'checked' : ''} onchange="_autoSaveModeKind('sequential')">
+        <span class="amr-text">🐢 Последовательно</span>
+        <span class="amr-rec">★ рекомендуется</span>
+      </label>
+      <label class="auto-mode-radio" title="${esc(turboTip)}">
+        <input type="radio" name="auto-mode-kind" ${autoMode === 'turbo' ? 'checked' : ''} onchange="_autoSaveModeKind('turbo')">
+        <span class="amr-text">⚡ Турбо</span>
+      </label>
     </span>
     <span class="auto-err-mode" title="Что делать если Seedance вернёт moderation error">
       <label><input type="radio" name="auto-err" id="auto-error-mode-heal" ${autoErr === 'heal' ? 'checked' : ''} onchange="_autoSaveErrMode('heal')"> 🩹 Авто-лечение</label>
