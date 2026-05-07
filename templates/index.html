@@ -743,20 +743,29 @@
         <label>Название *</label>
         <input id="new-series-title" type="text" placeholder="Название сериала">
       </div>
-      <div class="two-col">
-        <div class="field-group">
-          <label>Жанр</label>
-          <input id="new-series-genre" type="text" placeholder="Романтика, Триллер...">
+      <!-- Жанр / Тон / Целевая аудитория — спрятаны под disclosure: чаще
+           всего эти поля заполняются AI после "Сгенерировать по идее" и
+           юзеру нет смысла их видеть в первую очередь. Заголовок-аккордеон
+           разворачивает блок если нужно отредактировать вручную. -->
+      <details class="advanced-fields" style="margin:6px 0">
+        <summary style="cursor:pointer;font-size:0.86rem;color:var(--muted);user-select:none;padding:6px 0">
+          ⚙ Дополнительно: жанр, тон, аудитория
+        </summary>
+        <div class="two-col" style="margin-top:6px">
+          <div class="field-group">
+            <label>Жанр</label>
+            <input id="new-series-genre" type="text" placeholder="Романтика, Триллер...">
+          </div>
+          <div class="field-group">
+            <label>Тон</label>
+            <input id="new-series-tone" type="text" placeholder="Драматичный, Мистический...">
+          </div>
         </div>
         <div class="field-group">
-          <label>Тон</label>
-          <input id="new-series-tone" type="text" placeholder="Драматичный, Мистический...">
+          <label>Целевая аудитория</label>
+          <input id="new-series-audience" type="text" placeholder="Женщины 25-35, TikTok...">
         </div>
-      </div>
-      <div class="field-group">
-        <label>Целевая аудитория</label>
-        <input id="new-series-audience" type="text" placeholder="Женщины 25-35, TikTok...">
-      </div>
+      </details>
       <div class="field-group">
         <label>Описание мира</label>
         <textarea id="new-series-world" placeholder="Кратко о сеттинге, времени действия..."></textarea>

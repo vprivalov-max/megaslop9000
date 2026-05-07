@@ -702,8 +702,8 @@ async function generateFromIdea() {
 }
 
 const GENRES = [
-  { value: 'Romance',          label: 'Romance',          checked: true,  desc: 'Любовная история с эмоциональным напряжением, притяжением и препятствиями между героями. Сердце — отношения.' },
-  { value: 'Revenge Drama',    label: 'Revenge',          checked: true,  desc: 'Главная героиня была унижена или предана — и теперь методично разрушает жизни обидчиков. Катарсис через справедливость.' },
+  { value: 'Romance',          label: 'Romance',          checked: false, desc: 'Любовная история с эмоциональным напряжением, притяжением и препятствиями между героями. Сердце — отношения.' },
+  { value: 'Revenge Drama',    label: 'Revenge',          checked: false, desc: 'Главная героиня была унижена или предана — и теперь методично разрушает жизни обидчиков. Катарсис через справедливость.' },
   { value: 'Cinderella',       label: 'Cinderella',       checked: false, desc: 'Девушка из низов попадает в мир богатых и влиятельных. Классический подъём через любовь, случай или скрытый талант.' },
   { value: 'Enemies to Lovers',label: 'Enemies→Lovers',  checked: false, desc: 'Герои ненавидят друг друга с первой сцены — и именно это притяжение переходит в страсть. Медленное горение.' },
   { value: 'Thriller',         label: 'Thriller',         checked: false, desc: 'Постоянное напряжение, угроза жизни или тайна, которую надо раскрыть. Зритель всегда на краю.' },
