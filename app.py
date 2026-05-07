@@ -1336,6 +1336,18 @@ def avai_generate(prompt: str, output_path: Path, reference_url: str = None, asp
     img_resp.raise_for_status()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_bytes(img_resp.content)
+    # Lazy migration: AVAI returns 1K JPEG (output_format=jpg), so legacy .png
+    # files at the same stem are stale 2K PNG (or older mis-named JPEGs) and
+    # should be cleaned up to avoid (a) wasting disk on prod volume and
+    # (b) confusing tools that pick the .png by alphabetical sort. Only purge
+    # when we just wrote .jpg — never the other way.
+    if output_path.suffix.lower() in ('.jpg', '.jpeg'):
+        legacy_png = output_path.with_suffix('.png')
+        if legacy_png.exists() and legacy_png != output_path:
+            try:
+                legacy_png.unlink()
+            except Exception as e:
+                print(f'[avai_generate] could not remove legacy {legacy_png}: {e}')
     return image_url
 
 def allowed_file(filename):
@@ -3103,7 +3115,7 @@ def generate_outfit_image(sid, char_id, outfit_id):
 
     char_slug = slugify(char['name'])
     out_dir = assets_dir(sid) / 'characters' / char_slug / 'outfits'
-    out_path = out_dir / f'{asset_name(char["name"], outfit["label"])}.png'
+    out_path = out_dir / f'{asset_name(char["name"], outfit["label"])}.jpg'
 
     try:
         image_url = avai_generate(prompt, out_path, reference_url=reference_url)
@@ -3193,14 +3205,14 @@ def generate_character_image(sid, char_id):
 
     char_slug = slugify(char['name'])
     char_dir = assets_dir(sid) / 'characters' / char_slug
-    out_path = char_dir / f'{asset_name(char["name"], "BASE")}.png'
+    out_path = char_dir / f'{asset_name(char["name"], "BASE")}.jpg'
 
     try:
         image_url = avai_generate(prompt, out_path)
         rel_path = str(out_path.relative_to(series_path(sid)))
         refs = char.setdefault('ref_images', [])
         # Replace or prepend
-        refs[:] = [r for r in refs if not r.endswith(out_path.name)]
+        refs[:] = [r for r in refs if Path(r).stem != out_path.stem]
         refs.insert(0, rel_path)
         # Store remote URL for i2i outfit variants later
         char['avai_base_url'] = image_url
@@ -3245,7 +3257,7 @@ def regenerate_character(sid, char_id):
     char_slug = slugify(char['name'])
     char_dir = assets_dir(sid) / 'characters' / char_slug
     char_dir.mkdir(parents=True, exist_ok=True)
-    out_path = char_dir / f'{asset_name(char["name"], "BASE")}.png'
+    out_path = char_dir / f'{asset_name(char["name"], "BASE")}.jpg'
 
     # 1) Regenerate base
     try:
@@ -3262,7 +3274,7 @@ def regenerate_character(sid, char_id):
     rel_path = str(out_path.relative_to(series_path(sid)))
     refs = char.setdefault('ref_images', [])
     # Replace any prior copy of this filename, then put fresh one first
-    refs[:] = [r for r in refs if not r.endswith(out_path.name)]
+    refs[:] = [r for r in refs if Path(r).stem != out_path.stem]
     refs.insert(0, rel_path)
     char['avai_base_url'] = image_url
 
@@ -3298,7 +3310,7 @@ def regenerate_character(sid, char_id):
                 ref_prompt = re.sub(r'\s+', ' ', ref_prompt).strip()
                 outfit_dir = char_dir / 'outfits'
                 outfit_dir.mkdir(parents=True, exist_ok=True)
-                outfit_out = outfit_dir / f'{asset_name(char["name"], outfit["label"])}.png'
+                outfit_out = outfit_dir / f'{asset_name(char["name"], outfit["label"])}.jpg'
                 # Remove old generated photo before regen so we don't leave orphans
                 if outfit.get('photo'):
                     old_full = series_path(sid) / outfit['photo']
@@ -3466,13 +3478,13 @@ def generate_location_image(sid, loc_id):
 
     loc_slug = slugify(loc['name'])
     loc_dir = assets_dir(sid) / 'locations' / loc_slug
-    out_path = loc_dir / f'{asset_name(loc["name"])}.png'
+    out_path = loc_dir / f'{asset_name(loc["name"])}.jpg'
 
     try:
         image_url = avai_generate(prompt, out_path, aspect_ratio='16:9')
         rel_path = str(out_path.relative_to(series_path(sid)))
         refs = loc.setdefault('ref_images', [])
-        refs[:] = [r for r in refs if not r.endswith(out_path.name)]
+        refs[:] = [r for r in refs if Path(r).stem != out_path.stem]
         refs.insert(0, rel_path)
         loc['avai_url'] = image_url  # used by Seedance for video refs
         save_series(sid, s)
@@ -3506,7 +3518,7 @@ def regenerate_location(sid, loc_id):
     loc_slug = slugify(loc['name'])
     loc_dir = assets_dir(sid) / 'locations' / loc_slug
     loc_dir.mkdir(parents=True, exist_ok=True)
-    out_path = loc_dir / f'{asset_name(loc["name"])}.png'
+    out_path = loc_dir / f'{asset_name(loc["name"])}.jpg'
     try:
         if out_path.exists():
             try: out_path.unlink()
@@ -3514,7 +3526,7 @@ def regenerate_location(sid, loc_id):
         image_url = avai_generate(prompt, out_path, aspect_ratio='16:9')
         rel_path = str(out_path.relative_to(series_path(sid)))
         refs = loc.setdefault('ref_images', [])
-        refs[:] = [r for r in refs if not r.endswith(out_path.name)]
+        refs[:] = [r for r in refs if Path(r).stem != out_path.stem]
         refs.insert(0, rel_path)
         loc['avai_url'] = image_url
         save_series(sid, s)
@@ -3610,7 +3622,7 @@ def generate_item_image(sid, item_id):
 
     item_slug = slugify(item['name'])
     item_dir = assets_dir(sid) / 'items' / item_slug
-    out_path = item_dir / f'{asset_name(item["name"])}.png'
+    out_path = item_dir / f'{asset_name(item["name"])}.jpg'
 
     try:
         # Items use square aspect — works as a portable reference for both
@@ -3618,7 +3630,7 @@ def generate_item_image(sid, item_id):
         image_url = avai_generate(prompt, out_path, aspect_ratio='1:1')
         rel_path = str(out_path.relative_to(series_path(sid)))
         refs = item.setdefault('ref_images', [])
-        refs[:] = [r for r in refs if not r.endswith(out_path.name)]
+        refs[:] = [r for r in refs if Path(r).stem != out_path.stem]
         refs.insert(0, rel_path)
         item['avai_url'] = image_url  # used by Seedance for video refs
         save_series(sid, s)
@@ -3651,7 +3663,7 @@ def regenerate_item(sid, item_id):
     item_slug = slugify(item['name'])
     item_dir = assets_dir(sid) / 'items' / item_slug
     item_dir.mkdir(parents=True, exist_ok=True)
-    out_path = item_dir / f'{asset_name(item["name"])}.png'
+    out_path = item_dir / f'{asset_name(item["name"])}.jpg'
     try:
         if out_path.exists():
             try: out_path.unlink()
@@ -3659,7 +3671,7 @@ def regenerate_item(sid, item_id):
         image_url = avai_generate(prompt, out_path, aspect_ratio='1:1')
         rel_path = str(out_path.relative_to(series_path(sid)))
         refs = item.setdefault('ref_images', [])
-        refs[:] = [r for r in refs if not r.endswith(out_path.name)]
+        refs[:] = [r for r in refs if Path(r).stem != out_path.stem]
         refs.insert(0, rel_path)
         item['avai_url'] = image_url
         save_series(sid, s)
@@ -3812,7 +3824,7 @@ def _gen_char_base_inline(s, sid, char):
     )
     prompt = re.sub(r'\s+', ' ', prompt).strip()
     char_slug = slugify(char['name'])
-    out_path = assets_dir(sid) / 'characters' / char_slug / f'{asset_name(char["name"], "BASE")}.png'
+    out_path = assets_dir(sid) / 'characters' / char_slug / f'{asset_name(char["name"], "BASE")}.jpg'
     image_url = avai_generate(prompt, out_path)
     rel_path = str(out_path.relative_to(series_path(sid)))
     char.setdefault('ref_images', []).insert(0, rel_path)
@@ -3863,7 +3875,7 @@ def _gen_outfit_inline(s, sid, char, outfit):
     )
     prompt = re.sub(r'\s+', ' ', prompt).strip()
     char_slug = slugify(char['name'])
-    out_path = assets_dir(sid) / 'characters' / char_slug / 'outfits' / f'{asset_name(char["name"], outfit["label"])}.png'
+    out_path = assets_dir(sid) / 'characters' / char_slug / 'outfits' / f'{asset_name(char["name"], outfit["label"])}.jpg'
     image_url = avai_generate(prompt, out_path, reference_url=reference_url)
     outfit['photo'] = str(out_path.relative_to(series_path(sid)))
     outfit['avai_url'] = image_url
@@ -3887,7 +3899,7 @@ def _gen_loc_inline(s, sid, loc):
     )
     prompt = re.sub(r'\s+', ' ', prompt).strip()
     loc_slug = slugify(loc['name'])
-    out_path = assets_dir(sid) / 'locations' / loc_slug / f'{asset_name(loc["name"])}.png'
+    out_path = assets_dir(sid) / 'locations' / loc_slug / f'{asset_name(loc["name"])}.jpg'
     image_url = avai_generate(prompt, out_path, aspect_ratio='16:9')
     loc.setdefault('ref_images', []).insert(0, str(out_path.relative_to(series_path(sid))))
 
@@ -3916,7 +3928,7 @@ def _gen_item_inline(s, sid, item):
     )
     prompt = re.sub(r'\s+', ' ', prompt).strip()
     item_slug = slugify(item['name'])
-    out_path = assets_dir(sid) / 'items' / item_slug / f'{asset_name(item["name"])}.png'
+    out_path = assets_dir(sid) / 'items' / item_slug / f'{asset_name(item["name"])}.jpg'
     image_url = avai_generate(prompt, out_path, aspect_ratio='1:1')
     rel_path = str(out_path.relative_to(series_path(sid)))
     item.setdefault('ref_images', []).insert(0, rel_path)
