@@ -7807,6 +7807,20 @@ const Sounds = (() => {
     if (!isHitmarkerEnabled()) return;
     _playSample('/static/sounds/noscoped.mp3', 0.95);
   }
+  // "OH MY GOD" — plays on the 2nd kill of a DOUBLE event (1/25 spawn).
+  // File path is the standard /static/sounds/omg.mp3 — drop the asset there
+  // when ready. Gracefully no-ops if the file 404s (Sounds._playSample's
+  // try/catch handles that already).
+  function playOmg() {
+    if (!isHitmarkerEnabled()) return;
+    _playSample('/static/sounds/omg.mp3', 1.0);
+  }
+  // "WOBO COMBO" — plays starting on the 2nd kill of a WOBO event (1/100).
+  // Loops through the rest of the chain (5 → 2 → 1 spawns) as ambience.
+  function playWoboCombo() {
+    if (!isHitmarkerEnabled()) return;
+    _playSample('/static/sounds/wobo-combo.mp3', 1.0);
+  }
   function isHitmarkerEnabled() {
     return localStorage.getItem('mlg_hitmarker_enabled') === '1';
   }
@@ -7816,6 +7830,7 @@ const Sounds = (() => {
   return { playSuccess, playError, playFanfare, speak,
            isEnabled, setEnabled, isVoiceEnabled, setVoiceEnabled,
            playHitmarker, playGunshot, playTriple, playWow, playDamnSon, playNoScoped,
+           playOmg, playWoboCombo,
            isHitmarkerEnabled, setHitmarkerEnabled };
 })();
 
@@ -7873,8 +7888,13 @@ function _scheduleSnoop() {
       _snoopSpawnTimer = setTimeout(tick, 5000);  // re-check soon
       return;
     }
-    // Don't spawn if one is already on screen
-    if (!document.querySelector('.mlg-snoop')) _spawnSnoop();
+    // Don't spawn if one is already on screen. _rollAndSpawn (defined below)
+    // rolls the rare-combo dice (1/100 wobo, 1/25 double) and falls through
+    // to a regular single spawn otherwise.
+    if (!document.querySelector('.mlg-snoop')) {
+      if (typeof _rollAndSpawn === 'function') _rollAndSpawn();
+      else _spawnSnoop();
+    }
     const nextDelay = 25000 + Math.random() * 35000;   // 25-60s
     _snoopSpawnTimer = setTimeout(tick, nextDelay);
   };
@@ -8033,13 +8053,86 @@ const _MLG_SKINS = [
   { kind: 'frog',  src: '/static/img/frog.gif',  width: 110 },
 ];
 
-function _spawnSnoop() {
+// ── Combo events (1-in-N rare spawns) ───────────────────────────────────────
+// Each combo has its own state object stored under a unique id; per-target
+// click handlers consult the state to know whether to trigger follow-up
+// spawns / play combo-specific announcer sounds.
+//
+//   DOUBLE  (1/25):  2 spawn → after 2nd kill: "OH MY GOD" + 1 more spawns
+//   WOBO    (1/100): 3 spawn → "WOBO COMBO" sound starts on 2nd kill →
+//                    after all 3 killed: 2 spawn → after both killed:
+//                    1 final spawn
+//
+// State: { type, killsInWave, totalInWave, wavesRemaining, soundStarted }
+const _MLG_COMBOS = {};
+
+function _spawnCombo(type) {
+  const id = `${type}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+  if (type === 'double') {
+    _MLG_COMBOS[id] = { type, kills: 0, total: 2, followUpQueued: false };
+    for (let i = 0; i < 2; i++) {
+      setTimeout(() => _spawnSnoop({ comboId: id }), i * 120);
+    }
+    _spawnMlgVoiceText('DOUBLE SPAWN!');
+  } else if (type === 'wobo') {
+    _MLG_COMBOS[id] = { type, kills: 0, total: 3, stage: 1, soundStarted: false };
+    for (let i = 0; i < 3; i++) {
+      setTimeout(() => _spawnSnoop({ comboId: id }), i * 120);
+    }
+    _spawnMlgVoiceText('★ WOBO COMBO ★');
+  }
+}
+
+function _onComboKill(combo, comboId) {
+  if (!combo) return;
+  combo.kills += 1;
+  // ── DOUBLE event: 2 → +1 ────────────────────────────────────────────────
+  if (combo.type === 'double') {
+    if (combo.kills === 2 && !combo.followUpQueued) {
+      combo.followUpQueued = true;
+      // OMG sound + followup spawn appears suddenly (300ms gap).
+      setTimeout(() => { Sounds.playOmg(); _spawnMlgVoiceText('OH MY GOD!'); }, 100);
+      setTimeout(() => _spawnSnoop({ comboId }), 300);
+      combo.total = 3;
+    }
+    if (combo.kills >= 3) delete _MLG_COMBOS[comboId];
+  }
+  // ── WOBO event: 3 → 2 → 1 ──────────────────────────────────────────────
+  else if (combo.type === 'wobo') {
+    // Sound kicks in on 2nd kill of the FIRST wave (3 spawns), keeps playing.
+    if (combo.stage === 1 && combo.kills === 2 && !combo.soundStarted) {
+      combo.soundStarted = true;
+      Sounds.playWoboCombo();
+    }
+    if (combo.stage === 1 && combo.kills >= 3) {
+      // Wave 1 cleared → spawn wave 2 (2 targets).
+      combo.stage = 2; combo.kills = 0; combo.total = 2;
+      setTimeout(() => _spawnMlgVoiceText('+2 INCOMING!'), 100);
+      for (let i = 0; i < 2; i++) {
+        setTimeout(() => _spawnSnoop({ comboId }), 250 + i * 120);
+      }
+    } else if (combo.stage === 2 && combo.kills >= 2) {
+      // Wave 2 cleared → spawn wave 3 (1 target, the finale).
+      combo.stage = 3; combo.kills = 0; combo.total = 1;
+      setTimeout(() => _spawnMlgVoiceText('FINISH HIM!'), 100);
+      setTimeout(() => _spawnSnoop({ comboId }), 300);
+    } else if (combo.stage === 3 && combo.kills >= 1) {
+      // Combo complete.
+      _spawnMlgVoiceText('★ WOBO MASTER ★');
+      delete _MLG_COMBOS[comboId];
+    }
+  }
+}
+
+function _spawnSnoop(opts = {}) {
+  const comboId = opts.comboId || null;
   // Pick a random skin from the pool — same kill-logic for all of them.
   const skin = _MLG_SKINS[Math.floor(Math.random() * _MLG_SKINS.length)];
   const sn = document.createElement('img');
   sn.src = skin.src;
   sn.className = 'mlg-snoop';
   sn.dataset.kind = skin.kind;
+  if (comboId) sn.dataset.comboId = comboId;
   sn.alt = skin.kind;
   sn.style.width = (skin.width || 110) + 'px';
   // Random position — keep him fully on-screen, away from edges
@@ -8053,30 +8146,37 @@ function _spawnSnoop() {
     Sounds.playGunshot();
     _spawnHitmarkerVisual(e.clientX, e.clientY);
     const kills = _bumpMlgKill(skin.kind);
-    // Kill announcer logic — sound + matching text overlay:
-    //   - kill #3 (first triple in player's history): GUARANTEED TRIPLE
-    //   - subsequent 3-kill milestones (#6, #9, ...): 35% chance of TRIPLE
-    //   - otherwise: 32% chance of random voice line (WOW / DAMN SON / NO-SCOPED)
-    //   Each voice cue spawns matching big-text overlay so phrase is heard AND seen.
+
+    // Combo-event hook: drives DOUBLE / WOBO follow-up spawns and sounds.
+    // Suppresses the regular voice-line lottery so combo announcer voices
+    // don't talk over each other.
+    let suppressRegularAnnouncer = false;
+    if (comboId && _MLG_COMBOS[comboId]) {
+      _onComboKill(_MLG_COMBOS[comboId], comboId);
+      suppressRegularAnnouncer = true;
+    }
+
+    // Kill announcer logic — sound + matching text overlay (skipped during combo):
     let played = false;
-    if (kills === 3) {
-      setTimeout(() => { Sounds.playTriple(); _spawnMlgVoiceText('TRIPLE!!!'); }, 180);
-      played = true;
-    } else if (kills > 3 && kills % 3 === 0 && Math.random() < 0.35) {
-      setTimeout(() => { Sounds.playTriple(); _spawnMlgVoiceText('TRIPLE!!!'); }, 180);
-      played = true;
+    if (!suppressRegularAnnouncer) {
+      if (kills === 3) {
+        setTimeout(() => { Sounds.playTriple(); _spawnMlgVoiceText('TRIPLE!!!'); }, 180);
+        played = true;
+      } else if (kills > 3 && kills % 3 === 0 && Math.random() < 0.35) {
+        setTimeout(() => { Sounds.playTriple(); _spawnMlgVoiceText('TRIPLE!!!'); }, 180);
+        played = true;
+      }
+      if (!played && Math.random() < 0.32) {
+        const voiceLines = [
+          { play: Sounds.playWow,      text: 'WOW!!!' },
+          { play: Sounds.playDamnSon,  text: 'DAMN SON!!' },
+          { play: Sounds.playNoScoped, text: 'NO SCOPED!!' },
+        ];
+        const pick = voiceLines[Math.floor(Math.random() * voiceLines.length)];
+        setTimeout(() => { pick.play(); _spawnMlgVoiceText(pick.text); }, 220);
+      }
     }
-    if (!played && Math.random() < 0.32) {
-      // Voice-line + matching text-overlay pairs (50/50 across pool).
-      const voiceLines = [
-        { play: Sounds.playWow,      text: 'WOW!!!' },
-        { play: Sounds.playDamnSon,  text: 'DAMN SON!!' },
-        { play: Sounds.playNoScoped, text: 'NO SCOPED!!' },
-      ];
-      const pick = voiceLines[Math.floor(Math.random() * voiceLines.length)];
-      setTimeout(() => { pick.play(); _spawnMlgVoiceText(pick.text); }, 220);
-    }
-    // Round-number milestone overlay — every 5 kills.
+    // Round-number milestone overlay — every 5 kills (always shown, even mid-combo).
     if (kills > 0 && kills % 5 === 0) {
       _spawnMlgMilestone(kills);
     }
@@ -8084,16 +8184,32 @@ function _spawnSnoop() {
     setTimeout(() => sn.remove(), 280);
   }, { once: false });
   document.body.appendChild(sn);
-  // Auto-despawn after 12s if user ignores him
+  // Auto-despawn after 12s if user ignores him. Combo targets get 18s grace
+  // because the user might be busy clicking siblings.
+  const despawnMs = comboId ? 18000 : 12000;
   setTimeout(() => {
     if (sn.parentNode) {
       sn.classList.add('mlg-snoop-fade');
       setTimeout(() => sn.remove(), 600);
     }
-  }, 12000);
+  }, despawnMs);
 }
 
-// Kick off the schedule once the page is interactive
+// Roll the spawn — most ticks produce a single target, but rare events
+// upgrade to a multi-spawn combo. Probabilities tuned per user spec:
+//   1/100 = WOBO COMBO   (3 → 2 → 1 chain)
+//   1/25  = DOUBLE       (2 → +1 with OMG)
+//   else  = single target
+function _rollAndSpawn() {
+  const r = Math.random();
+  if (r < 0.01)      _spawnCombo('wobo');
+  else if (r < 0.05) _spawnCombo('double');
+  else               _spawnSnoop();
+}
+
+// Kick off the schedule once the page is interactive. _scheduleSnoop()
+// invokes _rollAndSpawn() defined above — JS function declarations are
+// hoisted within the same scope so the order is fine.
 if (document.readyState !== 'loading') _scheduleSnoop();
 else document.addEventListener('DOMContentLoaded', _scheduleSnoop);
 
