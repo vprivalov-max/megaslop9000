@@ -5649,7 +5649,9 @@ function renderEpLocations() {
            ondragover="event.preventDefault();this.classList.add('drop-hover')"
            ondragleave="this.classList.remove('drop-hover')"
            ondrop="event.preventDefault();this.classList.remove('drop-hover');dropLocPhoto(event,'${l.id}')">
-        <div class="ep-loc-thumb">
+        <div class="ep-loc-thumb"
+             ${imgUrl ? `onclick="event.stopPropagation();openLocLightbox('${l.id}','${imgUrl}')" style="cursor:zoom-in"
+                         title="Открыть локацию (можно перегенерировать с пожеланиями)"` : ''}>
           ${imgUrl ? `<img src="${imgUrl}" alt="" onerror="this.replaceWith(_brokenImagePlaceholder('${imgUrl}'))">` : '📍'}
         </div>
         <div class="ep-loc-name">
