@@ -490,6 +490,18 @@
         <div id="ep-locations-list" class="ep-locations-check"></div>
       </div>
 
+      <div class="sidebar-section">
+        <div class="sidebar-section-header">
+          <h3>Предметы</h3>
+          <div style="display:flex;gap:4px">
+            <button class="btn-icon" title="Быстро добавить предмет" onclick="openQuickAddItem()">+</button>
+            <button class="btn-icon" title="Авто-детект сюжетных предметов из сценария" onclick="autoDetectItems()">🔍</button>
+            <button class="btn-folder" title="Открыть папку с фото" onclick="openAssetFolder('items')">📁</button>
+          </div>
+        </div>
+        <div id="ep-items-list" class="ep-items-check"></div>
+      </div>
+
       <div id="ep-reteller-section" class="sidebar-section reteller-only">
         <h3>Reteller</h3>
         <div id="ep-reteller-info" class="reteller-info"></div>

@@ -3329,6 +3329,7 @@ async function loadEpisodeView() {
 
   renderEpCharacters();
   renderEpLocations();
+  renderEpItems();
   renderEpReteller();
   updateGenScriptBtn();
 
@@ -5197,6 +5198,7 @@ async function generateEpisodeScript() {
     }
     renderEpCharacters();
     renderEpLocations();
+  renderEpItems();
     updateScriptCounter();
     updateGenScriptBtn();
     status.textContent = '✓ Сценарий готов. Жми «🤖 Извлечь персонажей и локации» когда будешь готов.';
@@ -5682,6 +5684,205 @@ function toggleEpLoc(locId, cb) {
   document.getElementById(`ep-loc-${locId}`)?.classList.toggle('in-episode', cb.checked);
 }
 
+// ── Items panel inside the episode tab ──────────────────────────────────────
+// Mirrors the Locations panel layout (renderEpLocations + toggleEpLoc) but
+// for series.items[] / episode.items_used[]. Items here are PLOT-RELEVANT
+// objects (a locket, a USB stick with evidence, the stolen handbag) — not
+// every random prop in frame. The auto-detect button sends the script to
+// the backend's item extractor which decides what's plot-load-bearing vs
+// background dressing.
+
+function renderEpItems() {
+  const el = document.getElementById('ep-items-list');
+  if (!el) return;
+  const items = S.series?.items || [];
+  if (!items.length) {
+    el.innerHTML = '<div style="color:var(--muted);font-size:0.82rem">'
+      + 'Нет сюжетных предметов. Нажми 🔍 чтобы автоопределить из сценария или + для ручного добавления.</div>';
+    return;
+  }
+  const used = S.episode?.items_used || [];
+  el.innerHTML = items.map(it => {
+    const hasRef = it.ref_images && it.ref_images.length > 0;
+    const imgUrl = hasRef ? `/assets/${S.seriesId}/${it.ref_images[0]}` : null;
+    const inEp = used.includes(it.id);
+    return `
+      <div class="ep-loc-row ${inEp ? 'in-episode' : ''}" id="ep-item-${it.id}"
+           ondragover="event.preventDefault();this.classList.add('drop-hover')"
+           ondragleave="this.classList.remove('drop-hover')"
+           ondrop="event.preventDefault();this.classList.remove('drop-hover');dropItemPhoto && dropItemPhoto(event,'${it.id}')">
+        <div class="ep-loc-thumb"
+             ${imgUrl ? `onclick="event.stopPropagation();openItemLightbox('${it.id}','${imgUrl}')" style="cursor:zoom-in"
+                         title="Открыть предмет (можно перегенерировать с пожеланиями)"` : ''}>
+          ${imgUrl
+            ? `<img src="${imgUrl}" alt="" onerror="this.replaceWith(_brokenImagePlaceholder('${imgUrl}'))">`
+            : '🎒'}
+        </div>
+        <div class="ep-loc-name">
+          <div class="ep-char-name-row">
+            <input type="checkbox" ${inEp ? 'checked' : ''} onchange="toggleEpItem('${it.id}',this)">
+            <span>${esc(it.name)}</span>
+          </div>
+          ${!hasRef ? `
+            <div class="ep-char-gen-btns" id="ep-item-btns-${it.id}">
+              <button class="btn-generate" id="ep-item-gen-btn-${it.id}" onclick="generateItemImage('${it.id}')">⚡ Сгенерировать</button>
+            </div>
+            <div class="ep-char-gen-status" id="ep-item-status-${it.id}"></div>
+          ` : ''}
+        </div>
+      </div>
+    `;
+  }).join('');
+}
+
+function toggleEpItem(itemId, cb) {
+  if (!S.episode.items_used) S.episode.items_used = [];
+  if (cb.checked) {
+    if (!S.episode.items_used.includes(itemId)) S.episode.items_used.push(itemId);
+  } else {
+    S.episode.items_used = S.episode.items_used.filter(x => x !== itemId);
+  }
+  document.getElementById(`ep-item-${itemId}`)?.classList.toggle('in-episode', cb.checked);
+}
+
+// Item lightbox — full-size + regenerate-with-wishes (mirrors openLocLightbox).
+function openItemLightbox(itemId, url) {
+  closeLightbox();
+  const it = (S.series.items || []).find(x => x.id === itemId);
+  if (!it) return;
+  const div = document.createElement('div');
+  div.id = 'lightbox-overlay';
+  div.className = 'lightbox-overlay';
+  div.innerHTML = `
+    <button class="lb-close" onclick="closeLightbox()">✕</button>
+    <div class="lightbox-content" onclick="event.stopPropagation()">
+      <div class="lb-img-wrap">
+        <img src="${url}" alt="${esc(it.name)}"
+             onerror="this.replaceWith(_brokenImagePlaceholder('${url}'))">
+        <div class="lb-caption"><strong>🎒 ${esc(it.name)}</strong></div>
+      </div>
+      <div class="lightbox-panel">
+        <h3>↻ Перегенерировать предмет</h3>
+        <div class="hint">Старое фото удалится. Пожелания сохранятся в предмете.</div>
+        <div>
+          <label style="font-size:0.82rem;color:var(--muted);display:block;margin-bottom:4px">Что учесть / исправить</label>
+          <textarea id="lb-regen-wishes" rows="5"
+            placeholder="Например:&#10;«потёртый, не новый»&#10;«с инициалами М.К.»&#10;«цвет тёмно-бордовый»">${esc(it.image_constraints || '')}</textarea>
+        </div>
+        <div id="lb-regen-status" class="lb-status"></div>
+        <button id="lb-regen-btn" class="btn-regen" onclick="regenerateItemFromLightbox('${itemId}')">↻ Перегенерировать</button>
+      </div>
+    </div>`;
+  div.onclick = (e) => { if (e.target === div) closeLightbox(); };
+  document.body.appendChild(div);
+}
+
+async function regenerateItemFromLightbox(itemId) {
+  const wishes = (document.getElementById('lb-regen-wishes')?.value || '').trim();
+  const btn = document.getElementById('lb-regen-btn');
+  const status = document.getElementById('lb-regen-status');
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ Генерирую...'; }
+  if (status) status.textContent = '';
+  try {
+    const r = await api.post(`/api/series/${S.seriesId}/items/${itemId}/regenerate`, { wishes });
+    if (r?.error) throw new Error(r.error);
+    const fresh = await api.get(`/api/series/${S.seriesId}`);
+    if (fresh) S.series = fresh;
+    if (typeof renderItemsList === 'function') renderItemsList();
+    if (typeof renderEpItems === 'function') renderEpItems();
+    if (status) status.textContent = '✓ Готово';
+    const newUrl = r.url ? `${r.url}?t=${Date.now()}` : null;
+    if (newUrl) openItemLightbox(itemId, newUrl);
+  } catch (e) {
+    if (status) status.textContent = '✗ ' + (e?.message || e);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '↻ Перегенерировать'; }
+  }
+}
+
+// Quick-add item from the episode sidebar (no full modal — just name + desc).
+async function openQuickAddItem() {
+  const name = (prompt('Название предмета (e.g. «флешка», «локет», «золотые часы»):') || '').trim();
+  if (!name) return;
+  const description = (prompt('Краткое описание (можно пусто):') || '').trim();
+  try {
+    const r = await api.post(`/api/series/${S.seriesId}/items`, { name, description });
+    if (r?.error) throw new Error(r.error);
+    const fresh = await api.get(`/api/series/${S.seriesId}`);
+    if (fresh) S.series = fresh;
+    renderItemsList && renderItemsList();
+    renderEpItems && renderEpItems();
+    showToast(`✓ Добавлен «${name}»`);
+  } catch (e) {
+    alert('Ошибка добавления: ' + (e?.message || e));
+  }
+}
+
+// Auto-detect plot-relevant items from the current episode's script.
+async function autoDetectItems() {
+  if (!S.episode?.number) { showToast('Открой эпизод сначала'); return; }
+  const btn = document.querySelector('#ep-items-list')?.parentElement?.querySelector('button[onclick="autoDetectItems()"]');
+  const orig = btn?.innerHTML;
+  if (btn) { btn.disabled = true; btn.innerHTML = '⏳'; }
+  try {
+    const r = await api.post(
+      `/api/series/${S.seriesId}/episodes/${S.episode.number}/detect-items`, {}
+    );
+    if (r?.error) throw new Error(r.error);
+    const fresh = await api.get(`/api/series/${S.seriesId}`);
+    if (fresh) S.series = fresh;
+    // Re-load episode so items_used updates show.
+    const ep = await api.get(`/api/series/${S.seriesId}/episodes/${S.episode.number}`);
+    if (ep) S.episode = ep;
+    renderItemsList && renderItemsList();
+    renderEpItems && renderEpItems();
+    showToast(`✓ Найдено ${(r.detected || []).length} предметов`);
+  } catch (e) {
+    alert('Авто-детект не удался: ' + (e?.message || e));
+  } finally {
+    if (btn) { btn.disabled = false; btn.innerHTML = orig || '🔍'; }
+  }
+}
+
+// Stub for thumb-drag-drop (mirrors dropLocPhoto). If the matching upload
+// endpoint exists, drop events will succeed; otherwise it's a no-op.
+async function dropItemPhoto(event, itemId) {
+  const file = event.dataTransfer?.files?.[0];
+  if (!file) return;
+  const fd = new FormData();
+  fd.append('file', file);
+  try {
+    const r = await fetch(`/api/series/${S.seriesId}/assets/item/${itemId}`,
+      { method: 'POST', body: fd });
+    const j = await r.json();
+    if (j.error) throw new Error(j.error);
+    const fresh = await api.get(`/api/series/${S.seriesId}`);
+    if (fresh) S.series = fresh;
+    renderItemsList && renderItemsList();
+    renderEpItems && renderEpItems();
+  } catch (e) {
+    alert('Загрузка не удалась: ' + (e?.message || e));
+  }
+}
+
+async function generateItemImage(itemId) {
+  const btn = document.getElementById(`ep-item-gen-btn-${itemId}`);
+  const status = document.getElementById(`ep-item-status-${itemId}`);
+  if (btn) { btn.disabled = true; btn.textContent = '⏳'; }
+  if (status) status.textContent = 'Генерирую...';
+  try {
+    const r = await api.post(`/api/series/${S.seriesId}/items/${itemId}/generate-image`, {});
+    if (r?.error) throw new Error(r.error);
+    const fresh = await api.get(`/api/series/${S.seriesId}`);
+    if (fresh) S.series = fresh;
+    renderItemsList && renderItemsList();
+    renderEpItems && renderEpItems();
+  } catch (e) {
+    if (status) status.textContent = '✗ ' + (e?.message || e);
+    if (btn) { btn.disabled = false; btn.textContent = '⚡ Сгенерировать'; }
+  }
+}
+
 function renderEpCharacters() {
   const el = document.getElementById('ep-characters-list');
   const chars = S.series?.characters || [];
@@ -5701,6 +5902,7 @@ async function extractFromStoryInline(btn) {
     S.series = res.series;
     renderEpCharacters();
     renderEpLocations();
+  renderEpItems();
     showToast(`Добавлено: ${res.added_characters.length} перс., ${res.added_locations.length} лок.`);
   } catch(e) {
     btn.disabled = false; btn.innerHTML = '🤖 Извлечь из сюжета';
@@ -5740,12 +5942,14 @@ async function autoExtractFromStory() {
     S.series = res.series;
     renderEpCharacters();
     renderEpLocations();
+  renderEpItems();
     if (res.added_characters.length || res.added_locations.length) {
       showToast(`Найдено: ${res.added_characters.length} перс., ${res.added_locations.length} лок.`);
     }
   } catch(e) {
     renderEpCharacters();
     renderEpLocations();
+  renderEpItems();
   }
 }
 
@@ -5993,6 +6197,7 @@ async function dropLocPhoto(event, locId) {
     if (!res.ok) throw new Error(data.error || res.statusText);
     S.series = data.series;
     renderEpLocations();
+  renderEpItems();
     const loc = S.series.locations?.find(x => x.id === locId);
     showToast(`${loc?.name || 'Локация'} — фото обновлено`);
   } catch(e) {
@@ -6052,6 +6257,7 @@ async function generateLocImage(locId) {
       statusEl.textContent = '';
       S.series = await api.get(`/api/series/${S.seriesId}`);
       renderEpLocations();
+  renderEpItems();
       showToast('Локация — фото готово!');
     } else {
       statusEl.textContent = 'Ошибка: ' + (res.error || 'Неизвестная ошибка');

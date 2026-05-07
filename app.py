@@ -3331,6 +3331,91 @@ def regenerate_item(sid, item_id):
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/series/<sid>/episodes/<int:num>/detect-items', methods=['POST'])
+def detect_items_in_episode(sid, num):
+    """LLM extracts PLOT-RELEVANT items from the episode's script. Plot-relevant
+    means the item is load-bearing for the story (the locket revealed at the
+    climax, the USB stick with evidence, the stolen handbag) — NOT every random
+    prop in frame (coffee cups, generic furniture, background dressing).
+
+    For each detected item:
+      - if a series.items entry with the same lowercased name exists → reuse its id
+      - otherwise create a new series.items entry (no ref_image yet — autogen
+        sweep or manual click handles photo)
+      - add the id to episode.items_used (idempotent)
+
+    Returns {'detected': [{name, description, status: 'created'|'existing'}, ...]}.
+    """
+    s = load_series(sid)
+    ep = load_episode(sid, num)
+    if not s or not ep:
+        return jsonify({'error': 'not found'}), 404
+    script = (ep.get('script') or '').strip()
+    if not script:
+        return jsonify({'error': 'episode has no script yet'}), 400
+
+    system = (
+        "You extract PLOT-RELEVANT items from a short-drama script. Return STRICT JSON.\n"
+        "PLOT-RELEVANT = the item is load-bearing for the story: it gets revealed,\n"
+        "stolen, exchanged, hidden, used as evidence, gifted, broken, found,\n"
+        "carried by a character through multiple scenes, or its presence/absence\n"
+        "drives a beat. Examples: a locket with a photo, a USB stick with files,\n"
+        "a wedding ring, a stolen handbag, a contract document, a vial of poison.\n\n"
+        "NOT plot-relevant — DO NOT extract: generic furniture, coffee cups,\n"
+        "phones used only for routine calls, clothing (covered separately by\n"
+        "outfits), food eaten without significance, background dressing.\n\n"
+        "Return JSON: {\"items\": [{\"name\": \"...\", \"description\": \"...\"}, ...]}\n"
+        "name: short concrete noun phrase, lowercased (e.g. 'silver locket',\n"
+        "  'usb stick with evidence', 'stolen handbag').\n"
+        "description: 1 sentence describing visual appearance for image gen.\n"
+        "If nothing qualifies, return {\"items\": []}. No prose, no preamble."
+    )
+    raw = claude_ask(
+        f"Script:\n\n{script[:18000]}",
+        system=system, model='', max_tokens=2048,
+    )
+    try:
+        parsed = loads_lenient(raw)
+        detected_raw = parsed.get('items') or []
+    except Exception as e:
+        return jsonify({'error': f'LLM returned unparseable JSON: {e}; raw={raw[:300]}'}), 502
+
+    s.setdefault('items', [])
+    if not isinstance(ep.get('items_used'), list):
+        ep['items_used'] = []
+    detected_summary = []
+    for d in detected_raw[:20]:  # cap at 20 to avoid runaways
+        name = (d.get('name') or '').strip()
+        desc = (d.get('description') or '').strip()
+        if not name:
+            continue
+        existing = next((it for it in s['items'] if it.get('name', '').lower() == name.lower()), None)
+        if existing:
+            item_id = existing['id']
+            status = 'existing'
+            # Refresh description if currently empty.
+            if not (existing.get('description') or '').strip() and desc:
+                existing['description'] = desc
+        else:
+            item_id = str(uuid.uuid4())[:8]
+            s['items'].append({
+                'id': item_id,
+                'name': name,
+                'description': desc,
+                'ref_images': [],
+                'avai_url': '',
+                'image_constraints': '',
+            })
+            status = 'created'
+        if item_id not in ep['items_used']:
+            ep['items_used'].append(item_id)
+        detected_summary.append({'name': name, 'description': desc, 'status': status})
+
+    save_series(sid, s)
+    save_episode(sid, num, ep)
+    return jsonify({'detected': detected_summary, 'items_used': ep['items_used']})
+
+
 # ── Auto-generate missing assets (background sweep) ──────────────────────────
 
 import threading
