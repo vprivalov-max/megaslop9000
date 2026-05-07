@@ -3255,7 +3255,10 @@ async function openCreateEpisode() {
       { idempotencyKey }
     );
     if (!S.episodes.some(e => e.number === ep.number)) S.episodes.push(ep);
-    navigate('episode', { seriesId: S.seriesId, episodeNum: ep.number });
+    // Stay on the series view — re-render the episode list so the new card
+    // appears. User clicks it themselves when they want to enter.
+    if (typeof renderEpisodesList === 'function') renderEpisodesList();
+    showToast(`✓ Создан Эп. ${ep.number}`);
   } catch (e) {
     showToast('Ошибка: ' + (e?.message || e));
   } finally {
