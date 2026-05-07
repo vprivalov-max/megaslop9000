@@ -6406,11 +6406,11 @@ function buildEpCharCard(c, inEpisode) {
 
   card.innerHTML = `
     <div class="ep-char-card-top" onclick="toggleEpCharCard('${c.id}')">
-      <div class="ep-char-photo" ${photoUrl ? `onclick="event.stopPropagation();openCharLightbox('${c.id}','${photoUrl}')" style="cursor:zoom-in"` : ''}
+      <div class="ep-char-photo" ${photoUrl ? `onclick="event.stopPropagation();openCharAssets('${c.id}')" style="cursor:zoom-in"` : ''}
            ondragover="event.preventDefault();this.classList.add('drop-hover')"
            ondragleave="this.classList.remove('drop-hover')"
            ondrop="event.preventDefault();this.classList.remove('drop-hover');dropCharPhoto(event,'${c.id}')"
-           title="${photoUrl ? 'Открыть фото крупно (можно перегенерировать)' : ''}">
+           title="${photoUrl ? 'Открыть карточку персонажа — образы, рефы, регенерация' : ''}">
         ${photoUrl
           ? `<img src="${photoUrl}" alt="${esc(c.name)}" onerror="this.replaceWith(_brokenImagePlaceholder('${photoUrl}'))">`
           : `<div class="no-photo">${primaryOutfit ? '👗' : '👤'}</div>`}
