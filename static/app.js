@@ -8053,29 +8053,104 @@ const _MLG_SKINS = [
   { kind: 'frog',  src: '/static/img/frog.gif',  width: 110 },
 ];
 
-// ── Combo events (1-in-N rare spawns) ───────────────────────────────────────
-// Each combo has its own state object stored under a unique id; per-target
-// click handlers consult the state to know whether to trigger follow-up
-// spawns / play combo-specific announcer sounds.
+// ── Combo events (rare scheduled multi-spawns) ──────────────────────────────
+// Combo events are NOT rolled per-spawn-tick — they live on independent
+// schedulers so we can preload their sound files ~20s before the event
+// fires (rather than bloating the page-load budget with audio for events
+// the user might never see in a session).
 //
-//   DOUBLE  (1/25):  2 spawn → after 2nd kill: "OH MY GOD" + 1 more spawns
-//   WOBO    (1/100): 3 spawn → "WOBO COMBO" sound starts on 2nd kill →
-//                    after all 3 killed: 2 spawn → after both killed:
-//                    1 final spawn
+//   DOUBLE  (every 8-20 min): 2 spawn → kill #2 fires OMG (random of two
+//                             sound variants) → 3rd target sneaks in 300ms
+//                             after the 2nd kill. Per-kill text overlay
+//                             picks a hype line.
+//   WOBO    (every 30-90 min): 3 spawn → 2nd kill of wave-1 starts the
+//                              wobo-combo loop sound → wave-1 cleared →
+//                              2 spawn → wave-2 cleared → 1 final spawn.
 //
-// State: { type, killsInWave, totalInWave, wavesRemaining, soundStarted }
+// State: { type, soundUrl, kills, stage, ... }
 const _MLG_COMBOS = {};
 
-function _spawnCombo(type) {
+// Hype lines flashed during DOUBLE combos. Each kill flashes one at random.
+const _OMG_TEXT_LINES = [
+  'MY GOD!', 'OH MY GOD!!', 'JESUS!', 'HOLY SHIT!', 'FUCKING HELL!',
+  'INSANE!', 'NO WAY!', 'WHAT THE—!', 'GOD DAMN!', 'UNREAL!!',
+];
+const _OMG_SOUND_URLS = [
+  '/static/sounds/omg-fuckn.mp3',
+  '/static/sounds/omg-mlg.mp3',
+];
+const _WOBO_SOUND_URL = '/static/sounds/wobo-combo.mp3';
+
+// Lazy preloader — fetches the URL into HTTP cache + Web Audio buffer, but
+// only when called. Used by combo schedulers ~20s before each event.
+async function _lazyPreloadSound(url) {
+  if (!url) return;
+  if (window._mlgBufferCache && window._mlgBufferCache[url]) return; // already loaded
+  try { await fetch(url, { credentials: 'same-origin', cache: 'force-cache' }); } catch {}
+  // HTMLAudioElement fallback
+  if (!window._mlgAudioPreload) window._mlgAudioPreload = {};
+  if (!window._mlgAudioPreload[url]) {
+    try { const a = new Audio(url); a.preload = 'auto'; a.load(); window._mlgAudioPreload[url] = a; } catch {}
+  }
+  // AudioBuffer for zero-latency playback
+  try {
+    if (!window._mlgBufferCache) window._mlgBufferCache = {};
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return;
+    const ctx = window._mlgPreloadCtx || (window._mlgPreloadCtx = new Ctx());
+    const res = await fetch(url, { credentials: 'same-origin', cache: 'force-cache' });
+    if (!res.ok) return;
+    const ab = await res.arrayBuffer();
+    const buf = await new Promise((resolve, reject) => {
+      try {
+        const p = ctx.decodeAudioData(ab, resolve, reject);
+        if (p && typeof p.then === 'function') p.then(resolve, reject);
+      } catch (e) { reject(e); }
+    });
+    window._mlgBufferCache[url] = buf;
+  } catch {}
+}
+
+// Plays a sample BY URL (not by hardcoded path inside Sounds.*) — needed for
+// random-variant OMG + the on-demand wobo. Mirrors Sounds._playSample but
+// scoped to a URL passed in at runtime. Honours the same MLG-toggle gate.
+function _playSampleByUrl(url, vol = 1.0) {
+  if (!Sounds.isHitmarkerEnabled()) return;
+  // Buffer path
+  try {
+    const buf = window._mlgBufferCache && window._mlgBufferCache[url];
+    if (buf) {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      const ctx = window._mlgPlaybackCtx || (window._mlgPlaybackCtx = new Ctx());
+      if (ctx.state === 'suspended') ctx.resume();
+      const src = ctx.createBufferSource(); src.buffer = buf;
+      const gain = ctx.createGain(); gain.gain.value = vol;
+      src.connect(gain); gain.connect(ctx.destination); src.start(0);
+      return;
+    }
+  } catch {}
+  // HTMLAudioElement fallback (works without buffer cache).
+  try {
+    const cached = window._mlgAudioPreload && window._mlgAudioPreload[url];
+    const a = cached ? cached.cloneNode() : new Audio(url);
+    a.volume = vol;
+    a.play().catch(() => {});
+  } catch {}
+}
+
+// Spawn a combo. soundUrl is the pre-chosen + pre-loaded sound; required
+// because the scheduler picks the variant at scheduling time so it can
+// preload the right one.
+function _spawnCombo(type, soundUrl) {
   const id = `${type}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
   if (type === 'double') {
-    _MLG_COMBOS[id] = { type, kills: 0, total: 2, followUpQueued: false };
+    _MLG_COMBOS[id] = { type, kills: 0, total: 2, followUpQueued: false, soundUrl };
     for (let i = 0; i < 2; i++) {
       setTimeout(() => _spawnSnoop({ comboId: id }), i * 120);
     }
     _spawnMlgVoiceText('DOUBLE SPAWN!');
   } else if (type === 'wobo') {
-    _MLG_COMBOS[id] = { type, kills: 0, total: 3, stage: 1, soundStarted: false };
+    _MLG_COMBOS[id] = { type, kills: 0, total: 3, stage: 1, soundStarted: false, soundUrl };
     for (let i = 0; i < 3; i++) {
       setTimeout(() => _spawnSnoop({ comboId: id }), i * 120);
     }
@@ -8086,42 +8161,106 @@ function _spawnCombo(type) {
 function _onComboKill(combo, comboId) {
   if (!combo) return;
   combo.kills += 1;
-  // ── DOUBLE event: 2 → +1 ────────────────────────────────────────────────
+  // ── DOUBLE event ───────────────────────────────────────────────────────
   if (combo.type === 'double') {
+    // Per-kill hype text overlay — fires after EVERY kill in a DOUBLE combo.
+    const line = _OMG_TEXT_LINES[Math.floor(Math.random() * _OMG_TEXT_LINES.length)];
+    setTimeout(() => _spawnMlgVoiceText(line), 80);
     if (combo.kills === 2 && !combo.followUpQueued) {
       combo.followUpQueued = true;
       // OMG sound + followup spawn appears suddenly (300ms gap).
-      setTimeout(() => { Sounds.playOmg(); _spawnMlgVoiceText('OH MY GOD!'); }, 100);
+      setTimeout(() => _playSampleByUrl(combo.soundUrl, 1.0), 100);
       setTimeout(() => _spawnSnoop({ comboId }), 300);
       combo.total = 3;
     }
-    if (combo.kills >= 3) delete _MLG_COMBOS[comboId];
+    if (combo.kills >= 3) {
+      delete _MLG_COMBOS[comboId];
+      _scheduleNextDoubleCombo();   // queue the next one
+    }
   }
   // ── WOBO event: 3 → 2 → 1 ──────────────────────────────────────────────
   else if (combo.type === 'wobo') {
-    // Sound kicks in on 2nd kill of the FIRST wave (3 spawns), keeps playing.
     if (combo.stage === 1 && combo.kills === 2 && !combo.soundStarted) {
       combo.soundStarted = true;
-      Sounds.playWoboCombo();
+      _playSampleByUrl(combo.soundUrl, 1.0);
     }
     if (combo.stage === 1 && combo.kills >= 3) {
-      // Wave 1 cleared → spawn wave 2 (2 targets).
       combo.stage = 2; combo.kills = 0; combo.total = 2;
       setTimeout(() => _spawnMlgVoiceText('+2 INCOMING!'), 100);
       for (let i = 0; i < 2; i++) {
         setTimeout(() => _spawnSnoop({ comboId }), 250 + i * 120);
       }
     } else if (combo.stage === 2 && combo.kills >= 2) {
-      // Wave 2 cleared → spawn wave 3 (1 target, the finale).
       combo.stage = 3; combo.kills = 0; combo.total = 1;
       setTimeout(() => _spawnMlgVoiceText('FINISH HIM!'), 100);
       setTimeout(() => _spawnSnoop({ comboId }), 300);
     } else if (combo.stage === 3 && combo.kills >= 1) {
-      // Combo complete.
       _spawnMlgVoiceText('★ WOBO MASTER ★');
       delete _MLG_COMBOS[comboId];
+      _scheduleNextWoboCombo();   // queue the next one
     }
   }
+}
+
+// ── Combo schedulers ────────────────────────────────────────────────────────
+// Independent timers per combo type. The same flow on each tick:
+//   1. Pick the sound variant (DOUBLE has two — pick at schedule time).
+//   2. Pick a delay (T) within range.
+//   3. Schedule a preload at T-20s (so the file is in cache + AudioBuffer).
+//   4. Schedule the actual event firing at T.
+// MLG-toggle is checked at firing time; if off, the event is silently
+// dropped and rescheduled for the next slot.
+let _doubleComboTimer = null, _doublePreloadTimer = null;
+let _woboComboTimer   = null, _woboPreloadTimer   = null;
+
+function _scheduleNextDoubleCombo() {
+  if (_doubleComboTimer) clearTimeout(_doubleComboTimer);
+  if (_doublePreloadTimer) clearTimeout(_doublePreloadTimer);
+  // Range: 8-20 minutes between DOUBLE events.
+  const delayMs = (8 * 60 * 1000) + Math.random() * (12 * 60 * 1000);
+  const soundUrl = _OMG_SOUND_URLS[Math.floor(Math.random() * _OMG_SOUND_URLS.length)];
+  // Preload 20s before fire (or right now if delay < 20s, which it never is here).
+  const preloadAt = Math.max(0, delayMs - 20000);
+  _doublePreloadTimer = setTimeout(() => { _lazyPreloadSound(soundUrl); }, preloadAt);
+  const fire = () => {
+    if (!Sounds.isHitmarkerEnabled()) { _scheduleNextDoubleCombo(); return; }
+    // Don't fire if a target is already on screen — let it clear, retry in 30s.
+    if (document.querySelector('.mlg-snoop')) {
+      _doubleComboTimer = setTimeout(fire, 30000);
+      return;
+    }
+    _spawnCombo('double', soundUrl);
+  };
+  _doubleComboTimer = setTimeout(fire, delayMs);
+}
+
+function _scheduleNextWoboCombo() {
+  if (_woboComboTimer) clearTimeout(_woboComboTimer);
+  if (_woboPreloadTimer) clearTimeout(_woboPreloadTimer);
+  // Range: 30-90 minutes between WOBO events (rare).
+  const delayMs = (30 * 60 * 1000) + Math.random() * (60 * 60 * 1000);
+  const preloadAt = Math.max(0, delayMs - 20000);
+  _woboPreloadTimer = setTimeout(() => { _lazyPreloadSound(_WOBO_SOUND_URL); }, preloadAt);
+  const fire = () => {
+    if (!Sounds.isHitmarkerEnabled()) { _scheduleNextWoboCombo(); return; }
+    if (document.querySelector('.mlg-snoop')) {
+      _woboComboTimer = setTimeout(fire, 60000);
+      return;
+    }
+    _spawnCombo('wobo', _WOBO_SOUND_URL);
+  };
+  _woboComboTimer = setTimeout(fire, delayMs);
+}
+
+// First-run kickoff once the page is interactive.
+if (document.readyState !== 'loading') {
+  _scheduleNextDoubleCombo();
+  _scheduleNextWoboCombo();
+} else {
+  document.addEventListener('DOMContentLoaded', () => {
+    _scheduleNextDoubleCombo();
+    _scheduleNextWoboCombo();
+  });
 }
 
 function _spawnSnoop(opts = {}) {
@@ -8195,16 +8334,12 @@ function _spawnSnoop(opts = {}) {
   }, despawnMs);
 }
 
-// Roll the spawn — most ticks produce a single target, but rare events
-// upgrade to a multi-spawn combo. Probabilities tuned per user spec:
-//   1/100 = WOBO COMBO   (3 → 2 → 1 chain)
-//   1/25  = DOUBLE       (2 → +1 with OMG)
-//   else  = single target
+// Per-tick spawn: always a single target. Combo events live on their own
+// schedulers (see _scheduleNextDoubleCombo / _scheduleNextWoboCombo) so
+// their sound files can be preloaded ~20s before firing rather than at
+// page load — keeps initial page weight down.
 function _rollAndSpawn() {
-  const r = Math.random();
-  if (r < 0.01)      _spawnCombo('wobo');
-  else if (r < 0.05) _spawnCombo('double');
-  else               _spawnSnoop();
+  _spawnSnoop();
 }
 
 // Kick off the schedule once the page is interactive. _scheduleSnoop()
