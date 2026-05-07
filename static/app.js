@@ -6712,26 +6712,44 @@ const Sounds = (() => {
   // MLG hitmarker — real CoD/Halo "tink!" sample. Pre-loaded on first call
   // and reused for every click. Cloned per-play so rapid clicks overlap
   // (HTMLAudio can only play one stream at a time per element).
-  // Audio sample loader — uses preloaded element from _preloadMlgAssets()
-  // when available (zero-lag first play), falls back to lazy-load on-demand.
-  // Cloned per-play so rapid clicks overlap instead of restarting one stream.
-  const _audioCache = {};
+  // Audio sample loader — uses Web Audio API AudioBuffer when pre-decoded
+  // (zero-latency, fully in-memory), falls back to HTMLAudioElement clone
+  // for samples that haven't finished decoding yet. The preload phase
+  // (_preloadMlgAssets) decodes all known MLG sounds into AudioBuffers up-front,
+  // so by the first user click everything plays instantly.
+  const _audioElCache = {};
   function _playSample(path, volume = 0.7) {
-    if (!_audioCache[path]) {
-      // Hot path: preload phase already created an Audio for this URL
+    // Hot path: AudioBuffer is decoded and ready in window._mlgBufferCache
+    const buf = window._mlgBufferCache && window._mlgBufferCache[path];
+    if (buf) {
+      const c = _ensureCtx();
+      if (!c) return;
+      if (c.state === 'suspended') c.resume().catch(() => {});
+      try {
+        const src = c.createBufferSource();
+        const g = c.createGain();
+        src.buffer = buf;
+        g.gain.value = volume;
+        src.connect(g).connect(c.destination);
+        src.start(0);
+      } catch {}
+      return;
+    }
+    // Fallback: HTMLAudioElement (used until AudioBuffer finishes decoding)
+    if (!_audioElCache[path]) {
       const preloaded = window._mlgAudioPreload && window._mlgAudioPreload[path];
       if (preloaded) {
-        _audioCache[path] = preloaded;
+        _audioElCache[path] = preloaded;
       } else {
         try {
-          _audioCache[path] = new Audio(path);
-          _audioCache[path].preload = 'auto';
-          _audioCache[path].load();
+          _audioElCache[path] = new Audio(path);
+          _audioElCache[path].preload = 'auto';
+          _audioElCache[path].load();
         } catch { return; }
       }
     }
     try {
-      const clone = _audioCache[path].cloneNode(true);
+      const clone = _audioElCache[path].cloneNode(true);
       clone.volume = volume;
       clone.play().catch(() => {});
     } catch {}
@@ -7055,55 +7073,79 @@ function _spawnSnoop() {
 if (document.readyState !== 'loading') _scheduleSnoop();
 else document.addEventListener('DOMContentLoaded', _scheduleSnoop);
 
-// Preload ALL MLG assets up-front so first-play has zero network lag.
-// Without this, the first hitmarker click hits a cold cache and the
-// "tink!" arrives ~200-500ms late on slow connections. Two-phase:
-//   1) fetch() each URL — populates HTTP cache without needing user-gesture
-//   2) new Audio() with preload='auto' — primes the decode pipeline so
-//      Audio.play() fires instantly when needed
-function _preloadMlgAssets() {
-  const audioUrls = [
-    '/static/sounds/hitmarker.mp3',
-    '/static/sounds/gunshot.mp3',
-    '/static/sounds/triple.mp3',
-    '/static/sounds/wow.mp3',
-    '/static/sounds/damnson.mp3',
-    '/static/sounds/noscoped.mp3',
-    '/static/sounds/wait-a-minute.mp3',
-  ];
-  const imageUrls = [
-    '/static/img/hitmarker.png',
-    '/static/img/snoop.gif',
-    '/static/img/frog.gif',
-  ];
-  // Phase 1: HTTP cache warmup — fetch into browser cache. Doesn't need
-  // playback context, works regardless of autoplay policy.
-  for (const url of audioUrls.concat(imageUrls)) {
+// Preload ALL MLG assets up-front so first-play has zero latency.
+// Strategy: Web Audio AudioBuffer (fully decoded, plays instantly) +
+// HTMLAudioElement fallback for samples still decoding. Without buffers,
+// HTMLAudioElement.play() has 100-500ms first-call latency even with
+// preload='auto' because browsers defer actual buffer fill until play().
+const _MLG_AUDIO_URLS = [
+  '/static/sounds/hitmarker.mp3',
+  '/static/sounds/gunshot.mp3',
+  '/static/sounds/triple.mp3',
+  '/static/sounds/wow.mp3',
+  '/static/sounds/damnson.mp3',
+  '/static/sounds/noscoped.mp3',
+  '/static/sounds/wait-a-minute.mp3',
+];
+const _MLG_IMAGE_URLS = [
+  '/static/img/hitmarker.png',
+  '/static/img/snoop.gif',
+  '/static/img/frog.gif',
+];
+
+async function _preloadMlgAssets() {
+  // Phase 1: HTTP cache warmup — fetch into browser cache so subsequent
+  // requests are instant. Doesn't require user-gesture or audio context.
+  for (const url of _MLG_AUDIO_URLS.concat(_MLG_IMAGE_URLS)) {
     try { fetch(url, { credentials: 'same-origin', cache: 'force-cache' }).catch(() => {}); }
     catch {}
   }
-  // Phase 2: pre-instantiate Audio elements so cloneNode() in playSample
-  // doesn't trigger a fresh decode. Stash on the same internal cache the
-  // Sounds module uses on first play.
-  for (const url of audioUrls) {
+  // Phase 2: HTMLAudioElement fallback cache (for the ~50ms window before
+  // AudioBuffers finish decoding).
+  if (!window._mlgAudioPreload) window._mlgAudioPreload = {};
+  for (const url of _MLG_AUDIO_URLS) {
     try {
       const a = new Audio(url);
       a.preload = 'auto';
       a.load();
-      // Eagerly populate the Sounds module's _audioCache too — its first-
-      // play branch checks this map before creating a new Audio.
-      if (!window._mlgAudioPreload) window._mlgAudioPreload = {};
       window._mlgAudioPreload[url] = a;
     } catch {}
   }
-  // Pre-decode images by instantiating Image() — same pattern as audio
-  for (const url of imageUrls) {
+  // Phase 3: image prefetch + decode
+  for (const url of _MLG_IMAGE_URLS) {
     try {
       const img = new Image();
       img.decoding = 'async';
       img.src = url;
     } catch {}
   }
+  // Phase 4: decode each MP3 into an AudioBuffer for true zero-latency
+  // playback. AudioContext can be created without user-gesture (it'll be
+  // 'suspended' until first play, but decodeAudioData() works regardless).
+  if (!window._mlgBufferCache) window._mlgBufferCache = {};
+  let ctx = null;
+  try {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (Ctx) ctx = new Ctx();
+  } catch {}
+  if (!ctx) return;
+  // Decode in parallel — fetch + arrayBuffer + decodeAudioData are all async.
+  // Use force-cache so we re-use Phase 1's downloads.
+  await Promise.all(_MLG_AUDIO_URLS.map(async (url) => {
+    try {
+      const res = await fetch(url, { credentials: 'same-origin', cache: 'force-cache' });
+      if (!res.ok) return;
+      const ab = await res.arrayBuffer();
+      // Safari needs the callback signature; modern browsers accept Promise.
+      const buf = await new Promise((resolve, reject) => {
+        try {
+          const p = ctx.decodeAudioData(ab, resolve, reject);
+          if (p && typeof p.then === 'function') p.then(resolve, reject);
+        } catch (e) { reject(e); }
+      });
+      window._mlgBufferCache[url] = buf;
+    } catch (e) { /* fallback path will handle it */ }
+  }));
 }
 if (document.readyState !== 'loading') _preloadMlgAssets();
 else document.addEventListener('DOMContentLoaded', _preloadMlgAssets);

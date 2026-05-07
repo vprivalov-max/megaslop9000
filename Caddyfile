@@ -2,6 +2,16 @@
 # Replace the hostname below to match your real domain. Caddy will fetch a
 # Let's Encrypt cert automatically on first request.
 
+# Global options — disable HTTP/3 (QUIC). Symptoms on Coolify VPS were
+# `net::ERR_QUIC_PROTOCOL_ERROR.QUIC_TOO_MANY_RTOS` for ~30% of MP3/PNG
+# requests (network MTU / UDP unreliability). HTTP/2 over TLS is plenty
+# fast for this traffic and rock-solid.
+{
+    servers {
+        protocols h1 h2
+    }
+}
+
 series.gamegears.online {
     encode gzip zstd
 
