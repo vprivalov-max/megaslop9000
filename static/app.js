@@ -3612,6 +3612,15 @@ async function loadEpisodeView() {
   setVal('ep-synopsis', S.episode.synopsis);
   setVal('ep-script', S.episode.script);
   setVal('ep-scene-blocking', S.episode.scene_blocking || '');
+  // If user previously had the scene-view open (it persists across navigation
+  // because we don't tear down the DOM), the inner cards still show the
+  // PREVIOUS episode's parsed scenes — `setVal('ep-script', ...)` only
+  // updates the hidden textarea. Re-render the scene-view body so it reflects
+  // the current episode's script.
+  const sceneView = document.getElementById('ep-script-scenes');
+  if (sceneView && !sceneView.classList.contains('hidden')) {
+    if (typeof _renderSceneViewBody === 'function') _renderSceneViewBody();
+  }
   // Apply Turbo/Sequential UI visibility on episode load (scene-blocking
   // section hidden in sequential mode where it's irrelevant).
   if (typeof _applyAutoModeUI === 'function') _applyAutoModeUI();
