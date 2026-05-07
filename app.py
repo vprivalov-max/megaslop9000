@@ -104,6 +104,14 @@ def is_scene_heading(line: str) -> bool:
 app = Flask(__name__, static_folder='static', template_folder='templates')
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB
 
+# Behind Coolify/Traefik/Caddy reverse proxy — trust X-Forwarded-* headers so
+# url_for(_external=True) builds correct https://<public-host>/auth/google/callback
+# URLs. Without this Flask sees the inner http://app:8080 → Google rejects the
+# OAuth start with `redirect_uri_mismatch`. Got accidentally deleted in a
+# later refactor — restoring.
+from werkzeug.middleware.proxy_fix import ProxyFix
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
+
 BASE = Path(__file__).parent
 # DATA_ROOT holds per-user subfolders: <DATA_ROOT>/<email>/projects/<sid>/...
 # Override via env (DATA_ROOT=/var/lib/series-writer on the server).

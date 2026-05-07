@@ -3104,6 +3104,9 @@ async function loadEpisodeView() {
   setVal('ep-synopsis', S.episode.synopsis);
   setVal('ep-script', S.episode.script);
   setVal('ep-scene-blocking', S.episode.scene_blocking || '');
+  // Apply Turbo/Sequential UI visibility on episode load (scene-blocking
+  // section hidden in sequential mode where it's irrelevant).
+  if (typeof _applyAutoModeUI === 'function') _applyAutoModeUI();
   setVal('ep-reteller-prompt', S.episode.reteller_prompt || '');
   updateScriptCounter();
 
@@ -3618,11 +3621,18 @@ function _renderScenesHTML(scenes, coverage = []) {
   // Auto-mode state for the button label
   const autoActive = (typeof AUTO !== 'undefined') && AUTO.active;
   const autoErr    = (localStorage.getItem('auto_error_mode') || 'heal');  // 'heal' | 'stop'
+  const autoMode   = (localStorage.getItem('auto_mode_kind')  || 'sequential'); // 'sequential' | 'turbo'
+  const seqTip = 'ПОСЛЕДОВАТЕЛЬНО — каждый чанк ждёт предыдущий, ему передаётся last frame видео + кадры перед склейками для непрерывности. Дольше, но качество и консистентность мизансцены лучше. Галочки lastframe/cutframes в Seedance-панели игнорируются — режим всегда включён.';
+  const turboTip = 'ТУРБО — все чанки уходят в очередь Seedance параллельно через единый batch-JSON эпизода (один Claude-вызов на весь эпизод). Использует scene blocking для общей геометрии локации. Быстрее в N раз, но без видео-continuity между чанками — возможны мелкие drift-ы.';
   html += `<div class="ep-scene-toolbar">
     <button id="auto-mode-btn" class="${autoActive ? 'btn-danger' : 'btn-accent'}" onclick="_autoModeToggle()"
-      title="Запустить авто-генерацию всех сегментов через Seedance. Учитывает галочки lastframe / cut-frames в Seedance-панели.">
+      title="Запустить Auto-mode. Поведение зависит от режима справа: Последовательно (стабильно) или Турбо (быстро).">
       ${autoActive ? '⏸ Стоп Auto-mode' : '▶ Auto-mode'}
     </button>
+    <span class="auto-mode-kind" title="Переключатель режима генерации. Наведи на ⓘ для подробностей.">
+      <label title="${esc(seqTip)}"><input type="radio" name="auto-mode-kind" ${autoMode === 'sequential' ? 'checked' : ''} onchange="_autoSaveModeKind('sequential')"> 🐢 Последовательно</label>
+      <label title="${esc(turboTip)}"><input type="radio" name="auto-mode-kind" ${autoMode === 'turbo' ? 'checked' : ''} onchange="_autoSaveModeKind('turbo')"> ⚡ Турбо</label>
+    </span>
     <span class="auto-err-mode" title="Что делать если Seedance вернёт moderation error">
       <label><input type="radio" name="auto-err" id="auto-error-mode-heal" ${autoErr === 'heal' ? 'checked' : ''} onchange="_autoSaveErrMode('heal')"> 🩹 Авто-лечение</label>
       <label><input type="radio" name="auto-err" id="auto-error-mode-stop" ${autoErr === 'stop' ? 'checked' : ''} onchange="_autoSaveErrMode('stop')"> ⏹ Стоп + сигнал</label>
@@ -4089,7 +4099,8 @@ async function rebuildBatchPrompts() {
   // Need segments from the parsed scene-view
   const ta = document.getElementById('ep-script');
   if (!ta) return;
-  const segs = (typeof _autoCollectSegments === 'function') ? _autoCollectSegments() : [];
+  // batch-compose feeds Turbo auto-mode → establishing shots forced ON.
+  const segs = (typeof _autoCollectSegments === 'function') ? _autoCollectSegments({ forceEstablishing: true }) : [];
   if (!segs.length) {
     showToast('⚠ Нет сегментов — открой "🎬 Сцены" чтобы сценарий разбился', 4000);
     return;
@@ -4240,11 +4251,37 @@ function _autoSaveErrMode(mode) {
   localStorage.setItem('auto_error_mode', mode);
 }
 
-function _autoCollectSegments() {
+// Auto-mode kind: sequential (default, stable continuity) or turbo (parallel
+// batch). Persisted in localStorage; UI hides scene-blocking section in
+// sequential mode (it's irrelevant — each chunk gets its own continuity from
+// last-frame + cut-frames, no global blocking needed).
+function _autoSaveModeKind(kind) {
+  if (kind !== 'sequential' && kind !== 'turbo') return;
+  localStorage.setItem('auto_mode_kind', kind);
+  _applyAutoModeUI();
+}
+function _autoGetModeKind() {
+  return localStorage.getItem('auto_mode_kind') || 'sequential';
+}
+function _applyAutoModeUI() {
+  const kind = _autoGetModeKind();
+  const sec = document.getElementById('scene-blocking-section');
+  if (sec) sec.style.display = (kind === 'turbo') ? '' : 'none';
+}
+// Run on episode-view render so visibility matches saved choice
+document.addEventListener('DOMContentLoaded', _applyAutoModeUI);
+
+function _autoCollectSegments(opts = {}) {
   const ta = document.getElementById('ep-script');
   if (!ta) return [];
   const scenes = _parseScriptScenes(ta.value || '', _segmentOverrides());
-  const establishing = !!document.getElementById('sd-establishing-shot')?.checked;
+  // Establishing shot is FORCED ON when called from auto-mode (both Sequential
+  // and Turbo) — sets a 2s wide-shot of the location at the start of every
+  // new scene, regardless of the manual checkbox in the Seedance panel.
+  // For other callers (manual segment preview), respect the checkbox.
+  const establishing = opts.forceEstablishing
+    ? true
+    : !!document.getElementById('sd-establishing-shot')?.checked;
   const out = [];
   scenes.forEach((sc, sIdx) => {
     for (let g = 0; g < sc.segCount; g++) {
@@ -4342,16 +4379,53 @@ async function startAutoMode() {
     }
   }
 
-  // Read current Seedance toggles — these define behaviour for the whole batch
-  const useLastframe = !!document.getElementById('sd-use-lastframe')?.checked;
-  const useCutframes = !!document.getElementById('sd-use-cutframes')?.checked;
+  // Auto-mode behaviour is now driven by the mode toggle in the toolbar
+  // (not by lastframe/cutframes checkboxes which are for manual one-shot use).
+  //   sequential — last-frame + cut-frames ALWAYS on, chunks render serially
+  //                with full video continuity. Best quality, slowest.
+  //   turbo      — all chunks fire in parallel via single batch-compose,
+  //                no continuity frames, relies on scene blocking + per-segment
+  //                prompt for spatial consistency. Faster, less consistent.
+  const autoModeKind = _autoGetModeKind();
+  const isTurbo  = autoModeKind === 'turbo';
+  const useLastframe = !isTurbo;        // sequential = always true
+  const useCutframes = !isTurbo;        // sequential = always true
   const useStyle     = !!document.getElementById('sd-use-style')?.checked;
   const styleVal     = (document.getElementById('sd-style')?.value || '').trim();
   const baseOnly     = !!document.getElementById('sd-base-only')?.checked;
   const closeUpOnly  = !!document.getElementById('sd-close-up-only')?.checked;
-  AUTO.parallel  = !useLastframe && !useCutframes;
+  AUTO.parallel = isTurbo;
+
+  // Turbo prerequisites: episodeBlocking + batch_prompts must exist.
+  // If empty — auto-fill them before starting the parallel run, so the user
+  // doesn't have to hit two extra buttons every time.
+  if (isTurbo) {
+    const blockingEl = document.getElementById('ep-scene-blocking');
+    const blocking = (blockingEl?.value || '').trim();
+    const hasBatchPrompts = !!(S.episode?.batch_prompts && Object.keys(S.episode.batch_prompts).length);
+    if (!blocking) {
+      showToast('⚙ Турбо-режим: сначала генерю scene blocking...', 4000);
+      try {
+        if (typeof generateSceneBlocking === 'function') await generateSceneBlocking();
+      } catch (e) {
+        showToast('✗ Не удалось сгенерить blocking: ' + (e.message || e), 6000);
+        return;
+      }
+    }
+    if (!hasBatchPrompts) {
+      showToast('⚙ Турбо-режим: собираю batch JSON эпизода...', 4000);
+      try {
+        if (typeof rebuildBatchPrompts === 'function') await rebuildBatchPrompts();
+      } catch (e) {
+        showToast('✗ Не удалось собрать batch JSON: ' + (e.message || e), 6000);
+        return;
+      }
+    }
+  }
   AUTO.errorMode = (localStorage.getItem('auto_error_mode') || 'heal');
-  const allSegs  = _autoCollectSegments();
+  // Both auto-mode flavors force establishing shots ON (2s location intro
+   // on every new scene), regardless of the manual checkbox.
+  const allSegs  = _autoCollectSegments({ forceEstablishing: true });
   // Per-segment auto-mode skip filter
   const skippedCount = allSegs.filter(s => _isSegmentAutoSkipped(s.anchor)).length;
   AUTO.segments = allSegs.filter(s => !_isSegmentAutoSkipped(s.anchor));

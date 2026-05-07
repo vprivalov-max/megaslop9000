@@ -333,20 +333,24 @@
         </div>
 
         <div class="field-group">
-          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
-            <label style="margin:0" title="Единое описание геометрии сцены (где стоят/сидят персонажи, реквизит, окна, двери) — вшивается в Constraints каждого чанка при batch-compose в Auto-mode параллельно. Защита от spatial drift между сегментами.">
-              🎯 Расположение персонажей в сцене (SCENE BLOCKING)
-            </label>
-            <div style="display:flex;gap:6px;align-items:center">
-              <button class="btn-ghost btn-sm" id="ep-gen-blocking-btn" onclick="generateSceneBlocking()" title="Claude прочитает сценарий + roster и заполнит blocking 60-120 слов английского текста">✨ Сгенерить</button>
-              <button class="btn-ghost btn-sm" onclick="openBatchJsonViewer()" title="Просмотр единого JSON-промпта эпизода (batch-compose). Содержит episodeBlocking + per-segment prompts которые auto-mode parallel шлёт в Seedance.">📋 batch JSON</button>
-              <span id="ep-blocking-status" style="font-size:0.76rem;color:var(--muted)"></span>
+          <!-- Scene blocking section — only relevant for TURBO auto-mode.
+               Hidden in sequential mode (where continuity is per-chunk via lastframe). -->
+          <div id="scene-blocking-section">
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
+              <label style="margin:0" title="Единое описание геометрии сцены (где стоят/сидят персонажи, реквизит, окна, двери) — вшивается в Constraints каждого чанка при batch-compose в Auto-mode турбо. Защита от spatial drift между сегментами.">
+                🎯 Расположение персонажей в сцене (SCENE BLOCKING)
+              </label>
+              <div style="display:flex;gap:6px;align-items:center">
+                <button class="btn-ghost btn-sm" id="ep-gen-blocking-btn" onclick="generateSceneBlocking()" title="Claude прочитает сценарий + roster и заполнит blocking 60-120 слов английского текста">✨ Сгенерить</button>
+                <button class="btn-ghost btn-sm" onclick="openBatchJsonViewer()" title="Просмотр единого JSON-промпта эпизода (batch-compose). Содержит episodeBlocking + per-segment prompts которые Auto-mode турбо шлёт в Seedance.">📋 batch JSON</button>
+                <span id="ep-blocking-status" style="font-size:0.76rem;color:var(--muted)"></span>
+              </div>
             </div>
+            <textarea id="ep-scene-blocking"
+              class="synopsis-area"
+              style="min-height:90px;font-family:'SF Mono',Menlo,monospace;font-size:0.84rem"
+              placeholder="Scene blocking — единое 60-120 слов англ. описание расстановки персонажей и геометрии локации на ВСЮ серию. Используется при batch-compose в Auto-mode турбо — гарантирует что Lina всегда сидит у окна слева, Kyle всегда напротив справа, и т.д. между всеми чанками. Можно заполнить вручную или нажми ✨ Сгенерить."></textarea>
           </div>
-          <textarea id="ep-scene-blocking"
-            class="synopsis-area"
-            style="min-height:90px;font-family:'SF Mono',Menlo,monospace;font-size:0.84rem"
-            placeholder="Scene blocking — единое 60-120 слов англ. описание расстановки персонажей и геометрии локации на ВСЮ серию. Используется при batch-compose в Auto-mode параллельно — гарантирует что Lina всегда сидит у окна слева, Kyle всегда напротив справа, и т.д. между всеми чанками. Можно заполнить вручную или нажми ✨ Сгенерить."></textarea>
 
           <!-- Inline logic-check panel (appears after script gen if violations found) -->
           <div id="ep-logic-panel" class="logic-panel hidden">
