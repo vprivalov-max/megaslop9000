@@ -6638,15 +6638,23 @@ const Sounds = (() => {
   // MLG hitmarker — real CoD/Halo "tink!" sample. Pre-loaded on first call
   // and reused for every click. Cloned per-play so rapid clicks overlap
   // (HTMLAudio can only play one stream at a time per element).
-  // Audio sample loader — preloaded once, cloned per-play so rapid clicks
-  // don't restart a single shared element.
+  // Audio sample loader — uses preloaded element from _preloadMlgAssets()
+  // when available (zero-lag first play), falls back to lazy-load on-demand.
+  // Cloned per-play so rapid clicks overlap instead of restarting one stream.
   const _audioCache = {};
   function _playSample(path, volume = 0.7) {
     if (!_audioCache[path]) {
-      try {
-        _audioCache[path] = new Audio(path);
-        _audioCache[path].preload = 'auto';
-      } catch { return; }
+      // Hot path: preload phase already created an Audio for this URL
+      const preloaded = window._mlgAudioPreload && window._mlgAudioPreload[path];
+      if (preloaded) {
+        _audioCache[path] = preloaded;
+      } else {
+        try {
+          _audioCache[path] = new Audio(path);
+          _audioCache[path].preload = 'auto';
+          _audioCache[path].load();
+        } catch { return; }
+      }
     }
     try {
       const clone = _audioCache[path].cloneNode(true);
@@ -6972,6 +6980,59 @@ function _spawnSnoop() {
 // Kick off the schedule once the page is interactive
 if (document.readyState !== 'loading') _scheduleSnoop();
 else document.addEventListener('DOMContentLoaded', _scheduleSnoop);
+
+// Preload ALL MLG assets up-front so first-play has zero network lag.
+// Without this, the first hitmarker click hits a cold cache and the
+// "tink!" arrives ~200-500ms late on slow connections. Two-phase:
+//   1) fetch() each URL — populates HTTP cache without needing user-gesture
+//   2) new Audio() with preload='auto' — primes the decode pipeline so
+//      Audio.play() fires instantly when needed
+function _preloadMlgAssets() {
+  const audioUrls = [
+    '/static/sounds/hitmarker.mp3',
+    '/static/sounds/gunshot.mp3',
+    '/static/sounds/triple.mp3',
+    '/static/sounds/wow.mp3',
+    '/static/sounds/damnson.mp3',
+    '/static/sounds/noscoped.mp3',
+    '/static/sounds/wait-a-minute.mp3',
+  ];
+  const imageUrls = [
+    '/static/img/hitmarker.png',
+    '/static/img/snoop.gif',
+    '/static/img/frog.gif',
+  ];
+  // Phase 1: HTTP cache warmup — fetch into browser cache. Doesn't need
+  // playback context, works regardless of autoplay policy.
+  for (const url of audioUrls.concat(imageUrls)) {
+    try { fetch(url, { credentials: 'same-origin', cache: 'force-cache' }).catch(() => {}); }
+    catch {}
+  }
+  // Phase 2: pre-instantiate Audio elements so cloneNode() in playSample
+  // doesn't trigger a fresh decode. Stash on the same internal cache the
+  // Sounds module uses on first play.
+  for (const url of audioUrls) {
+    try {
+      const a = new Audio(url);
+      a.preload = 'auto';
+      a.load();
+      // Eagerly populate the Sounds module's _audioCache too — its first-
+      // play branch checks this map before creating a new Audio.
+      if (!window._mlgAudioPreload) window._mlgAudioPreload = {};
+      window._mlgAudioPreload[url] = a;
+    } catch {}
+  }
+  // Pre-decode images by instantiating Image() — same pattern as audio
+  for (const url of imageUrls) {
+    try {
+      const img = new Image();
+      img.decoding = 'async';
+      img.src = url;
+    } catch {}
+  }
+}
+if (document.readyState !== 'loading') _preloadMlgAssets();
+else document.addEventListener('DOMContentLoaded', _preloadMlgAssets);
 
 // Big rainbow MLG text overlay — used for both round-number milestones
 // and voice-line reactions. `opts.big` is the top giant line, `opts.small`
