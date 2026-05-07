@@ -361,7 +361,7 @@ def _recover_inflight_chunks():
                         changed = True
                 if changed:
                     try:
-                        ep_file.write_text(json.dumps(ep, ensure_ascii=False, indent=2))
+                        _atomic_write_json(ep_file, ep)
                     except Exception as e:
                         print(f'[recover] failed to save {ep_file}: {e}')
     if scanned:
@@ -1433,11 +1433,72 @@ def scaffold_series_folders(sid: str, title: str) -> dict:
         print(f'[scaffold_series_folders] {sid}: {result["prproj_warning"]}', flush=True)
     return result
 
+# File-write serialization: per-path lock so concurrent threads don't race on
+# the same JSON file. Without this, two threads doing write_text on the same
+# path can produce a corrupted "Extra data" file (writer A's content followed
+# by writer B's tail), which then breaks load_episode forever.
+_FILE_LOCKS = {}
+_FILE_LOCKS_GUARD = threading.Lock()
+
+def _file_lock(path):
+    key = str(path)
+    with _FILE_LOCKS_GUARD:
+        lk = _FILE_LOCKS.get(key)
+        if lk is None:
+            lk = threading.Lock()
+            _FILE_LOCKS[key] = lk
+        return lk
+
+def _atomic_write_json(path, data):
+    """Write JSON atomically: dump to a sibling tmp file, fsync, os.replace.
+    Combined with a per-path threading.Lock, this guarantees readers always
+    see either the old complete content or the new complete content — never
+    a half-written file. `os.replace` is atomic on POSIX."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + f'.tmp.{os.getpid()}.{threading.get_ident()}')
+    payload = json.dumps(data, indent=2, ensure_ascii=False)
+    with _file_lock(path):
+        with open(tmp, 'w', encoding='utf-8') as f:
+            f.write(payload)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass  # some filesystems don't support fsync
+        os.replace(tmp, path)
+
+def _load_json_resilient(path):
+    """Read a JSON file. If it's been corrupted by a non-atomic concurrent
+    write (symptom: `JSONDecodeError: Extra data: line N column M`), recover
+    by parsing only the first complete object via `raw_decode` and rewriting
+    the file with the recovered content. Logs the recovery so we know it
+    happened. Returns the parsed object, or raises if even the first object
+    is unparseable."""
+    raw = Path(path).read_text(encoding='utf-8')
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as e:
+        if 'Extra data' not in str(e):
+            raise
+        try:
+            obj, end = json.JSONDecoder().raw_decode(raw)
+        except json.JSONDecodeError:
+            raise  # truly broken — surface original error to caller
+        print(f'[recover] {path}: corrupted by concurrent write '
+              f'(extra {len(raw) - end} bytes after offset {end}); '
+              f'rewriting with recovered prefix', flush=True)
+        try:
+            _atomic_write_json(path, obj)
+        except Exception as we:
+            print(f'[recover] {path}: failed to rewrite recovered content: {we}', flush=True)
+        return obj
+
 def load_series(sid):
     f = series_file(sid)
     if not f.exists():
         return None
-    data = json.loads(f.read_text())
+    data = _load_json_resilient(f)
     # Forward-compat defaults so old series.json don't break new features.
     data.setdefault('video_provider', 'reteller')        # 'reteller' | 'seedance'
     data.setdefault('auto_reteller_prompt', True)        # auto-build Reteller prompt after script gen
@@ -1446,23 +1507,29 @@ def load_series(sid):
 
 def save_series(sid, data):
     series_path(sid).mkdir(exist_ok=True)
-    series_file(sid).write_text(json.dumps(data, indent=2, ensure_ascii=False))
+    _atomic_write_json(series_file(sid), data)
 
 def load_episode(sid, num):
     f = episodes_dir(sid) / f'{int(num):03d}.json'
-    return json.loads(f.read_text()) if f.exists() else None
+    return _load_json_resilient(f) if f.exists() else None
 
 def save_episode(sid, num, data):
     episodes_dir(sid).mkdir(exist_ok=True)
-    (episodes_dir(sid) / f'{int(num):03d}.json').write_text(
-        json.dumps(data, indent=2, ensure_ascii=False)
-    )
+    _atomic_write_json(episodes_dir(sid) / f'{int(num):03d}.json', data)
 
 def list_episodes(sid):
     d = episodes_dir(sid)
     if not d.exists():
         return []
-    return [json.loads(f.read_text(encoding='utf-8')) for f in sorted(d.glob('*.json')) if not f.name.startswith('._')]
+    out = []
+    for f in sorted(d.glob('*.json')):
+        if f.name.startswith('._') or '.tmp.' in f.name:
+            continue
+        try:
+            out.append(_load_json_resilient(f))
+        except Exception as e:
+            print(f'[list_episodes] skipping unreadable {f.name}: {e}', flush=True)
+    return out
 
 
 def is_batch_mode(s):
