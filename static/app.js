@@ -1967,6 +1967,26 @@ function applyVideoProviderMode() {
   document.body.classList.toggle('seedance-mode', provider === 'seedance');
   const sel = document.getElementById('video-provider-select');
   if (sel) sel.value = provider;
+  // Sync image-provider dropdown to persisted choice. '' = auto fallback.
+  const imgSel = document.getElementById('image-provider-select');
+  if (imgSel) {
+    const pref = (S.series && S.series.preferred_image_provider) || '';
+    imgSel.value = pref || 'auto';
+  }
+}
+
+// Persist per-series image-provider preference (banana / seedream / auto).
+// Backend reads this via _series_image_provider() and reorders the provider
+// chain in avai_generate so user's pick goes first.
+async function setImageProvider(provider) {
+  if (!S.series) return;
+  S.series.preferred_image_provider = provider === 'auto' ? '' : provider;
+  try {
+    await api.put(`/api/series/${S.seriesId}`, { preferred_image_provider: S.series.preferred_image_provider });
+    showToast(`✓ Image provider: ${provider}`);
+  } catch (e) {
+    console.error('setImageProvider failed', e);
+  }
 }
 
 async function setVideoProvider(provider) {
@@ -8868,7 +8888,27 @@ async function sdHandleDrop(ev) {
   ev.preventDefault();
   if (SD.refs.length >= 9) { showToast('Максимум 9 референсов'); return; }
 
-  // 1. File from desktop / external app
+  // 1. Internal payload (char/loc card) — CHECK FIRST. The browser may
+  // also attach a "file" representation of the dragged element image
+  // (the drag-preview bitmap shows up as dataTransfer.files[0]), and if
+  // we look at files BEFORE JSON we'd treat an internal card drag as a
+  // new external file → uploaded to AVAI as a custom ref, ignoring the
+  // existing entity id. User-reported bug: "перетаскиваю локацию,
+  // появляются часики, но не прикрепляется".
+  try {
+    const json = ev.dataTransfer.getData('application/json');
+    if (json) {
+      const payload = JSON.parse(json);
+      if (payload && payload.kind && payload.id) {
+        if (SD.refs.some(r => r.kind === payload.kind && r.id === payload.id && r.outfit === payload.outfit)) return;
+        SD.refs.push({ ...payload, tag: _sdNextFreeTag() });
+        sdRenderRefs();
+        return;
+      }
+    }
+  } catch {}
+
+  // 2. File from desktop / external app
   const files = Array.from(ev.dataTransfer.files || []).filter(f => f.type.startsWith('image/'));
   if (files.length) {
     for (const file of files) {
@@ -8878,21 +8918,12 @@ async function sdHandleDrop(ev) {
     return;
   }
 
-  // 2. Image URL dragged from another browser tab
+  // 3. Image URL dragged from another browser tab
   const uri = ev.dataTransfer.getData('text/uri-list') || ev.dataTransfer.getData('text/plain');
   if (uri && /^https?:\/\//.test(uri.trim()) && /\.(png|jpe?g|webp|gif)(\?|$)/i.test(uri.trim())) {
     await sdUploadCustomUrl(uri.trim());
     return;
   }
-
-  // 3. Internal payload (char/loc card)
-  let payload;
-  try { payload = JSON.parse(ev.dataTransfer.getData('application/json') || '{}'); }
-  catch { return; }
-  if (!payload.kind || !payload.id) return;
-  if (SD.refs.some(r => r.kind === payload.kind && r.id === payload.id && r.outfit === payload.outfit)) return;
-  SD.refs.push({ ...payload, tag: _sdNextFreeTag() });
-  sdRenderRefs();
 }
 
 // Pick the smallest 1-9 integer not currently used as a `tag` on SD.refs.

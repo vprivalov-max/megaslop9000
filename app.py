@@ -1519,15 +1519,31 @@ def _avai_call(provider: str, prompt: str, reference_url: str = None, aspect_rat
     return image_url
 
 
-def avai_generate(prompt: str, output_path: Path, reference_url: str = None, aspect_ratio: str = '9:16') -> str:
+def _series_image_provider(s):
+    """Read per-series user preference for image provider order.
+    Returns one of: 'banana', 'seedream', '' (auto). Stored on series.json
+    via the per-series toolbar dropdown."""
+    pref = (s or {}).get('preferred_image_provider', '') or ''
+    return pref if pref in ('banana', 'seedream') else ''
+
+
+def avai_generate(prompt: str, output_path: Path, reference_url: str = None, aspect_ratio: str = '9:16', preferred_provider: str = '') -> str:
     """Generate via AVAI. Tries Banana (Gemini Image Pro) first; on failure
     falls back to Seedream (NOT Seedance — Seedance is video, we need an image)
     with the same prompt + reference. Returns the remote image URL on success,
     raises with a combined error message on total failure.
-    aspect_ratio: '9:16' (vertical, default — characters/portraits) or '16:9' (horizontal — locations)."""
+    aspect_ratio: '9:16' (vertical, default — characters/portraits) or '16:9' (horizontal — locations).
+    preferred_provider: '' / 'auto' (default banana→seedream), 'banana', 'seedream' — explicit
+    user override via per-series toggle. If specified, that provider runs FIRST."""
     errors = []
     image_url = None
-    for provider in ('banana', 'seedream'):
+    if preferred_provider == 'seedream':
+        provider_chain = ('seedream', 'banana')
+    elif preferred_provider == 'banana':
+        provider_chain = ('banana', 'seedream')
+    else:
+        provider_chain = ('banana', 'seedream')
+    for provider in provider_chain:
         try:
             image_url = _avai_call(provider, prompt, reference_url=reference_url, aspect_ratio=aspect_ratio)
             print(f'[avai_generate] {provider} OK → {image_url[:80]}...')
@@ -3374,7 +3390,7 @@ def generate_outfit_image(sid, char_id, outfit_id):
     out_path = out_dir / f'{asset_name(char["name"], outfit["label"])}.jpg'
 
     try:
-        image_url = avai_generate(prompt, out_path, reference_url=reference_url)
+        image_url = avai_generate(prompt, out_path, reference_url=reference_url, preferred_provider=_series_image_provider(s))
         rel_path = str(out_path.relative_to(series_path(sid)))
         # Remove old photo if exists
         if outfit.get('photo'):
@@ -3464,7 +3480,7 @@ def generate_character_image(sid, char_id):
     out_path = char_dir / f'{asset_name(char["name"], "BASE")}.jpg'
 
     try:
-        image_url = avai_generate(prompt, out_path)
+        image_url = avai_generate(prompt, out_path, preferred_provider=_series_image_provider(s))
         rel_path = str(out_path.relative_to(series_path(sid)))
         refs = char.setdefault('ref_images', [])
         # Replace or prepend
@@ -3523,7 +3539,7 @@ def regenerate_character(sid, char_id):
                 out_path.unlink()
             except Exception:
                 pass
-        image_url = avai_generate(prompt, out_path)
+        image_url = avai_generate(prompt, out_path, preferred_provider=_series_image_provider(s))
     except Exception as e:
         return jsonify({'error': f'Не удалось сгенерировать основной образ: {e}'}), 500
 
@@ -3576,7 +3592,7 @@ def regenerate_character(sid, char_id):
                 if outfit_out.exists():
                     try: outfit_out.unlink()
                     except Exception: pass
-                outfit_url = avai_generate(ref_prompt, outfit_out, reference_url=new_base_url)
+                outfit_url = avai_generate(ref_prompt, outfit_out, reference_url=new_base_url, preferred_provider=_series_image_provider(s))
                 outfit['photo'] = str(outfit_out.relative_to(series_path(sid)))
                 outfit['avai_url'] = outfit_url
                 regenerated.append(outfit.get('label') or outfit['id'])
@@ -3659,14 +3675,26 @@ def upload_char_photo(sid, char_id):
     char_dir = assets_dir(sid) / 'characters' / char_slug
     char_dir.mkdir(parents=True, exist_ok=True)
     ext = f.filename.rsplit('.', 1)[-1].lower() if '.' in f.filename else 'jpg'
-    filename = f'{asset_name(char["name"], "BASE")}.{ext}'  # e.g. CLAIRE_BASE.jpg
-    (char_dir / filename).write_bytes(f.read())
-    rel_path = f'assets/characters/{char_slug}/{filename}'
-    refs = char.setdefault('ref_images', [])
-    if rel_path not in refs:
-        refs.insert(0, rel_path)
+    filename = f'{asset_name(char["name"], "BASE")}.{ext}'
+    new_rel = f'assets/characters/{char_slug}/{filename}'
+    new_full = char_dir / filename
+    # Replace semantics: when user uploads their own photo, drop ALL prior
+    # base refs + delete the on-disk files (not just append). Old photos
+    # were accumulating in the gallery — user complained it's confusing.
+    # Skip deletion of files that share the new path (overwrite case).
+    base = series_path(sid)
+    for old_rel in (char.get('ref_images') or []):
+        if old_rel == new_rel:
+            continue
+        try:
+            (base / old_rel).unlink(missing_ok=True)
+        except Exception:
+            pass
+    new_full.write_bytes(f.read())
+    char['ref_images'] = [new_rel]
+    char['avai_base_url'] = ''  # invalidate cached AVAI URL — was for the old auto-gen
     save_series(sid, s)
-    return jsonify({'ready': True, 'url': f'/assets/{sid}/{rel_path}', 'series': s})
+    return jsonify({'ready': True, 'url': f'/assets/{sid}/{new_rel}', 'series': s})
 
 
 @app.route('/api/series/<sid>/locations/<loc_id>/upload-photo', methods=['POST'])
@@ -3682,14 +3710,22 @@ def upload_loc_photo(sid, loc_id):
     loc_dir = assets_dir(sid) / 'locations' / loc_slug
     loc_dir.mkdir(parents=True, exist_ok=True)
     ext = f.filename.rsplit('.', 1)[-1].lower() if '.' in f.filename else 'jpg'
-    filename = f'{asset_name(loc["name"])}.{ext}'  # e.g. THE_NETWORKING_EVENT_VENUE.jpg
-    (loc_dir / filename).write_bytes(f.read())
-    rel_path = f'assets/locations/{loc_slug}/{filename}'
-    refs = loc.setdefault('ref_images', [])
-    if rel_path not in refs:
-        refs.insert(0, rel_path)
+    filename = f'{asset_name(loc["name"])}.{ext}'
+    new_rel = f'assets/locations/{loc_slug}/{filename}'
+    new_full = loc_dir / filename
+    base = series_path(sid)
+    for old_rel in (loc.get('ref_images') or []):
+        if old_rel == new_rel:
+            continue
+        try:
+            (base / old_rel).unlink(missing_ok=True)
+        except Exception:
+            pass
+    new_full.write_bytes(f.read())
+    loc['ref_images'] = [new_rel]
+    loc['avai_url'] = ''  # invalidate cached AVAI URL
     save_series(sid, s)
-    return jsonify({'ready': True, 'url': f'/assets/{sid}/{rel_path}', 'series': s})
+    return jsonify({'ready': True, 'url': f'/assets/{sid}/{new_rel}', 'series': s})
 
 
 # ── Open folder in Finder ─────────────────────────────────────────────────────
@@ -3737,7 +3773,7 @@ def generate_location_image(sid, loc_id):
     out_path = loc_dir / f'{asset_name(loc["name"])}.jpg'
 
     try:
-        image_url = avai_generate(prompt, out_path, aspect_ratio='16:9')
+        image_url = avai_generate(prompt, out_path, aspect_ratio='16:9', preferred_provider=_series_image_provider(s))
         rel_path = str(out_path.relative_to(series_path(sid)))
         refs = loc.setdefault('ref_images', [])
         refs[:] = [r for r in refs if Path(r).stem != out_path.stem]
@@ -3779,7 +3815,7 @@ def regenerate_location(sid, loc_id):
         if out_path.exists():
             try: out_path.unlink()
             except Exception: pass
-        image_url = avai_generate(prompt, out_path, aspect_ratio='16:9')
+        image_url = avai_generate(prompt, out_path, aspect_ratio='16:9', preferred_provider=_series_image_provider(s))
         rel_path = str(out_path.relative_to(series_path(sid)))
         refs = loc.setdefault('ref_images', [])
         refs[:] = [r for r in refs if Path(r).stem != out_path.stem]
@@ -3883,7 +3919,7 @@ def generate_item_image(sid, item_id):
     try:
         # Items use square aspect — works as a portable reference for both
         # vertical (Reteller) and horizontal (Seedance) compositions.
-        image_url = avai_generate(prompt, out_path, aspect_ratio='1:1')
+        image_url = avai_generate(prompt, out_path, aspect_ratio='1:1', preferred_provider=_series_image_provider(s))
         rel_path = str(out_path.relative_to(series_path(sid)))
         refs = item.setdefault('ref_images', [])
         refs[:] = [r for r in refs if Path(r).stem != out_path.stem]
@@ -3924,7 +3960,7 @@ def regenerate_item(sid, item_id):
         if out_path.exists():
             try: out_path.unlink()
             except Exception: pass
-        image_url = avai_generate(prompt, out_path, aspect_ratio='1:1')
+        image_url = avai_generate(prompt, out_path, aspect_ratio='1:1', preferred_provider=_series_image_provider(s))
         rel_path = str(out_path.relative_to(series_path(sid)))
         refs = item.setdefault('ref_images', [])
         refs[:] = [r for r in refs if Path(r).stem != out_path.stem]
@@ -4390,7 +4426,7 @@ def _gen_char_base_inline(s, sid, char):
     prompt = re.sub(r'\s+', ' ', prompt).strip()
     char_slug = slugify(char['name'])
     out_path = assets_dir(sid) / 'characters' / char_slug / f'{asset_name(char["name"], "BASE")}.jpg'
-    image_url = avai_generate(prompt, out_path)
+    image_url = avai_generate(prompt, out_path, preferred_provider=_series_image_provider(s))
     rel_path = str(out_path.relative_to(series_path(sid)))
     char.setdefault('ref_images', []).insert(0, rel_path)
     char['avai_base_url'] = image_url
@@ -4441,7 +4477,7 @@ def _gen_outfit_inline(s, sid, char, outfit):
     prompt = re.sub(r'\s+', ' ', prompt).strip()
     char_slug = slugify(char['name'])
     out_path = assets_dir(sid) / 'characters' / char_slug / 'outfits' / f'{asset_name(char["name"], outfit["label"])}.jpg'
-    image_url = avai_generate(prompt, out_path, reference_url=reference_url)
+    image_url = avai_generate(prompt, out_path, reference_url=reference_url, preferred_provider=_series_image_provider(s))
     outfit['photo'] = str(out_path.relative_to(series_path(sid)))
     outfit['avai_url'] = image_url
 
@@ -4465,7 +4501,7 @@ def _gen_loc_inline(s, sid, loc):
     prompt = re.sub(r'\s+', ' ', prompt).strip()
     loc_slug = slugify(loc['name'])
     out_path = assets_dir(sid) / 'locations' / loc_slug / f'{asset_name(loc["name"])}.jpg'
-    image_url = avai_generate(prompt, out_path, aspect_ratio='16:9')
+    image_url = avai_generate(prompt, out_path, aspect_ratio='16:9', preferred_provider=_series_image_provider(s))
     loc.setdefault('ref_images', []).insert(0, str(out_path.relative_to(series_path(sid))))
 
 
@@ -4494,7 +4530,7 @@ def _gen_item_inline(s, sid, item):
     prompt = re.sub(r'\s+', ' ', prompt).strip()
     item_slug = slugify(item['name'])
     out_path = assets_dir(sid) / 'items' / item_slug / f'{asset_name(item["name"])}.jpg'
-    image_url = avai_generate(prompt, out_path, aspect_ratio='1:1')
+    image_url = avai_generate(prompt, out_path, aspect_ratio='1:1', preferred_provider=_series_image_provider(s))
     rel_path = str(out_path.relative_to(series_path(sid)))
     item.setdefault('ref_images', []).insert(0, rel_path)
     item['avai_url'] = image_url
@@ -5543,7 +5579,7 @@ def audit_logic_holes(sid, num, script):
     )
     try:
         raw = claude_ask_fast(context, system=_LOGIC_HOLE_AUDIT_SYSTEM)
-        data = json.loads(strip_json(raw))
+        data = loads_lenient(strip_json(raw))
         if not isinstance(data, dict): raise ValueError('not a dict')
         data.setdefault('violations', [])
         data['passes'] = bool(data.get('passes', not any(
@@ -5551,6 +5587,18 @@ def audit_logic_holes(sid, num, script):
         )))
         return data
     except Exception as e:
+        # Last-ditch repair: try just regex-stripping fences + lenient parse
+        try:
+            data = loads_lenient(_strip_markdown_fence(raw))
+            if isinstance(data, dict):
+                data.setdefault('violations', [])
+                data['passes'] = bool(data.get('passes', not any(
+                    v.get('severity') == 'critical' for v in data['violations']
+                )))
+                return data
+        except Exception:
+            pass
+        _log_event('WARN', 'audit_json_parse_fail', err=str(e)[:200], raw_head=raw[:200] if 'raw' in dir() else '')
         return {'passes': True, 'violations': [], 'audit_error': str(e)}
 
 
@@ -5697,7 +5745,7 @@ def audit_script(sid, num, script, brief):
     )
     try:
         raw = claude_ask_fast(prompt, system=_AUDIT_SYSTEM)
-        data = json.loads(strip_json(raw))
+        data = loads_lenient(strip_json(raw))
         if not isinstance(data, dict): raise ValueError('not a dict')
         data.setdefault('violations', [])
         data['passes'] = bool(data.get('passes', not any(
@@ -5705,6 +5753,18 @@ def audit_script(sid, num, script, brief):
         )))
         return data
     except Exception as e:
+        # Last-ditch repair: try just regex-stripping fences + lenient parse
+        try:
+            data = loads_lenient(_strip_markdown_fence(raw))
+            if isinstance(data, dict):
+                data.setdefault('violations', [])
+                data['passes'] = bool(data.get('passes', not any(
+                    v.get('severity') == 'critical' for v in data['violations']
+                )))
+                return data
+        except Exception:
+            pass
+        _log_event('WARN', 'audit_json_parse_fail', err=str(e)[:200], raw_head=raw[:200] if 'raw' in dir() else '')
         return {'passes': True, 'violations': [], 'audit_error': str(e)}
 
 

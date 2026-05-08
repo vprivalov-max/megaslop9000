@@ -152,6 +152,14 @@
               <option value="seedance">Seedance</option>
             </select>
           </label>
+          <label class="video-provider-toggle" title="Какой image-провайдер пробовать ПЕРВЫМ при генерации картинок (chars/locs/items). Auto = banana → seedream fallback">
+            <span>Картинки:</span>
+            <select id="image-provider-select" onchange="setImageProvider(this.value)">
+              <option value="auto">🥖 Auto (Banana → Seedream)</option>
+              <option value="banana">🍌 Banana первым</option>
+              <option value="seedream">🌱 Seedream первым</option>
+            </select>
+          </label>
           <button class="btn-secondary reteller-only" onclick="openReteller()">🎬 Отправить в Reteller</button>
           <button class="btn-ghost" onclick="renameOutFiles()" title="Переименовать файлы в папке OUT по студийным требованиям">📁 Переименовать OUT</button>
           <button class="btn-primary" onclick="openCreateEpisode()" data-mlg-action="gunshot">+ Эпизод</button>
