@@ -1446,18 +1446,22 @@ async function toggleSeriesAutogen() {
 let _autogenPollTimer = null;
 
 async function triggerAutogenSweep() {
-  const btn = document.getElementById('autogen-sweep-btn');
-  const status = document.getElementById('autogen-sweep-status');
-  if (!btn || !status) return;
-  btn.disabled = true;
-  btn.innerHTML = '<span class="spinner"></span> запускаю…';
+  const btns = [
+    document.getElementById('autogen-sweep-btn'),
+    document.getElementById('autogen-sweep-btn-ep'),
+  ].filter(Boolean);
+  const statuses = [
+    document.getElementById('autogen-sweep-status'),
+    document.getElementById('autogen-sweep-status-ep'),
+  ].filter(Boolean);
+  if (!btns.length) return;
+  btns.forEach(b => { b.disabled = true; b.innerHTML = '<span class="spinner"></span> запускаю…'; });
   try {
     await fetch(`/api/series/${S.seriesId}/auto-generate/sweep`, {method: 'POST'});
     pollAutogenStatus();
   } catch (e) {
-    btn.disabled = false;
-    btn.innerHTML = '🎨 Сгенерировать недостающее';
-    status.textContent = 'Ошибка: ' + e.message;
+    btns.forEach(b => { b.disabled = false; b.innerHTML = '🎨 Сгенерировать недостающее'; });
+    statuses.forEach(s => { s.textContent = 'Ошибка: ' + e.message; });
   }
 }
 
@@ -1482,9 +1486,24 @@ function _autogenApplyInProgress(inProgress) {
 }
 
 async function pollAutogenStatus() {
-  const btn = document.getElementById('autogen-sweep-btn');
-  const status = document.getElementById('autogen-sweep-status');
-  if (!status) return;
+  // Two button/status pairs: one in series sidebar, one in episode sidebar.
+  // Helpers below mutate BOTH so the user sees identical state regardless
+  // of which view they're on.
+  const _allBtns = () => [
+    document.getElementById('autogen-sweep-btn'),
+    document.getElementById('autogen-sweep-btn-ep'),
+  ].filter(Boolean);
+  const _allStatuses = () => [
+    document.getElementById('autogen-sweep-status'),
+    document.getElementById('autogen-sweep-status-ep'),
+  ].filter(Boolean);
+  const _setBtnHtml = (html) => _allBtns().forEach(b => { b.innerHTML = html; });
+  const _setBtnDisabled = (d) => _allBtns().forEach(b => { b.disabled = d; });
+  const _setStatusText = (t) => _allStatuses().forEach(s => { s.textContent = t; });
+  const _setStatusHtml = (h) => _allStatuses().forEach(s => { s.innerHTML = h; });
+  const status = document.getElementById('autogen-sweep-status') || document.getElementById('autogen-sweep-status-ep');
+  const btn = document.getElementById('autogen-sweep-btn') || document.getElementById('autogen-sweep-btn-ep');
+  if (!status && !btn) return;
   if (_autogenPollTimer) { clearInterval(_autogenPollTimer); _autogenPollTimer = null; }
 
   // Track previous done count so we know when to re-fetch+re-render lists
@@ -1498,8 +1517,8 @@ async function pollAutogenStatus() {
       if (st.running) {
         const ipBits = (st.in_progress || []).map(x => x.name).filter(Boolean).slice(0, 3).join(', ');
         const ipSuffix = ipBits ? ` · сейчас: ${ipBits}` : '';
-        status.textContent = `генерация… ${st.done}/${st.queue}` + (st.errors.length ? ` · ошибок: ${st.errors.length}` : '') + ipSuffix;
-        if (btn) btn.innerHTML = '<span class="spinner"></span> ' + st.done + '/' + st.queue;
+        _setStatusText(`генерация… ${st.done}/${st.queue}` + (st.errors.length ? ` · ошибок: ${st.errors.length}` : '') + ipSuffix);
+        _setBtnHtml('<span class="spinner"></span> ' + st.done + '/' + st.queue);
         // Re-fetch + re-render every time `done` increments — lets assets pop in live
         if (prevDone !== -1 && st.done > prevDone) {
           try {
@@ -1522,15 +1541,16 @@ async function pollAutogenStatus() {
         prevDone = st.done;
       } else {
         if (_autogenPollTimer) { clearInterval(_autogenPollTimer); _autogenPollTimer = null; }
-        if (btn) { btn.disabled = false; btn.innerHTML = '🎨 Сгенерировать недостающее'; }
+        _setBtnDisabled(false);
+        _setBtnHtml('🎨 Сгенерировать недостающее');
         if (st.queue === 0 && st.done === 0) {
-          status.textContent = '— ничего не нужно генерить';
+          _setStatusText('— ничего не нужно генерить');
         } else if (st.errors && st.errors.length) {
-          status.innerHTML = `<span style="color:var(--danger,#f87171)">готово ${st.done}/${st.queue} · ошибок ${st.errors.length}</span>`;
+          _setStatusHtml(`<span style="color:var(--danger,#f87171)">готово ${st.done}/${st.queue} · ошибок ${st.errors.length}</span>`);
           showToast('Авто-генерация: ошибок — ' + st.errors.length + '. Подробности в консоли сервера.');
           console.warn('[autogen errors]', st.errors);
         } else {
-          status.innerHTML = `<span style="color:var(--success,#4ade80)">✓ готово ${st.done}/${st.queue}</span>`;
+          _setStatusHtml(`<span style="color:var(--success,#4ade80)">✓ готово ${st.done}/${st.queue}</span>`);
         }
         // Refresh series state to show new images
         try {
@@ -1540,12 +1560,13 @@ async function pollAutogenStatus() {
           renderLocationsList();
           renderItemsList();
         } catch {}
-        setTimeout(() => { if (status) status.textContent = ''; }, 6000);
+        setTimeout(() => _setStatusText(''), 6000);
       }
     } catch (e) {
       if (_autogenPollTimer) { clearInterval(_autogenPollTimer); _autogenPollTimer = null; }
-      if (btn) { btn.disabled = false; btn.innerHTML = '🎨 Сгенерировать недостающее'; }
-      status.textContent = 'Ошибка опроса: ' + e.message;
+      _setBtnDisabled(false);
+      _setBtnHtml('🎨 Сгенерировать недостающее');
+      _setStatusText('Ошибка опроса: ' + e.message);
     }
   };
   await tick();
@@ -4121,6 +4142,11 @@ async function loadEpisodeView() {
   if (typeof sdInitForEpisode === 'function') {
     setTimeout(() => sdInitForEpisode(), 50);
   }
+  // Hook the episode-side autogen-sweep button into the same poller as
+  // the series view. Если sweep уже идёт (запущен на серии или на другом
+  // эпизоде) — кнопка-копия в этом эпизоде сразу подхватит статус и не
+  // будет показывать "🎨 Сгенерировать недостающее" пока процесс активен.
+  if (typeof checkAutogenOnLoad === 'function') checkAutogenOnLoad();
 
   document.getElementById('ep-number-badge').textContent = chunkLabel(S.series, S.episodeNum, { short: true });
   renderEpisodeNeighbours();

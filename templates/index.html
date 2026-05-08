@@ -104,6 +104,17 @@
         <button class="btn-ghost btn-sm" onclick="openBibleEditor()">Редактировать</button>
       </div>
 
+      <!-- Style section moved up to position #2 — was buried at the bottom
+           where users couldn't find it. Now visually adjacent to the bible
+           so the user notices the visual look question early. -->
+      <div class="sidebar-section">
+        <div class="section-header">
+          <h3>🎨 Визуальный стиль</h3>
+          <button class="btn-icon" onclick="openStyleEditor()" title="Открыть выбор стиля">✎</button>
+        </div>
+        <div id="style-section" class="style-section"></div>
+      </div>
+
       <div class="sidebar-section">
         <div class="section-header">
           <h3>Персонажи</h3>
@@ -129,12 +140,6 @@
           </div>
         </div>
         <div id="items-list" class="characters-list"></div>
-      </div>
-
-      <div class="sidebar-section">
-        <h3>Стиль</h3>
-        <div id="style-section" class="style-section"></div>
-        <button class="btn-ghost btn-sm" onclick="openStyleEditor()">Редактировать стиль</button>
       </div>
     </aside>
 
@@ -522,6 +527,14 @@
     <div class="episode-resizer" id="episode-resizer" title="Перетащи чтобы изменить ширину сайдбара эпизода"></div>
 
     <aside class="episode-sidebar" id="episode-sidebar">
+      <!-- Mirror of the series-side autogen sweep button so the user can fire
+           it from inside an episode without going back. Same id used by
+           the autogen poll status — re-using rather than duplicating logic. -->
+      <div class="sidebar-section" style="padding:8px 10px;background:rgba(132,94,247,0.06);border:1px solid rgba(132,94,247,0.2);border-radius:6px;margin-bottom:10px">
+        <button class="btn btn-sm btn-ghost" onclick="triggerAutogenSweep()" id="autogen-sweep-btn-ep" style="font-size:0.78rem;width:100%">🎨 Сгенерировать недостающее</button>
+        <span id="autogen-sweep-status-ep" style="font-size:0.72rem;color:var(--muted);display:block;margin-top:4px"></span>
+      </div>
+
       <div class="sidebar-section">
         <div class="sidebar-section-header">
           <h3>Персонажи</h3>
