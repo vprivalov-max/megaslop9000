@@ -186,6 +186,23 @@ async function trackTask(label, ctx, fn) {
   }
 }
 
+// Cache-bust counter for asset URLs. Bumped after every operation that
+// changes an image on disk (upload, regen, autogen sweep tick), then every
+// <img src> formed via assetUrl() carries `?v=<ts>` so the browser refetches
+// instead of showing the cached old version. User reported: "изменения в
+// картинках появляются только после перезагрузки".
+window._assetVer = Date.now();
+function bumpAssetVersion() { window._assetVer = Date.now(); }
+function assetUrl(rel) {
+  if (!rel) return '';
+  if (typeof rel !== 'string') return rel;
+  if (/^https?:/.test(rel)) return rel;  // remote URLs (avai-gen) — leave alone
+  const sid = (typeof S !== 'undefined' && S && S.seriesId) ? S.seriesId : '';
+  const base = sid ? `/assets/${sid}/${rel}` : (rel.startsWith('/') ? rel : '/' + rel);
+  const sep = base.includes('?') ? '&' : '?';
+  return `${base}${sep}v=${window._assetVer}`;
+}
+
 // Resizable sidebar plumbing. Both the series-page sidebar (drag-handle on
 // its right edge, growing rightward) and the episode-page sidebar (handle
 // on its left edge, growing leftward) get the same treatment. Each persists
@@ -1443,9 +1460,17 @@ async function pollAutogenStatus() {
           try {
             const fresh = await fetch(`/api/series/${S.seriesId}`).then(r => r.json());
             S.series = fresh;
+            // Asset on disk changed — invalidate the cache-buster so next render
+            // fetches fresh image bytes instead of showing the previous version.
+            bumpAssetVersion();
             renderCharactersList();
             renderLocationsList();
             renderItemsList();
+            // Episode-side panels also have <img> for the same chars/locs/items —
+            // they'd otherwise keep showing stale until user navigates away.
+            if (typeof renderEpCharacters === 'function') renderEpCharacters();
+            if (typeof renderEpLocations === 'function') renderEpLocations();
+            if (typeof renderEpItems === 'function') renderEpItems();
             _autogenApplyInProgress(st.in_progress || []);  // re-apply spinners after re-render wipes them
           } catch {}
         }
@@ -1895,6 +1920,7 @@ async function plRegenMilestone(n) {
   try {
     await plSaveMilestone(n);
     const res = await api.post(`/api/series/${S.seriesId}/milestones/${n}/regenerate`, {});
+    bumpAssetVersion();
     const ta = document.getElementById(`ms-ta-${n}`);
     if (ta) ta.value = res.synopsis;
     S.series.milestone_synopses = S.series.milestone_synopses || {};
@@ -2459,6 +2485,7 @@ async function qcGenerate() {
     if (!charId) throw new Error('cannot create char');
     QC._tempCharId = charId;
     const r = await api.post(`/api/series/${S.seriesId}/characters/${charId}/generate-image`, {});
+    bumpAssetVersion();
     if (!r.ready) throw new Error(r.error || 'no image');
     QC.generatedRel = r.url || '';
     QC.file = null;
@@ -2501,6 +2528,7 @@ async function qcSave() {
       const resp = await fetch(`/api/series/${S.seriesId}/characters/${charId}/upload-photo`, {
         method: 'POST', body: fd,
       });
+      bumpAssetVersion();
       if (!resp.ok) throw new Error(await resp.text());
     }
     // Refresh series view
@@ -2585,6 +2613,7 @@ async function qlGenerate() {
     if (!locId) throw new Error('cannot create location');
     QL._tempLocId = locId;
     const r = await api.post(`/api/series/${S.seriesId}/locations/${locId}/generate-image`, {});
+    bumpAssetVersion();
     if (!r.ready) throw new Error(r.error || 'no image');
     QL.generatedRel = r.url || '';
     QL.file = null;
@@ -2622,6 +2651,7 @@ async function qlSave() {
       const resp = await fetch(`/api/series/${S.seriesId}/locations/${locId}/upload-photo`, {
         method: 'POST', body: fd,
       });
+      bumpAssetVersion();
       if (!resp.ok) throw new Error(await resp.text());
     }
     S.series = await api.get(`/api/series/${S.seriesId}`);
@@ -2766,7 +2796,7 @@ function renderLocAssetsGrid(loc) {
   const refs = loc.ref_images || [];
   grid.innerHTML = refs.map(r => {
     const fname = r.split('/').pop();
-    const url = `/assets/${S.seriesId}/${r}`;
+    const url = `${assetUrl(r)}`;
     return `
       <div class="photo-thumb-wrap" onclick="openLocLightbox('${loc.id}','${url}')">
         <img src="${url}" alt="">
@@ -2914,6 +2944,7 @@ async function dedupeSeriesItems() {
   showToast('🧹 Анализирую дубликаты…');
   try {
     const r = await api.post(`/api/series/${S.seriesId}/dedupe-items`, {});
+    bumpAssetVersion();
     if (r.error) throw new Error(r.error);
     if (!r.merged) {
       showToast('✓ Дубликатов не найдено');
@@ -2980,7 +3011,7 @@ function renderItemAssetsGrid(item) {
   const refs = item.ref_images || [];
   grid.innerHTML = refs.map(r => {
     const fname = r.split('/').pop();
-    const url = `/assets/${S.seriesId}/${r}`;
+    const url = `${assetUrl(r)}`;
     return `
       <div class="photo-thumb-wrap" onclick="openItemLightbox('${item.id}','${url}')">
         <img src="${url}" alt="">
@@ -3168,7 +3199,7 @@ function renderCharAssetsGrid(char) {
   const refs = char.ref_images || [];
   grid.innerHTML = refs.map(r => {
     const fname = r.split('/').pop();
-    const url = `/assets/${S.seriesId}/${r}`;
+    const url = `${assetUrl(r)}`;
     return `
       <div class="photo-thumb-wrap" onclick="openCharLightbox('${char.id}','${url}')">
         <img src="${url}" alt="">
@@ -3248,6 +3279,7 @@ async function relinkOrphanedAssets(btn) {
   if (out) out.textContent = '';
   try {
     const r = await api.post(`/api/series/${S.seriesId}/relink-assets`, {});
+    bumpAssetVersion();
     if (r?.error) throw new Error(r.error);
     const lines = (r.relinked || []).map(x =>
       `✓ ${x.kind} «${x.name}» → ${x.files.join(', ')}`
@@ -3300,14 +3332,14 @@ function openOutfitLightbox(charId, outfitId) {
   if (c.ref_images?.length) {
     items.push({
       kind: 'base', id: 'base', label: 'База',
-      photoUrl: `/assets/${S.seriesId}/${c.ref_images[0]}`,
+      photoUrl: `${assetUrl(c.ref_images[0])}`,
     });
   }
   for (const o of (c.outfits || [])) {
     if (o.photo) {
       items.push({
         kind: 'outfit', id: o.id, label: o.label || '(без названия)',
-        photoUrl: `/assets/${S.seriesId}/${o.photo}`,
+        photoUrl: `${assetUrl(o.photo)}`,
       });
     }
   }
@@ -3569,7 +3601,7 @@ function renderOutfitsList(char) {
   }
   el.innerHTML = outfits.map(o => {
     const hasPhoto = !!o.photo;
-    const photoUrl = hasPhoto ? `/assets/${S.seriesId}/${o.photo}` : '';
+    const photoUrl = hasPhoto ? `${assetUrl(o.photo)}` : '';
     const photoHtml = hasPhoto
       ? `<img src="${photoUrl}" alt="">`
       : `<div style="font-size:2.2rem">👗</div>`;
@@ -6138,6 +6170,7 @@ async function confirmAcceptModal() {
     if (_acceptModalSkipKinds.has('item')) payload.items = JSON.parse(overlay.dataset.newItems || '[]');
     try {
       await api.post(`/api/series/${S.seriesId}/skip-autogen`, payload);
+      bumpAssetVersion();
       // Refresh series to pick up the persisted flags.
       const fresh = await api.get(`/api/series/${S.seriesId}`);
       if (fresh) S.series = fresh;
@@ -6618,7 +6651,7 @@ function renderEpLocations() {
   const seedanceMode = document.body.classList.contains('seedance-mode');
   el.innerHTML = locs.map(l => {
     const hasRef = l.ref_images && l.ref_images.length > 0;
-    const imgUrl = hasRef ? `/assets/${S.seriesId}/${l.ref_images[0]}` : null;
+    const imgUrl = hasRef ? `${assetUrl(l.ref_images[0])}` : null;
     const inEp = used.includes(l.id);
     const dragAttrs = (seedanceMode && hasRef)
       ? `draggable="true" ondragstart="sdLocDragStart(event,'${l.id}')"` : '';
@@ -6680,7 +6713,7 @@ function renderEpItems() {
   const used = S.episode?.items_used || [];
   el.innerHTML = items.map(it => {
     const hasRef = it.ref_images && it.ref_images.length > 0;
-    const imgUrl = hasRef ? `/assets/${S.seriesId}/${it.ref_images[0]}` : null;
+    const imgUrl = hasRef ? `${assetUrl(it.ref_images[0])}` : null;
     const inEp = used.includes(it.id);
     return `
       <div class="ep-loc-row ${inEp ? 'in-episode' : ''}" id="ep-item-${it.id}"
@@ -6761,6 +6794,7 @@ async function regenerateItemFromLightbox(itemId) {
   if (status) status.textContent = '';
   try {
     const r = await api.post(`/api/series/${S.seriesId}/items/${itemId}/regenerate`, { wishes });
+    bumpAssetVersion();
     if (r?.error) throw new Error(r.error);
     const fresh = await api.get(`/api/series/${S.seriesId}`);
     if (fresh) S.series = fresh;
@@ -6848,6 +6882,7 @@ async function generateItemImage(itemId) {
   if (status) status.textContent = 'Генерирую...';
   try {
     const r = await api.post(`/api/series/${S.seriesId}/items/${itemId}/generate-image`, {});
+    bumpAssetVersion();
     if (r?.error) throw new Error(r.error);
     const fresh = await api.get(`/api/series/${S.seriesId}`);
     if (fresh) S.series = fresh;
@@ -6948,9 +6983,9 @@ function buildEpCharCard(c, inEpisode) {
   // Photo: first selected outfit's photo > base photo > placeholder
   let photoUrl = null;
   if (primaryOutfit?.photo) {
-    photoUrl = `/assets/${S.seriesId}/${primaryOutfit.photo}`;
+    photoUrl = `${assetUrl(primaryOutfit.photo)}`;
   } else if (c.ref_images?.length) {
-    photoUrl = `/assets/${S.seriesId}/${c.ref_images[0]}`;
+    photoUrl = `${assetUrl(c.ref_images[0])}`;
   }
   const hasBasePhoto = !!(c.ref_images?.length);
   // Overlay shown if the primary outfit needs gen
@@ -7149,6 +7184,7 @@ async function dropCharPhoto(event, charId) {
   fd.append('photo', file);
   try {
     const res = await fetch(`/api/series/${S.seriesId}/characters/${charId}/upload-photo`, { method: 'POST', body: fd });
+    bumpAssetVersion();
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || res.statusText);
     S.series = data.series;
@@ -7169,6 +7205,7 @@ async function dropLocPhoto(event, locId) {
   fd.append('photo', file);
   try {
     const res = await fetch(`/api/series/${S.seriesId}/locations/${locId}/upload-photo`, { method: 'POST', body: fd });
+    bumpAssetVersion();
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || res.statusText);
     S.series = data.series;
@@ -7229,6 +7266,7 @@ async function generateLocImage(locId) {
 
   try {
     const res = await api.post(`/api/series/${S.seriesId}/locations/${locId}/generate-image`, {});
+    bumpAssetVersion();
     if (res.ready) {
       statusEl.textContent = '';
       S.series = await api.get(`/api/series/${S.seriesId}`);
@@ -7254,6 +7292,7 @@ async function generateCharImage(charId) {
 
   try {
     const res = await api.post(`/api/series/${S.seriesId}/characters/${charId}/generate-image`, {});
+    bumpAssetVersion();
     if (res.ready) {
       statusEl.textContent = '';
       S.series = await api.get(`/api/series/${S.seriesId}`);
@@ -8955,7 +8994,7 @@ function _maybeAutoMarkEpisodeReady(chunks) {
 function sdLocDragStart(ev, locId) {
   const l = (S.series.locations || []).find(x => x.id === locId);
   if (!l) return;
-  const photoUrl = l.ref_images?.[0] ? `/assets/${S.seriesId}/${l.ref_images[0]}` : '';
+  const photoUrl = l.ref_images?.[0] ? `${assetUrl(l.ref_images[0])}` : '';
   ev.dataTransfer.setData('application/json', JSON.stringify({
     kind: 'loc', id: locId, name: l.name, photoUrl
   }));
@@ -9163,13 +9202,13 @@ async function sdSlotDrop(e, idx) {
         name = c.name;
         if (payload.outfit) {
           const o = (c.outfits || []).find(o => o.label === payload.outfit);
-          if (o?.photo) photoUrl = `/assets/${S.seriesId}/${o.photo}`;
+          if (o?.photo) photoUrl = `${assetUrl(o.photo)}`;
         }
-        if (!photoUrl && c.ref_images?.[0]) photoUrl = `/assets/${S.seriesId}/${c.ref_images[0]}`;
+        if (!photoUrl && c.ref_images?.[0]) photoUrl = `${assetUrl(c.ref_images[0])}`;
       }
     } else if (payload.kind === 'loc') {
       const l = (S.series.locations || []).find(x => x.id === payload.id);
-      if (l) { name = l.name; if (l.ref_images?.[0]) photoUrl = `/assets/${S.seriesId}/${l.ref_images[0]}`; }
+      if (l) { name = l.name; if (l.ref_images?.[0]) photoUrl = `${assetUrl(l.ref_images[0])}`; }
     }
   }
   SD.refs[idx] = { ...payload, name, photoUrl };
@@ -9277,15 +9316,15 @@ async function sdRecomposeWithCurrentRefs() {
           name = c.name;
           if (r.outfit) {
             const o = (c.outfits || []).find(o => o.label === r.outfit);
-            if (o?.photo) photoUrl = `/assets/${S.seriesId}/${o.photo}`;
+            if (o?.photo) photoUrl = `${assetUrl(o.photo)}`;
           }
-          if (!photoUrl && c.ref_images?.[0]) photoUrl = `/assets/${S.seriesId}/${c.ref_images[0]}`;
+          if (!photoUrl && c.ref_images?.[0]) photoUrl = `${assetUrl(c.ref_images[0])}`;
         }
       } else if (r.kind === 'loc') {
         const l = (S.series.locations || []).find(x => x.id === r.id);
         if (l) {
           name = l.name;
-          if (l.ref_images?.[0]) photoUrl = `/assets/${S.seriesId}/${l.ref_images[0]}`;
+          if (l.ref_images?.[0]) photoUrl = `${assetUrl(l.ref_images[0])}`;
         }
       } else if (r.kind === 'lastframe' || r.kind === 'cutframe') {
         name = r.name || (r.kind === 'lastframe' ? 'last frame' : 'pre-cut frame');
@@ -9335,15 +9374,15 @@ async function sdCompose() {
           name = c.name;
           if (r.outfit) {
             const o = (c.outfits || []).find(o => o.label === r.outfit);
-            if (o?.photo) photoUrl = `/assets/${S.seriesId}/${o.photo}`;
+            if (o?.photo) photoUrl = `${assetUrl(o.photo)}`;
           }
-          if (!photoUrl && c.ref_images?.[0]) photoUrl = `/assets/${S.seriesId}/${c.ref_images[0]}`;
+          if (!photoUrl && c.ref_images?.[0]) photoUrl = `${assetUrl(c.ref_images[0])}`;
         }
       } else if (r.kind === 'loc') {
         const l = (S.series.locations || []).find(x => x.id === r.id);
         if (l) {
           name = l.name;
-          if (l.ref_images?.[0]) photoUrl = `/assets/${S.seriesId}/${l.ref_images[0]}`;
+          if (l.ref_images?.[0]) photoUrl = `${assetUrl(l.ref_images[0])}`;
         }
       } else if (r.kind === 'lastframe') {
         // Server-attached continuity frame from previous chunk
@@ -9559,7 +9598,7 @@ async function sdRefreshList() {
 
 function _sdCardHTML(c) {
   const stCls = `sd-status-${c.status || 'pending'}`;
-  const videoUrl = c.video_path ? `/assets/${S.seriesId}/${c.video_path}` : '';
+  const videoUrl = c.video_path ? `${assetUrl(c.video_path)}` : '';
   const cost = c.cost != null ? `· $${Number(c.cost).toFixed(2)}` : '';
   let placeholderText;
   if (c.status === 'failed') placeholderText = '✗ failed';
@@ -9960,13 +9999,13 @@ async function sdReuse(idx) {
         name = ch.name;
         if (r.outfit) {
           const o = (ch.outfits || []).find(o => o.label === r.outfit);
-          if (o?.photo) photoUrl = `/assets/${S.seriesId}/${o.photo}`;
+          if (o?.photo) photoUrl = `${assetUrl(o.photo)}`;
         }
-        if (!photoUrl && ch.ref_images?.[0]) photoUrl = `/assets/${S.seriesId}/${ch.ref_images[0]}`;
+        if (!photoUrl && ch.ref_images?.[0]) photoUrl = `${assetUrl(ch.ref_images[0])}`;
       }
     } else if (r.kind === 'loc') {
       const l = (S.series.locations || []).find(x => x.id === r.id);
-      if (l) { name = l.name; if (l.ref_images?.[0]) photoUrl = `/assets/${S.seriesId}/${l.ref_images[0]}`; }
+      if (l) { name = l.name; if (l.ref_images?.[0]) photoUrl = `${assetUrl(l.ref_images[0])}`; }
     } else if (r.kind === 'lastframe') {
       // Last-frame ref: URL is already a public AVAI image — use it as the thumbnail too.
       name = r.name || `last frame · prev #${r.prev_idx ?? '?'}`;
@@ -10313,7 +10352,7 @@ function mtRenderTimeline() {
   }
   empty?.classList.add('hidden');
   el.innerHTML = MT.clips.map((c, i) => {
-    const url = c.video_path ? `/assets/${S.seriesId}/${c.video_path}` : '';
+    const url = c.video_path ? `${assetUrl(c.video_path)}` : '';
     const dur = Math.max(0.1, (c.out || 0) - (c.in || 0));
     const w = Math.max(70, dur * MT.pxPerSec);
     const trimMark = (c.in > 0.05 || (c.orig_duration && Math.abs(c.out - c.orig_duration) > 0.05))
@@ -10616,7 +10655,7 @@ function mtLoadClipIntoPlayer(idx, localOffset = 0) {
   if (idx < 0 || idx >= MT.clips.length) return;
   const c = MT.clips[idx];
   if (!c.video_path) return;
-  const url = `/assets/${S.seriesId}/${c.video_path}`;
+  const url = `${assetUrl(c.video_path)}`;
   const targetTime = (c.in || 0) + localOffset;
   if (MT.curIdx !== idx) {
     MT.curIdx = idx;
@@ -11024,7 +11063,7 @@ async function mtRefreshLibrary() {
       return;
     }
     lib.innerHTML = items.map(c => {
-      const url = `/assets/${S.seriesId}/${c.video_path}`;
+      const url = `${assetUrl(c.video_path)}`;
       return `
         <div class="mt-lib-item" draggable="true"
              ondragstart="mtLibDragStart(event,${c.ep},${c.idx})"
@@ -11226,7 +11265,7 @@ function cropOpen(clipId) {
     CROP.fx = 0; CROP.fy = 0; CROP.fw = 1; CROP.fh = 1;
   }
   const v = document.getElementById('crop-source');
-  v.src = `/assets/${S.seriesId}/${clip.video_path}#t=${(clip.in||0)+0.1}`;
+  v.src = `${assetUrl(clip.video_path)}#t=${(clip.in||0)+0.1}`;
   v.onloadedmetadata = () => {
     CROP.videoNatW = v.videoWidth;
     CROP.videoNatH = v.videoHeight;
