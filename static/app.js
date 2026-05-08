@@ -10051,10 +10051,18 @@ async function sdRecomposeWithCurrentRefs() {
           name = l.name;
           if (l.ref_images?.[0]) photoUrl = `${assetUrl(l.ref_images[0])}`;
         }
+      } else if (r.kind === 'item') {
+        const it = (S.series.items || []).find(x => x.id === r.id);
+        if (it) {
+          name = it.name;
+          if (it.ref_images?.[0]) photoUrl = `${assetUrl(it.ref_images[0])}`;
+        }
       } else if (r.kind === 'lastframe' || r.kind === 'cutframe') {
         name = r.name || (r.kind === 'lastframe' ? 'last frame' : 'pre-cut frame');
         photoUrl = r.url || '';
       }
+      if (!photoUrl && r.url) photoUrl = r.url;
+      if (!name && r.name) name = r.name;
       // Restore stable tag from pre-recompose snapshot
       const snap = tagSnapshot.find(s => s.kind === r.kind && s.id === r.id && (s.outfit || null) === (r.outfit || null));
       return { ...r, name, photoUrl, tag: snap?.tag };
@@ -10109,6 +10117,12 @@ async function sdCompose() {
           name = l.name;
           if (l.ref_images?.[0]) photoUrl = `${assetUrl(l.ref_images[0])}`;
         }
+      } else if (r.kind === 'item') {
+        const it = (S.series.items || []).find(x => x.id === r.id);
+        if (it) {
+          name = it.name;
+          if (it.ref_images?.[0]) photoUrl = `${assetUrl(it.ref_images[0])}`;
+        }
       } else if (r.kind === 'lastframe') {
         // Server-attached continuity frame from previous chunk
         name = r.name || 'last frame';
@@ -10118,6 +10132,8 @@ async function sdCompose() {
         name = r.name || 'pre-cut frame';
         photoUrl = r.url || '';
       }
+      if (!photoUrl && r.url) photoUrl = r.url;
+      if (!name && r.name) name = r.name;
       return { ...r, name, photoUrl };
     });
     sdRenderRefs();
@@ -10715,7 +10731,10 @@ async function sdReuse(idx) {
   document.getElementById('sd-duration').value = c.duration || 15;
   document.getElementById('sd-resolution').value = c.resolution || '720p';
   document.getElementById('sd-mod-bypass').value = c.moderation_bypass || 'collage_grid';
-  // Rebuild refs from stored descriptors
+  // Rebuild refs from stored descriptors. Must cover every kind that compose/
+  // start can emit (char, loc, item, lastframe, cutframe) — otherwise reuse
+  // for the heal-prompt flow drops the photo and the user sees "no photo" with
+  // an unbound @ImageN tag.
   SD.refs = (c.refs || []).map(r => {
     let name = '', photoUrl = '';
     if (r.kind === 'char') {
@@ -10723,7 +10742,10 @@ async function sdReuse(idx) {
       if (ch) {
         name = ch.name;
         if (r.outfit) {
-          const o = (ch.outfits || []).find(o => o.label === r.outfit);
+          // Outfits sometimes get referenced by id in older data; fall back so
+          // we don't silently lose the photo when the label was renamed.
+          const o = (ch.outfits || []).find(o => o.label === r.outfit)
+                 || (ch.outfits || []).find(o => o.id === r.outfit);
           if (o?.photo) photoUrl = `${assetUrl(o.photo)}`;
         }
         if (!photoUrl && ch.ref_images?.[0]) photoUrl = `${assetUrl(ch.ref_images[0])}`;
@@ -10731,11 +10753,22 @@ async function sdReuse(idx) {
     } else if (r.kind === 'loc') {
       const l = (S.series.locations || []).find(x => x.id === r.id);
       if (l) { name = l.name; if (l.ref_images?.[0]) photoUrl = `${assetUrl(l.ref_images[0])}`; }
+    } else if (r.kind === 'item') {
+      const it = (S.series.items || []).find(x => x.id === r.id);
+      if (it) { name = it.name; if (it.ref_images?.[0]) photoUrl = `${assetUrl(it.ref_images[0])}`; }
     } else if (r.kind === 'lastframe') {
       // Last-frame ref: URL is already a public AVAI image — use it as the thumbnail too.
       name = r.name || `last frame · prev #${r.prev_idx ?? '?'}`;
       photoUrl = r.url || '';
+    } else if (r.kind === 'cutframe') {
+      name = r.name || `pre-cut frame${r.cut_index != null ? ' #' + r.cut_index : ''}`;
+      photoUrl = r.url || '';
     }
+    // Fallback: if we still have nothing useful but the stored descriptor
+    // carries a remote URL (e.g. legacy chunks where the kind was an unknown
+    // tag like 'url' / 'item' before this branch existed) — use it directly.
+    if (!photoUrl && r.url) photoUrl = r.url;
+    if (!name && r.name) name = r.name;
     return { ...r, name, photoUrl };
   });
   sdRenderRefs();
