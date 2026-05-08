@@ -483,6 +483,36 @@ def _log_event(level, event, email=None, **fields):
     except Exception:
         pass
 
+@app.route('/api/client-log', methods=['POST'])
+def client_log():
+    """Frontend → backend logging bridge. Lets the JS side emit structured
+    events into the same per-user JSONL log file that backend uses, so
+    user-visible auto-mode milestones / errors are debuggable from the admin
+    Logs viewer (instead of asking the user to open DevTools and screenshot).
+    Body: {level: 'INFO'|'WARN'|'ERROR', event: str, ...fields}.
+    Hard cap on field sizes to prevent abuse (chatty client could spam disk)."""
+    body = request.get_json(silent=True) or {}
+    level = (body.get('level') or 'INFO').upper()
+    if level not in ('INFO', 'WARN', 'ERROR'):
+        level = 'INFO'
+    event = (body.get('event') or 'client').strip()[:80]
+    fields = {}
+    for k, v in body.items():
+        if k in ('level', 'event'):
+            continue
+        if isinstance(v, str):
+            fields[k[:40]] = v[:500]
+        elif isinstance(v, (int, float, bool)) or v is None:
+            fields[k[:40]] = v
+        else:
+            try:
+                fields[k[:40]] = json.dumps(v)[:500]
+            except Exception:
+                fields[k[:40]] = str(v)[:500]
+    _log_event(level, f'client.{event}', **fields)
+    return jsonify({'ok': True})
+
+
 @app.before_request
 def _log_request_start():
     if request.path.startswith('/static/') or request.path == '/healthz':

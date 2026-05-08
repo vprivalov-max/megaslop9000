@@ -5721,19 +5721,39 @@ function stopAutoMode() {
   _autoUpdateStatusUI();
 }
 
+// Fire-and-forget client → backend log bridge. Used to record AUTO milestones
+// so debugging "почему ничего не запустилось" doesn't require a DevTools
+// session — sequence shows up directly in admin Logs viewer.
+function clog(level, event, fields = {}) {
+  try {
+    fetch('/api/client-log', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ level, event, ...fields }),
+      keepalive: true,
+    }).catch(() => {});
+  } catch {}
+}
+
 async function startAutoMode() {
+  clog('INFO', 'auto.entry', { sid: S.seriesId || null, ep: S.episode?.number ?? null });
   if (AUTO.active) {
+    clog('WARN', 'auto.bail', { reason: 'already_active' });
     showToast('Auto-mode уже активен');
     return;
   }
   if (!S.episode) {
+    clog('WARN', 'auto.bail', { reason: 'no_episode' });
     showToast('⚠ Сначала открой эпизод');
     return;
   }
   // Pre-flight: warn if any active char/loc lacks ref before kicking off N
   // chunks of generation. User often regrets discovering missing assets only
   // after burning compute on chunks with placeholder/random faces.
-  if (!await _confirmMissingAssetsBeforeGen('Auto-mode (видео-генерацию)')) return;
+  if (!await _confirmMissingAssetsBeforeGen('Auto-mode (видео-генерацию)')) {
+    clog('WARN', 'auto.bail', { reason: 'missing_assets_cancelled' });
+    return;
+  }
   // Auto-mode hard requirement: duration MUST be 15s. The whole segmentation
   // logic (TARGET=12s, SOFT_MAX=13s, MIN=5s) is calibrated assuming 15s
   // Seedance chunks. If user picked 5/10s clips, segments won't fit and the
@@ -5749,7 +5769,10 @@ async function startAutoMode() {
       `OK — да, ставлю 15с и запускаю.\n` +
       `Cancel — отменить, поставлю сам.`
     );
-    if (!confirmFix) return;
+    if (!confirmFix) {
+      clog('WARN', 'auto.bail', { reason: 'duration_cancelled', curDur });
+      return;
+    }
     if (durEl) {
       durEl.value = '15';
       durEl.dispatchEvent(new Event('change', { bubbles: true }));
@@ -5817,6 +5840,12 @@ async function startAutoMode() {
   AUTO.lastStatus = '';
 
   if (!AUTO.total) {
+    clog('WARN', 'auto.bail', {
+      reason: 'no_segments',
+      total_raw: allSegs.length,
+      skipped: skippedCount,
+      script_len: (document.getElementById('ep-script')?.value || '').length,
+    });
     showToast(`⚠ Нет сегментов для генерации${skippedCount ? ` (${skippedCount} помечены как skip)` : ''}`);
     return;
   }
@@ -5847,10 +5876,14 @@ async function startAutoMode() {
       : sceneGroups.length > 1
         ? 'Внутри каждой сцены чанки идут последовательно (нужно для last-frame / cut-frames continuity). Сцены друг от друга не зависят и идут параллельно (cap = 3 одновременно).'
         : 'Последовательный режим: каждый чанк ждёт предыдущего.'}`
-  )) return;
+  )) {
+    clog('WARN', 'auto.bail', { reason: 'main_confirm_cancelled', total: AUTO.total });
+    return;
+  }
 
   AUTO.active = true;
   _autoUpdateStatusUI();
+  clog('INFO', 'auto.start', { total: AUTO.total, parallel: !!AUTO.parallel, scenes: sceneGroups.length });
   showToast(`▶ Auto-mode запущен · ${AUTO.total} сегмент${AUTO.total > 1 ? 'ов' : ''} (${modeWord})`, 4000);
 
   // CRITICAL: capture episode identity ONCE — every in-flight request must target
@@ -6168,6 +6201,7 @@ async function startAutoMode() {
     AUTO.active = false;
     _autoUpdateStatusUI();
     Sounds.playError();
+    clog('ERROR', 'auto.crash', { msg: (e?.message || String(e)).slice(0, 400) });
     showToast(`✗ Auto-mode упал: ${e.message || e}`, 8000);
   }
 }
