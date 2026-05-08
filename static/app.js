@@ -1590,14 +1590,26 @@ function _checkMissingAssets(scope = 'episode') {
     if (!c.ref_images || !c.ref_images.length) {
       out.chars.push({ name: c.name, id: cid });
     }
-    // Check requested outfits for this char
+    // Check requested outfits for this char. The episode stores values that
+    // may be either outfit LABELS or outfit IDS depending on when the entry
+    // was written (legacy episodes mix both). Try both to find the outfit.
+    // If the value matches NEITHER an existing label NOR an existing id —
+    // it's an orphan ref pointing at a deleted/renamed outfit. We silently
+    // ignore it instead of reporting "missing" (the outfit literally doesn't
+    // exist anymore so there's nothing to generate). This is what was
+    // happening in the user's screenshot: SARAH/49d33f6b, MARCUS/d22d7423,
+    // ELENA/c5d28813 were stale 8-char outfit ids; backend autogen saw all
+    // real outfits already had photos and reported "ничего не нужно генерить",
+    // while this preflight kept screaming about orphans.
     const requested = charOutfits[cid] || [];
     const labels = Array.isArray(requested) ? requested : (requested ? [requested] : []);
-    for (const label of labels) {
-      if (!label || label === 'base') continue;
-      const outfit = (c.outfits || []).find(o => o.label === label);
-      if (!outfit || (!outfit.photo && !outfit.is_base)) {
-        out.outfits.push({ char: c.name, label });
+    for (const ref of labels) {
+      if (!ref || ref === 'base') continue;
+      const outfits = c.outfits || [];
+      const outfit = outfits.find(o => o.label === ref) || outfits.find(o => o.id === ref);
+      if (!outfit) continue;  // orphan — drop silently
+      if (!outfit.photo && !outfit.is_base) {
+        out.outfits.push({ char: c.name, label: outfit.label });
       }
     }
   }
