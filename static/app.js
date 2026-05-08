@@ -10360,7 +10360,7 @@ function _sdCardHTML(c) {
     <div class="sd-gen-meta">
       <div><span class="${stCls}">●</span> #${c.idx} · ${c.status} · ${c.duration}s ${c.resolution} · ${c.moderation_bypass} ${cost}</div>
       <div class="sd-prompt">${esc(c.prompt || '')}</div>
-      ${c.error ? `<div style="color:#e74c3c">${esc(c.error)}</div>` : ''}
+      ${c.error && c.status !== 'completed' ? `<div style="color:#e74c3c">${esc(c.error)}</div>` : ''}
       <div class="sd-gen-actions">
         ${videoUrl ? `<a class="btn-ghost btn-sm" href="${videoUrl}" download>⬇ Скачать</a>` : ''}
         ${videoUrl ? `<button class="btn-ghost btn-sm" onclick="sdAddToTimeline(${c.idx}, this)">➕ На таймлайн</button>` : ''}

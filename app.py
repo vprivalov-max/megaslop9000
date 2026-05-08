@@ -10005,7 +10005,25 @@ def seedance_list(sid, num):
     ep = load_episode(sid, num)
     if not ep:
         return jsonify({'error': 'not found'}), 404
-    return jsonify({'chunks': _seedance_chunks(ep)})
+    chunks = _seedance_chunks(ep)
+    # One-shot cleanup: wipe stale `error` strings that were left over from a
+    # transient failure (AVAI 401 etc.) on chunks that ultimately rendered
+    # successfully. Without this old chunks keep showing red "401: Unauthorized"
+    # under the video preview forever even though they're completed.
+    healed = False
+    for c in chunks:
+        if c.get('status') == 'completed' and c.get('video_path') and c.get('error'):
+            c.pop('error', None)
+            healed = True
+    if healed:
+        with _episode_lock(sid, num):
+            ep2 = load_episode(sid, num) or ep
+            for c in _seedance_chunks(ep2):
+                if c.get('status') == 'completed' and c.get('video_path') and c.get('error'):
+                    c.pop('error', None)
+            save_episode(sid, num, ep2)
+            chunks = _seedance_chunks(ep2)
+    return jsonify({'chunks': chunks})
 
 
 @app.route('/api/series/<sid>/episodes/<int:num>/auto-assemble', methods=['POST'])
@@ -12149,6 +12167,13 @@ def seedance_poll(sid, num):
                     _download_video(vurl, vid_local)
                     c['video_url'] = vurl
                     c['video_path'] = str(vid_local.relative_to(series_path(sid)))
+                    # Successful render — wipe any stale error field carried over
+                    # from a previous transient failure (e.g. AVAI 401 on a tick
+                    # before the user fixed the key, then chunk eventually
+                    # completed). Without this the card keeps showing red-text
+                    # "401: Unauthorized" even though the video is right there.
+                    if c.get('error'):
+                        c.pop('error', None)
                     if c.get('chunk_text'):
                         try:
                             es = claude_ask(
