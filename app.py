@@ -530,6 +530,35 @@ def healthz():
     return {'ok': True, 'auth': AUTH_ENABLED}
 
 
+@app.route('/api/me/validate-avai-key')
+def validate_avai_key():
+    """Live-checks the current user's AVAI key by hitting a cheap auth-only
+    endpoint (no generation, no cost). Returns:
+      {state: 'ok'|'missing'|'invalid'|'unreachable', detail?, balance?}
+    Frontend calls this once per page load (or on demand) so we can pop the
+    fix-it modal proactively the moment we know the key is dead — instead
+    of waiting for the user to click generate and getting a wall of 401."""
+    key = _get_user_avai_key()
+    if not key:
+        return jsonify({'state': 'missing'})
+    try:
+        r = requests.get('https://avai-gen.com/api/public/balance',
+                         headers={'x-api-key': key}, timeout=10)
+    except Exception as e:
+        # Network blip / AVAI downtime — don't pop a key-error modal because
+        # the key might be fine. Tell FE to retry later.
+        return jsonify({'state': 'unreachable', 'detail': str(e)[:200]})
+    if r.status_code == 401:
+        return jsonify({'state': 'invalid', 'detail': 'AVAI returned 401 Unauthorized'})
+    if not r.ok:
+        return jsonify({'state': 'unreachable', 'detail': f'HTTP {r.status_code}: {r.text[:120]}'})
+    try:
+        data = r.json()
+    except Exception:
+        data = {}
+    return jsonify({'state': 'ok', 'balance': data.get('balance') or data.get('credits')})
+
+
 # ── MLG kill leaderboard ─────────────────────────────────────────────────────
 # Per-user kill stats live in <DATA_ROOT>/<email-slug>/mlg_stats.json.
 # Schema: {"kills": int, "first_kill": ts, "last_kill": ts, "by_target": {kind: count}}

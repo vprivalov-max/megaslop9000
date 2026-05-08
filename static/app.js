@@ -194,8 +194,34 @@ async function _checkApiKeysOnBoot() {
     window._currentUser = me;
     if (!me.has_avai_key) {
       _showApiKeySetupModal('avai', { firstTime: true });
+      return;
     }
+    // Has a key string — but is it actually VALID? Live-check via the cheap
+    // /validate-avai-key endpoint (auth-only, no generation, no cost). Pop
+    // the fix-it modal proactively if AVAI rejects it (401) or it's empty.
+    // Skip the unreachable case — could be transient AVAI downtime, don't
+    // bother user about that.
+    try {
+      const v = await fetch('/api/me/validate-avai-key').then(r => r.ok ? r.json() : null);
+      if (v && (v.state === 'invalid' || v.state === 'missing')) {
+        _showApiKeySetupModal('avai', { reason: v.state });
+      }
+    } catch {}
   } catch {}
+}
+
+// Re-check key validity on demand (after Settings save, or before a
+// generation flow if the user has been idle a while). Returns the state
+// string so callers can short-circuit if invalid.
+async function recheckAvaiKey() {
+  try {
+    const v = await fetch('/api/me/validate-avai-key').then(r => r.ok ? r.json() : null);
+    if (!v) return 'unreachable';
+    if (v.state === 'invalid' || v.state === 'missing') {
+      _showApiKeySetupModal('avai', { reason: v.state });
+    }
+    return v.state;
+  } catch { return 'unreachable'; }
 }
 
 // Show modal demanding the user enter an API key. `kind` = 'avai' | 'reteller'.
@@ -268,12 +294,39 @@ async function _saveApiKeyFromModal(kind) {
   try {
     const payload = isAvai ? { avai_key: value } : { reteller_key: value };
     await api.post('/api/config', payload);
-    if (status) { status.textContent = '✓ Сохранено'; status.style.color = 'var(--success)'; }
+    // For AVAI: post-save live validation so the user gets immediate feedback
+    // if they pasted a typo / expired key. Reteller has no cheap auth-check
+    // endpoint exposed yet, so we skip live-validate there.
+    if (isAvai) {
+      if (status) { status.textContent = '⏳ Проверяю...'; }
+      try {
+        const v = await fetch('/api/me/validate-avai-key').then(r => r.ok ? r.json() : null);
+        if (v && v.state === 'ok') {
+          if (status) {
+            const bal = v.balance != null ? ` (баланс: ${v.balance})` : '';
+            status.textContent = '✓ Ключ валиден' + bal; status.style.color = 'var(--success)';
+          }
+        } else if (v && (v.state === 'invalid' || v.state === 'missing')) {
+          if (status) {
+            status.textContent = '✗ AVAI отверг ключ — проверь что скопировал правильно';
+            status.style.color = 'var(--danger)';
+          }
+          return;  // don't close modal, let user retry
+        } else {
+          // unreachable / network blip — accept, user can re-validate later
+          if (status) { status.textContent = '✓ Сохранено (проверка авторизации не удалась — попробуй сгенерить)'; status.style.color = 'var(--warning)'; }
+        }
+      } catch {
+        if (status) { status.textContent = '✓ Сохранено'; status.style.color = 'var(--success)'; }
+      }
+    } else {
+      if (status) { status.textContent = '✓ Сохранено'; status.style.color = 'var(--success)'; }
+    }
     setTimeout(() => {
       _closeApiKeyModal();
       // Refresh /api/me state so subsequent gates see the new key
       _checkApiKeysOnBoot();
-    }, 600);
+    }, 800);
   } catch (e) {
     if (status) { status.textContent = '✗ ' + (e.message || e); status.style.color = 'var(--danger)'; }
   }
