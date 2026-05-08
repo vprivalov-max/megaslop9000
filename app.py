@@ -2987,25 +2987,11 @@ def get_series(sid):
         print(f'[get_series {sid}] heal failed: {e}')
     # Re-load post-heal so client gets the fresh state
     s = load_series(sid)
-    # Self-healing: if anything has missing refs AND autogen is enabled AND no
-    # sweep is currently running — kick one off. Catches the rare case where a
-    # previous trigger failed silently and assets stay un-generated forever.
-    try:
-        if s and s.get('auto_generate_assets'):
-            st = _autogen_status(sid)
-            if not st.get('running'):
-                pending = (
-                    sum(1 for c in (s.get('characters') or []) if not c.get('ref_images'))
-                    + sum(1 for c in (s.get('characters') or []) for o in (c.get('outfits') or [])
-                          if not o.get('photo') and not o.get('is_base'))
-                    + sum(1 for l in (s.get('locations') or []) if not l.get('ref_images'))
-                    + sum(1 for it in (s.get('items') or []) if not it.get('ref_images'))
-                )
-                if pending > 0:
-                    print(f'[get_series {sid}] {pending} missing assets, kicking autogen', flush=True)
-                    trigger_autogen_if_enabled(sid)
-    except Exception as e:
-        print(f'[get_series {sid}] self-heal autogen kick failed: {e}', flush=True)
+    # No self-heal autogen kick here. Triggering generation as a side-effect of
+    # opening a series page surprised users (work started without a click) and
+    # racing modals (script-accept flow couldn't show «Не генерить» options
+    # because the sweep was already running). User explicitly drives autogen
+    # via the «🎨 Сгенерировать недостающее» button when they want it.
     return jsonify(s)
 
 @app.route('/api/series/<sid>', methods=['PUT'])
@@ -6819,8 +6805,12 @@ def extract_from_story(sid):
             added_locs.append(loc['name'])
 
     save_series(sid, s)
-    if added_chars or added_locs:
-        trigger_autogen_if_enabled(sid)
+    # Don't trigger autogen here. The frontend acceptScript flow shows a modal
+    # FIRST so the user can drag photos / mark «🚫 Не генерить» / pick custom
+    # styles. Frontend kicks off autogen explicitly via /auto-generate/sweep
+    # in _proceedAfterAccept after the modal closes. Auto-firing here meant
+    # generation started BEFORE the user even saw the modal, defeating the
+    # whole point.
     return jsonify({
         'added_characters': added_chars,
         'added_locations':  added_locs,
@@ -7197,8 +7187,10 @@ def extract_characters_from_script(sid, num):
     ep['cast_extracted'] = True
     save_episode(sid, num, ep)
 
-    if added_chars or added_locs or appearance_updates or added_items:
-        trigger_autogen_if_enabled(sid)
+    # NB: frontend triggers autogen explicitly (POST /auto-generate/sweep) after
+    # the user closes the «Найдены новые персонажи/локации» modal. Auto-firing
+    # here started generation before the modal even appeared — user saw images
+    # being created they didn't yet have a chance to opt out of.
 
     # Build dropped-name reports for nicer UI feedback
     char_id2name = {c['id']: c['name'] for c in s.get('characters', [])}
