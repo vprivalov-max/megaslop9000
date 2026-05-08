@@ -4085,6 +4085,35 @@ async function openCreateEpisode() {
 // and after the current one. Replaces the old "Эпизод N" duplicate input
 // next to the "Эп. N" badge — gives the user one-click navigation between
 // neighbouring episodes without going back to the series view.
+// Compute generation state for the neighbours-pill dot:
+//   'empty'       — no Seedance chunks yet (грей точка)
+//   'in-progress' — at least one chunk is pending/processing/submitting (пульсирующая фиолетовая)
+//   'failed'      — has failed chunks and nothing in-flight (красная)
+//   'partial'     — есть completed но не все/не собрано (амбер)
+//   'done'        — assembled_path OR gen_status==='done' (зелёная)
+function _episodeGenState(ep) {
+  if (!ep) return 'empty';
+  if (ep.gen_status === 'done' || ep.assembled_path) return 'done';
+  const chunks = ep.seedance_chunks || [];
+  if (!chunks.length) return 'empty';
+  const inFlight = chunks.some(c => ['pending', 'processing', 'submitting'].includes(c.status));
+  if (inFlight || ep.gen_status === 'generating') return 'in-progress';
+  const anyCompleted = chunks.some(c => c.status === 'completed');
+  const anyFailed = chunks.some(c => c.status === 'failed');
+  if (anyFailed && !anyCompleted) return 'failed';
+  if (anyCompleted && anyFailed) return 'partial';
+  if (anyCompleted) return 'partial';   // нет assembled_path → не «done»
+  return 'empty';
+}
+
+const _GEN_STATE_DOT = {
+  'empty':       { color: 'rgba(160,160,170,0.45)', label: 'нет генераций' },
+  'in-progress': { color: '#a78bfa',                 label: 'идёт генерация',     pulse: true },
+  'failed':      { color: '#f87171',                 label: 'есть упавшие чанки' },
+  'partial':     { color: '#fbbf24',                 label: 'не все чанки готовы' },
+  'done':        { color: '#4ade80',                 label: 'полностью сгенерирована' },
+};
+
 function renderEpisodeNeighbours() {
   const nav = document.getElementById('ep-neighbours');
   if (!nav) return;
@@ -4103,10 +4132,39 @@ function renderEpisodeNeighbours() {
     const ep = eps[i];
     const isCur = ep.number === cur;
     const label = isBatchMode(S.series) ? chunkLabel(S.series, ep.number, { short: true }) : `Эп. ${ep.number}`;
-    parts.push(`<a class="epn-pill ${isCur ? 'current' : ''}" ${isCur ? '' : `onclick="navigate('episode',{seriesId:'${S.seriesId}',episodeNum:${ep.number}})"`} title="${esc(ep.title || '')}">${label}</a>`);
+    const state = _episodeGenState(ep);
+    const dotMeta = _GEN_STATE_DOT[state];
+    const dotHtml = `<span class="epn-dot epn-dot-${state}" style="background:${dotMeta.color}"></span>`;
+    const titleParts = [ep.title || '', `${dotMeta.label}`].filter(Boolean);
+    const title = esc(titleParts.join(' · '));
+    parts.push(`<a class="epn-pill ${isCur ? 'current' : ''}" ${isCur ? '' : `onclick="navigate('episode',{seriesId:'${S.seriesId}',episodeNum:${ep.number}})"`} title="${title}">${dotHtml}${label}</a>`);
   }
   if (end < eps.length - 1) parts.push(`<span class="epn-arrow" title="Есть ещё эпизоды после этих">…</span>`);
   nav.innerHTML = parts.join('');
+}
+
+// Background refresh of the neighbours-pill state. While AUTO is running the
+// chunk statuses on disk change every few seconds — re-pull S.episodes and
+// re-render so the dots reflect current state without forcing a navigation.
+let _epnRefreshTimer = null;
+function _epnEnsureRefresh() {
+  if (_epnRefreshTimer) return;
+  _epnRefreshTimer = setInterval(async () => {
+    const onEpView = document.getElementById('view-episode') &&
+                     !document.getElementById('view-episode').classList.contains('hidden');
+    if (!onEpView || !S.seriesId) return;
+    // Only fetch when something is plausibly happening: AUTO running OR
+    // range-gen running OR any episode has in-flight chunks at last snapshot.
+    const anyHot = (typeof AUTO !== 'undefined' && AUTO.active) ||
+                   (typeof RANGE !== 'undefined' && RANGE.active) ||
+                   (S.episodes || []).some(e => (e.seedance_chunks || []).some(c =>
+                     ['pending', 'processing', 'submitting'].includes(c.status)));
+    if (!anyHot) return;
+    try {
+      S.episodes = await api.get(`/api/series/${S.seriesId}/episodes`);
+      renderEpisodeNeighbours();
+    } catch {}
+  }, 12000);
 }
 
 // Inline synopsis generation inside the episode page (replaces the
@@ -4234,6 +4292,7 @@ async function loadEpisodeView() {
 
   document.getElementById('ep-number-badge').textContent = chunkLabel(S.series, S.episodeNum, { short: true });
   renderEpisodeNeighbours();
+  _epnEnsureRefresh();
   setVal('ep-title-input', S.episode.title);
   setVal('ep-synopsis', S.episode.synopsis);
   setVal('ep-script', S.episode.script);

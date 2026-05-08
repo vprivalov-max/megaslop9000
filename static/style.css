@@ -837,6 +837,19 @@ body.sidebar-dragging * {
   color: var(--muted); padding: 4px 10px; border-radius: 999px;
   font-size: 0.78rem; cursor: pointer; transition: all 0.12s;
   text-decoration: none; line-height: 1.2;
+  display: inline-flex; align-items: center; gap: 6px;
+}
+.ep-neighbours .epn-dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  display: inline-block; flex: 0 0 7px;
+  box-shadow: 0 0 0 1px rgba(0,0,0,0.35) inset;
+}
+.ep-neighbours .epn-dot-in-progress {
+  animation: epn-pulse 1.4s ease-in-out infinite;
+}
+@keyframes epn-pulse {
+  0%, 100% { opacity: 1;   transform: scale(1); }
+  50%      { opacity: 0.4; transform: scale(1.35); }
 }
 .ep-neighbours .epn-pill:hover {
   background: var(--surface); color: var(--text); border-color: var(--accent);
