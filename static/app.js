@@ -8349,16 +8349,9 @@ function _scheduleNextWoboCombo() {
   _woboComboTimer = setTimeout(fire, delayMs);
 }
 
-// First-run kickoff once the page is interactive.
-if (document.readyState !== 'loading') {
-  _scheduleNextDoubleCombo();
-  _scheduleNextWoboCombo();
-} else {
-  document.addEventListener('DOMContentLoaded', () => {
-    _scheduleNextDoubleCombo();
-    _scheduleNextWoboCombo();
-  });
-}
+// NOTE: combo schedulers boot was moved to _bootMlgFeatureWhenIdle() so
+// MLG never starts working until window 'load' + idle callback fired —
+// keeps page-load lightweight.
 
 function _spawnSnoop(opts = {}) {
   const comboId = opts.comboId || null;
@@ -8439,11 +8432,47 @@ function _rollAndSpawn() {
   _spawnSnoop();
 }
 
-// Kick off the schedule once the page is interactive. _scheduleSnoop()
-// invokes _rollAndSpawn() defined above — JS function declarations are
-// hoisted within the same scope so the order is fine.
-if (document.readyState !== 'loading') _scheduleSnoop();
-else document.addEventListener('DOMContentLoaded', _scheduleSnoop);
+// MLG entire feature is gated behind page-fully-loaded. User reported page
+// load was tracking sluggish — pushing all MLG asset preload + spawn
+// schedulers to fire ONLY after window 'load' (which waits for all images,
+// CSS, fonts, deferred scripts to settle). Inside that handler we further
+// defer to requestIdleCallback so we don't compete with the first
+// interactive paint for the user. Combined effect: page is responsive
+// before any MLG fetch/decode work begins.
+
+let _mlgBootStarted = false;
+function _bootMlgFeatureWhenIdle() {
+  if (_mlgBootStarted) return;
+  _mlgBootStarted = true;
+  const start = () => {
+    // Order matters: assets first (so when scheduler fires its 12.5-min
+    // interval the buffers are ready), then the spawn-tick scheduler, then
+    // combo schedulers. _preloadMlgAssets is async — combo schedulers don't
+    // need to await it (they preload their own sound at T-20s anyway).
+    _preloadMlgAssets().finally(() => {
+      _scheduleSnoop();
+      _scheduleNextDoubleCombo();
+      _scheduleNextWoboCombo();
+    });
+  };
+  // Prefer requestIdleCallback so we yield to the browser's first paint /
+  // post-load layout work. Fallback to a generous setTimeout in browsers
+  // that don't have it (Safari < 17 etc).
+  if (typeof window.requestIdleCallback === 'function') {
+    window.requestIdleCallback(start, { timeout: 4000 });
+  } else {
+    setTimeout(start, 1500);
+  }
+}
+if (document.readyState === 'complete') {
+  // Page already loaded by the time this script ran (rare with our defer
+  // pattern, but possible with cached pages / back-button restore).
+  _bootMlgFeatureWhenIdle();
+} else {
+  // 'load' fires after every <img>, <link>, deferred script settles —
+  // strictly later than DOMContentLoaded.
+  window.addEventListener('load', _bootMlgFeatureWhenIdle, { once: true });
+}
 
 // Preload ALL MLG assets up-front so first-play has zero latency.
 // Strategy: Web Audio AudioBuffer (fully decoded, plays instantly) +
@@ -8519,8 +8548,9 @@ async function _preloadMlgAssets() {
     } catch (e) { /* fallback path will handle it */ }
   }));
 }
-if (document.readyState !== 'loading') _preloadMlgAssets();
-else document.addEventListener('DOMContentLoaded', _preloadMlgAssets);
+// NOTE: _preloadMlgAssets is now invoked from _bootMlgFeatureWhenIdle()
+// (which fires on window 'load' + requestIdleCallback). Direct firing here
+// was moved out so MLG asset bytes don't compete with first-paint resources.
 
 // Big rainbow MLG text overlay — used for both round-number milestones
 // and voice-line reactions. `opts.big` is the top giant line, `opts.small`
