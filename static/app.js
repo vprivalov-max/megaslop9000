@@ -2694,6 +2694,37 @@ function openAddItem() {
   openModal('modal-item');
 }
 
+// One-click cleanup of duplicate items in the current series. Hits the
+// /dedupe-items endpoint which runs fuzzy + LLM-synonym pass over series.items
+// and merges synonym groups (dictaphone/voice recorder, locket/pendant). All
+// episode.items_used arrays are rewritten to point at canonical ids.
+async function dedupeSeriesItems() {
+  if (!S.seriesId) return;
+  const items = S.series?.items || [];
+  if (items.length < 2) { showToast('Меньше 2 предметов — нечего объединять'); return; }
+  if (!confirm(`Найти и склеить дубликаты среди ${items.length} предметов? Claude проверит синонимы (диктофон/recorder и т.п.) и объединит. Действие необратимо, но не теряет данные — берётся самое полное описание.`)) return;
+  showToast('🧹 Анализирую дубликаты…');
+  try {
+    const r = await api.post(`/api/series/${S.seriesId}/dedupe-items`, {});
+    if (r.error) throw new Error(r.error);
+    if (!r.merged) {
+      showToast('✓ Дубликатов не найдено');
+      return;
+    }
+    const groups = (r.groups || []).map(g =>
+      `  • ${g.canonical.name} ← ${g.merged.map(m => m.name).join(', ')}`
+    ).join('\n');
+    alert(`✓ Склеено ${r.merged} дубликатов в ${r.groups?.length || 0} группах:\n\n${groups}`);
+    // Refresh state and re-render lists.
+    const fresh = await api.get(`/api/series/${S.seriesId}`);
+    if (fresh) S.series = fresh;
+    if (typeof renderItemsList === 'function') renderItemsList();
+    if (typeof renderEpItems === 'function') renderEpItems();
+  } catch (e) {
+    alert('Ошибка дедупликации: ' + (e?.message || e));
+  }
+}
+
 function openEditItem(itemId) {
   const it = (S.series.items || []).find(x => x.id === itemId);
   if (!it) return;

@@ -122,7 +122,10 @@
       <div class="sidebar-section">
         <div class="section-header">
           <h3>Предметы</h3>
-          <button class="btn-icon" onclick="openAddItem()" title="Добавить предмет">+</button>
+          <div style="display:flex;gap:4px">
+            <button class="btn-icon" onclick="openAddItem()" title="Добавить предмет">+</button>
+            <button class="btn-icon" onclick="dedupeSeriesItems()" title="🧹 Объединить дубликаты — Claude найдёт предметы-синонимы (диктофон/recorder, локет/pendant) и склеит их">🧹</button>
+          </div>
         </div>
         <div id="items-list" class="characters-list"></div>
       </div>

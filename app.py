@@ -3797,6 +3797,63 @@ def _norm_for_dedup(s):
     s = (s or '').lower().translate(_TRANSLIT_DEDUP)
     return re.sub(r'[^a-z0-9]+', '', s)
 
+def _llm_dedupe_against_existing(existing_items, new_items):
+    """Ask Claude to merge synonym/translation duplicates between newly-detected
+    items and the existing series.items list. The lexical _fuzzy_find_item misses
+    synonyms — 'dictaphone' / 'voice recorder' / 'recording device' are all the
+    same prop but share no substring or 3-word description overlap.
+
+    Returns {new_idx: existing_id} for items the model says are duplicates.
+    Items without a mapping are kept as truly new.
+
+    No-op (empty mapping) when no existing items or no new items."""
+    if not existing_items or not new_items:
+        return {}
+    payload = {
+        'existing': [
+            {'id': it['id'], 'name': it.get('name', ''), 'description': (it.get('description') or '')[:160]}
+            for it in existing_items
+        ],
+        'new': [
+            {'idx': i, 'name': (it.get('name') or ''), 'description': (it.get('description') or '')[:160]}
+            for i, it in enumerate(new_items)
+        ],
+    }
+    system = (
+        "You merge duplicate plot-items. Two items are DUPLICATES if they refer to "
+        "the same physical prop in the story, regardless of:\n"
+        "  - language drift (Russian vs English description)\n"
+        "  - synonyms (dictaphone = voice recorder = recording device; locket = pendant; "
+        "gun = pistol = revolver; flashdrive = USB stick = USB drive)\n"
+        "  - paraphrasing (silver locket vs antique silver pendant with photo)\n\n"
+        "They are NOT duplicates if:\n"
+        "  - one is a SECOND distinct copy of the same kind of object the script "
+        "treats as a separate plot-prop (e.g. 'second dictaphone' that's NOT the "
+        "hidden one — both can exist)\n"
+        "  - they're different objects that just look similar\n\n"
+        "Return STRICT JSON, no prose, no markdown:\n"
+        '{"merges":[{"new_idx":INT,"existing_id":"..."}]}\n'
+        "Include ONLY confirmed duplicates. Items not listed in `merges` are kept "
+        "as new entries. If nothing duplicates, return {\"merges\":[]}."
+    )
+    try:
+        raw = claude_ask(json.dumps(payload, ensure_ascii=False), system=system, max_tokens=1024)
+        parsed = loads_lenient(raw)
+        out = {}
+        for m in (parsed.get('merges') or []):
+            try:
+                idx = int(m.get('new_idx'))
+                eid = str(m.get('existing_id') or '').strip()
+                if eid and any(it['id'] == eid for it in existing_items):
+                    out[idx] = eid
+            except (ValueError, TypeError):
+                continue
+        return out
+    except Exception as e:
+        print(f'[item-dedupe-llm] failed: {e}', flush=True)
+        return {}
+
+
 def _fuzzy_find_item(items, name, desc):
     """Find an existing item matching the new name/description, even when
     the LLM returned a slight rewording or a translation. Tiered match:
@@ -3843,6 +3900,137 @@ def _fuzzy_find_item(items, name, desc):
             if len(desc_words_n & ex_words_n) >= 3:
                 return it
     return None
+
+
+@app.route('/api/series/<sid>/dedupe-items', methods=['POST'])
+def dedupe_series_items(sid):
+    """Walks series.items, finds dups via fuzzy + LLM-synonym pass, merges
+    them into a canonical set. Used to clean up dups accumulated BEFORE the
+    detect-items dedup logic was added (e.g. 'Hidden Voice Recorder' +
+    'hidden dictaphone' + 'desk dictaphone' all referring to one prop).
+    For each dup group:
+      - keeps the entry with the longest description (or earliest by id)
+        as canonical
+      - rewrites every episode.items_used to point at canonical
+      - removes the dup entry from series.items
+    Returns {'merged': N, 'kept': N, 'groups': [...]}.
+    Idempotent — running twice does nothing the second time."""
+    s = load_series(sid)
+    if not s:
+        return jsonify({'error': 'not found'}), 404
+    items = list(s.get('items', []) or [])
+    if len(items) < 2:
+        return jsonify({'merged': 0, 'kept': len(items), 'groups': []}), 200
+
+    # Build groups by walking pairs through fuzzy + LLM. Greedy: each item is
+    # tested against already-formed group leads; if matches → joins that group.
+    groups = []  # list of [item, item, ...]
+    for it in items:
+        joined = False
+        for grp in groups:
+            lead = grp[0]
+            if _fuzzy_find_item([lead], it['name'], it.get('description', '')):
+                grp.append(it); joined = True; break
+        if not joined:
+            groups.append([it])
+
+    # Stage B: try to merge groups that didn't match lexically — pass each
+    # group's lead vs all OTHER leads through the LLM dedup.
+    if len(groups) >= 2:
+        leads = [grp[0] for grp in groups]
+        # Use LLM to find synonym-pairs among leads. Treat first lead as
+        # "existing", every other lead as "new" — then iterate pairs.
+        # To keep prompt small we batch all leads and ask for transitive
+        # equivalence sets.
+        try:
+            sys = (
+                "Cluster these plot-items into groups where each group is the "
+                "SAME prop (across language, synonyms, paraphrasing). Return "
+                'JSON: {"groups":[["id1","id2",...], ["id3"], ...]}. Items not '
+                'paired with any duplicate go in their own singleton group. '
+                'No prose, strict JSON.'
+            )
+            payload = json.dumps({
+                'items': [
+                    {'id': lead['id'], 'name': lead.get('name', ''), 'description': (lead.get('description') or '')[:160]}
+                    for lead in leads
+                ]
+            }, ensure_ascii=False)
+            raw = claude_ask(payload, system=sys, max_tokens=1024)
+            parsed = loads_lenient(raw)
+            llm_groups = parsed.get('groups') or []
+            # Validate: collect lead-id → llm-group-idx
+            id_to_grp = {}
+            for gi, grp_ids in enumerate(llm_groups):
+                for iid in grp_ids:
+                    id_to_grp[iid] = gi
+            # Re-cluster `groups` according to llm groupings.
+            if id_to_grp:
+                new_groups = {}
+                for grp in groups:
+                    lead_id = grp[0]['id']
+                    gi = id_to_grp.get(lead_id)
+                    if gi is None:
+                        # LLM dropped it — keep as own group
+                        new_groups[f'orphan-{lead_id}'] = new_groups.get(f'orphan-{lead_id}', []) + grp
+                    else:
+                        new_groups.setdefault(gi, []).extend(grp)
+                groups = list(new_groups.values())
+        except Exception as e:
+            print(f'[dedupe-items-llm] failed (using fuzzy-only): {e}', flush=True)
+
+    # Apply merges: pick canonical, rewrite items_used in all episodes,
+    # remove dups from series.items.
+    canonical_by_dup_id = {}  # dup_id → canonical_id
+    final_items = []
+    merged_groups_log = []
+    for grp in groups:
+        if len(grp) == 1:
+            final_items.append(grp[0])
+            continue
+        # Canonical = longest description (most info), tie-break on shortest name.
+        grp_sorted = sorted(grp, key=lambda x: (-len(x.get('description', '')), len(x.get('name', ''))))
+        canonical = grp_sorted[0]
+        # Merge ref_images / avai_url from any group member if canonical is empty
+        for member in grp:
+            if member is canonical:
+                continue
+            if not canonical.get('ref_images') and member.get('ref_images'):
+                canonical['ref_images'] = member['ref_images']
+            if not canonical.get('avai_url') and member.get('avai_url'):
+                canonical['avai_url'] = member['avai_url']
+            canonical_by_dup_id[member['id']] = canonical['id']
+        final_items.append(canonical)
+        merged_groups_log.append({
+            'canonical': {'id': canonical['id'], 'name': canonical['name']},
+            'merged': [{'id': m['id'], 'name': m['name']} for m in grp if m is not canonical],
+        })
+
+    if not canonical_by_dup_id:
+        return jsonify({'merged': 0, 'kept': len(items), 'groups': []})
+
+    s['items'] = final_items
+    save_series(sid, s)
+    # Rewrite every episode's items_used to use canonical ids only.
+    for ep in list_episodes(sid):
+        used = ep.get('items_used') or []
+        if not used:
+            continue
+        rewritten = []
+        seen = set()
+        for iid in used:
+            cid = canonical_by_dup_id.get(iid, iid)
+            if cid not in seen:
+                rewritten.append(cid); seen.add(cid)
+        if rewritten != used:
+            ep['items_used'] = rewritten
+            save_episode(sid, ep['number'], ep)
+
+    return jsonify({
+        'merged': len(canonical_by_dup_id),
+        'kept': len(final_items),
+        'groups': merged_groups_log,
+    })
 
 
 @app.route('/api/series/<sid>/episodes/<int:num>/detect-items', methods=['POST'])
@@ -3922,13 +4110,44 @@ def detect_items_in_episode(sid, num):
     s.setdefault('items', [])
     if not isinstance(ep.get('items_used'), list):
         ep['items_used'] = []
-    detected_summary = []
-    for d in detected_raw[:20]:  # cap at 20 to avoid runaways
+    # Cap detected list early so the dedup-pass payload stays small.
+    detected_capped = detected_raw[:20]
+    # Two-stage dedup vs existing items:
+    #   Stage A: cheap lexical _fuzzy_find_item (handles exact + transliteration
+    #            + substring + description-word-overlap)
+    #   Stage B: if anything remains "new", ask Claude to merge synonyms
+    #            (dictaphone↔voice recorder, etc.) — single small LLM call.
+    pre_matches = {}  # idx → existing item dict
+    leftovers   = []  # [(idx, name, desc), ...] for stage B
+    for i, d in enumerate(detected_capped):
         name = (d.get('name') or '').strip()
         desc = (d.get('description') or '').strip()
         if not name:
             continue
-        existing = _fuzzy_find_item(s['items'], name, desc)
+        match = _fuzzy_find_item(s['items'], name, desc)
+        if match:
+            pre_matches[i] = match
+        else:
+            leftovers.append((i, name, desc))
+    llm_merges = {}
+    if leftovers and s['items']:
+        new_for_llm = [{'name': n, 'description': desc} for (_, n, desc) in leftovers]
+        merged = _llm_dedupe_against_existing(s['items'], new_for_llm)
+        # `merged` keys are indices into new_for_llm; map back to detected_capped indices.
+        for j, eid in merged.items():
+            if 0 <= j < len(leftovers):
+                orig_idx = leftovers[j][0]
+                existing = next((it for it in s['items'] if it['id'] == eid), None)
+                if existing:
+                    llm_merges[orig_idx] = existing
+
+    detected_summary = []
+    for i, d in enumerate(detected_capped):
+        name = (d.get('name') or '').strip()
+        desc = (d.get('description') or '').strip()
+        if not name:
+            continue
+        existing = pre_matches.get(i) or llm_merges.get(i)
         if existing:
             item_id = existing['id']
             status = 'existing'
