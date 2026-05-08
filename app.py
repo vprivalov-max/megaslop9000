@@ -2648,6 +2648,11 @@ def _import_worker(sid, episode_records):
                 ep['characters_used'] = ep_char_ids
                 ep['locations_used']  = ep_loc_ids
                 ep['items_used']      = ep_item_ids
+                # Mark cast as user-confirmed so the scene-view auto-opens on
+                # next page-load — user already "accepted" the script by
+                # importing it. Without this flag the FE thinks they still
+                # need to click «✅ Принять сценарий» on every episode.
+                ep['cast_extracted'] = True
                 save_series(sid, s)
                 save_episode(sid, num, ep)
             except Exception as e:
@@ -9965,6 +9970,150 @@ def seedance_list(sid, num):
     if not ep:
         return jsonify({'error': 'not found'}), 404
     return jsonify({'chunks': _seedance_chunks(ep)})
+
+
+@app.route('/api/series/<sid>/episodes/<int:num>/auto-assemble', methods=['POST'])
+def auto_assemble_episode(sid, num):
+    """Stitch all completed seedance chunks of ONE episode into a single mp4.
+
+    Used by the range-generation queue when `auto_assemble` is on:
+    once Auto-mode finishes for an episode, the frontend hits this endpoint
+    to produce a downloadable final cut without manual timeline work.
+
+    Logic:
+      - Collect chunks where status='completed' and video_path exists.
+      - Order by `script_order` (set on /seedance/start) — falls back to idx.
+      - If query/body `require_all=true` (default), refuse when any segment
+        from the episode's expected scene-segment list is missing — frontend
+        passes `expected_segments` count to gate.
+      - Concat-copy via ffmpeg (no re-encode), output to OUT/<title>_E<num>.mp4.
+      - Returns {ok, path, url, size_mb, chunks}.
+    """
+    s = load_series(sid)
+    if not s:
+        return jsonify({'error': 'series not found'}), 404
+    ep = load_episode(sid, num)
+    if not ep:
+        return jsonify({'error': 'episode not found'}), 404
+
+    body = request.json or {}
+    require_all = body.get('require_all', True)
+    expected_segments = body.get('expected_segments')   # optional, set by frontend from script
+
+    chunks = [c for c in (_seedance_chunks(ep) or [])
+              if c.get('status') == 'completed' and c.get('video_path')]
+    if not chunks:
+        return jsonify({'error': 'нет готовых чанков для сборки'}), 400
+
+    # Sort: script_order asc → idx asc (stable for chunks lacking the field).
+    def _sort_key(c):
+        so = c.get('script_order')
+        return (0, so) if isinstance(so, int) else (1, c.get('idx', 0))
+    chunks.sort(key=_sort_key)
+
+    if require_all and isinstance(expected_segments, int) and expected_segments > 0:
+        if len(chunks) < expected_segments:
+            return jsonify({
+                'error': 'не все сегменты готовы',
+                'have': len(chunks),
+                'expected': expected_segments,
+            }), 409
+
+    base = series_path(sid)
+    seg_paths = []
+    for c in chunks:
+        p = base / c['video_path']
+        if not p.exists():
+            return jsonify({'error': f"file missing: {c['video_path']}"}), 400
+        seg_paths.append(str(p))
+
+    ffmpeg_bin = shutil.which('ffmpeg')
+    if not ffmpeg_bin:
+        return jsonify({'error': 'ffmpeg не установлен. brew install ffmpeg'}), 500
+
+    out_dir = base / 'OUT'
+    out_dir.mkdir(exist_ok=True)
+    safe_title = (ep.get('title') or f'E{num}').strip()
+    safe_title = re.sub(r'[^\w\-]+', '_', safe_title)[:60] or f'E{num}'
+    out_name = f"{safe_title}_E{num:03d}.mp4"
+    out_path = out_dir / out_name
+
+    # Concat-demuxer (no re-encode) — assumes chunks share codec/dims/fps,
+    # which is true since they all came from the same Seedance run with same
+    # duration/resolution params. Falls back to filter-complex on failure.
+    list_file = out_dir / f'_concat_{int(time.time())}_{num}.txt'
+    list_file.write_text(
+        '\n'.join(f"file '{p}'" for p in seg_paths),
+        encoding='utf-8',
+    )
+    cmd_copy = [
+        ffmpeg_bin, '-y', '-f', 'concat', '-safe', '0',
+        '-i', str(list_file), '-c', 'copy', str(out_path),
+    ]
+    queue_wait = time.time()
+    with RENDER_SEMAPHORE:
+        if time.time() - queue_wait > 0.5:
+            print(f'[auto-assemble] {sid}/ep{num} waited {time.time()-queue_wait:.1f}s in queue')
+        try:
+            proc = subprocess.run(cmd_copy, capture_output=True, text=True, timeout=600)
+        except subprocess.TimeoutExpired:
+            try: list_file.unlink(missing_ok=True)
+            except Exception: pass
+            return jsonify({'error': 'ffmpeg timeout (>10 min)'}), 500
+
+        # Concat-copy fails when codec params drift between chunks. Retry with
+        # filter-complex (re-encode) before giving up.
+        if proc.returncode != 0:
+            print(f'[auto-assemble] {sid}/ep{num} concat-copy failed, retry filter-complex')
+            inputs = []
+            filt = []
+            for i, p in enumerate(seg_paths):
+                inputs += ['-i', p]
+                filt.append(f"[{i}:v]setpts=PTS-STARTPTS,scale=trunc(iw/2)*2:trunc(ih/2)*2,setsar=1[v{i}]")
+                filt.append(f"[{i}:a]asetpts=PTS-STARTPTS[a{i}]")
+            n = len(seg_paths)
+            cat = ''.join(f"[v{i}][a{i}]" for i in range(n))
+            filt.append(f"{cat}concat=n={n}:v=1:a=1[v][a]")
+            cmd_re = [ffmpeg_bin, '-y', *inputs, '-filter_complex', ';'.join(filt),
+                      '-map', '[v]', '-map', '[a]',
+                      '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20',
+                      '-pix_fmt', 'yuv420p',
+                      '-c:a', 'aac', '-b:a', '128k', str(out_path)]
+            try:
+                proc = subprocess.run(cmd_re, capture_output=True, text=True, timeout=900)
+            except subprocess.TimeoutExpired:
+                try: list_file.unlink(missing_ok=True)
+                except Exception: pass
+                return jsonify({'error': 'ffmpeg timeout (filter-complex >15 min)'}), 500
+            if proc.returncode != 0:
+                try: list_file.unlink(missing_ok=True)
+                except Exception: pass
+                return jsonify({
+                    'error': 'ffmpeg failed (both concat-copy and filter-complex)',
+                    'stderr': (proc.stderr or '')[-2000:],
+                }), 500
+
+    try: list_file.unlink(missing_ok=True)
+    except Exception: pass
+
+    # Mark episode as assembled + record path.
+    with _episode_lock(sid, num):
+        ep2 = load_episode(sid, num)
+        rel = str(out_path.relative_to(base))
+        ep2['assembled_path'] = rel
+        ep2['assembled_at'] = int(time.time())
+        ep2['gen_status'] = 'done'
+        save_episode(sid, num, ep2)
+
+    size_mb = round(out_path.stat().st_size / 1024 / 1024, 2)
+    return jsonify({
+        'ok': True,
+        'path': rel,
+        'url': f'/assets/{sid}/{rel}',
+        'size_mb': size_mb,
+        'chunks': len(seg_paths),
+        'filename': out_name,
+    })
 
 
 @app.route('/api/series/<sid>/episodes/<int:num>/seedance/download-zip')
