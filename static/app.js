@@ -10376,7 +10376,10 @@ async function sdGenerate() {
 }
 
 async function sdRefreshList() {
-  if (!S.episode) return;
+  // Guard against the race where S.episode is set (e.g. by a prior route)
+  // before S.seriesId — without this we hit /api/series/null/.../seedance/list
+  // and log a 404 WARN. Pure UI refresh; safe to no-op until both are set.
+  if (!S.episode || !S.seriesId) return;
   try {
     const res = await api.get(
       `/api/series/${S.seriesId}/episodes/${S.episode.number}/seedance/list`
@@ -10835,7 +10838,7 @@ async function sdReuse(idx) {
 }
 
 async function sdPollOnce() {
-  if (!S.episode) return null;
+  if (!S.episode || !S.seriesId) return null;
   try {
     const res = await api.post(
       `/api/series/${S.seriesId}/episodes/${S.episode.number}/seedance/poll`, {}
