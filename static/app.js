@@ -1652,14 +1652,21 @@ async function pollAutogenStatus() {
         // when queue and done are both zero (means user clicked button + nothing
         // was needed).
         if (sawRunning) {
+          // Status-line policy: ONLY show errors. Success states ("✓ готово
+          // N/M" and "ничего не нужно генерить") used to render here on every
+          // sweep-finish — but the autogen system can re-trigger sweeps in the
+          // background (script accept, get_series self-heal, etc.), and each
+          // brief running=true blip would re-paint the line, schedule a 6s
+          // clear, then paint again on the next blip. Net effect: text
+          // appearing and disappearing under the button, shaking the layout.
+          // User just wants "ошибки если есть, иначе тишина".
           if (st.errors && st.errors.length) {
             _setStatusHtml(`<span style="color:var(--danger,#f87171)">готово ${st.done}/${st.queue} · ошибок ${st.errors.length}</span>`);
             showToast('Авто-генерация: ошибок — ' + st.errors.length + '. Подробности в консоли сервера.');
             console.warn('[autogen errors]', st.errors);
-          } else if (st.done > 0) {
-            _setStatusHtml(`<span style="color:var(--success,#4ade80)">✓ готово ${st.done}/${st.queue}</span>`);
+            setTimeout(() => _setStatusText(''), 6000);
           } else {
-            _setStatusText('— ничего не нужно генерить');
+            _setStatusText('');
           }
           // Refresh series state to show new images
           try {
@@ -1669,7 +1676,6 @@ async function pollAutogenStatus() {
             renderLocationsList();
             renderItemsList();
           } catch {}
-          setTimeout(() => _setStatusText(''), 6000);
         } else {
           // Idle background poll — keep status empty. Don't fight with whatever
           // text might have been written by triggerAutogenSweep / acceptScript.
