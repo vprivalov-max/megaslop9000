@@ -3301,6 +3301,7 @@ def delete_location(sid, loc_id):
 
 @app.route('/api/series/<sid>/assets/location/<loc_id>', methods=['POST'])
 def upload_location_asset(sid, loc_id):
+    """Replace-semantics location upload (mirrors character endpoint above)."""
     s = load_series(sid)
     if not s:
         return jsonify({'error': 'series not found'}), 404
@@ -3309,25 +3310,24 @@ def upload_location_asset(sid, loc_id):
     file = request.files['file']
     if not file or not allowed_file(file.filename):
         return jsonify({'error': 'invalid file type'}), 400
-
+    loc = next((l for l in s.get('locations', []) if l['id'] == loc_id), None)
+    if not loc:
+        return jsonify({'error': 'location not found'}), 404
     loc_dir = assets_dir(sid) / 'locations' / loc_id
     loc_dir.mkdir(parents=True, exist_ok=True)
     filename = secure_filename(file.filename)
-    stem = Path(filename).stem
-    ext = Path(filename).suffix
     final = loc_dir / filename
-    counter = 1
-    while final.exists():
-        final = loc_dir / f'{stem}_{counter}{ext}'
-        counter += 1
-
-    file.save(final)
     rel_path = str(final.relative_to(series_path(sid)))
-    for loc in s.get('locations', []):
-        if loc['id'] == loc_id:
-            loc.setdefault('ref_images', []).append(rel_path)
+    base = series_path(sid)
+    for old_rel in (loc.get('ref_images') or []):
+        if old_rel == rel_path: continue
+        try: (base / old_rel).unlink(missing_ok=True)
+        except Exception: pass
+    file.save(final)
+    loc['ref_images'] = [rel_path]
+    loc['avai_url'] = ''
     save_series(sid, s)
-    return jsonify({'path': rel_path, 'url': f'/assets/{sid}/{rel_path}'})
+    return jsonify({'path': rel_path, 'url': f'/assets/{sid}/{rel_path}', 'series': s})
 
 @app.route('/api/series/<sid>/assets/location/<loc_id>/<path:filename>', methods=['DELETE'])
 def delete_location_asset(sid, loc_id, filename):
@@ -3406,6 +3406,7 @@ def delete_item(sid, item_id):
 
 @app.route('/api/series/<sid>/assets/item/<item_id>', methods=['POST'])
 def upload_item_asset(sid, item_id):
+    """Replace-semantics item upload (mirrors character endpoint above)."""
     s = load_series(sid)
     if not s:
         return jsonify({'error': 'series not found'}), 404
@@ -3414,23 +3415,22 @@ def upload_item_asset(sid, item_id):
     file = request.files['file']
     if not file or not allowed_file(file.filename):
         return jsonify({'error': 'invalid file type'}), 400
-
+    item = next((x for x in s.get('items', []) if x['id'] == item_id), None)
+    if not item:
+        return jsonify({'error': 'item not found'}), 404
     item_dir = assets_dir(sid) / 'items' / item_id
     item_dir.mkdir(parents=True, exist_ok=True)
     filename = secure_filename(file.filename)
-    stem = Path(filename).stem
-    ext = Path(filename).suffix
     final = item_dir / filename
-    counter = 1
-    while final.exists():
-        final = item_dir / f'{stem}_{counter}{ext}'
-        counter += 1
-
-    file.save(final)
     rel_path = str(final.relative_to(series_path(sid)))
-    for it in s.get('items', []):
-        if it['id'] == item_id:
-            it.setdefault('ref_images', []).append(rel_path)
+    base = series_path(sid)
+    for old_rel in (item.get('ref_images') or []):
+        if old_rel == rel_path: continue
+        try: (base / old_rel).unlink(missing_ok=True)
+        except Exception: pass
+    file.save(final)
+    item['ref_images'] = [rel_path]
+    item['avai_url'] = ''
     save_series(sid, s)
     return jsonify({'path': rel_path, 'url': f'/assets/{sid}/{rel_path}'})
 
@@ -8808,6 +8808,14 @@ def delete_episode(sid, num):
 
 @app.route('/api/series/<sid>/assets/character/<char_id>', methods=['POST'])
 def upload_character_asset(sid, char_id):
+    """Upload a user-supplied photo. REPLACES the existing ref images
+    (any prior auto-generated portraits get removed from disk + dropped
+    from ref_images). Mirrors the behaviour of /upload-photo so both
+    upload entrypoints are consistent — user reported "uploaded photo
+    disappears, old one stays" because the two endpoints had different
+    semantics (this one was append-only, /upload-photo replaces).
+    Now both replace; delete-button in the gallery still works for
+    individual ref removal."""
     s = load_series(sid)
     if not s:
         return jsonify({'error': 'series not found'}), 404
@@ -8817,26 +8825,34 @@ def upload_character_asset(sid, char_id):
     if not file or not allowed_file(file.filename):
         return jsonify({'error': 'invalid file type'}), 400
 
+    char = next((c for c in s['characters'] if c['id'] == char_id), None)
+    if not char:
+        return jsonify({'error': 'character not found'}), 404
+
     char_dir = assets_dir(sid) / 'characters' / char_id
     char_dir.mkdir(parents=True, exist_ok=True)
     filename = secure_filename(file.filename)
-    # Avoid collisions
     stem = Path(filename).stem
-    ext = Path(filename).suffix
+    ext = Path(filename).suffix or '.jpg'
     final = char_dir / filename
-    counter = 1
-    while final.exists():
-        final = char_dir / f'{stem}_{counter}{ext}'
-        counter += 1
-
-    file.save(final)
+    # Don't fight name collisions with old refs — those refs are about to be
+    # wiped anyway. Just use the user's filename verbatim, overwriting if needed.
     rel_path = str(final.relative_to(series_path(sid)))
 
-    for char in s['characters']:
-        if char['id'] == char_id:
-            char.setdefault('ref_images', []).append(rel_path)
+    # Wipe prior on-disk files + ref_images entries (skip the path we're about
+    # to write so we don't accidentally delete the new file in case of overlap).
+    base = series_path(sid)
+    for old_rel in (char.get('ref_images') or []):
+        if old_rel == rel_path:
+            continue
+        try: (base / old_rel).unlink(missing_ok=True)
+        except Exception: pass
+
+    file.save(final)
+    char['ref_images'] = [rel_path]
+    char['avai_base_url'] = ''  # invalidate — old AVAI URL pointed at the old (deleted) gen
     save_series(sid, s)
-    return jsonify({'path': rel_path, 'url': f'/assets/{sid}/{rel_path}'})
+    return jsonify({'path': rel_path, 'url': f'/assets/{sid}/{rel_path}', 'series': s})
 
 @app.route('/api/series/<sid>/assets/character/<char_id>/<path:filename>', methods=['DELETE'])
 def delete_character_asset(sid, char_id, filename):
