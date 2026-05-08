@@ -1613,9 +1613,10 @@
         </label>
         <input type="text" id="admin-logs-grep" placeholder="🔎 grep substring" style="font-size:0.85rem;flex:1;min-width:180px" oninput="_adminLogsGrepDebounced()">
         <button class="btn-ghost btn-sm" onclick="loadAdminLogs()">↻ Обновить</button>
+        <button class="btn-ghost btn-sm" onclick="copyAdminLogs(this)" title="Скопировать всё что сейчас отфильтровано — plain text, готов вставить куда угодно">📋 Копировать</button>
       </div>
       <div id="admin-logs-stats" style="font-size:0.78rem;color:var(--muted)"></div>
-      <div id="admin-logs-table" style="max-height:60vh;overflow-y:auto;font-family:monospace;font-size:0.78rem;background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:8px"></div>
+      <div id="admin-logs-table" style="max-height:60vh;overflow-y:auto;font-family:monospace;font-size:0.78rem;background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:8px;user-select:text;-webkit-user-select:text" tabindex="0"></div>
     </div>
   </div>
 </div>

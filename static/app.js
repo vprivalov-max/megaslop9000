@@ -392,6 +392,11 @@ function _adminLogsGrepDebounced() {
   _adminLogsGrepTimer = setTimeout(loadAdminLogs, 350);
 }
 
+// Last loaded log lines, kept around for the «Копировать» button so we can
+// emit plain text without re-parsing the rendered HTML (and lose level/event
+// info in the process).
+let _adminLogsLastLines = [];
+
 async function loadAdminLogs() {
   const userSel = document.getElementById('admin-logs-user');
   const dateSel = document.getElementById('admin-logs-date');
@@ -414,6 +419,7 @@ async function loadAdminLogs() {
     const r = await fetch('/api/admin/logs?' + params.toString()).then(x => x.json());
     if (r.error) throw new Error(r.error);
     if (statsEl) statsEl.textContent = `Файл: ${r.file} · показано ${r.returned || 0} из ${r.total_lines || 0} строк`;
+    _adminLogsLastLines = r.lines || [];
     if (!r.lines || !r.lines.length) {
       tableEl.innerHTML = '<div style="color:var(--muted);padding:20px;text-align:center">Нет записей по фильтрам</div>';
       return;
@@ -422,6 +428,58 @@ async function loadAdminLogs() {
     tableEl.scrollTop = tableEl.scrollHeight;
   } catch (e) {
     tableEl.textContent = 'Ошибка: ' + (e.message || e);
+  }
+}
+
+// Flatten one log entry to a single plain-text line — same shape one would
+// see in tail -f, but human-friendly. Used by «📋 Копировать».
+function _logLineToText(obj) {
+  const time = (obj.ts || '').slice(11, 23);
+  const lvl = (obj.level || '').padEnd(5);
+  const ev = obj.event || '?';
+  let body = '';
+  if (ev === 'http') {
+    body = `${obj.status || '?'} ${obj.method || ''} ${obj.path || ''} · ${obj.ms || '?'}ms${obj.ip ? ' · ' + obj.ip : ''}`;
+  } else if (ev === 'uncaught') {
+    body = `${obj.exc_type || ''}: ${obj.exc_msg || ''} · ${obj.method || ''} ${obj.path || ''}`;
+    if (obj.trace) body += '\n' + obj.trace;
+  } else {
+    const fields = Object.entries(obj)
+      .filter(([k]) => !['ts', 'level', 'event', 'email'].includes(k))
+      .map(([k, v]) => `${k}=${typeof v === 'string' ? v : JSON.stringify(v)}`)
+      .join(' ');
+    body = `${ev} ${fields}`.trim();
+  }
+  return `${time} ${lvl} ${body}`;
+}
+
+async function copyAdminLogs(btn) {
+  if (!_adminLogsLastLines.length) {
+    showToast('Сначала загрузи логи', 3000);
+    return;
+  }
+  const text = _adminLogsLastLines.map(_logLineToText).join('\n');
+  const orig = btn ? btn.innerHTML : '';
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+    } else {
+      // Fallback: temp textarea + execCommand. Works under non-https / older
+      // browsers where clipboard API is gated.
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand('copy');
+      document.body.removeChild(ta);
+    }
+    if (btn) { btn.innerHTML = '✓ Скопировано'; setTimeout(() => { btn.innerHTML = orig; }, 1800); }
+    showToast(`✓ Скопировано ${_adminLogsLastLines.length} строк в буфер`, 3000);
+  } catch (e) {
+    if (btn) btn.innerHTML = orig;
+    showToast('Ошибка копирования: ' + (e.message || e), 4000);
   }
 }
 
