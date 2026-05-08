@@ -2388,13 +2388,16 @@ def _import_worker(sid, episode_records):
                         s['locations'].append(new_l)
                         ep_loc_ids.append(new_l['id'])
 
-                # Merge items
+                # Merge items — fuzzy dedup so cross-language re-imports of the
+                # same prop don't make duplicates ("Hidden Recorder" / "скрытый
+                # диктофон" / "Recording Device" → all collapse to one entry).
                 ep_item_ids = []
                 for it in (extracted.get('items') or [])[:20]:
                     name = (it.get('name') or '').strip()
+                    desc = (it.get('description') or '').strip()
                     if not name:
                         continue
-                    existing = next((x for x in s['items'] if x['name'].lower() == name.lower()), None)
+                    existing = _fuzzy_find_item(s['items'], name, desc)
                     if existing:
                         ep_item_ids.append(existing['id'])
                     else:
@@ -3777,6 +3780,71 @@ def regenerate_item(sid, item_id):
         return jsonify({'error': str(e)}), 500
 
 
+# Cyrillic → Latin transliteration table for cross-language item dedup.
+# Tiny on purpose — we only need it for the simple case where the same prop
+# is described in Russian and English versions of the same script (e.g.
+# "диктофон" / "dictaphone", "локет" / "locket", "флешка" / "flash drive").
+_TRANSLIT_DEDUP = str.maketrans({
+    'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ж': 'zh',
+    'з': 'z', 'и': 'i', 'й': 'y', 'к': 'k', 'л': 'l', 'м': 'm', 'н': 'n',
+    'о': 'o', 'п': 'p', 'р': 'r', 'с': 's', 'т': 't', 'у': 'u', 'ф': 'f',
+    'х': 'h', 'ц': 'ts', 'ч': 'ch', 'ш': 'sh', 'щ': 'sch', 'ъ': '', 'ы': 'y',
+    'ь': '', 'э': 'e', 'ю': 'yu', 'я': 'ya',
+})
+
+def _norm_for_dedup(s):
+    """Lowercase + translit + alnum-only for fuzzy comparisons."""
+    s = (s or '').lower().translate(_TRANSLIT_DEDUP)
+    return re.sub(r'[^a-z0-9]+', '', s)
+
+def _fuzzy_find_item(items, name, desc):
+    """Find an existing item matching the new name/description, even when
+    the LLM returned a slight rewording or a translation. Tiered match:
+      1. Exact case-insensitive name (fast path, current behaviour)
+      2. Normalised name (strip punctuation, transliterate Cyrillic → Latin)
+      3. Substring overlap of normalised name (e.g. 'hidden recorder' vs
+         'recorder') — both ways
+      4. Description overlap (≥3 words shared in normalised form) — handles
+         total renames like 'диктофон' → 'recording device'
+    Returns the matched dict or None."""
+    if not items:
+        return None
+    name_l = name.lower()
+    # Tier 1: exact ci match
+    for it in items:
+        if it.get('name', '').lower() == name_l:
+            return it
+    name_n = _norm_for_dedup(name)
+    if not name_n:
+        return None
+    # Tier 2 + 3: normalised exact / substring
+    for it in items:
+        ex = _norm_for_dedup(it.get('name', ''))
+        if not ex:
+            continue
+        if ex == name_n:
+            return it
+        # Substring either direction (longer-than-3 to skip noise like 'a')
+        if len(name_n) >= 4 and len(ex) >= 4:
+            if name_n in ex or ex in name_n:
+                return it
+    # Tier 4: description-word overlap
+    if desc:
+        desc_words = set(re.findall(r'[a-zа-яё]{4,}', desc.lower()))
+        desc_words_n = {_norm_for_dedup(w) for w in desc_words}
+        desc_words_n.discard('')
+        for it in items:
+            ex_desc = it.get('description', '')
+            if not ex_desc:
+                continue
+            ex_words = set(re.findall(r'[a-zа-яё]{4,}', ex_desc.lower()))
+            ex_words_n = {_norm_for_dedup(w) for w in ex_words}
+            ex_words_n.discard('')
+            if len(desc_words_n & ex_words_n) >= 3:
+                return it
+    return None
+
+
 @app.route('/api/series/<sid>/episodes/<int:num>/detect-items', methods=['POST'])
 def detect_items_in_episode(sid, num):
     """LLM extracts PLOT-RELEVANT items from the episode's script. Plot-relevant
@@ -3800,6 +3868,28 @@ def detect_items_in_episode(sid, num):
     if not script:
         return jsonify({'error': 'episode has no script yet'}), 400
 
+    # KNOWN-items context so re-runs across language barriers don't dup. The
+    # LLM was previously fed the script with no awareness of what's already
+    # in series.json — so e.g. a Russian script containing "скрытый диктофон"
+    # extracted as "Hidden Recorder" / "Recording Device" / "Скрытый диктофон"
+    # on different runs, producing 3 separate item entries for the same prop.
+    # Now the prompt explicitly lists known items (name + description) and
+    # tells the model to reuse the EXACT existing name when it sees the same
+    # plot-prop, regardless of language drift in the script.
+    known_items_block = ''
+    existing_items = s.get('items', []) or []
+    if existing_items:
+        known_lines = [
+            f"  - {it['name']!r}: {(it.get('description') or '').strip()[:120]}"
+            for it in existing_items if it.get('name')
+        ]
+        known_items_block = (
+            "\n\n=== ALREADY KNOWN ITEMS (use the EXACT existing name when the script "
+            "describes the same prop, even if the script uses a different language or "
+            "synonym; do NOT create a duplicate with a translated/paraphrased name) ===\n"
+            + '\n'.join(known_lines) + '\n'
+        )
+
     system = (
         "You extract PLOT-RELEVANT items from a short-drama script. Return STRICT JSON.\n"
         "PLOT-RELEVANT = the item is load-bearing for the story: it gets revealed,\n"
@@ -3811,13 +3901,16 @@ def detect_items_in_episode(sid, num):
         "phones used only for routine calls, clothing (covered separately by\n"
         "outfits), food eaten without significance, background dressing.\n\n"
         "Return JSON: {\"items\": [{\"name\": \"...\", \"description\": \"...\"}, ...]}\n"
-        "name: short concrete noun phrase, lowercased (e.g. 'silver locket',\n"
-        "  'usb stick with evidence', 'stolen handbag').\n"
+        "name: short concrete noun phrase. PREFER the EXACT existing name from the\n"
+        "  KNOWN ITEMS list when the script is talking about the same prop, even\n"
+        "  across languages (Russian script + English known name = use the English\n"
+        "  known name). Only invent a new name when the prop is genuinely new.\n"
         "description: 1 sentence describing visual appearance for image gen.\n"
-        "If nothing qualifies, return {\"items\": []}. No prose, no preamble."
+        "If nothing qualifies (or all qualifying items are already in KNOWN), return\n"
+        "{\"items\": []}. No prose, no preamble."
     )
     raw = claude_ask(
-        f"Script:\n\n{script[:18000]}",
+        f"Script:\n\n{script[:18000]}{known_items_block}",
         system=system, model='', max_tokens=2048,
     )
     try:
@@ -3835,7 +3928,7 @@ def detect_items_in_episode(sid, num):
         desc = (d.get('description') or '').strip()
         if not name:
             continue
-        existing = next((it for it in s['items'] if it.get('name', '').lower() == name.lower()), None)
+        existing = _fuzzy_find_item(s['items'], name, desc)
         if existing:
             item_id = existing['id']
             status = 'existing'

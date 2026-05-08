@@ -3697,6 +3697,30 @@ async function loadEpisodeView() {
   // updates the hidden textarea. Re-render the scene-view body so it reflects
   // the current episode's script.
   const sceneView = document.getElementById('ep-script-scenes');
+  // Auto-open scene view if the episode was already accepted (cast_extracted=true).
+  // Reproduces the state the user left in: they don't have to click "Принять"
+  // again on every page reload. The accept button is also reskinned to "✅ Принят"
+  // and the "🔄 Перепроанализировать" button becomes visible for explicit re-runs.
+  const acceptBtn = document.getElementById('ep-accept-script-btn');
+  const reanalyzeBtn = document.getElementById('ep-reanalyze-btn');
+  if (S.episode.cast_extracted === true && (S.episode.script || '').trim()) {
+    if (sceneView && sceneView.classList.contains('hidden')) {
+      try { toggleSceneView(); } catch {}
+    }
+    if (acceptBtn) {
+      acceptBtn.innerHTML = '✅ Принят';
+      acceptBtn.style.opacity = '0.55';
+      acceptBtn.title = 'Сценарий уже принят — клик переключит в режим сцен. Чтобы заново разобрать персонажей/предметы — кнопка «🔄 Перепроанализировать» справа.';
+    }
+    if (reanalyzeBtn) reanalyzeBtn.style.display = '';
+  } else {
+    if (acceptBtn) {
+      acceptBtn.innerHTML = '✅ Принять сценарий';
+      acceptBtn.style.opacity = '';
+      acceptBtn.title = 'Сохранить сценарий, найти новых персонажей/локации/предметы, при необходимости показать модалку для drag-drop фоток, потом перейти в режим сцен и запустить автоген';
+    }
+    if (reanalyzeBtn) reanalyzeBtn.style.display = 'none';
+  }
   if (sceneView && !sceneView.classList.contains('hidden')) {
     if (typeof _renderSceneViewBody === 'function') _renderSceneViewBody();
   }
@@ -5666,10 +5690,22 @@ function _scriptSoundsEnabled() {
 // per-asset clicks) because they'd race the sweep.
 // ──────────────────────────────────────────────────────────────────────────
 
-async function acceptScript() {
+async function acceptScript(opts = {}) {
   if (!S.episode) { alert('Сначала открой эпизод'); return; }
   const script = (document.getElementById('ep-script').value || '').trim();
   if (!script) { alert('Сценарий пустой — впиши или сгенерируй сначала'); return; }
+  // Already-accepted shortcut: episode has cast_extracted=true → no need to
+  // re-run LLM extraction. Just open scene view (which is what the user
+  // expected after their first accept anyway). Pass opts.force=true to
+  // override and re-analyse from scratch (button "🔄 Перепроанализировать").
+  if (!opts.force && S.episode.cast_extracted === true) {
+    const sceneView = document.getElementById('ep-script-scenes');
+    if (sceneView && sceneView.classList.contains('hidden')) {
+      toggleSceneView();
+    }
+    showToast('✓ Сценарий уже принят — открыл режим сцен', 3500);
+    return;
+  }
   const btn = document.getElementById('ep-accept-script-btn');
   const orig = btn.innerHTML;
   btn.disabled = true;

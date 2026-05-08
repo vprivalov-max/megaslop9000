@@ -331,6 +331,7 @@
               <button class="ep-script-btn ready" id="ep-gen-script-btn" onclick="generateEpisodeScript()">⚡ Сгенерировать</button>
               <button class="ep-script-btn ready" id="ep-accept-script-btn" onclick="acceptScript()" title="Сохранить сценарий, найти новых персонажей/локации/предметы, при необходимости показать модалку для drag-drop фоток, потом перейти в режим сцен и запустить автоген"
                       style="background:linear-gradient(135deg,#10b981,#059669);color:#fff;font-weight:700">✅ Принять сценарий</button>
+              <button class="btn-ghost btn-sm" id="ep-reanalyze-btn" onclick="acceptScript({force:true})" title="Перепроанализировать сценарий (если добавил новые персонажей/предметы вручную или изменил текст)" style="display:none">🔄 Перепроанализировать</button>
             </div>
           </div>
           <textarea id="ep-script" class="script-area" placeholder="Screenplay / Script..."></textarea>
