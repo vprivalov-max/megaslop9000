@@ -1536,6 +1536,11 @@ async function pollAutogenStatus() {
 
   // Track previous done count so we know when to re-fetch+re-render lists
   let prevDone = -1;
+  // Track whether we've ever observed a running sweep this session — used by
+  // the not-running branch to decide whether to render a final "done"/"errors"/
+  // "ничего не нужно" line vs. just stay quiet (which would otherwise flicker
+  // every 2.5s as the heartbeat re-arms the poller from cold state).
+  let sawRunning = false;
   const tick = async () => {
     try {
       const r = await fetch(`/api/series/${S.seriesId}/auto-generate/status`);
@@ -1549,6 +1554,7 @@ async function pollAutogenStatus() {
       const ipList = st.in_progress || [];
       const isPhantom = st.running && (st.queue || 0) === 0 && ipList.length === 0;
       if (st.running && !isPhantom) {
+        sawRunning = true;
         const ipBits = ipList.map(x => x.name).filter(Boolean).slice(0, 3).join(', ');
         const ipSuffix = ipBits ? ` · сейчас: ${ipBits}` : '';
         _setStatusText(`генерация… ${st.done}/${st.queue}` + (st.errors.length ? ` · ошибок: ${st.errors.length}` : '') + ipSuffix);
@@ -1577,24 +1583,42 @@ async function pollAutogenStatus() {
         if (_autogenPollTimer) { clearInterval(_autogenPollTimer); _autogenPollTimer = null; }
         _setBtnDisabled(false);
         _setBtnHtml('🎨 Сгенерировать недостающее');
-        if (st.queue === 0 && st.done === 0) {
-          _setStatusText('— ничего не нужно генерить');
-        } else if (st.errors && st.errors.length) {
-          _setStatusHtml(`<span style="color:var(--danger,#f87171)">готово ${st.done}/${st.queue} · ошибок ${st.errors.length}</span>`);
-          showToast('Авто-генерация: ошибок — ' + st.errors.length + '. Подробности в консоли сервера.');
-          console.warn('[autogen errors]', st.errors);
+        // Status text rules — pick ONE branch and don't re-render it on every
+        // poll tick (otherwise the line keeps appearing/disappearing every 2.5s
+        // and the button visually shakes around it):
+        //   • sawRunning true on a previous tick → show finished result message
+        //   • sawRunning false (we never observed a running sweep this session)
+        //     → idle state; just clear the status so it doesn't flicker
+        // The "— ничего не нужно генерить" message used to be the idle state too
+        // and triggered the bug; now it only shows on the freshly-finished tick
+        // when queue and done are both zero (means user clicked button + nothing
+        // was needed).
+        if (sawRunning) {
+          if (st.errors && st.errors.length) {
+            _setStatusHtml(`<span style="color:var(--danger,#f87171)">готово ${st.done}/${st.queue} · ошибок ${st.errors.length}</span>`);
+            showToast('Авто-генерация: ошибок — ' + st.errors.length + '. Подробности в консоли сервера.');
+            console.warn('[autogen errors]', st.errors);
+          } else if (st.done > 0) {
+            _setStatusHtml(`<span style="color:var(--success,#4ade80)">✓ готово ${st.done}/${st.queue}</span>`);
+          } else {
+            _setStatusText('— ничего не нужно генерить');
+          }
+          // Refresh series state to show new images
+          try {
+            const fresh = await fetch(`/api/series/${S.seriesId}`).then(r => r.json());
+            S.series = fresh;
+            renderCharactersList();
+            renderLocationsList();
+            renderItemsList();
+          } catch {}
+          setTimeout(() => _setStatusText(''), 6000);
         } else {
-          _setStatusHtml(`<span style="color:var(--success,#4ade80)">✓ готово ${st.done}/${st.queue}</span>`);
+          // Idle background poll — keep status empty. Don't fight with whatever
+          // text might have been written by triggerAutogenSweep / acceptScript.
+          // Bail out completely — no need to keep ticking when nothing is
+          // happening (the heartbeat will re-attach if a sweep starts).
         }
-        // Refresh series state to show new images
-        try {
-          const fresh = await fetch(`/api/series/${S.seriesId}`).then(r => r.json());
-          S.series = fresh;
-          renderCharactersList();
-          renderLocationsList();
-          renderItemsList();
-        } catch {}
-        setTimeout(() => _setStatusText(''), 6000);
+        return 'done';   // signal to outer loop: stop ticking
       }
     } catch (e) {
       if (_autogenPollTimer) { clearInterval(_autogenPollTimer); _autogenPollTimer = null; }
@@ -1603,8 +1627,15 @@ async function pollAutogenStatus() {
       _setStatusText('Ошибка опроса: ' + e.message);
     }
   };
-  await tick();
-  _autogenPollTimer = setInterval(tick, 2500);
+  // Run first tick. If it returned 'done' (sweep is not running) — don't arm
+  // the recurring poller. The heartbeat will re-spawn pollAutogenStatus when
+  // it sees running=true again. Without this guard the poller kept ticking
+  // every 2.5s with the same "ничего не нужно" message, scheduling overlapping
+  // 6s clears, which made the status line shake around the button.
+  const firstResult = await tick();
+  if (firstResult !== 'done') {
+    _autogenPollTimer = setInterval(tick, 2500);
+  }
 }
 
 // Pre-flight check before any video generation. Returns list of missing assets:

@@ -3038,11 +3038,14 @@ def style_sample():
     # Cache key — sha256(desc + base) so re-running the same prompt is free.
     import hashlib
     key = hashlib.sha256((desc + '|' + base).encode('utf-8')).hexdigest()[:16]
-    cache_dir = BASE / 'static' / 'img' / 'style-samples-cache'
+    # Persistent location — survives redeploys (DATA_ROOT is mounted volume).
+    # `static/img/...` gets wiped on every `git pull` / image rebuild. New URL
+    # is /style-samples-cache/<key>.jpg, served by serve_style_sample below.
+    cache_dir = DATA_ROOT / '_global' / 'style-samples-cache'
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_path = cache_dir / f'{key}.jpg'
     if cache_path.exists():
-        return jsonify({'url': f'/static/img/style-samples-cache/{key}.jpg', 'cached': True})
+        return jsonify({'url': f'/style-samples-cache/{key}.jpg', 'cached': True})
     # Build prompt with the requested style
     prompt = (
         f"{base_subject}. {desc}. Centered portrait composition, neutral background. "
@@ -3056,7 +3059,7 @@ def style_sample():
         r = requests.get(avai_url, timeout=60)
         r.raise_for_status()
         cache_path.write_bytes(r.content)
-        return jsonify({'url': f'/static/img/style-samples-cache/{key}.jpg', 'cached': False})
+        return jsonify({'url': f'/style-samples-cache/{key}.jpg', 'cached': False})
     except Exception as e:
         _log_event('WARN', 'style_sample_fail', desc=desc[:120], err=str(e)[:200])
         return jsonify({'error': str(e)}), 500
@@ -3071,7 +3074,8 @@ def regenerate_style_samples():
     actor = current_user_email() or ''
     if actor != PRIMARY_USER_EMAIL and AUTH_ENABLED:
         return jsonify({'error': 'admin only'}), 403
-    out_dir = BASE / 'static' / 'img' / 'style-samples'
+    # Persistent location — see notes on /api/style-sample above.
+    out_dir = DATA_ROOT / '_global' / 'style-samples'
     out_dir.mkdir(parents=True, exist_ok=True)
     base_subject = 'a Black male rapper in his 50s with long braids, gold chains, sunglasses'
     results = []
@@ -3090,10 +3094,42 @@ def regenerate_style_samples():
             r.raise_for_status()
             out_path = out_dir / f'{preset_id}.jpg'
             out_path.write_bytes(r.content)
-            results.append({'id': preset_id, 'ok': True, 'path': str(out_path.relative_to(BASE))})
+            results.append({'id': preset_id, 'ok': True, 'path': str(out_path)})
         except Exception as e:
             results.append({'id': preset_id, 'ok': False, 'err': str(e)[:200]})
     return jsonify({'results': results})
+
+
+@app.route('/style-samples/<path:filename>')
+def serve_style_sample(filename):
+    """Serve baseline preset samples from the persistent DATA_ROOT location.
+    Falls back to the old static/img/style-samples/<filename> if a sample
+    hasn't been migrated yet — keeps existing series working during the
+    transition. The first time admin clicks 'Перегенерировать стили' all five
+    baseline samples land in DATA_ROOT/_global/style-samples/ and stay there
+    across deploys."""
+    from flask import send_from_directory, abort
+    persistent = DATA_ROOT / '_global' / 'style-samples'
+    target = persistent / filename
+    if target.exists():
+        return send_from_directory(persistent, filename)
+    legacy = BASE / 'static' / 'img' / 'style-samples'
+    if (legacy / filename).exists():
+        return send_from_directory(legacy, filename)
+    abort(404)
+
+
+@app.route('/style-samples-cache/<path:filename>')
+def serve_style_sample_cache(filename):
+    """Serve user-generated custom-style samples from the persistent cache."""
+    from flask import send_from_directory, abort
+    cache = DATA_ROOT / '_global' / 'style-samples-cache'
+    if (cache / filename).exists():
+        return send_from_directory(cache, filename)
+    legacy = BASE / 'static' / 'img' / 'style-samples-cache'
+    if (legacy / filename).exists():
+        return send_from_directory(legacy, filename)
+    abort(404)
 
 def _rmtree_hard(path):
     """Permanently wipe a directory tree. Robust against AppleDouble (`._*`)
@@ -3147,27 +3183,27 @@ _VISUAL_STYLE_PRESETS = {
     'cinematic': {
         'label': 'Кинематограф',
         'desc':  'Cinematic film look — shallow depth of field, professional color grading (teal/orange or analog film), 35mm aesthetic, soft natural lighting, subtle film grain. Photorealistic skin and materials.',
-        'sample': '/static/img/style-samples/cinematic.jpg',
+        'sample': '/style-samples/cinematic.jpg',
     },
     'photorealistic': {
         'label': 'Фотореализм',
         'desc':  'Photorealistic, sharp focus, neutral color grading, even lighting. Skin pores, fabric weave, micro-detail visible. No stylization.',
-        'sample': '/static/img/style-samples/photorealistic.jpg',
+        'sample': '/style-samples/photorealistic.jpg',
     },
     'anime': {
         'label': 'Аниме',
         'desc':  'Anime style, cel-shaded, clean line art, vibrant flat colors, large expressive eyes, stylized proportions, smooth gradients. Studio-quality animation frame look.',
-        'sample': '/static/img/style-samples/anime.jpg',
+        'sample': '/style-samples/anime.jpg',
     },
     'pixar': {
         'label': '3D Pixar',
         'desc':  'Pixar 3D animation style, soft volumetric lighting, exaggerated facial expressions, slightly stylised proportions, vibrant saturated palette, cinematic composition.',
-        'sample': '/static/img/style-samples/pixar.jpg',
+        'sample': '/style-samples/pixar.jpg',
     },
     'noir': {
         'label': 'Film Noir',
         'desc':  'Film noir, high-contrast black-and-white, dramatic chiaroscuro lighting, venetian blind shadows, smoky atmosphere, 1940s aesthetic.',
-        'sample': '/static/img/style-samples/noir.jpg',
+        'sample': '/style-samples/noir.jpg',
     },
     'auto': {
         'label': 'Авто (AI выберет)',
