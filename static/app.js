@@ -603,6 +603,15 @@ function navigate(view, params = {}) {
   document.querySelectorAll('.view').forEach(v => v.classList.add('hidden'));
   document.getElementById('view-' + view).classList.remove('hidden');
   Object.assign(S, params);
+  // Apply cached video-provider mode IMMEDIATELY so refreshing on a series/
+  // episode page doesn't flash Reteller-only DOM for ~300ms while waiting
+  // for /api/series to return. The fetched value reconciles via
+  // applyVideoProviderMode() below.
+  if (view === 'series' || view === 'episode') {
+    _preApplyVideoProviderMode(S.seriesId);
+  } else {
+    document.body.classList.remove('seedance-mode');
+  }
 
   // Topnav "Редактор" button — visible whenever a series is open and we're
   // not already inside the montage editor.
@@ -2179,6 +2188,28 @@ function applyVideoProviderMode() {
     const pref = (S.series && S.series.preferred_image_provider) || '';
     imgSel.value = pref || 'auto';
   }
+  // Cache provider per-series in localStorage so the next page-refresh can
+  // apply body.seedance-mode IMMEDIATELY (before the /api/series fetch comes
+  // back). Without this, Reteller-mode HTML defaults flash for ~100-300ms
+  // every refresh and look like "режим слетел на ретеллер".
+  try {
+    if (S.seriesId) {
+      localStorage.setItem(`series_provider:${S.seriesId}`, provider);
+      localStorage.setItem('last_video_provider', provider);
+    }
+  } catch {}
+}
+
+// Pre-apply body class from cache so the page doesn't flash Reteller-mode
+// on refresh. Called from navigate() before the fetch fires; reconciled by
+// applyVideoProviderMode() once S.series arrives.
+function _preApplyVideoProviderMode(seriesId) {
+  try {
+    let p = '';
+    if (seriesId) p = localStorage.getItem(`series_provider:${seriesId}`) || '';
+    if (!p) p = localStorage.getItem('last_video_provider') || '';
+    if (p) document.body.classList.toggle('seedance-mode', p === 'seedance');
+  } catch {}
 }
 
 // Persist per-series image-provider preference (banana / seedream / auto).
