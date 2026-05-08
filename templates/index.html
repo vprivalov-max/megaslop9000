@@ -1082,6 +1082,9 @@
     </div>
     <div class="modal-footer">
       <button class="btn-ghost" onclick="closeModal('modal-style')">Отмена</button>
+      <!-- Primary-only: rebuild all baseline preset samples by hitting AVAI.
+           Hidden for regular users (no need + would spend their AVAI credits). -->
+      <button class="btn-ghost" id="btn-regen-style-samples" onclick="regenerateAllStyleSamples()" style="display:none;color:var(--accent)" title="Перегенерировать все 5 базовых сэмплов через AVAI (~50с, ~$0.10). Только админ.">🔄 Регенерить сэмплы</button>
       <button class="btn-primary" onclick="saveStyle()">Сохранить</button>
     </div>
   </div>

@@ -3823,6 +3823,11 @@ async function openStyleEditor() {
   const cur = (S.series && S.series.style) || {};
   const grid = document.getElementById('style-presets-grid');
   if (!grid) { openModal('modal-style'); return; }
+  // Show admin-only "Регенерить сэмплы" button only to primary user.
+  const adminBtn = document.getElementById('btn-regen-style-samples');
+  if (adminBtn) {
+    adminBtn.style.display = (window._currentUser && window._currentUser.is_primary) ? '' : 'none';
+  }
   setVal('style-type', cur.type || 'cinematic');
   // Render preset cards + custom card at the end.
   grid.innerHTML = presets.map(p => `
@@ -3887,6 +3892,35 @@ async function saveStyle() {
   S.series = await api.get(`/api/series/${S.seriesId}`);
   closeModal('modal-style');
   renderStyleSection();
+}
+
+// Primary-only: rebuild all baseline preset samples (cinematic, photorealistic,
+// anime, pixar, noir) by calling AVAI 5 times. ~50s + ~$0.10. Saves images
+// to static/img/style-samples/<id>.jpg so every user sees them in the picker.
+async function regenerateAllStyleSamples() {
+  if (!confirm('Сгенерировать все 5 базовых сэмплов через AVAI?\n\nЗаймёт ~50 секунд, потратит ~$0.10. После — карточки стилей у всех юзеров получат превью.')) return;
+  const btn = document.getElementById('btn-regen-style-samples');
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ Генерирую (~50с)...'; }
+  try {
+    const r = await api.post('/api/admin/regenerate-style-samples', {});
+    const ok = (r.results || []).filter(x => x.ok).length;
+    const fail = (r.results || []).filter(x => !x.ok);
+    let msg = `✓ Готово: ${ok}/${r.results?.length || 0} сэмплов сгенерировано`;
+    if (fail.length) {
+      msg += '\n\nОшибки:\n' + fail.map(x => `  • ${x.id}: ${x.err}`).join('\n');
+    }
+    alert(msg);
+    // Force browser to refetch the new images by bumping cache buster
+    bumpAssetVersion();
+    // Refresh preset cache so new sample paths show
+    _stylePresetsCache = null;
+    closeModal('modal-style');
+    setTimeout(() => openStyleEditor(), 200);
+  } catch (e) {
+    alert('Ошибка: ' + (e?.message || e));
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '🔄 Регенерить сэмплы'; }
+  }
 }
 
 // Auto-prompt the user for a style choice after script-import or when a
