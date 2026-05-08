@@ -3311,8 +3311,12 @@ function _brokenImagePlaceholder(url) {
 // blob back to support / dev. Resilient: never throws into the UI.
 async function debugAsset(url) {
   try {
-    // url looks like '/assets/<sid>/<rel_path>' — feed rel_path to the debug API
-    const m = url.match(/^\/assets\/([^/]+)\/(.+)$/);
+    // url looks like '/assets/<sid>/<rel_path>?v=<cache-buster>' — strip query
+    // string before feeding rel_path to the debug API. Without this strip the
+    // backend tries to open `file.jpg?v=1778...` literally, always reports
+    // exists=false even when the file IS on disk. (User-reported false alarm.)
+    const cleanUrl = url.split('?')[0].split('#')[0];
+    const m = cleanUrl.match(/^\/assets\/([^/]+)\/(.+)$/);
     if (!m) {
       alert('Не разобрать путь к ассету: ' + url);
       return;

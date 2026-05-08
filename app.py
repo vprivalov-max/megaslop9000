@@ -3734,14 +3734,16 @@ def regenerate_character(sid, char_id):
 
     # 1) Regenerate base
     try:
-        # Drop the old file so AVAI doesn't accidentally serve it cached.
-        if out_path.exists():
-            try:
-                out_path.unlink()
-            except Exception:
-                pass
+        # Don't preemptively delete the old file — if avai_generate fails
+        # (network blip, 401, content-filter), we'd have killed the user's
+        # existing photo with no replacement, leaving ref_images pointing at
+        # a vanished path. avai_generate will overwrite out_path anyway when
+        # it succeeds. User-reported: "Подменил фотку, обновил страницу,
+        # фото утеряно" was caused by this preemptive delete + AVAI failure.
         image_url = avai_generate(prompt, out_path, preferred_provider=_series_image_provider(s))
     except Exception as e:
+        _log_event('WARN', 'regenerate_character_failed', char_id=char_id,
+                   name=char.get('name', ''), err=str(e)[:300])
         return jsonify({'error': f'Не удалось сгенерировать основной образ: {e}'}), 500
 
     rel_path = str(out_path.relative_to(series_path(sid)))
@@ -8852,6 +8854,14 @@ def upload_character_asset(sid, char_id):
     char['ref_images'] = [rel_path]
     char['avai_base_url'] = ''  # invalidate — old AVAI URL pointed at the old (deleted) gen
     save_series(sid, s)
+    # Log so we can trace user-reported "uploaded photo vanished" cases.
+    try:
+        size = final.stat().st_size if final.exists() else -1
+    except Exception:
+        size = -1
+    _log_event('INFO', 'upload_character_asset', sid=sid, char_id=char_id,
+               filename=filename, rel_path=rel_path, file_size=size,
+               file_exists_after_save=final.exists())
     return jsonify({'path': rel_path, 'url': f'/assets/{sid}/{rel_path}', 'series': s})
 
 @app.route('/api/series/<sid>/assets/character/<char_id>/<path:filename>', methods=['DELETE'])
