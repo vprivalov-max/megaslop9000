@@ -8923,7 +8923,14 @@ def delete_style_asset(sid, filename):
 @app.route('/assets/<sid>/<path:filepath>')
 def serve_asset(sid, filepath):
     asset_path = series_path(sid) / filepath
-    return send_from_directory(str(asset_path.parent), asset_path.name)
+    resp = send_from_directory(str(asset_path.parent), asset_path.name)
+    # Long-cache (1 year) since the URL itself includes a `?v=<ts>` cache
+    # buster from assetUrl() — when the file changes, the FE bumps the
+    # version → URL changes → browser fetches the new bytes. While the
+    # version stays the same, browser serves from cache → page reload
+    # is instant instead of refetching every image.
+    resp.headers['Cache-Control'] = 'public, max-age=31536000, immutable'
+    return resp
 
 
 @app.route('/api/series/<sid>/skip-autogen', methods=['POST'])

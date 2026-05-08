@@ -186,13 +186,32 @@ async function trackTask(label, ctx, fn) {
   }
 }
 
-// Cache-bust counter for asset URLs. Bumped after every operation that
-// changes an image on disk (upload, regen, autogen sweep tick), then every
-// <img src> formed via assetUrl() carries `?v=<ts>` so the browser refetches
-// instead of showing the cached old version. User reported: "изменения в
-// картинках появляются только после перезагрузки".
-window._assetVer = Date.now();
-function bumpAssetVersion() { window._assetVer = Date.now(); }
+// Cache-bust counter for asset URLs.
+//
+// CRITICAL: must persist across page loads — otherwise EVERY page reload
+// generates a fresh Date.now() and the browser sees N different URLs for
+// the same N images → re-downloads everything. User reported "сайт всё
+// очень долго прогружается" — this was the cause.
+//
+// Now: read last-bump value from localStorage on boot. Bumps happen only
+// when an asset actually changes (upload, regen, autogen tick). Browser's
+// HTTP cache then works as intended — same URL between reloads → 304s
+// instead of full re-downloads.
+window._assetVer = (function () {
+  try {
+    const saved = localStorage.getItem('asset_ver');
+    if (saved) return parseInt(saved, 10);
+  } catch {}
+  // First-ever boot: pick a stable starter so subsequent same-day reloads
+  // return the same URLs.
+  const init = Date.now();
+  try { localStorage.setItem('asset_ver', String(init)); } catch {}
+  return init;
+})();
+function bumpAssetVersion() {
+  window._assetVer = Date.now();
+  try { localStorage.setItem('asset_ver', String(window._assetVer)); } catch {}
+}
 function assetUrl(rel) {
   if (!rel) return '';
   if (typeof rel !== 'string') return rel;
