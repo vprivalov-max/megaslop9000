@@ -5002,12 +5002,25 @@ def auto_generate_missing_assets(sid):
         try:
             s2 = load_series(sid)
             if s2 and s2.get('auto_generate_assets'):
+                # NB: must mirror the _skip_autogen logic from task-collection
+                # above. Otherwise entities the user explicitly opted-out of
+                # auto-gen (via "🚫 Не генерить" tickbox in the Accept-script
+                # modal) are counted as pending forever — sweep finishes with
+                # queue=0 (everything skipped at task-build time), recheck sees
+                # pending>0 (skip flag ignored here), spawns another sweep,
+                # loops infinitely. Symptom on the frontend: the heartbeat
+                # catches every brief running=true blip and the «ничего не
+                # нужно генерить» line keeps re-painting under the button.
                 pending = (
-                    sum(1 for c in s2.get('characters', []) if not c.get('ref_images')) +
-                    sum(1 for c in s2.get('characters', []) for o in c.get('outfits', [])
-                        if not o.get('photo') and not o.get('is_base')) +
-                    sum(1 for l in s2.get('locations', []) if not l.get('ref_images')) +
-                    sum(1 for it in s2.get('items', []) if not it.get('ref_images'))
+                    sum(1 for c in s2.get('characters', [])
+                        if not c.get('ref_images') and not c.get('_skip_autogen')) +
+                    sum(1 for c in s2.get('characters', []) if not c.get('_skip_autogen')
+                        for o in c.get('outfits', [])
+                        if not o.get('photo') and not o.get('is_base') and not o.get('_skip_autogen')) +
+                    sum(1 for l in s2.get('locations', [])
+                        if not l.get('ref_images') and not l.get('_skip_autogen')) +
+                    sum(1 for it in s2.get('items', [])
+                        if not it.get('ref_images') and not it.get('_skip_autogen'))
                 )
                 if pending > 0:
                     print(f'[autogen {sid}] {pending} new assets queued during sweep — re-running')
