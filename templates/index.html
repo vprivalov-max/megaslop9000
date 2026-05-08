@@ -1067,26 +1067,18 @@
 
 <!-- Style Editor Modal -->
 <div id="modal-style" class="modal hidden">
-  <div class="modal-box">
+  <div class="modal-box modal-wide" style="max-width:880px">
     <div class="modal-header">
-      <h2>Стиль сериала</h2>
+      <h2>Визуальный стиль сериала</h2>
       <button class="btn-icon" onclick="closeModal('modal-style')">✕</button>
     </div>
     <div class="modal-body">
-      <div class="field-group">
-        <label>Визуальный стиль</label>
-        <select id="style-type">
-          <option value="cinematic">Кинематограф</option>
-          <option value="photorealistic">Фотореализм</option>
-          <option value="anime">Аниме</option>
-          <option value="auto">Авто (AI выберет)</option>
-          <option value="custom">Свой стиль</option>
-        </select>
-      </div>
-      <div class="field-group">
-        <label>Описание своего стиля</label>
-        <textarea id="style-custom-desc" placeholder="Описание стиля (для style=custom)..."></textarea>
-      </div>
+      <p style="color:var(--muted);font-size:0.85rem;margin:0 0 12px">
+        Выбранный стиль будет применяться ко всем картинкам персонажей, локаций, предметов и видео.
+        Чтобы посмотреть, как герои будут выглядеть в каждом стиле — кликни на карточку.
+      </p>
+      <div id="style-presets-grid" class="style-presets-grid"></div>
+      <input type="hidden" id="style-type" value="cinematic">
     </div>
     <div class="modal-footer">
       <button class="btn-ghost" onclick="closeModal('modal-style')">Отмена</button>

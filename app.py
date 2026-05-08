@@ -2928,9 +2928,111 @@ def update_series(sid):
         s['settings'].update(data.pop('settings'))
     if 'style' in data:
         s['style'].update(data.pop('style'))
+        # Sync visual_style with style preset choice — this is what gen prompts
+        # actually read. Without this sync, picking "Кинематограф" in the modal
+        # changed style.type but generation still used the default look.
+        st = s['style']
+        t = (st.get('type') or '').strip()
+        if t == 'custom':
+            cd = (st.get('custom_description') or '').strip()
+            if cd:
+                s['visual_style'] = cd
+        elif t in _VISUAL_STYLE_PRESETS:
+            s['visual_style'] = _VISUAL_STYLE_PRESETS[t]['desc']  # may be '' for 'auto'
     s.update(data)
     save_series(sid, s)
     return jsonify(s)
+
+
+@app.route('/api/style-presets')
+def style_presets():
+    """Return the catalog of built-in visual styles for the picker UI."""
+    return jsonify({
+        'presets': [
+            {'id': k, **v} for k, v in _VISUAL_STYLE_PRESETS.items()
+        ]
+    })
+
+
+@app.route('/api/style-sample', methods=['POST'])
+def style_sample():
+    """Generate ONE sample image for a custom style description. UI shows it
+    in the style-picker so the user can preview their custom desc before
+    committing the whole series to that look. Cached by description hash so
+    re-clicking on the same desc reuses the prior generation.
+
+    Body: {description: str, base?: 'snoop'|'man'|'woman'} — base picks the
+    canonical subject for the sample. Default = a generic young man portrait
+    so the user sees how chars in their series will look."""
+    body = request.get_json(silent=True) or {}
+    desc = (body.get('description') or '').strip()
+    if not desc:
+        return jsonify({'error': 'description required'}), 400
+    base = (body.get('base') or 'man').lower()
+    base_subject = {
+        'snoop':  'a Black male rapper in his 50s with long braids, gold chains, sunglasses, smoking pose',
+        'man':    'a young man in his late 20s, neutral expression, photogenic features, casual shirt',
+        'woman':  'a young woman in her late 20s, neutral expression, photogenic features, casual blouse',
+    }.get(base, base)
+    # Cache key — sha256(desc + base) so re-running the same prompt is free.
+    import hashlib
+    key = hashlib.sha256((desc + '|' + base).encode('utf-8')).hexdigest()[:16]
+    cache_dir = BASE / 'static' / 'img' / 'style-samples-cache'
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = cache_dir / f'{key}.jpg'
+    if cache_path.exists():
+        return jsonify({'url': f'/static/img/style-samples-cache/{key}.jpg', 'cached': True})
+    # Build prompt with the requested style
+    prompt = (
+        f"{base_subject}. {desc}. Centered portrait composition, neutral background. "
+        f"Square 1:1 framing."
+    )
+    prompt = re.sub(r'\s+', ' ', prompt).strip()
+    try:
+        avai_url = _avai_call('banana', prompt, aspect_ratio='1:1')
+        # Download and save to cache
+        import requests
+        r = requests.get(avai_url, timeout=60)
+        r.raise_for_status()
+        cache_path.write_bytes(r.content)
+        return jsonify({'url': f'/static/img/style-samples-cache/{key}.jpg', 'cached': False})
+    except Exception as e:
+        _log_event('WARN', 'style_sample_fail', desc=desc[:120], err=str(e)[:200])
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/admin/regenerate-style-samples', methods=['POST'])
+def regenerate_style_samples():
+    """Primary-only one-shot: generates the baseline preset samples (cinematic,
+    photorealistic, anime, pixar, noir) using a canonical subject so the style
+    picker shows real previews. Saves to static/img/style-samples/<id>.jpg.
+    Run once per deploy when AVAI prompts change. ~5 LLM calls × ~10s each."""
+    actor = current_user_email() or ''
+    if actor != PRIMARY_USER_EMAIL and AUTH_ENABLED:
+        return jsonify({'error': 'admin only'}), 403
+    out_dir = BASE / 'static' / 'img' / 'style-samples'
+    out_dir.mkdir(parents=True, exist_ok=True)
+    base_subject = 'a Black male rapper in his 50s with long braids, gold chains, sunglasses'
+    results = []
+    for preset_id, preset in _VISUAL_STYLE_PRESETS.items():
+        if not preset.get('desc'):
+            continue   # skip 'auto' — no fixed style
+        prompt = (
+            f"{base_subject}. {preset['desc']}. Centered portrait composition, "
+            f"neutral background. Square 1:1 framing."
+        )
+        prompt = re.sub(r'\s+', ' ', prompt).strip()
+        try:
+            avai_url = _avai_call('banana', prompt, aspect_ratio='1:1')
+            import requests
+            r = requests.get(avai_url, timeout=60)
+            r.raise_for_status()
+            out_path = out_dir / f'{preset_id}.jpg'
+            out_path.write_bytes(r.content)
+            results.append({'id': preset_id, 'ok': True, 'path': str(out_path.relative_to(BASE))})
+        except Exception as e:
+            results.append({'id': preset_id, 'ok': False, 'err': str(e)[:200]})
+    return jsonify({'results': results})
 
 def _rmtree_hard(path):
     """Permanently wipe a directory tree. Robust against AppleDouble (`._*`)
@@ -2980,8 +3082,46 @@ _DEFAULT_VISUAL_STYLE = (
     "subtle film grain, professional cinematography lighting."
 )
 
+_VISUAL_STYLE_PRESETS = {
+    'cinematic': {
+        'label': 'Кинематограф',
+        'desc':  'Cinematic film look — shallow depth of field, professional color grading (teal/orange or analog film), 35mm aesthetic, soft natural lighting, subtle film grain. Photorealistic skin and materials.',
+        'sample': '/static/img/style-samples/cinematic.jpg',
+    },
+    'photorealistic': {
+        'label': 'Фотореализм',
+        'desc':  'Photorealistic, sharp focus, neutral color grading, even lighting. Skin pores, fabric weave, micro-detail visible. No stylization.',
+        'sample': '/static/img/style-samples/photorealistic.jpg',
+    },
+    'anime': {
+        'label': 'Аниме',
+        'desc':  'Anime style, cel-shaded, clean line art, vibrant flat colors, large expressive eyes, stylized proportions, smooth gradients. Studio-quality animation frame look.',
+        'sample': '/static/img/style-samples/anime.jpg',
+    },
+    'pixar': {
+        'label': '3D Pixar',
+        'desc':  'Pixar 3D animation style, soft volumetric lighting, exaggerated facial expressions, slightly stylised proportions, vibrant saturated palette, cinematic composition.',
+        'sample': '/static/img/style-samples/pixar.jpg',
+    },
+    'noir': {
+        'label': 'Film Noir',
+        'desc':  'Film noir, high-contrast black-and-white, dramatic chiaroscuro lighting, venetian blind shadows, smoky atmosphere, 1940s aesthetic.',
+        'sample': '/static/img/style-samples/noir.jpg',
+    },
+    'auto': {
+        'label': 'Авто (AI выберет)',
+        'desc':  '',
+        'sample': '',
+    },
+}
+
 def _series_visual_style(s):
-    """Returns the project's visual style override or the realistic default."""
+    """Returns the project's visual style override or the realistic default.
+    Two storage paths kept in sync:
+      - s['visual_style'] : free-text description (what generation prompts read)
+      - s['style']['type']: preset key OR 'custom' (what UI binds to)
+    When type is set to a preset, visual_style is force-synced to the preset's
+    desc string so picking 'cinematic' actually drives the gen prompts."""
     val = ((s or {}).get('visual_style') or '').strip()
     return val or _DEFAULT_VISUAL_STYLE
 

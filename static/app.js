@@ -1072,6 +1072,10 @@ async function importCreateSeries() {
     navigate('series', { seriesId: r.sid });
     // The series view will pick up the import-status banner via pollImportStatus.
     if (extract) setTimeout(() => pollImportStatus(r.sid), 600);
+    // First-time choice: ask for visual style right after the user creates the
+    // series. They can dismiss to use cinematic default; saving locks in choice
+    // for all character/loc/item generations + Seedance video.
+    setTimeout(() => maybePromptForStyle(true), 900);
   } catch (e) {
     alert('Ошибка импорта: ' + (e?.message || e));
   } finally {
@@ -1367,6 +1371,8 @@ async function createSeries() {
       showToast('⚠ ' + data._scaffold.prproj_warning + ' (templates/empty.prproj)');
     }
     navigate('series', { seriesId: data.id });
+    // Same first-time style prompt as the import flow.
+    setTimeout(() => maybePromptForStyle(true), 900);
   } catch(e) {
     showToast('Ошибка: ' + e.message);
   }
@@ -3798,10 +3804,80 @@ async function regenerateCharacter() {
 }
 
 // ── Style editor ──────────────────────────────────────────────────────────────
-function openStyleEditor() {
-  setVal('style-type', S.series.style.type);
-  setVal('style-custom-desc', S.series.style.custom_description);
+// Cached preset list (loaded once per session).
+let _stylePresetsCache = null;
+
+async function _loadStylePresets() {
+  if (_stylePresetsCache) return _stylePresetsCache;
+  try {
+    const r = await fetch('/api/style-presets').then(x => x.json());
+    _stylePresetsCache = r.presets || [];
+  } catch {
+    _stylePresetsCache = [];
+  }
+  return _stylePresetsCache;
+}
+
+async function openStyleEditor() {
+  const presets = await _loadStylePresets();
+  const cur = (S.series && S.series.style) || {};
+  const grid = document.getElementById('style-presets-grid');
+  if (!grid) { openModal('modal-style'); return; }
+  setVal('style-type', cur.type || 'cinematic');
+  // Render preset cards + custom card at the end.
+  grid.innerHTML = presets.map(p => `
+    <div class="style-card ${cur.type === p.id ? 'selected' : ''}" data-preset="${esc(p.id)}" onclick="_styleCardSelect('${esc(p.id)}')">
+      <div class="style-thumb">
+        ${p.sample
+          ? `<img src="${esc(p.sample)}" alt="${esc(p.label)}" onerror="this.parentElement.innerHTML='<span>нет сэмпла<br><small>(сгенерируй через 🎨 в админке)</small></span>'">`
+          : `<span style="font-size:1.6rem">🎲</span>`}
+      </div>
+      <div class="style-info">
+        <div class="name">${esc(p.label)}</div>
+        ${p.desc ? `<div class="desc">${esc(p.desc.slice(0, 90))}${p.desc.length > 90 ? '…' : ''}</div>` : '<div class="desc">AI выберет стиль исходя из тона серии</div>'}
+      </div>
+    </div>`).join('') + `
+    <div class="style-card custom-card ${cur.type === 'custom' ? 'selected' : ''}" data-preset="custom" onclick="_styleCardSelect('custom')">
+      <div class="style-thumb" id="style-custom-preview">
+        🎨
+      </div>
+      <div class="style-info">
+        <div class="name">Свой стиль</div>
+        <div class="desc">Опиши и сгенерь сэмпл</div>
+      </div>
+      <div class="custom-input">
+        <textarea id="style-custom-desc" placeholder="Например: art-nouveau с сепией, гравюрная штриховка, стиль 1920-х" onclick="event.stopPropagation()" oninput="event.stopPropagation()">${esc(cur.custom_description || '')}</textarea>
+        <button class="btn-sample" onclick="event.stopPropagation();_generateStyleSample()">🎨 Сгенерировать сэмпл</button>
+      </div>
+    </div>`;
   openModal('modal-style');
+}
+
+function _styleCardSelect(id) {
+  document.querySelectorAll('.style-card').forEach(c => {
+    c.classList.toggle('selected', c.dataset.preset === id);
+  });
+  setVal('style-type', id);
+}
+
+async function _generateStyleSample() {
+  const desc = (document.getElementById('style-custom-desc')?.value || '').trim();
+  if (!desc) { alert('Опиши стиль текстом сначала'); return; }
+  const btn = document.querySelector('.style-card.custom-card .btn-sample');
+  const preview = document.getElementById('style-custom-preview');
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ Генерирую...'; }
+  if (preview) preview.innerHTML = '<span class="spinner"></span>';
+  try {
+    const r = await api.post('/api/style-sample', { description: desc, base: 'man' });
+    if (r.error) throw new Error(r.error);
+    if (preview) preview.innerHTML = `<img src="${esc(r.url)}" alt="custom style sample" style="width:100%;height:100%;object-fit:cover;display:block">`;
+    // Auto-select the custom card so save uses it.
+    _styleCardSelect('custom');
+  } catch (e) {
+    if (preview) preview.innerHTML = `<span style="color:var(--danger);font-size:0.78rem">✗ ${esc(e?.message || e)}</span>`;
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '🎨 Сгенерировать сэмпл'; }
+  }
 }
 
 async function saveStyle() {
@@ -3811,6 +3887,23 @@ async function saveStyle() {
   S.series = await api.get(`/api/series/${S.seriesId}`);
   closeModal('modal-style');
   renderStyleSection();
+}
+
+// Auto-prompt the user for a style choice after script-import or when a
+// fresh series with no style picked yet opens. Called from importCreateSeries
+// (right after navigating to the new series) and from loadSeriesView when
+// style.type === 'cinematic' is the default-untouched value.
+let _styleAutoPromptedFor = null;
+async function maybePromptForStyle(force = false) {
+  if (!S.series) return;
+  const sid = S.seriesId;
+  if (!force && _styleAutoPromptedFor === sid) return;
+  // Skip if user already actively saved a non-default style choice.
+  const cur = S.series.style || {};
+  const isDefault = (cur.type === 'cinematic' && !cur.custom_description) || !cur.type;
+  if (!force && !isDefault) return;
+  _styleAutoPromptedFor = sid;
+  setTimeout(() => openStyleEditor(), 400);
 }
 
 // ── Episodes ──────────────────────────────────────────────────────────────────
