@@ -186,6 +186,48 @@ async function trackTask(label, ctx, fn) {
   }
 }
 
+// Resizable sidebar plumbing. Both the series-page sidebar (drag-handle on
+// its right edge, growing rightward) and the episode-page sidebar (handle
+// on its left edge, growing leftward) get the same treatment. Each persists
+// its width independently via localStorage.
+function _wireResizable(handleId, sidebarId, storageKey, direction = 'right') {
+  const handle = document.getElementById(handleId);
+  const sidebar = document.getElementById(sidebarId);
+  if (!handle || !sidebar) return;
+  try {
+    const saved = parseInt(localStorage.getItem(storageKey) || '0', 10);
+    if (saved >= 200 && saved <= 700) sidebar.style.width = saved + 'px';
+  } catch {}
+  let dragging = false, startX = 0, startW = 0;
+  handle.addEventListener('mousedown', (e) => {
+    dragging = true; startX = e.clientX;
+    startW = sidebar.getBoundingClientRect().width;
+    handle.classList.add('dragging');
+    document.body.classList.add('sidebar-dragging');
+    e.preventDefault();
+  });
+  document.addEventListener('mousemove', (e) => {
+    if (!dragging) return;
+    const dx = e.clientX - startX;
+    // direction='right' means handle is on sidebar's right edge → drag right grows. Episode
+    // sidebar is on the right of the page, handle on its left → drag right SHRINKS.
+    let next = direction === 'right' ? startW + dx : startW - dx;
+    next = Math.max(200, Math.min(700, next));
+    sidebar.style.width = next + 'px';
+  });
+  document.addEventListener('mouseup', () => {
+    if (!dragging) return;
+    dragging = false;
+    handle.classList.remove('dragging');
+    document.body.classList.remove('sidebar-dragging');
+    try { localStorage.setItem(storageKey, String(parseInt(sidebar.style.width, 10) || 280)); } catch {}
+  });
+}
+document.addEventListener('DOMContentLoaded', () => {
+  _wireResizable('sidebar-resizer',  'series-sidebar',  'sidebar_width',         'right');
+  _wireResizable('episode-resizer',  'episode-sidebar', 'episode_sidebar_width', 'left');
+});
+
 // Wire up monitor controls once DOM is ready
 async function _checkApiKeysOnBoot() {
   try {
@@ -1010,7 +1052,9 @@ async function pollImportStatus(sid) {
             renderItemsList && renderItemsList();
           }
         } catch {}
-        showToast(`🎉 Импорт завершён: ${st.done} серий · ошибок ${st.errors.length}`, 6000);
+        // Banner already shows "✓ Готово" with counts — no need for an
+        // additional toast. Was the second "import finished" indicator
+        // user reported as «дёргается / показывает дважды».
       }
     } catch {}
   };
@@ -1018,36 +1062,69 @@ async function pollImportStatus(sid) {
   _importStatusTimer = setInterval(tick, 3000);
 }
 
+// Single hide-timeout id so we don't stack multiple hide-trigger setTimeouts
+// across poll ticks.
+let _importBannerHideTimer = null;
 function _renderImportBanner(st) {
-  // Banner lives at #import-progress-banner inside the series view. Created
-  // lazily on first poll if missing.
+  // Banner lives at #import-progress-banner pinned to body so it survives
+  // renderSeriesView() rebuilding .series-main (the previous host). Multiple
+  // ticks reuse the SAME element — only inner text/width update, not full
+  // innerHTML rebuild (which restarted the spinner CSS animation each tick
+  // and looked like flicker).
   let el = document.getElementById('import-progress-banner');
+  const wasNew = !el;
   if (!el) {
-    const host = document.querySelector('.series-main') || document.body;
-    if (!host) return;
     el = document.createElement('div');
     el.id = 'import-progress-banner';
     el.className = 'import-progress-banner';
-    host.insertBefore(el, host.firstChild);
+    el.style.cssText = 'position:fixed;top:60px;left:50%;transform:translateX(-50%);max-width:720px;width:90vw;z-index:1500';
+    document.body.appendChild(el);
   }
-  if (!st.running && st.done === 0) { el.classList.add('hidden'); return; }
+  if (!st.running && st.done === 0) {
+    el.classList.add('hidden');
+    return;
+  }
   el.classList.remove('hidden');
   const pct = st.total ? Math.round(100 * st.done / st.total) : 0;
   const errCount = (st.errors || []).length;
-  el.innerHTML = `
-    <div class="ipb-row">
-      ${st.running ? '<span class="ipb-spinner"></span>' : '<span>✓</span>'}
-      <span>
-        <strong>Импорт сценария:</strong>
-        ${st.done} / ${st.total} серий обработано
-        ${st.current ? `· сейчас: <span style="color:var(--muted)">${esc(st.current)}</span>` : ''}
-        ${errCount ? ` · <span style="color:var(--warning)">ошибок: ${errCount}</span>` : ''}
-      </span>
-    </div>
-    <div class="ipb-bar"><div class="ipb-bar-fill" style="width:${pct}%"></div></div>
-  `;
+  if (wasNew || !el.querySelector('.ipb-row')) {
+    // Build skeleton ONCE per banner instance.
+    el.innerHTML = `
+      <div class="ipb-row">
+        <span class="ipb-spinner-slot"></span>
+        <span class="ipb-text"></span>
+      </div>
+      <div class="ipb-bar"><div class="ipb-bar-fill" style="width:0%"></div></div>
+    `;
+  }
+  // Targeted updates: spinner / done state, text, bar width. Pure text/style
+  // mutations — no DOM teardown, no spinner-animation restart.
+  const spinSlot = el.querySelector('.ipb-spinner-slot');
+  if (spinSlot) {
+    if (st.running && !spinSlot.querySelector('.ipb-spinner')) {
+      spinSlot.innerHTML = '<span class="ipb-spinner"></span>';
+    } else if (!st.running) {
+      spinSlot.innerHTML = '<span style="color:#10b981">✓</span>';
+    }
+  }
+  const textEl = el.querySelector('.ipb-text');
+  if (textEl) {
+    const cur = st.current ? `· сейчас: <span style="color:var(--muted)">${esc(st.current)}</span>` : '';
+    const errs = errCount ? ` · <span style="color:var(--warning)">ошибок: ${errCount}</span>` : '';
+    textEl.innerHTML = `<strong>Импорт сценария:</strong> ${st.done} / ${st.total} серий обработано ${cur}${errs}`;
+  }
+  const fill = el.querySelector('.ipb-bar-fill');
+  if (fill) fill.style.width = `${pct}%`;
   if (!st.running) {
-    setTimeout(() => { el.classList.add('hidden'); el.innerHTML = ''; }, 8000);
+    if (_importBannerHideTimer) clearTimeout(_importBannerHideTimer);
+    _importBannerHideTimer = setTimeout(() => {
+      const cur = document.getElementById('import-progress-banner');
+      if (cur) cur.remove();
+      _importBannerHideTimer = null;
+    }, 8000);
+  } else if (_importBannerHideTimer) {
+    clearTimeout(_importBannerHideTimer);
+    _importBannerHideTimer = null;
   }
 }
 

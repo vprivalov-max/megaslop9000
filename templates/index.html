@@ -139,6 +139,11 @@
     </aside>
 
     <!-- Main content -->
+    <!-- Drag-handle between sidebar and main. Width of sidebar persists in
+         localStorage('sidebar_width') so the user's preferred dimensions
+         survive reload. -->
+    <div class="sidebar-resizer" id="sidebar-resizer" title="Перетащи чтобы изменить ширину сайдбара"></div>
+
     <main class="series-main">
       <div class="series-toolbar">
         <h2 id="series-title-display"></h2>
@@ -514,7 +519,9 @@
       </div>
     </div>
 
-    <aside class="episode-sidebar">
+    <div class="episode-resizer" id="episode-resizer" title="Перетащи чтобы изменить ширину сайдбара эпизода"></div>
+
+    <aside class="episode-sidebar" id="episode-sidebar">
       <div class="sidebar-section">
         <div class="sidebar-section-header">
           <h3>Персонажи</h3>

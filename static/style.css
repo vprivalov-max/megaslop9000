@@ -176,14 +176,37 @@ button { cursor: pointer; transition: all 0.15s; }
 /* ── Series layout ── */
 .series-layout {
   display: flex; height: calc(100vh - 52px); overflow: hidden;
+  position: relative;
 }
 #series-sidebar {
-  width: 280px; min-width: 280px;
+  width: 280px; min-width: 200px; max-width: 700px;
   background: var(--surface); border-right: 1px solid var(--border);
   overflow-y: auto; padding: 20px 16px; display: flex; flex-direction: column; gap: 8px;
+  flex-shrink: 0;
+}
+/* Drag-handle between sidebar and main. Hover gives a visual hint, active
+   drag changes cursor for the whole document. Width of grip is 6px so
+   it's easy to grab but doesn't waste pixels. */
+.sidebar-resizer {
+  width: 6px;
+  background: transparent;
+  cursor: col-resize;
+  flex-shrink: 0;
+  z-index: 10;
+  transition: background 0.15s;
+  margin-left: -3px;
+}
+.sidebar-resizer:hover,
+.sidebar-resizer.dragging {
+  background: var(--accent, #845ef7);
+}
+body.sidebar-dragging,
+body.sidebar-dragging * {
+  cursor: col-resize !important;
+  user-select: none !important;
 }
 .series-main {
-  flex: 1; overflow-y: auto; padding: 24px;
+  flex: 1; overflow-y: auto; padding: 24px; min-width: 320px;
 }
 .sidebar-section { margin-bottom: 24px; }
 .sidebar-section h3 { font-size: 0.8rem; font-weight: 700; text-transform: uppercase;
@@ -292,8 +315,22 @@ button { cursor: pointer; transition: all 0.15s; }
 /* ── Episode editor ── */
 .episode-layout {
   display: flex; height: calc(100vh - 52px); overflow: hidden;
+  position: relative;
 }
-.episode-editor { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+.episode-editor { flex: 1; display: flex; flex-direction: column; overflow: hidden; min-width: 320px; }
+/* Resizer between episode editor and right-side sidebar (chars/locs/items). */
+.episode-resizer {
+  width: 6px;
+  background: transparent;
+  cursor: col-resize;
+  flex-shrink: 0;
+  z-index: 10;
+  transition: background 0.15s;
+}
+.episode-resizer:hover,
+.episode-resizer.dragging {
+  background: var(--accent, #845ef7);
+}
 .editor-toolbar {
   display: flex; align-items: center; justify-content: space-between;
   padding: 14px 24px; border-bottom: 1px solid var(--border);
@@ -330,9 +367,9 @@ button { cursor: pointer; transition: all 0.15s; }
 
 /* ── Episode sidebar ── */
 .episode-sidebar {
-  width: 250px; min-width: 250px;
+  width: 280px; min-width: 220px; max-width: 700px;
   background: var(--surface); border-left: 1px solid var(--border);
-  overflow-y: auto; padding: 20px 16px;
+  overflow-y: auto; padding: 20px 16px; flex-shrink: 0;
 }
 .ep-characters-check { display: flex; flex-direction: column; gap: 6px; }
 .char-check-item {
