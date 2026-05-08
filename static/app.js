@@ -5731,13 +5731,35 @@ async function startAutoMode() {
 
   // Poll one chunk until completed/failed, with optional heal+retry.
   // Returns { ok: bool, chunk?, error? }
+  // Direct, episode-targeted poll. We must NOT use sdPollOnce() here — that one
+  // reads `S.episode.number`, which changes the moment the user navigates to
+  // another episode mid-generation. AUTO must always poll the episode it was
+  // started on (epSid/epNumber from closure), so generation continues from the
+  // background tab even when the user is browsing other parts of the app.
+  // sdRenderList() is still called when the target episode IS the visible one,
+  // so the chunk cards animate normally.
+  async function _autoPollTargetEpisode() {
+    try {
+      const res = await api.post(
+        `/api/series/${epSid}/episodes/${epNumber}/seedance/poll`, {}
+      );
+      const chunks = res.chunks || [];
+      // Only update the on-screen chunk grid if THIS episode is the visible one.
+      if (S.seriesId === epSid && S.episode?.number === epNumber) {
+        try { _sdNotifyTransitions(chunks); } catch {}
+        try { sdRenderList(chunks); } catch {}
+      }
+      return chunks;
+    } catch (e) { return null; }
+  }
+
   async function _autoPollUntilDone(chunkIdx, composeRes, segText, segDuration) {
     let healAttempts = 0;
     let curIdx = chunkIdx;
     while (true) {
       if (AUTO.cancelRequested) return { ok: false, error: 'cancelled' };
       await new Promise(r => setTimeout(r, sharedOpts.POLL_INTERVAL_MS));
-      const polled = await sdPollOnce();
+      const polled = await _autoPollTargetEpisode();
       const chunk = (polled || []).find(c => c.idx === curIdx);
       if (!chunk) {
         AUTO.lastStatus = `… не вижу чанка #${curIdx}`;
