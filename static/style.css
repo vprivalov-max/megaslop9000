@@ -617,6 +617,15 @@ button { cursor: pointer; transition: all 0.15s; }
   font-size: 0.95rem; color: #fff;
 }
 
+/* ── Seedance chunk-list bulk toolbar (always visible above grid) ── */
+.sd-list-toolbar {
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 10px; margin-bottom: 6px;
+  background: var(--surface2); border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.sd-list-toolbar.hidden { display: none; }
+
 /* ── Auto-mode radio cards (Sequential / Turbo) ── */
 /* Each option is its own pill so the recommendation label stays attached
    to Sequential rather than floating between rows the way the inline

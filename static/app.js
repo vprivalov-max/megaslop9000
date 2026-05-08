@@ -9214,6 +9214,22 @@ function sdRenderList(chunks) {
   if (!el) return;
   // cache the last server-state list so optimistic adds can stack on top
   if (!chunks.some(c => c._optimistic)) SD._lastChunks = chunks;
+  // Show/hide the always-visible bulk toolbar above the list. Renders the
+  // chunk count so user sees "5 / 12 selected" at a glance without diving
+  // into the floating bulk-bar (which only appears after first selection).
+  const toolbar = document.getElementById('sd-list-toolbar');
+  if (toolbar) {
+    if (!chunks.length) {
+      toolbar.classList.add('hidden');
+    } else {
+      toolbar.classList.remove('hidden');
+      const cnt = document.getElementById('sd-list-count');
+      if (cnt) {
+        const sel = (SD.selected && SD.selected.size) || 0;
+        cnt.textContent = sel ? `Выбрано ${sel} из ${chunks.length}` : `Всего ${chunks.length}`;
+      }
+    }
+  }
   if (!chunks.length) { el.innerHTML = ''; return; }
   try {
     // Order in DOM: newest (highest idx) first — same as before (.slice().reverse()).
@@ -9344,6 +9360,11 @@ function _sdUpdateBulkBar() {
   const sel = SD.selected || new Set();
   const count = sel.size;
   const list = SD._lastChunks || [];
+  // Sync the always-visible top-bar counter with current selection.
+  const cnt = document.getElementById('sd-list-count');
+  if (cnt && list.length) {
+    cnt.textContent = count ? `Выбрано ${count} из ${list.length}` : `Всего ${list.length}`;
+  }
   if (count === 0) {
     if (bar) bar.classList.add('hidden');
     return;
@@ -10721,10 +10742,39 @@ async function mtRender() {
     const res = await api.post(`/api/series/${S.seriesId}/timeline/render`, {});
     showToast(`✓ Готово · ${res.size_mb} МБ · ${res.mode}`);
     await mtRefreshRenders();
+    // Trigger immediate browser download of the freshly-rendered file.
+    // User asked for this — previously they had to scroll down to the
+    // renders list to grab the file. Now a download starts automatically
+    // the moment the render completes.
+    if (res.url) _mtTriggerDownload(res.url, res.path);
   } catch (e) {
     showToast('✗ ' + (e.message || e), 7000);
   } finally {
     if (btn) { btn.disabled = false; btn.innerHTML = old || '▶ Собрать MP4'; }
+  }
+}
+
+// Triggers a browser download for an asset URL. Uses a hidden <a download>
+// because window.open() / location.href would navigate away from the page.
+// The `path` arg is the relative path inside the series — its basename
+// becomes the suggested filename so the user gets a sensible name in
+// their Downloads folder rather than the random "render-xxxxx.mp4" UUID.
+function _mtTriggerDownload(url, path) {
+  try {
+    const a = document.createElement('a');
+    a.href = url;
+    if (path) {
+      const fname = String(path).split('/').pop() || 'render.mp4';
+      a.download = fname;
+    } else {
+      a.download = '';
+    }
+    a.style.display = 'none';
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => a.remove(), 100);
+  } catch (e) {
+    console.warn('[mtRender] auto-download failed', e);
   }
 }
 

@@ -474,6 +474,17 @@
             </div>
           </div>
 
+          <!-- Always-visible quick-select bar above the chunk grid. Lets user
+               start a bulk operation without first having to tick at least one
+               card to reveal the floating bulk-bar. Hides itself when the chunk
+               list is empty (managed by sdRenderList). -->
+          <div id="sd-list-toolbar" class="sd-list-toolbar hidden">
+            <span class="muted" style="font-size:0.78rem">Bulk:</span>
+            <button class="btn-ghost btn-sm" onclick="sdBulkSelectAll()" title="Выделить все генерации">☑ Выделить все</button>
+            <button class="btn-ghost btn-sm" onclick="sdBulkClearSelection()" title="Снять выделение со всех">☐ Снять все</button>
+            <span class="muted" id="sd-list-count" style="font-size:0.78rem;margin-left:auto"></span>
+          </div>
+
           <div id="sd-gen-list" class="sd-gen-list"></div>
         </div>
 
