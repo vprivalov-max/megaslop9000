@@ -5006,7 +5006,25 @@ def toggle_auto_generate(sid):
 
 @app.route('/api/series/<sid>/auto-generate/status', methods=['GET'])
 def autogen_status_endpoint(sid):
-    return jsonify(_autogen_status(sid))
+    st = _autogen_status(sid)
+    # Phantom-running self-heal: if running=true but the worker thread is
+    # actually dead (queue=0, nothing in progress, lock acquired but never
+    # released), reset the state. Happens when the daemon thread dies mid-
+    # run (server reload kills daemon threads, KeyboardInterrupt, hard
+    # crash) and the finally{} that flips running=false never executed.
+    # Without this self-heal the UI spinner spins forever at 0/0.
+    if st.get('running') and not st.get('queue') and not (st.get('in_progress') or []):
+        # Try to acquire the per-series lock non-blocking. If we can grab
+        # it, the worker is definitely not running anymore — release it
+        # back and reset the status.
+        lock = _AUTOGEN_LOCKS.get(sid)
+        if lock is None or lock.acquire(blocking=False):
+            if lock is not None:
+                lock.release()
+            st['running'] = False
+            st['in_progress'] = []
+            print(f'[autogen {sid}] phantom-running detected — reset', flush=True)
+    return jsonify(st)
 
 
 @app.route('/api/series/<sid>/auto-generate/sweep', methods=['POST'])

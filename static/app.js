@@ -1533,8 +1533,14 @@ async function pollAutogenStatus() {
       const st = await r.json();
       // Mark in-progress items on DOM (spinner overlay) and clear stale marks
       _autogenApplyInProgress(st.in_progress || []);
-      if (st.running) {
-        const ipBits = (st.in_progress || []).map(x => x.name).filter(Boolean).slice(0, 3).join(', ');
+      // Phantom-running guard: a stale running=true with empty queue and
+      // no in_progress entries means the worker thread died (server reload,
+      // KeyboardInterrupt, etc.) without reaching the finally{} that flips
+      // running=false. Don't spin the UI forever — treat it as done.
+      const ipList = st.in_progress || [];
+      const isPhantom = st.running && (st.queue || 0) === 0 && ipList.length === 0;
+      if (st.running && !isPhantom) {
+        const ipBits = ipList.map(x => x.name).filter(Boolean).slice(0, 3).join(', ');
         const ipSuffix = ipBits ? ` · сейчас: ${ipBits}` : '';
         _setStatusText(`генерация… ${st.done}/${st.queue}` + (st.errors.length ? ` · ошибок: ${st.errors.length}` : '') + ipSuffix);
         _setBtnHtml('<span class="spinner"></span> ' + st.done + '/' + st.queue);
