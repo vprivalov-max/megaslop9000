@@ -446,6 +446,162 @@ def _is_path_allowed(path):
         return True
     return path in ('/login', '/auth/google', '/auth/google/callback', '/auth/logout', '/healthz')
 
+# ── Per-user structured logging ─────────────────────────────────────────────
+# Writes one JSONL line per request to <DATA_ROOT>/<email-slug>/_logs/YYYY-MM-DD.jsonl
+# so the primary operator can debug other users' issues without SSHing into the
+# VPS to grep docker logs. Captures: timestamp, route, method, status, duration,
+# user_email, error trace (when 5xx). Also `_log_event(...)` lets app code emit
+# structured events (e.g. "[autogen] FAILED item/...") into the same file.
+
+_LOG_LOCK = threading.Lock()
+
+def _user_log_dir(email):
+    safe = re.sub(r'[^a-z0-9]+', '_', (email or 'anon').lower()).strip('_') or 'anon'
+    return DATA_ROOT / safe / '_logs'
+
+def _log_event(level, event, email=None, **fields):
+    """Append a structured log line to the user's daily JSONL log file.
+    Safe to call from any thread or background worker. Best-effort — failures
+    are swallowed (we don't want logging to crash a request)."""
+    try:
+        if email is None:
+            try: email = current_user_email() or 'anon'
+            except Exception: email = 'anon'
+        d = _user_log_dir(email)
+        d.mkdir(parents=True, exist_ok=True)
+        today = datetime.datetime.utcnow().strftime('%Y-%m-%d')
+        line = json.dumps({
+            'ts': datetime.datetime.utcnow().isoformat(timespec='milliseconds') + 'Z',
+            'level': level,
+            'event': event,
+            'email': email,
+            **fields,
+        }, ensure_ascii=False)
+        with _LOG_LOCK:
+            with open(d / f'{today}.jsonl', 'a', encoding='utf-8') as f:
+                f.write(line + '\n')
+    except Exception:
+        pass
+
+@app.before_request
+def _log_request_start():
+    if request.path.startswith('/static/') or request.path == '/healthz':
+        return None
+    request._t0 = time.time()
+
+@app.after_request
+def _log_request_end(resp):
+    try:
+        if request.path.startswith('/static/') or request.path == '/healthz':
+            return resp
+        t0 = getattr(request, '_t0', None)
+        ms = round((time.time() - t0) * 1000) if t0 else None
+        # Skip 200s on chatty polling endpoints — log only the interesting stuff.
+        if resp.status_code < 400:
+            chatty = ('auto-generate/status', 'seedance/poll', 'seedance/list',
+                      'auto-generate/sweep', 'import-status')
+            if any(p in request.path for p in chatty):
+                return resp
+        level = 'ERROR' if resp.status_code >= 500 else ('WARN' if resp.status_code >= 400 else 'INFO')
+        _log_event(level, 'http',
+                   method=request.method, path=request.path,
+                   status=resp.status_code, ms=ms,
+                   ip=(request.headers.get('X-Forwarded-For') or request.remote_addr or '').split(',')[0].strip())
+    except Exception:
+        pass
+    return resp
+
+@app.errorhandler(Exception)
+def _log_uncaught(e):
+    try:
+        import traceback
+        _log_event('ERROR', 'uncaught',
+                   method=request.method, path=request.path,
+                   exc_type=type(e).__name__, exc_msg=str(e)[:500],
+                   trace=traceback.format_exc()[-2000:])
+    except Exception:
+        pass
+    # Re-raise so Flask's default handling still runs (returns 500 to client)
+    raise
+
+
+@app.route('/api/admin/logs')
+def admin_logs():
+    """Read recent log lines for any user. Gated to PRIMARY_USER_EMAIL only.
+    Query params:
+      email   = user email or slug (defaults to current user)
+      date    = YYYY-MM-DD (defaults to today)
+      lines   = max lines to return (default 500, max 5000)
+      level   = ERROR | WARN | INFO (filter)
+      grep    = case-insensitive substring filter on the JSON line
+    Returns {lines: [parsed_json, ...], total_lines, file}."""
+    actor = current_user_email() or ''
+    if actor != PRIMARY_USER_EMAIL and not (not AUTH_ENABLED):
+        return jsonify({'error': 'admin only'}), 403
+    target_email = (request.args.get('email') or actor).strip()
+    date_str = (request.args.get('date') or datetime.datetime.utcnow().strftime('%Y-%m-%d')).strip()
+    try:
+        max_lines = max(1, min(5000, int(request.args.get('lines') or 500)))
+    except ValueError:
+        max_lines = 500
+    level_filter = (request.args.get('level') or '').upper().strip() or None
+    grep = (request.args.get('grep') or '').lower().strip() or None
+    log_path = _user_log_dir(target_email) / f'{date_str}.jsonl'
+    if not log_path.exists():
+        return jsonify({'lines': [], 'total_lines': 0, 'file': str(log_path), 'exists': False})
+    try:
+        with open(log_path, 'r', encoding='utf-8') as f:
+            all_lines = f.readlines()
+    except Exception as e:
+        return jsonify({'error': f'read failed: {e}'}), 500
+    parsed = []
+    for raw in all_lines:
+        if grep and grep not in raw.lower():
+            continue
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            continue
+        if level_filter and obj.get('level') != level_filter:
+            continue
+        parsed.append(obj)
+    # Tail to max_lines (most recent N)
+    parsed = parsed[-max_lines:]
+    return jsonify({
+        'lines': parsed,
+        'total_lines': len(all_lines),
+        'returned': len(parsed),
+        'file': str(log_path.relative_to(DATA_ROOT)),
+        'exists': True,
+    })
+
+
+@app.route('/api/admin/users')
+def admin_users():
+    """List users that have any data on the server (so primary operator can
+    pick from a dropdown). Gated to PRIMARY_USER_EMAIL."""
+    actor = current_user_email() or ''
+    if actor != PRIMARY_USER_EMAIL and not (not AUTH_ENABLED):
+        return jsonify({'error': 'admin only'}), 403
+    users = []
+    if DATA_ROOT.exists():
+        for child in sorted(DATA_ROOT.iterdir()):
+            if not child.is_dir() or child.name.startswith('.'):
+                continue
+            log_dir = child / '_logs'
+            log_files = []
+            if log_dir.exists():
+                log_files = sorted([p.name.replace('.jsonl', '') for p in log_dir.glob('*.jsonl')], reverse=True)[:14]
+            # Try to read original email from keys file or projects dir
+            users.append({
+                'slug': child.name,
+                'has_logs': bool(log_files),
+                'log_dates': log_files,
+                'project_count': len(list((child / 'projects').glob('*'))) if (child / 'projects').exists() else 0,
+            })
+    return jsonify({'users': users})
+
+
 @app.before_request
 def _require_auth():
     if not AUTH_ENABLED:

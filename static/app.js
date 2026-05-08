@@ -192,6 +192,11 @@ async function _checkApiKeysOnBoot() {
     const me = await fetch('/api/me').then(r => r.ok ? r.json() : null);
     if (!me || !me.authenticated) return;
     window._currentUser = me;
+    // Show the admin logs button only to the primary user (operator).
+    if (me.is_primary) {
+      const btn = document.getElementById('admin-logs-btn');
+      if (btn) btn.style.display = '';
+    }
     if (!me.has_avai_key) {
       _showApiKeySetupModal('avai', { firstTime: true });
       return;
@@ -222,6 +227,112 @@ async function recheckAvaiKey() {
     }
     return v.state;
   } catch { return 'unreachable'; }
+}
+
+// ── Admin: per-user log viewer ──────────────────────────────────────────────
+// Only visible to the primary user. Lets the operator inspect any user's
+// recent server-side activity (HTTP requests, errors, structured events from
+// background workers) without SSHing into the VPS. Backed by JSONL files at
+// <DATA_ROOT>/<user-slug>/_logs/YYYY-MM-DD.jsonl.
+
+async function openAdminLogs() {
+  openModal('modal-admin-logs');
+  // Populate user dropdown
+  try {
+    const r = await fetch('/api/admin/users').then(x => x.json());
+    const sel = document.getElementById('admin-logs-user');
+    if (sel) {
+      sel.innerHTML = (r.users || []).map(u => {
+        const date = u.log_dates?.[0] || '—';
+        return `<option value="${esc(u.slug)}" data-dates='${JSON.stringify(u.log_dates || [])}'>${esc(u.slug)} (last: ${date}, projects: ${u.project_count})</option>`;
+      }).join('');
+      _adminLogsRebuildDateDropdown();
+      sel.addEventListener('change', _adminLogsRebuildDateDropdown);
+    }
+    loadAdminLogs();
+  } catch (e) {
+    document.getElementById('admin-logs-table').textContent = 'Ошибка: ' + (e.message || e);
+  }
+}
+
+function _adminLogsRebuildDateDropdown() {
+  const userSel = document.getElementById('admin-logs-user');
+  const dateSel = document.getElementById('admin-logs-date');
+  if (!userSel || !dateSel) return;
+  const opt = userSel.selectedOptions?.[0];
+  let dates = [];
+  try { dates = JSON.parse(opt?.dataset?.dates || '[]'); } catch {}
+  if (!dates.length) {
+    const today = new Date().toISOString().slice(0, 10);
+    dates = [today];
+  }
+  dateSel.innerHTML = dates.map(d => `<option value="${d}">${d}</option>`).join('');
+}
+
+let _adminLogsGrepTimer = null;
+function _adminLogsGrepDebounced() {
+  if (_adminLogsGrepTimer) clearTimeout(_adminLogsGrepTimer);
+  _adminLogsGrepTimer = setTimeout(loadAdminLogs, 350);
+}
+
+async function loadAdminLogs() {
+  const userSel = document.getElementById('admin-logs-user');
+  const dateSel = document.getElementById('admin-logs-date');
+  const levelSel = document.getElementById('admin-logs-level');
+  const grepEl  = document.getElementById('admin-logs-grep');
+  const tableEl = document.getElementById('admin-logs-table');
+  const statsEl = document.getElementById('admin-logs-stats');
+  if (!userSel || !dateSel || !tableEl) return;
+  const params = new URLSearchParams({
+    email: userSel.value || '',
+    date:  dateSel.value || '',
+    lines: '1000',
+  });
+  const level = levelSel?.value || '';
+  if (level) params.set('level', level);
+  const grep = grepEl?.value?.trim() || '';
+  if (grep) params.set('grep', grep);
+  tableEl.textContent = '⏳ Загружаю...';
+  try {
+    const r = await fetch('/api/admin/logs?' + params.toString()).then(x => x.json());
+    if (r.error) throw new Error(r.error);
+    if (statsEl) statsEl.textContent = `Файл: ${r.file} · показано ${r.returned || 0} из ${r.total_lines || 0} строк`;
+    if (!r.lines || !r.lines.length) {
+      tableEl.innerHTML = '<div style="color:var(--muted);padding:20px;text-align:center">Нет записей по фильтрам</div>';
+      return;
+    }
+    tableEl.innerHTML = r.lines.map(_renderLogLine).join('');
+    tableEl.scrollTop = tableEl.scrollHeight;
+  } catch (e) {
+    tableEl.textContent = 'Ошибка: ' + (e.message || e);
+  }
+}
+
+function _renderLogLine(obj) {
+  const lvl = obj.level || '';
+  const lvlColor = lvl === 'ERROR' ? '#f87171' : lvl === 'WARN' ? '#fbbf24' : 'var(--muted)';
+  const time = (obj.ts || '').slice(11, 23);
+  const ev = obj.event || '?';
+  let body = '';
+  if (ev === 'http') {
+    const stColor = obj.status >= 500 ? '#f87171' : obj.status >= 400 ? '#fbbf24' : '#10b981';
+    body = `<span style="color:${stColor}">${obj.status}</span> ${esc(obj.method || '')} ${esc(obj.path || '')} <span style="color:var(--muted)">· ${obj.ms}ms${obj.ip ? ' · ' + esc(obj.ip) : ''}</span>`;
+  } else if (ev === 'uncaught') {
+    body = `<span style="color:#f87171">${esc(obj.exc_type || '')}: ${esc(obj.exc_msg || '')}</span> · ${esc(obj.method || '')} ${esc(obj.path || '')}`;
+    if (obj.trace) body += `<details style="margin-top:4px"><summary style="cursor:pointer;color:var(--muted)">stack trace</summary><pre style="margin:4px 0;font-size:0.72rem;color:#e0e0e0;white-space:pre-wrap">${esc(obj.trace)}</pre></details>`;
+  } else {
+    // Generic event
+    const fields = Object.entries(obj)
+      .filter(([k]) => !['ts', 'level', 'event', 'email'].includes(k))
+      .map(([k, v]) => `${k}=${typeof v === 'string' ? esc(v).slice(0, 200) : JSON.stringify(v).slice(0, 200)}`)
+      .join(' ');
+    body = `<strong>${esc(ev)}</strong> ${fields}`;
+  }
+  return `<div style="padding:3px 0;border-bottom:1px solid var(--border)">
+    <span style="color:var(--muted)">${time}</span>
+    <span style="color:${lvlColor};font-weight:700;display:inline-block;min-width:50px">${lvl}</span>
+    ${body}
+  </div>`;
 }
 
 // Show modal demanding the user enter an API key. `kind` = 'avai' | 'reteller'.
