@@ -1402,9 +1402,11 @@
     <div class="modal-body">
       <div id="char-assets-grid" class="assets-photo-grid"></div>
       <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:6px">
-        <label class="upload-zone" style="flex:1;min-width:200px">
+        <label class="upload-zone" id="char-assets-drop-zone" style="flex:1;min-width:200px"
+               ondragover="_dropAssetOver(event)" ondragleave="_dropAssetLeave(event)"
+               ondrop="_dropAssetOnCharFromModal(event)">
           <input type="file" accept="image/*" multiple id="char-asset-file-input" hidden>
-          <span>+ Загрузить фото</span>
+          <span>+ Загрузить фото · или перетащи картинку сюда</span>
         </label>
         <button class="btn-ghost" style="color:var(--accent);border:1px solid rgba(0,212,170,0.4);padding:10px 14px"
                 onclick="openRegenChar()">↻ Перегенерировать персонажа</button>

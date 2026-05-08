@@ -2253,7 +2253,10 @@ function renderCharactersList() {
     const hasRefs = c.ref_images && c.ref_images.length > 0;
     const imgUrl = hasRefs ? `/assets/${s.id}/${c.ref_images[0]}` : null;
     return `
-      <div class="char-item" data-autogen-kind="char" data-autogen-id="${c.id}" onclick="openCharAssets('${c.id}')">
+      <div class="char-item" data-autogen-kind="char" data-autogen-id="${c.id}" onclick="openCharAssets('${c.id}')"
+           ondragover="_dropAssetOver(event)" ondragleave="_dropAssetLeave(event)"
+           ondrop="_dropAssetUpload(event, 'char', '${c.id}')"
+           title="Клик — открыть карточку. Перетащи картинку с компа — заменит фото.">
         <div class="char-avatar">
           ${imgUrl ? `<img src="${imgUrl}" alt="${esc(c.name)}" onerror="this.replaceWith(_brokenImagePlaceholder('${imgUrl}'))">` : esc(c.name[0])}
           <div class="autogen-overlay" hidden><span class="spinner"></span></div>
@@ -2282,7 +2285,10 @@ function renderLocationsList() {
     const hasRefs = l.ref_images && l.ref_images.length > 0;
     const imgUrl = hasRefs ? `/assets/${s.id}/${l.ref_images[0]}` : null;
     return `
-      <div class="char-item" data-autogen-kind="loc" data-autogen-id="${l.id}" onclick="openLocAssets('${l.id}')">
+      <div class="char-item" data-autogen-kind="loc" data-autogen-id="${l.id}" onclick="openLocAssets('${l.id}')"
+           ondragover="_dropAssetOver(event)" ondragleave="_dropAssetLeave(event)"
+           ondrop="_dropAssetUpload(event, 'loc', '${l.id}')"
+           title="Клик — открыть карточку. Перетащи картинку с компа — заменит фото.">
         <div class="char-avatar">
           ${imgUrl ? `<img src="${imgUrl}" alt="${esc(l.name)}" onerror="this.replaceWith(_brokenImagePlaceholder('${imgUrl}'))">` : '📍'}
           <div class="autogen-overlay" hidden><span class="spinner"></span></div>
@@ -2986,7 +2992,10 @@ function renderItemsList() {
     const hasRefs = it.ref_images && it.ref_images.length > 0;
     const imgUrl = hasRefs ? `/assets/${s.id}/${it.ref_images[0]}` : null;
     return `
-      <div class="char-item" data-autogen-kind="item" data-autogen-id="${it.id}" onclick="openItemAssets('${it.id}')">
+      <div class="char-item" data-autogen-kind="item" data-autogen-id="${it.id}" onclick="openItemAssets('${it.id}')"
+           ondragover="_dropAssetOver(event)" ondragleave="_dropAssetLeave(event)"
+           ondrop="_dropAssetUpload(event, 'item', '${it.id}')"
+           title="Клик — открыть карточку. Перетащи картинку с компа — заменит фото.">
         <div class="char-avatar">
           ${imgUrl ? `<img src="${imgUrl}" alt="${esc(it.name)}" onerror="this.replaceWith(_brokenImagePlaceholder('${imgUrl}'))">` : '🎒'}
           <div class="autogen-overlay" hidden><span class="spinner"></span></div>
@@ -7380,6 +7389,80 @@ function toggleEpCharCheck(charId, cb) {
     S.episode.characters_used = used.filter(x => x !== charId);
     card?.classList.remove('in-episode');
   }
+}
+
+// Generic drag-and-drop upload handler for character / location / item cards.
+// Routes to the correct /upload-photo endpoint based on `kind`. Used from
+// any DOM node that wants to accept image-file drops as a "replace ref photo"
+// gesture (cards in series sidebar, modal photo grids, episode-side photo
+// containers). The user-supplied photo replaces existing refs (server-side
+// /upload-photo endpoints all use replace-semantics now).
+async function _dropAssetUpload(event, kind, id) {
+  event.preventDefault();
+  event.stopPropagation();
+  const target = event.currentTarget;
+  if (target) target.classList.remove('drop-hover');
+  const file = event.dataTransfer?.files?.[0];
+  if (!file || !file.type.startsWith('image/')) return;
+  const fd = new FormData();
+  fd.append('photo', file);
+  const endpoint = (
+    kind === 'char' ? `/api/series/${S.seriesId}/characters/${id}/upload-photo` :
+    kind === 'loc'  ? `/api/series/${S.seriesId}/locations/${id}/upload-photo` :
+    kind === 'item' ? `/api/series/${S.seriesId}/items/${id}/upload-photo` :
+    null
+  );
+  if (!endpoint) return;
+  // Visual feedback: spinner inside any thumb in the dropped element.
+  const thumb = target?.querySelector('img');
+  if (thumb) thumb.style.opacity = '0.4';
+  try {
+    const res = await fetch(endpoint, { method: 'POST', body: fd });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || res.statusText);
+    bumpAssetVersion();
+    if (data.series) S.series = data.series;
+    else {
+      try { S.series = await api.get(`/api/series/${S.seriesId}`); } catch {}
+    }
+    // Re-render every list that might show this asset.
+    renderCharactersList && renderCharactersList();
+    renderLocationsList && renderLocationsList();
+    renderItemsList && renderItemsList();
+    if (typeof renderEpCharacters === 'function') renderEpCharacters();
+    if (typeof renderEpLocations === 'function') renderEpLocations();
+    if (typeof renderEpItems === 'function') renderEpItems();
+    // Re-open the modal photo grid if it's currently showing for this entity.
+    const modal = document.getElementById('modal-char-assets');
+    if (kind === 'char' && modal && modal.classList.contains('open')) {
+      const c = S.series.characters.find(x => x.id === id);
+      if (c) renderCharAssetsGrid(c);
+    }
+    showToast(`✓ Фото обновлено`);
+  } catch (e) {
+    showToast('Ошибка загрузки: ' + (e.message || e));
+  } finally {
+    if (thumb) thumb.style.opacity = '';
+  }
+}
+
+// Drop-on-modal-char-assets-zone: routes to currently-open character. The
+// modal stores currentCharId, so we just delegate. Same for loc/item.
+function _dropAssetOnCharFromModal(event) {
+  if (!currentCharId) return _dropAssetLeave(event);
+  return _dropAssetUpload(event, 'char', currentCharId);
+}
+
+// Standard ondragover handler — adds .drop-hover class so CSS can highlight.
+function _dropAssetOver(event) {
+  event.preventDefault();
+  event.stopPropagation();
+  // Show "copy" cursor (file drop) instead of default "no entry"
+  if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy';
+  event.currentTarget?.classList.add('drop-hover');
+}
+function _dropAssetLeave(event) {
+  event.currentTarget?.classList.remove('drop-hover');
 }
 
 async function dropCharPhoto(event, charId) {

@@ -526,6 +526,20 @@ body.sidebar-dragging * {
   cursor: pointer; transition: all 0.15s;
 }
 .upload-zone:hover { border-color: var(--primary); color: var(--primary); }
+/* Active drag-over state — for any DOM node tagged as a drop-target via
+   _dropAssetOver helper. Pulses + shows accent border so user sees where
+   dropping will land. */
+.drop-hover {
+  outline: 2px dashed var(--accent, #845ef7);
+  outline-offset: 2px;
+  background: rgba(132,94,247,0.08) !important;
+  transition: outline 0.1s, background 0.1s;
+}
+.upload-zone.drop-hover {
+  border-color: var(--accent, #845ef7);
+  color: var(--accent, #845ef7);
+  background: rgba(132,94,247,0.12) !important;
+}
 
 /* ── Modals ── */
 .modal {
