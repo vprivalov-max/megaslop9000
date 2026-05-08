@@ -4071,7 +4071,26 @@ def auto_generate_missing_assets(sid):
                 st['in_progress'] = [e for e in st['in_progress']
                                       if not (e.get('parent_id') == parent_id and e.get('child_id') == child_id)]
 
+        # Snapshot the user-keys context HERE while we're still on the parent
+        # thread (which had keys propagated by _spawn_with_keys). Each child
+        # worker copies this into its own threading.local at the top of its
+        # task — without this, ThreadPoolExecutor's child threads run with an
+        # empty _thread_keys and every helper that calls user_root() /
+        # current_user_email() / _get_user_avai_key() crashes with
+        # "Working outside of request context". This was the root cause of the
+        # "[autogen ...] FAILED item/...: Working outside of request context"
+        # spam — items don't have any other auth-attached call paths so they
+        # showed it loudest, but chars/locs would have hit it too if they
+        # didn't already have refs (ref_images guard skips before keys are used).
+        _ctx_email     = getattr(_thread_keys, 'email', None)
+        _ctx_avai_key  = getattr(_thread_keys, 'avai_key', None)
+        _ctx_rtl_key   = getattr(_thread_keys, 'reteller_key', None)
+
         def _run_task(kind, parent_id, child_id):
+            # Apply captured user-keys context to THIS worker thread.
+            _thread_keys.email        = _ctx_email
+            _thread_keys.avai_key     = _ctx_avai_key
+            _thread_keys.reteller_key = _ctx_rtl_key
             ip_entry = None
             try:
                 # Re-load LOCALLY so each worker has a fresh read for its mutation
@@ -4160,6 +4179,12 @@ def auto_generate_missing_assets(sid):
                 print(f'[autogen {sid}] FAILED {err_msg}', flush=True)
             finally:
                 _ip_remove(parent_id, child_id)
+                # Clear the worker-thread's _thread_keys so a recycled pool
+                # thread doesn't leak the previous task's user context into a
+                # later task (or another series's sweep on the same process).
+                _thread_keys.email        = None
+                _thread_keys.avai_key     = None
+                _thread_keys.reteller_key = None
 
         # Phase 1: char bases — outfits depend on these
         if char_tasks:
