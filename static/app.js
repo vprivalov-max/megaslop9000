@@ -1873,8 +1873,14 @@ async function _confirmMissingAssetsBeforeGen(label = 'генерации') {
   if (missing.chars.length) lines.push(`👤 Персонажи без портрета: ${missing.chars.map(c => c.name).join(', ')}`);
   if (missing.outfits.length) lines.push(`👕 Аутфиты не сгенерены: ${missing.outfits.map(o => `${o.char}/${o.label}`).join(', ')}`);
   if (missing.locs.length) lines.push(`🏛 Локации без фото: ${missing.locs.map(l => l.name).join(', ')}`);
-  const msg = `⚠ Не все ассеты этой сцены готовы:\n\n${lines.join('\n')}${runningSuffix}\n\nЗапустить ${label} всё равно?`;
-  return confirm(msg);
+  const msg = `Не все ассеты этой сцены готовы:\n\n${lines.join('\n')}${runningSuffix}\n\nЗапустить ${label} всё равно?`;
+  return appConfirm({
+    title: '⚠ Не все ассеты готовы',
+    message: msg,
+    okText: 'Запустить всё равно',
+    cancelText: 'Отмена',
+    okStyle: 'accent',
+  });
 }
 
 // Auto-resume polling if a sweep is running when the user opens the page
@@ -5908,6 +5914,11 @@ function _autoUpdateStatusUI() {
     btn.innerHTML = AUTO.active ? '⏸ Стоп Auto-mode' : '▶ Auto-mode';
     btn.className = AUTO.active ? 'btn-danger' : 'btn-accent';
   }
+  // Floating widget — visible everywhere on the site while AUTO runs, shows
+  // progress + percent + current status + stop button. Survives navigation
+  // (the AUTO loop continues on its captured epSid/epNumber regardless of
+  // which page is currently rendered).
+  _autoUpdateFloatingWidget();
   if (!el) return;
   if (!AUTO.active) {
     el.textContent = (AUTO.completedCount || AUTO.cursor) > 0 && AUTO.total > 0
@@ -5922,6 +5933,131 @@ function _autoUpdateStatusUI() {
   else if ((AUTO.activeChains || 0) > 1) mode = `сцены × ${AUTO.activeChains}`;
   else mode = 'последов.';
   el.textContent = `Auto-mode (${mode}) · ${done}/${AUTO.total} · ${status}`;
+}
+
+// ── Floating Auto-mode progress widget ─────────────────────────────────────
+// Pinned to the bottom-right, always-on while AUTO.active. Lazily injected so
+// it doesn't appear in the DOM until first activation. Click on it to navigate
+// back to the source episode; «⏸» button stops AUTO from anywhere.
+function _autoEnsureFloatingWidget() {
+  let w = document.getElementById('auto-float');
+  if (w) return w;
+  w = document.createElement('div');
+  w.id = 'auto-float';
+  w.className = 'auto-float';
+  w.innerHTML = `
+    <div class="auto-float-head" id="auto-float-head" title="Открыть серию которая генерится">
+      <span class="auto-float-spin"></span>
+      <span class="auto-float-title">Auto-mode</span>
+      <span class="auto-float-count" id="auto-float-count">—</span>
+      <button class="auto-float-stop" id="auto-float-stop" title="Остановить генерацию">⏸</button>
+    </div>
+    <div class="auto-float-bar"><div class="auto-float-bar-fill" id="auto-float-bar-fill"></div></div>
+    <div class="auto-float-status" id="auto-float-status"></div>
+  `;
+  document.body.appendChild(w);
+  // Wire — head jumps to source episode (closure captures sid/number — store
+  // them on the widget itself), stop kills AUTO. RANGE-gen also stops if
+  // active so the queue doesn't keep firing.
+  w.querySelector('#auto-float-stop').addEventListener('click', (ev) => {
+    ev.stopPropagation();
+    try { if (typeof stopRangeGen === 'function' && (typeof RANGE !== 'undefined') && RANGE.active) stopRangeGen(); } catch {}
+    try { if (typeof stopAutoMode === 'function') stopAutoMode(); } catch {}
+  });
+  w.querySelector('#auto-float-head').addEventListener('click', () => {
+    const sid = w.dataset.sid, ep = w.dataset.ep;
+    if (sid && ep) {
+      try { navigate('episode', { seriesId: sid, episodeNum: parseInt(ep, 10) }); } catch {}
+    }
+  });
+  return w;
+}
+function _autoUpdateFloatingWidget() {
+  const rangeActive = (typeof RANGE !== 'undefined') && RANGE.active;
+  const active = !!AUTO.active || rangeActive;
+  if (!active) {
+    const w = document.getElementById('auto-float');
+    if (w) w.remove();
+    return;
+  }
+  const w = _autoEnsureFloatingWidget();
+  const total = AUTO.total || 0;
+  const done = AUTO.completedCount || 0;
+  const pct = total ? Math.round((done / total) * 100) : 0;
+  const sid = (typeof AUTO._epSid === 'string') ? AUTO._epSid : (S.seriesId || '');
+  const ep = (typeof AUTO._epNumber === 'number') ? AUTO._epNumber : (S.episode?.number || '');
+  if (sid) w.dataset.sid = sid;
+  if (ep)  w.dataset.ep = String(ep);
+  const countEl = document.getElementById('auto-float-count');
+  const fillEl  = document.getElementById('auto-float-bar-fill');
+  const statusEl = document.getElementById('auto-float-status');
+  if (countEl) countEl.textContent = total ? `${done}/${total} · ${pct}%` : '…';
+  if (fillEl)  fillEl.style.width = `${pct}%`;
+  let mode;
+  if (AUTO.parallel) mode = 'паралл.';
+  else if ((AUTO.activeChains || 0) > 1) mode = `сцены × ${AUTO.activeChains}`;
+  else mode = 'последов.';
+  const epLabel = ep ? `Эп.${ep}` : '';
+  // Append range-gen queue progress if a multi-episode queue is in flight.
+  let rangeBit = '';
+  if (rangeActive && Array.isArray(RANGE.queue) && RANGE.queue.length) {
+    const cur = (RANGE.curIdx >= 0 ? RANGE.curIdx + 1 : 0);
+    rangeBit = ` · очередь ${cur}/${RANGE.queue.length}`;
+  }
+  if (statusEl) statusEl.textContent = `${epLabel} · ${mode} · ${AUTO.lastStatus || '...'}${rangeBit}`;
+}
+
+// ── In-app confirm modal ───────────────────────────────────────────────────
+// Returns Promise<bool>. Replaces native window.confirm() for high-traffic
+// user flows (Auto-mode, range-gen) — Chrome silently auto-rejects native
+// dialogs after several confirms in a single tab session («Don't show more
+// dialogs»), which manifested as «AUTO не запускается, ничего не происходит».
+// In-app modal lives in our own DOM, immune to the browser's throttle.
+function appConfirm(opts) {
+  const {
+    title = 'Подтверждение',
+    message = '',
+    okText = 'OK',
+    cancelText = 'Отмена',
+    okStyle = 'primary',     // 'primary' | 'danger' | 'accent'
+  } = (typeof opts === 'string') ? { message: opts } : (opts || {});
+  return new Promise((resolve) => {
+    // Tear down any prior instance so rapid consecutive calls don't stack.
+    document.getElementById('app-confirm-modal')?.remove();
+    const root = document.createElement('div');
+    root.id = 'app-confirm-modal';
+    root.className = 'app-confirm-modal';
+    const okClass = okStyle === 'danger' ? 'btn-danger' : okStyle === 'accent' ? 'btn-accent' : 'btn-primary';
+    root.innerHTML = `
+      <div class="app-confirm-backdrop"></div>
+      <div class="app-confirm-box" role="dialog" aria-modal="true">
+        <div class="app-confirm-title">${esc(title)}</div>
+        <div class="app-confirm-body"></div>
+        <div class="app-confirm-actions">
+          <button class="btn-ghost" data-act="cancel">${esc(cancelText)}</button>
+          <button class="${okClass}" data-act="ok" autofocus>${esc(okText)}</button>
+        </div>
+      </div>
+    `;
+    // Body via textContent so newlines preserve and we don't HTML-eval.
+    root.querySelector('.app-confirm-body').textContent = message;
+    document.body.appendChild(root);
+    const close = (val) => {
+      try { root.remove(); } catch {}
+      document.removeEventListener('keydown', onKey);
+      resolve(val);
+    };
+    const onKey = (e) => {
+      if (e.key === 'Escape') { e.preventDefault(); close(false); }
+      else if (e.key === 'Enter') { e.preventDefault(); close(true); }
+    };
+    document.addEventListener('keydown', onKey);
+    root.querySelector('[data-act="cancel"]').addEventListener('click', () => close(false));
+    root.querySelector('[data-act="ok"]').addEventListener('click', () => close(true));
+    root.querySelector('.app-confirm-backdrop').addEventListener('click', () => close(false));
+    // Focus OK so Enter works.
+    setTimeout(() => root.querySelector('[data-act="ok"]')?.focus(), 50);
+  });
 }
 
 function _autoModeToggle() {
@@ -5976,14 +6112,17 @@ async function startAutoMode() {
   const durEl = document.getElementById('sd-duration');
   const curDur = parseInt(durEl?.value, 10);
   if (curDur !== 15) {
-    const confirmFix = confirm(
-      `⚠ Длительность Seedance стоит ${curDur || '?'}с, но Auto-mode калиброван под 15-секундные чанки.\n\n` +
-      `Сегментация рассчитывала контент ≤13с с 2с буфером — короткие чанки порежут реплики, ` +
-      `длинные дадут пустоту в конце.\n\n` +
-      `Поставить 15с автоматически и продолжить?\n` +
-      `OK — да, ставлю 15с и запускаю.\n` +
-      `Cancel — отменить, поставлю сам.`
-    );
+    const confirmFix = await appConfirm({
+      title: '⚠ Не та длительность Seedance',
+      message:
+        `Длительность Seedance стоит ${curDur || '?'}с, но Auto-mode калиброван под 15-секундные чанки.\n\n` +
+        `Сегментация рассчитывала контент ≤13с с 2с буфером — короткие чанки порежут реплики, ` +
+        `длинные дадут пустоту в конце.\n\n` +
+        `Поставить 15с автоматически и продолжить?`,
+      okText: 'Поставить 15с и запустить',
+      cancelText: 'Отмена',
+      okStyle: 'accent',
+    });
     if (!confirmFix) {
       clog('WARN', 'auto.bail', { reason: 'duration_cancelled', curDur });
       return;
@@ -6081,17 +6220,22 @@ async function startAutoMode() {
         : 'последовательно (1 сцена)');
   const errWord  = AUTO.errorMode === 'heal' ? 'авто-лечение' : 'останов + сигнал';
   const skipNote = skippedCount ? `\nПропущено по чекбоксу: ${skippedCount}` : '';
-  if (!confirm(
-    `Запустить Auto-mode?\n\n` +
+  const _confirmMsg =
     `Сегментов: ${AUTO.total}${skipNote}\n` +
     `Режим: ${modeWord}\n` +
     `На ошибке модерации: ${errWord}\n\n` +
-    `${AUTO.parallel
+    (AUTO.parallel
       ? 'Параллельный режим: все сегменты отправляются в очередь Seedance подряд (~2с между запусками). Текстовый контекст между чанками сохраняется.'
       : sceneGroups.length > 1
         ? 'Внутри каждой сцены чанки идут последовательно (нужно для last-frame / cut-frames continuity). Сцены друг от друга не зависят и идут параллельно (cap = 3 одновременно).'
-        : 'Последовательный режим: каждый чанк ждёт предыдущего.'}`
-  )) {
+        : 'Последовательный режим: каждый чанк ждёт предыдущего.');
+  if (!await appConfirm({
+    title: '▶ Запустить Auto-mode?',
+    message: _confirmMsg,
+    okText: '▶ Запустить',
+    cancelText: 'Отмена',
+    okStyle: 'accent',
+  })) {
     clog('WARN', 'auto.bail', { reason: 'main_confirm_cancelled', total: AUTO.total });
     return;
   }
@@ -6108,6 +6252,9 @@ async function startAutoMode() {
   // into episode 3 — May 2026 incident).
   const epSid    = S.seriesId;
   const epNumber = S.episode.number;
+  // Stash on AUTO so the floating widget knows what episode this run targets.
+  AUTO._epSid = epSid;
+  AUTO._epNumber = epNumber;
 
   // Read params from sd panel (used for /seedance/start)
   const duration = parseInt(document.getElementById('sd-duration').value) || 15;
@@ -6486,13 +6633,17 @@ async function startRangeGen() {
     showToast('⚠ Не выделено ни одной серии готовой к генерации', 6000);
     return;
   }
-  if (!confirm(
-    `Запустить генерацию выделенных серий?\n\n` +
-    `Серий в очереди: ${queue.length} (${queue.join(', ')})\n` +
-    `Авто-сборка финала: ${aaEl?.checked ? 'да' : 'нет'}\n\n` +
-    `Каждая серия по очереди прогонится через Auto-mode (Sequential).\n` +
-    `Можно остановить кнопкой «Остановить» — текущая серия добежит, дальше очередь встанет.`
-  )) return;
+  if (!await appConfirm({
+    title: '▶ Пакетная генерация',
+    message:
+      `Серий в очереди: ${queue.length} (${queue.join(', ')})\n` +
+      `Авто-сборка финала: ${aaEl?.checked ? 'да' : 'нет'}\n\n` +
+      `Каждая серия по очереди прогонится через Auto-mode (Sequential).\n` +
+      `Остановить — кнопка «Остановить»: текущая серия добежит, дальше очередь встанет.`,
+    okText: '▶ Запустить очередь',
+    cancelText: 'Отмена',
+    okStyle: 'accent',
+  })) return;
 
   RANGE.active = true;
   RANGE.queue = queue;
@@ -6502,11 +6653,17 @@ async function startRangeGen() {
   RANGE.seriesId = S.seriesId;
   _rangeGenUI();
   _rangeGenSetStatus(`▶ В очереди: ${queue.length}`);
+  _autoUpdateFloatingWidget();
 
   // Suppress modal confirms / missing-asset warnings inside the loop. We restore
   // the original `confirm` after finishing or on error.
   const origConfirm = window.confirm;
+  const origAppConfirm = window.appConfirm;
   window.confirm = () => true;
+  // Also short-circuit appConfirm() so the in-app modals from inner Auto-mode
+  // calls don't block the queue. Only the outer queue-start confirm above
+  // actually shows a dialog.
+  window.appConfirm = () => Promise.resolve(true);
 
   try {
     for (let i = 0; i < queue.length; i++) {
@@ -6586,6 +6743,7 @@ async function startRangeGen() {
     }
   } finally {
     window.confirm = origConfirm;
+    window.appConfirm = origAppConfirm;
     RANGE.active = false;
     _rangeGenUI();
     if (RANGE.cancelRequested) {

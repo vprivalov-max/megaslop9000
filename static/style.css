@@ -2436,3 +2436,96 @@ body.seedance-mode .ep-loc-card:active { cursor: grabbing; }
     100% { filter: hue-rotate(720deg) brightness(1); }
   }
 }
+
+/* ── Floating Auto-mode progress widget ─────────────────────────────────── */
+.auto-float {
+  position: fixed; right: 16px; bottom: 16px; z-index: 9000;
+  width: 280px; max-width: calc(100vw - 32px);
+  background: linear-gradient(135deg, rgba(132,94,247,0.95), rgba(99,67,196,0.95));
+  border: 1px solid rgba(255,255,255,0.18);
+  border-radius: 12px; padding: 10px 12px;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.45), 0 2px 6px rgba(132,94,247,0.35);
+  color: #fff;
+  font-size: 0.84rem;
+  user-select: none;
+  backdrop-filter: blur(8px);
+  animation: auto-float-in 0.28s ease-out;
+}
+@keyframes auto-float-in {
+  from { transform: translateY(20px); opacity: 0; }
+  to   { transform: translateY(0);    opacity: 1; }
+}
+.auto-float-head {
+  display: flex; align-items: center; gap: 8px; cursor: pointer;
+  margin-bottom: 6px;
+}
+.auto-float-head:hover .auto-float-title { text-decoration: underline; }
+.auto-float-spin {
+  width: 12px; height: 12px; border-radius: 50%;
+  border: 2px solid rgba(255,255,255,0.35);
+  border-top-color: #fff;
+  animation: auto-float-spin 0.9s linear infinite;
+  flex: 0 0 12px;
+}
+@keyframes auto-float-spin {
+  to { transform: rotate(360deg); }
+}
+.auto-float-title { font-weight: 700; }
+.auto-float-count { margin-left: auto; font-variant-numeric: tabular-nums; opacity: 0.92; }
+.auto-float-stop {
+  background: rgba(255,255,255,0.18); border: 1px solid rgba(255,255,255,0.3);
+  color: #fff; border-radius: 6px; padding: 2px 8px; cursor: pointer;
+  font-size: 0.95rem; line-height: 1; transition: background 0.15s;
+}
+.auto-float-stop:hover { background: rgba(255,255,255,0.32); }
+.auto-float-bar {
+  width: 100%; height: 6px; background: rgba(0,0,0,0.25); border-radius: 3px; overflow: hidden;
+  margin: 4px 0;
+}
+.auto-float-bar-fill {
+  height: 100%; background: linear-gradient(90deg, #4ade80, #fbbf24);
+  width: 0%; transition: width 0.4s ease-out;
+}
+.auto-float-status {
+  font-size: 0.76rem; opacity: 0.88;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
+/* ── In-app confirm modal ───────────────────────────────────────────────── */
+.app-confirm-modal {
+  position: fixed; inset: 0; z-index: 11000;
+  display: flex; align-items: center; justify-content: center;
+}
+.app-confirm-backdrop {
+  position: absolute; inset: 0;
+  background: rgba(0,0,0,0.55); backdrop-filter: blur(2px);
+  animation: app-confirm-fade 0.18s ease-out;
+}
+.app-confirm-box {
+  position: relative; z-index: 1;
+  background: var(--surface, #1a1a1f);
+  border: 1px solid var(--border, #333);
+  border-radius: 12px;
+  box-shadow: 0 14px 60px rgba(0,0,0,0.6);
+  width: 460px; max-width: calc(100vw - 40px);
+  padding: 20px 22px 18px;
+  color: var(--text, #eee);
+  animation: app-confirm-pop 0.22s cubic-bezier(0.2, 1.0, 0.4, 1);
+}
+@keyframes app-confirm-fade { from { opacity: 0; } to { opacity: 1; } }
+@keyframes app-confirm-pop {
+  from { transform: translateY(14px) scale(0.97); opacity: 0; }
+  to   { transform: translateY(0)    scale(1);    opacity: 1; }
+}
+.app-confirm-title {
+  font-size: 1.08rem; font-weight: 700; margin-bottom: 10px;
+}
+.app-confirm-body {
+  font-size: 0.92rem; line-height: 1.45; color: var(--muted, #aaa);
+  white-space: pre-wrap;
+  margin-bottom: 18px;
+  max-height: 50vh; overflow-y: auto;
+}
+.app-confirm-actions {
+  display: flex; gap: 8px; justify-content: flex-end;
+}
