@@ -172,6 +172,7 @@
           </label>
           <button class="btn-secondary reteller-only" onclick="openReteller()">🎬 Отправить в Reteller</button>
           <button class="btn-ghost" onclick="renameOutFiles()" title="Переименовать файлы в папке OUT по студийным требованиям" style="display:none">📁 Переименовать OUT</button>
+          <button class="btn-secondary" onclick="openAppendScript()" title="Вставить готовый сценарий — он автоматически разобьётся на серии, добавится в этот сериал, и в фоне извлекутся персонажи/локации/предметы из каждой серии">📜 Добавить сценарий</button>
           <button class="btn-primary" onclick="openCreateEpisode()" data-mlg-action="gunshot">+ Эпизод</button>
         </div>
       </div>
@@ -1145,6 +1146,51 @@
     <div class="modal-footer">
       <button class="btn-ghost" onclick="closeModal('modal-create-episode')">Отмена</button>
       <button class="btn-primary" onclick="createEpisode()" data-mlg-action="gunshot">Создать</button>
+    </div>
+  </div>
+</div>
+
+<!-- Append script to existing series modal -->
+<div id="modal-append-script" class="modal hidden">
+  <div class="modal-box" style="max-width:760px">
+    <div class="modal-header">
+      <h2>📜 Добавить сценарий в сериал</h2>
+      <button class="btn-icon" onclick="closeModal('modal-append-script')">✕</button>
+    </div>
+    <div class="modal-body">
+      <p style="color:var(--muted);font-size:0.85rem;margin-top:0">
+        Вставь готовый сценарий — он автоматически разобьётся на серии (нумерация продолжится с текущей),
+        в фоне извлекутся персонажи, локации и предметы. Когда экстракция закончится — серии готовы к видео-генерации.
+      </p>
+      <div class="field-group">
+        <label>Сценарий (текст или drag &amp; drop файла .txt / .md)</label>
+        <textarea id="append-script-text" rows="14"
+          placeholder="Вставь весь сценарий целиком. Поддерживаемые разделители эпизодов:&#10;  === ЭПИЗОД 5 ===&#10;  ## Episode 5&#10;  Серия 5: Заголовок&#10;  5.&#10;Если разделителей нет — будет одна серия с этим текстом."
+          ondragover="event.preventDefault();this.style.borderColor='var(--accent)'"
+          ondragleave="this.style.borderColor=''"
+          ondrop="event.preventDefault();this.style.borderColor='';appendDropFile(event)"
+          oninput="appendUpdateStats()"></textarea>
+        <input type="file" id="append-script-file" accept=".txt,.md,.markdown,text/plain" style="display:none" onchange="appendPickFile(this)">
+        <div style="display:flex;gap:6px;align-items:center;justify-content:space-between;margin-top:4px">
+          <button type="button" class="btn-ghost btn-sm" onclick="document.getElementById('append-script-file').click()">📁 Выбрать файл</button>
+          <span id="append-script-stats" style="font-size:0.78rem;color:var(--muted)">0 символов</span>
+        </div>
+      </div>
+      <div class="field-group">
+        <button type="button" class="btn-ghost btn-sm" onclick="appendPreviewSplit()">👁 Превью разбивки на серии</button>
+        <div id="append-script-preview" style="margin-top:8px"></div>
+      </div>
+      <label class="cb" style="display:flex;align-items:flex-start;gap:8px;background:rgba(132,94,247,0.06);border:1px solid rgba(132,94,247,0.2);border-radius:8px;padding:10px 12px">
+        <input type="checkbox" id="append-extract-entities" checked style="margin-top:3px">
+        <div style="flex:1">
+          <div style="font-weight:600;color:var(--text)">🤖 Извлечь персонажей, локации, предметы</div>
+          <div style="font-size:0.78rem;color:var(--muted)">Запустится в фоне после добавления. ~5-15 секунд на серию. Существующие персонажи/локации/предметы из этого сериала переиспользуются (по имени, без дублей).</div>
+        </div>
+      </label>
+    </div>
+    <div class="modal-footer">
+      <button class="btn-ghost" onclick="closeModal('modal-append-script')">Отмена</button>
+      <button class="btn-primary" id="append-script-go-btn" onclick="appendScriptGo()" style="background:linear-gradient(135deg,#10b981,#059669)">📜 Добавить серии</button>
     </div>
   </div>
 </div>

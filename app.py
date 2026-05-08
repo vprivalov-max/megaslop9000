@@ -2799,6 +2799,65 @@ def import_status(sid):
     return jsonify(_import_status(sid))
 
 
+@app.route('/api/series/<sid>/append-from-script', methods=['POST'])
+def append_from_script(sid):
+    """Append a multi-episode script to an EXISTING series. Splits the pasted
+    text into episodes (using the same regex pipeline as /import-from-script),
+    numbers them continuing from the highest existing episode in this series,
+    and kicks off the entity-extraction worker. Returns immediately so the UI
+    can poll /import-status for progress.
+
+    Body:
+      {script: str, extract_entities?: bool}
+    """
+    s = load_series(sid)
+    if not s:
+        return jsonify({'error': 'series not found'}), 404
+    data = request.json or {}
+    script = (data.get('script') or '').strip()
+    if not script:
+        return jsonify({'error': 'script required'}), 400
+    do_extract = bool(data.get('extract_entities', True))
+
+    eps = _split_script_into_episodes(script)
+    if not eps:
+        return jsonify({'error': 'script split produced no episodes'}), 400
+
+    # Find the next free episode number — keep continuous numbering so the
+    # editor's «соседи» strip stays usable.
+    existing_eps = list_episodes(sid)
+    next_num = (max((e.get('number') or 0) for e in existing_eps) + 1) if existing_eps else 1
+
+    ep_records = []
+    for offset, e in enumerate(eps):
+        num = next_num + offset
+        ep_dict = {
+            'number': num,
+            'title':  e['title'] or f'Эпизод {num}',
+            'synopsis': '',
+            'script':   e['body'],
+            'characters_used': [],
+            'locations_used':  [],
+            'items_used':      [],
+            'notes': '', 'reteller_prompt': '',
+            'status': 'draft', 'ready': False,
+            'created_at': datetime.datetime.utcnow().isoformat(),
+        }
+        save_episode(sid, num, ep_dict)
+        ep_records.append({'number': num})
+
+    if do_extract and ep_records:
+        _spawn_with_keys(_import_worker, sid, ep_records)
+
+    return jsonify({
+        'sid': sid,
+        'first_episode': ep_records[0]['number'] if ep_records else None,
+        'last_episode':  ep_records[-1]['number'] if ep_records else None,
+        'episodes_appended': len(ep_records),
+        'extraction_started': do_extract and bool(ep_records),
+    }), 201
+
+
 @app.route('/api/series/<sid>/reextract', methods=['POST'])
 def reextract_series(sid):
     """Re-runs the per-episode entity extractor on an already-imported series.

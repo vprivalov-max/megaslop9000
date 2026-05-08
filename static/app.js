@@ -1176,6 +1176,106 @@ document.addEventListener('DOMContentLoaded', () => {
   if (ta) ta.addEventListener('input', importUpdateStats);
 });
 
+// ── Append-to-existing-series flow ──────────────────────────────────────────
+// Twin of the import-from-script flow above, but adds episodes to the CURRENT
+// series instead of creating a new one. Numbering continues from the highest
+// existing episode (so a 38-episode series + 12 new ones → episodes 39-50).
+function openAppendScript() {
+  if (!S.seriesId) { showToast('Открой сериал'); return; }
+  const ta = document.getElementById('append-script-text');
+  if (ta) ta.value = '';
+  const previewEl = document.getElementById('append-script-preview');
+  if (previewEl) previewEl.innerHTML = '';
+  appendUpdateStats();
+  openModal('modal-append-script');
+}
+function appendDropFile(ev) {
+  const file = ev.dataTransfer?.files?.[0];
+  if (!file) return;
+  _appendReadFile(file);
+}
+function appendPickFile(input) {
+  const file = input.files?.[0];
+  if (!file) return;
+  _appendReadFile(file);
+}
+function _appendReadFile(file) {
+  const reader = new FileReader();
+  reader.onload = () => {
+    setVal('append-script-text', reader.result || '');
+    appendUpdateStats();
+  };
+  reader.readAsText(file);
+}
+function appendUpdateStats() {
+  const txt = (document.getElementById('append-script-text')?.value || '');
+  const stats = document.getElementById('append-script-stats');
+  if (stats) stats.textContent = `${txt.length.toLocaleString('ru-RU')} символов`;
+}
+async function appendPreviewSplit() {
+  const script = (document.getElementById('append-script-text')?.value || '').trim();
+  const previewEl = document.getElementById('append-script-preview');
+  if (!script) { previewEl.innerHTML = '<div style="color:var(--warning);font-size:0.85rem">Сценарий пустой</div>'; return; }
+  previewEl.innerHTML = '<div style="font-size:0.85rem;color:var(--muted)"><span class="spinner"></span> Анализирую разбивку...</div>';
+  try {
+    const r = await api.post('/api/series/import-from-script/preview', { script });
+    if (r.error) throw new Error(r.error);
+    const eps = r.episodes || [];
+    const startNum = ((S.episodes || []).reduce((m, e) => Math.max(m, e.number || 0), 0)) + 1;
+    if (!eps.length) {
+      previewEl.innerHTML = '<div style="color:var(--warning);font-size:0.85rem">Не удалось разбить — будет добавлена 1 серия со всем текстом</div>';
+      return;
+    }
+    previewEl.innerHTML = `
+      <div style="font-size:0.85rem;color:var(--success);margin-bottom:6px">
+        ✓ Найдено эпизодов: <strong>${eps.length}</strong> · станут сериями <strong>№${startNum}–${startNum + eps.length - 1}</strong>
+      </div>
+      <div style="max-height:240px;overflow-y:auto;border:1px solid var(--border);border-radius:6px;padding:6px;background:var(--surface2)">
+        ${eps.map((e, i) => `
+          <div style="padding:5px 4px;border-bottom:1px solid var(--border);font-size:0.82rem">
+            <strong>№${startNum + i}</strong>
+            ${e.title ? `<span style="color:var(--muted)"> · ${esc(e.title)}</span>` : ''}
+            <span style="color:var(--muted);margin-left:8px">(${e.length.toLocaleString('ru-RU')} симв.)</span>
+            <div style="color:var(--muted);font-size:0.75rem;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(e.preview)}</div>
+          </div>`).join('')}
+      </div>`;
+  } catch (e) {
+    previewEl.innerHTML = `<div style="color:var(--danger);font-size:0.85rem">Ошибка: ${esc(e?.message || e)}</div>`;
+  }
+}
+async function appendScriptGo() {
+  const script = (document.getElementById('append-script-text')?.value || '').trim();
+  const extract = !!document.getElementById('append-extract-entities')?.checked;
+  if (!script) { alert('Сценарий пустой — вставь текст или подгрузи файл'); return; }
+  const btn = document.getElementById('append-script-go-btn');
+  const orig = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span> Добавляю...';
+  try {
+    const r = await api.post(`/api/series/${S.seriesId}/append-from-script`, {
+      script, extract_entities: extract,
+    });
+    if (r.error) throw new Error(r.error);
+    closeModal('modal-append-script');
+    const range = (r.first_episode === r.last_episode)
+      ? `№${r.first_episode}`
+      : `№${r.first_episode}–${r.last_episode}`;
+    showToast(`✓ Добавлено ${r.episodes_appended} серий (${range})${extract ? ' · извлечение запущено в фоне' : ''}`, 6000);
+    // Refresh series view so episodes show up in the list.
+    try {
+      S.episodes = await api.get(`/api/series/${S.seriesId}/episodes`);
+      S.series = await api.get(`/api/series/${S.seriesId}`);
+      renderEpisodesList();
+    } catch {}
+    if (extract) setTimeout(() => pollImportStatus(S.seriesId), 600);
+  } catch (e) {
+    alert('Ошибка: ' + (e?.message || e));
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = orig;
+  }
+}
+
 // Polls /import-status while extraction is running. Renders a banner on the
 // series page (#import-progress-banner) with X/Y counter + progress bar +
 // current episode label.
