@@ -1308,8 +1308,18 @@ def _avai_call(provider: str, prompt: str, reference_url: str = None, aspect_rat
         payload['model'] = 'pro'
     if reference_url:
         payload['contextImages'] = [{'url': reference_url}]
-    headers = {'x-api-key': _get_user_avai_key(), 'content-type': 'application/json'}
+    avai_key = _get_user_avai_key()
+    if not avai_key:
+        # Empty key → AVAI returns generic 401. Surface a specific error so the
+        # frontend can route the user to Settings instead of showing a wall of
+        # raw "Unauthorized" JSON. Code = AVAI_KEY_MISSING.
+        raise RuntimeError('AVAI_KEY_MISSING: AVAI API key не задан в твоём аккаунте — открой Settings и введи свой ключ с avai-gen.com')
+    headers = {'x-api-key': avai_key, 'content-type': 'application/json'}
     resp = requests.post(AVAI_API, json=payload, headers=headers, timeout=180)
+    if resp.status_code == 401:
+        # Server got the key, but it's invalid/expired. User needs to refresh
+        # their key. Different code than missing — different remedy hint.
+        raise RuntimeError('AVAI_KEY_INVALID: AVAI отверг твой API key (401 Unauthorized) — проверь что не истёк, и обнови в Settings → AVAI key')
     if not resp.ok:
         raise RuntimeError(f'AVAI {provider} error {resp.status_code}: {resp.text[:300]}')
     data = resp.json()
@@ -1343,9 +1353,17 @@ def avai_generate(prompt: str, output_path: Path, reference_url: str = None, asp
             errors.append(f'{provider}: {msg}')
             continue
     if not image_url:
+        # If ANY error mentions our specific auth markers, the issue is the API
+        # key — not the prompt. Show a focused message instead of suggesting
+        # "rewrite description more neutrally" which doesn't fix anything.
+        joined = ' | '.join(errors)
+        if 'AVAI_KEY_MISSING' in joined:
+            raise RuntimeError('AVAI_KEY_MISSING: AVAI API key не задан в твоём аккаунте — открой Settings и введи свой ключ с avai-gen.com')
+        if 'AVAI_KEY_INVALID' in joined or '401' in joined:
+            raise RuntimeError('AVAI_KEY_INVALID: AVAI отверг твой API key (401 Unauthorized). Возможные причины: ключ истёк / неверный / лимит средств исчерпан. Открой Settings → AVAI key и обнови.')
         raise RuntimeError(
             'Оба провайдера AVAI отказали. '
-            + ' | '.join(errors)
+            + joined
             + ' — попробуй переписать описание более нейтрально '
               '(без слов lingerie / bare chest / boxers).'
         )

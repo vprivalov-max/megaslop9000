@@ -44,7 +44,21 @@ function stage2ChunkRange(s) {
 // ── API helpers ───────────────────────────────────────────────────────────────
 async function parseApiError(r) {
   const text = await r.text();
-  try { const j = JSON.parse(text); return j.error || text; } catch { return text; }
+  let msg = text;
+  try { const j = JSON.parse(text); msg = j.error || text; } catch {}
+  // If the backend signals an AVAI auth problem, surface a focused modal that
+  // points the user at Settings instead of just throwing the raw error string
+  // up the stack (which usually ends as a giant JSON wall in a toast). This
+  // runs once per error — modal is idempotent (existing one is removed first).
+  try {
+    if (typeof msg === 'string' && /AVAI_KEY_(MISSING|INVALID)|Invalid API token|Unauthorized/i.test(msg)) {
+      if (typeof _showApiKeySetupModal === 'function') {
+        const reason = /MISSING/.test(msg) ? 'missing' : 'invalid';
+        setTimeout(() => _showApiKeySetupModal('avai', { reason }), 50);
+      }
+    }
+  } catch {}
+  return msg;
 }
 
 const api = {
@@ -189,11 +203,23 @@ async function _checkApiKeysOnBoot() {
 // demand with a different headline.
 function _showApiKeySetupModal(kind, opts = {}) {
   const isAvai = kind === 'avai';
-  const title = isAvai
-    ? (opts.firstTime ? '👋 Добро пожаловать! Введи свой AVAI API ключ' : 'Нужен AVAI API ключ')
-    : 'Нужен Reteller API ключ';
+  // `reason` distinguishes 3 cases: undefined (provider-switch), 'missing'
+  // (sweep/generation failed because key is empty), 'invalid' (AVAI returned
+  // 401 — key expired or wrong). Tailor headline so user knows what to do.
+  const reasonHeadline = (() => {
+    if (opts.firstTime) return '👋 Добро пожаловать! Введи свой AVAI API ключ';
+    if (opts.reason === 'invalid') return '⚠ AVAI не принял твой ключ (401 Unauthorized)';
+    if (opts.reason === 'missing') return '⚠ AVAI ключ не задан — генерация невозможна';
+    return 'Нужен AVAI API ключ';
+  })();
+  const title = isAvai ? reasonHeadline : 'Нужен Reteller API ключ';
+  const reasonHint = (() => {
+    if (opts.reason === 'invalid') return '<p style="color:var(--warning);margin:6px 0 0">Возможные причины: ключ истёк, потерял доступ, или закончились средства на счёте AVAI.</p>';
+    if (opts.reason === 'missing') return '<p style="color:var(--warning);margin:6px 0 0">У твоего аккаунта на этом сайте нет привязанного AVAI ключа. Добавь и попробуй снова.</p>';
+    return '';
+  })();
   const subtitle = isAvai
-    ? 'AVAI — провайдер для генерации видео и изображений (Seedance / Banana / Seedream). Ключ возьми на <a href="https://avai-gen.com" target="_blank" style="color:var(--accent)">avai-gen.com</a> в настройках своего аккаунта.'
+    ? 'AVAI — провайдер для генерации видео и изображений (Seedance / Banana / Seedream). Ключ возьми на <a href="https://avai-gen.com" target="_blank" style="color:var(--accent)">avai-gen.com</a> в настройках своего аккаунта.' + reasonHint
     : 'Reteller — альтернативный провайдер для генерации видео из сценариев. Ключ возьми в настройках аккаунта на <a href="https://reteller.ai" target="_blank" style="color:var(--accent)">reteller.ai</a>.';
   const fieldId = isAvai ? 'apikey-modal-avai' : 'apikey-modal-reteller';
   const placeholder = isAvai ? 'avai-...' : 'rtl_sk_...';
