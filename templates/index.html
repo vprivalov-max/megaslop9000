@@ -179,27 +179,21 @@
       <div id="landmarks-panel"></div>
       <div id="pipeline-section"></div>
 
-      <!-- Range-generation panel: pick from-to and run Auto-mode for marked episodes back-to-back. -->
+      <!-- Range-generation panel: tick checkboxes on episode rows below, then run Auto-mode for selected back-to-back. -->
       <div id="range-gen-panel" style="margin:10px 0;padding:10px 12px;background:rgba(132,94,247,0.05);border:1px solid rgba(132,94,247,0.2);border-radius:8px">
         <div style="display:flex;flex-wrap:wrap;align-items:center;gap:10px;font-size:0.85rem">
-          <strong>▶ Сгенерировать диапазон:</strong>
-          <label style="display:flex;align-items:center;gap:4px">с
-            <input type="number" id="range-gen-from" min="1" style="width:60px;padding:3px 6px;background:#1a1a1f;border:1px solid #333;border-radius:4px;color:#eee">
-          </label>
-          <label style="display:flex;align-items:center;gap:4px">по
-            <input type="number" id="range-gen-to" min="1" style="width:60px;padding:3px 6px;background:#1a1a1f;border:1px solid #333;border-radius:4px;color:#eee">
-          </label>
-          <label style="display:flex;align-items:center;gap:6px;cursor:pointer" title="Когда серия закончит генерацию — автоматически склеить все её чанки в финальный mp4 в папке OUT/">
+          <strong>▶ Пакетная генерация:</strong>
+          <span style="color:var(--muted);font-size:0.78rem">отметь галочками серии справа от их номеров</span>
+          <button class="btn-ghost btn-sm" onclick="selectAllReadyEpisodes()" title="Выделить все серии готовые к генерации (есть сценарий, все ассеты на месте)">✓ Все готовые</button>
+          <button class="btn-ghost btn-sm" onclick="clearEpisodeSelection()" title="Снять все галочки">✕ Снять</button>
+          <span id="range-gen-selected-count" style="font-size:0.82rem;color:#10b981;font-weight:600"></span>
+          <label style="display:flex;align-items:center;gap:6px;cursor:pointer;margin-left:auto" title="Когда серия закончит генерацию — автоматически склеить все её чанки в финальный mp4 в папке OUT/">
             <input type="checkbox" id="range-gen-auto-assemble" checked style="width:14px;height:14px">
             <span>авто-сборка финала</span>
           </label>
-          <label style="display:flex;align-items:center;gap:6px;cursor:pointer;opacity:0.85" title="Пропускать серии у которых не стоит флаг «Готова к генерации»">
-            <input type="checkbox" id="range-gen-only-ready" checked style="width:14px;height:14px">
-            <span>только готовые</span>
-          </label>
-          <button class="btn-accent btn-sm" id="range-gen-start-btn" onclick="startRangeGen()">▶ Запустить очередь</button>
+          <button class="btn-accent btn-sm" id="range-gen-start-btn" onclick="startRangeGen()">▶ Сгенерировать выделенные</button>
           <button class="btn-danger btn-sm" id="range-gen-stop-btn" onclick="stopRangeGen()" style="display:none">⏸ Остановить</button>
-          <span id="range-gen-status" style="margin-left:auto;font-size:0.82rem;color:var(--muted)"></span>
+          <span id="range-gen-status" style="font-size:0.82rem;color:var(--muted)"></span>
         </div>
       </div>
 
@@ -378,8 +372,7 @@
               <button class="ep-script-btn ready" id="ep-accept-script-btn" onclick="acceptScript()" title="Сохранить сценарий, найти новых персонажей/локации/предметы, при необходимости показать модалку для drag-drop фоток, потом перейти в режим сцен и запустить автоген"
                       style="background:linear-gradient(135deg,#10b981,#059669);color:#fff;font-weight:700">✅ Принять сценарий</button>
               <button class="btn-ghost btn-sm" id="ep-reanalyze-btn" onclick="acceptScript({force:true})" title="Перепроанализировать сценарий (если добавил новые персонажей/предметы вручную или изменил текст)" style="display:none">🔄 Перепроанализировать</button>
-              <button class="btn-ghost btn-sm" id="ep-gen-ready-btn" onclick="toggleGenReady()" title="Пометить серию как готовую к генерации видео — попадёт в очередь когда нажмёшь «Сгенерировать диапазон» на странице сериала" style="display:none">▶ Готова к генерации</button>
-            </div>
+                    </div>
           </div>
           <textarea id="ep-script" class="script-area" placeholder="Screenplay / Script..."></textarea>
           <div id="ep-script-scenes" class="ep-script-scenes hidden"></div>

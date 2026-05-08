@@ -2386,18 +2386,33 @@ function renderSeriesView() {
   // Episodes
   renderEpisodesList();
 
-  // Pre-fill range-gen inputs with the full episode span; user usually just
-  // wants "everything ready to go" and rarely narrows the range.
-  try {
-    const eps = (s.episodes || []).slice().sort((a,b) => (a.number||0) - (b.number||0));
-    if (eps.length) {
-      const fr = document.getElementById('range-gen-from');
-      const to = document.getElementById('range-gen-to');
-      if (fr && !fr.value) fr.value = eps[0].number;
-      if (to && !to.value) to.value = eps[eps.length - 1].number;
+  if (typeof _rangeGenUI === 'function') _rangeGenUI();
+  _restoreGenSelection();
+  _updateRangeGenSelectionCount();
+}
+
+function selectAllReadyEpisodes() {
+  if (!S._genSelected) S._genSelected = new Set();
+  let added = 0;
+  for (const ep of (S.episodes || [])) {
+    const info = _episodeReadyInfo(ep);
+    const gs = ep.gen_status || '';
+    if (info.ready && gs !== 'done' && gs !== 'generating') {
+      if (!S._genSelected.has(ep.number)) {
+        S._genSelected.add(ep.number);
+        added++;
+      }
     }
-    if (typeof _rangeGenUI === 'function') _rangeGenUI();
-  } catch {}
+  }
+  try { localStorage.setItem(`gen_selected:${S.seriesId}`, JSON.stringify([...S._genSelected])); } catch {}
+  renderEpisodesList();
+  showToast(added ? `✓ Выделено ${added} новых готовых серий` : 'Все готовые серии уже выделены', 3000);
+}
+
+function clearEpisodeSelection() {
+  S._genSelected = new Set();
+  try { localStorage.removeItem(`gen_selected:${S.seriesId}`); } catch {}
+  renderEpisodesList();
 }
 
 function renderCharactersList() {
@@ -2482,6 +2497,87 @@ function styleLabel(t) {
   return map[t] || t;
 }
 
+// Compute whether an episode is ready for video generation:
+//   - script accepted (has used entities OR cast_extracted=true)
+//   - every used char has a portrait (ref_images)
+//   - every requested outfit has a photo
+//   - every used location has a photo
+//   - every used item has a photo
+// Returns { ready: bool, missing: {chars, outfits, locs, items} } so the UI
+// can show what's blocking a particular episode without opening it. Replaces
+// the old manual gen_ready toggle: status now derives automatically from the
+// actual asset state, no human bookkeeping required.
+function _episodeReadyInfo(ep) {
+  const out = { ready: false, missing: { chars: [], outfits: [], locs: [], items: [] }, hasScript: false };
+  if (!ep || !S.series) return out;
+  const scriptOk = !!(ep.script || '').trim();
+  if (!scriptOk) return out;
+  const inferAccepted = !!ep.cast_extracted ||
+    ((ep.characters_used || []).length + (ep.locations_used || []).length + (ep.items_used || []).length) > 0;
+  if (!inferAccepted) return out;
+  out.hasScript = true;
+  const charById = Object.fromEntries((S.series.characters || []).map(c => [c.id, c]));
+  const locById  = Object.fromEntries((S.series.locations  || []).map(l => [l.id, l]));
+  const itemById = Object.fromEntries((S.series.items      || []).map(i => [i.id, i]));
+  for (const cid of (ep.characters_used || [])) {
+    const c = charById[cid];
+    if (!c || c._skip_autogen) continue;
+    if (!c.ref_images || !c.ref_images.length) {
+      out.missing.chars.push({ id: cid, name: c.name });
+    }
+    const reqOutfits = (ep.character_outfits && ep.character_outfits[cid]) || [];
+    const labels = Array.isArray(reqOutfits) ? reqOutfits : (reqOutfits ? [reqOutfits] : []);
+    for (const ref of labels) {
+      if (!ref || ref === 'base') continue;
+      const o = (c.outfits || []).find(o => o.label === ref) || (c.outfits || []).find(o => o.id === ref);
+      if (!o || o._skip_autogen) continue;
+      if (!o.photo) out.missing.outfits.push({ char: c.name, label: o.label });
+    }
+  }
+  for (const lid of (ep.locations_used || [])) {
+    const l = locById[lid];
+    if (!l || l._skip_autogen) continue;
+    if (!l.ref_images || !l.ref_images.length) {
+      out.missing.locs.push({ id: lid, name: l.name });
+    }
+  }
+  for (const iid of (ep.items_used || [])) {
+    const it = itemById[iid];
+    if (!it || it._skip_autogen) continue;
+    if (!it.ref_images || !it.ref_images.length) {
+      out.missing.items.push({ id: iid, name: it.name });
+    }
+  }
+  const totalMissing = out.missing.chars.length + out.missing.outfits.length + out.missing.locs.length + out.missing.items.length;
+  out.ready = totalMissing === 0;
+  return out;
+}
+
+// Toggle whether an episode is selected for the next range-gen kickoff. The
+// selection lives on `S._genSelected` (Set of episode numbers) and the
+// «Сгенерировать выделенные» button reads from it. Persisted to localStorage
+// per-series so a refresh doesn't lose the selection mid-curating.
+function toggleEpisodeSelected(num, ev) {
+  if (ev) ev.stopPropagation();
+  if (!S._genSelected) S._genSelected = new Set();
+  if (S._genSelected.has(num)) S._genSelected.delete(num);
+  else S._genSelected.add(num);
+  try { localStorage.setItem(`gen_selected:${S.seriesId}`, JSON.stringify([...S._genSelected])); } catch {}
+  _updateRangeGenSelectionCount();
+}
+function _restoreGenSelection() {
+  try {
+    const raw = localStorage.getItem(`gen_selected:${S.seriesId}`);
+    S._genSelected = new Set(raw ? JSON.parse(raw) : []);
+  } catch { S._genSelected = new Set(); }
+}
+function _updateRangeGenSelectionCount() {
+  const el = document.getElementById('range-gen-selected-count');
+  if (!el) return;
+  const n = S._genSelected ? S._genSelected.size : 0;
+  el.textContent = n ? `выделено: ${n}` : '';
+}
+
 function renderEpisodesList() {
   const el = document.getElementById('episodes-list');
   const empty = document.getElementById('episodes-empty');
@@ -2491,7 +2587,9 @@ function renderEpisodesList() {
     return;
   }
   empty.classList.add('hidden');
+  if (!S._genSelected) _restoreGenSelection();
   el.innerHTML = S.episodes.map(ep => {
+
     const rtlStatus = ep.reteller?.status;
     const hasVideo = ep.reteller?.video_url;
     const ar = ep.audit_report;
@@ -2509,10 +2607,12 @@ function renderEpisodesList() {
       ? `<span class="status-badge" style="background:rgba(132,94,247,0.12);color:#a78bfa" title="Дней с прошлой серии">+${dsp}д</span>` : '';
     // Gen-status badge: surfaces episode's place in the multi-episode queue
     // so the user sees at a glance which episodes are ready / queued / running
-    // / done / failed without opening each one.
+    // / done / failed without opening each one. «Готова» is now derived from
+    // the actual asset state — no manual flag.
     const gs = ep.gen_status || '';
-    const cast = !!ep.cast_extracted;
-    const ready = !!ep.gen_ready;
+    const readyInfo = _episodeReadyInfo(ep);
+    const isReady = readyInfo.ready;
+    const totalMissing = readyInfo.missing.chars.length + readyInfo.missing.outfits.length + readyInfo.missing.locs.length + readyInfo.missing.items.length;
     let genBadge = '';
     if (gs === 'done') {
       genBadge = `<span class="status-badge" style="background:rgba(74,222,128,0.20);color:#4ade80;font-weight:700" title="Все чанки сгенерированы и собраны">✅ Готово</span>`;
@@ -2522,13 +2622,33 @@ function renderEpisodesList() {
       genBadge = `<span class="status-badge" style="background:rgba(248,113,113,0.20);color:#f87171;font-weight:700" title="Генерация упала — открой серию для деталей">✗ Сбой</span>`;
     } else if (gs === 'queued') {
       genBadge = `<span class="status-badge" style="background:rgba(251,191,36,0.20);color:#fbbf24" title="Стоит в очереди range-gen">⏳ В очереди</span>`;
-    } else if (ready) {
-      genBadge = `<span class="status-badge" style="background:rgba(16,185,129,0.18);color:#10b981" title="Помечена готовой к генерации — попадёт в range-gen">▶ Готова</span>`;
-    } else if (cast) {
-      genBadge = `<span class="status-badge" style="background:rgba(132,94,247,0.10);color:#a78bfa" title="Сценарий принят, но не помечена как готовая к генерации">📜 Принят</span>`;
+    } else if (isReady) {
+      genBadge = `<span class="status-badge" style="background:rgba(16,185,129,0.18);color:#10b981;font-weight:700" title="Сценарий принят, все ассеты на месте — можно запускать видео-генерацию">▶ Готова</span>`;
+    } else if (readyInfo.hasScript) {
+      const tip = totalMissing
+        ? `Сценарий принят, но не хватает: ` +
+          [
+            readyInfo.missing.chars.length ? `персы (${readyInfo.missing.chars.length})` : '',
+            readyInfo.missing.outfits.length ? `аутфиты (${readyInfo.missing.outfits.length})` : '',
+            readyInfo.missing.locs.length ? `локации (${readyInfo.missing.locs.length})` : '',
+            readyInfo.missing.items.length ? `предметы (${readyInfo.missing.items.length})` : '',
+          ].filter(Boolean).join(', ')
+        : 'Сценарий принят, без ассетов';
+      genBadge = `<span class="status-badge" style="background:rgba(251,191,36,0.18);color:#fbbf24" title="${esc(tip)}">⚠ ${totalMissing} ассет${totalMissing === 1 ? '' : 'ов'}</span>`;
     }
+    // Selection checkbox — only meaningful for episodes that are READY for
+    // generation. For episodes that aren't ready, hide the checkbox so the
+    // user can't queue something that would just stall.
+    const checked = (S._genSelected && S._genSelected.has(ep.number)) ? 'checked' : '';
+    const isQueueable = isReady && gs !== 'done' && gs !== 'generating';
+    const checkboxHtml = isQueueable
+      ? `<label class="ep-row-check" onclick="event.stopPropagation()" title="Выделить для пакетной видео-генерации">
+           <input type="checkbox" ${checked} onchange="toggleEpisodeSelected(${ep.number}, event)">
+         </label>`
+      : `<span class="ep-row-check ep-row-check-disabled" title="${gs === 'done' ? 'Уже сгенерирована' : (gs === 'generating' ? 'Сейчас генерится' : 'Не готова — добей ассеты сначала')}"></span>`;
     return `
       <div class="episode-row" onclick="navigate('episode',{seriesId:'${S.seriesId}',episodeNum:${ep.number}})">
+        ${checkboxHtml}
         <div class="ep-num" title="${esc(chunkLabel(S.series, ep.number))}">${isBatchMode(S.series) ? chunkRange(S.series, ep.number).join('–') : ep.number}</div>
         <div class="ep-info">
           <div class="ep-title">${esc(ep.title)}</div>
@@ -2548,6 +2668,7 @@ function renderEpisodesList() {
       </div>
     `;
   }).join('');
+  _updateRangeGenSelectionCount();
 }
 
 function statusLabel(s) {
@@ -4429,7 +4550,6 @@ async function loadEpisodeView() {
   // and the "🔄 Перепроанализировать" button becomes visible for explicit re-runs.
   const acceptBtn = document.getElementById('ep-accept-script-btn');
   const reanalyzeBtn = document.getElementById('ep-reanalyze-btn');
-  const genReadyBtn = document.getElementById('ep-gen-ready-btn');
   // cast_extracted may be missing on legacy episodes; treat ANY episode with
   // a script + at least one used entity as already-accepted (covers imports
   // that pre-date the cast_extracted=True write in _import_worker).
@@ -4448,16 +4568,6 @@ async function loadEpisodeView() {
       acceptBtn.title = 'Сценарий уже принят — клик переключит в режим сцен. Чтобы заново разобрать персонажей/предметы — кнопка «🔄 Перепроанализировать» справа.';
     }
     if (reanalyzeBtn) reanalyzeBtn.style.display = '';
-    // After accept, surface the gen-ready toggle so the user can mark the
-    // episode for inclusion in range-gen.
-    if (genReadyBtn) {
-      genReadyBtn.style.display = '';
-      const ready = !!S.episode.gen_ready;
-      genReadyBtn.innerHTML = ready ? '✓ Готова к генерации' : '▶ Готова к генерации';
-      genReadyBtn.style.background = ready ? 'linear-gradient(135deg,#10b981,#059669)' : '';
-      genReadyBtn.style.color = ready ? '#fff' : '';
-      genReadyBtn.style.fontWeight = ready ? '700' : '';
-    }
   } else {
     if (acceptBtn) {
       acceptBtn.innerHTML = '✅ Принять сценарий';
@@ -4465,7 +4575,6 @@ async function loadEpisodeView() {
       acceptBtn.title = 'Сохранить сценарий, найти новых персонажей/локации/предметы, при необходимости показать модалку для drag-drop фоток, потом перейти в режим сцен и запустить автоген';
     }
     if (reanalyzeBtn) reanalyzeBtn.style.display = 'none';
-    if (genReadyBtn) genReadyBtn.style.display = 'none';
   }
   if (sceneView && !sceneView.classList.contains('hidden')) {
     if (typeof _renderSceneViewBody === 'function') _renderSceneViewBody();
@@ -6249,30 +6358,30 @@ function stopRangeGen() {
 async function startRangeGen() {
   if (RANGE.active) { showToast('Очередь уже идёт'); return; }
   if (!S.series) { showToast('Открой сериал'); return; }
-  const fromEl = document.getElementById('range-gen-from');
-  const toEl   = document.getElementById('range-gen-to');
-  const aaEl   = document.getElementById('range-gen-auto-assemble');
-  const onlyReadyEl = document.getElementById('range-gen-only-ready');
-  const eps = (S.series.episodes || []).slice().sort((a,b) => (a.number||0) - (b.number||0));
+  const aaEl = document.getElementById('range-gen-auto-assemble');
+  const eps = (S.episodes || S.series.episodes || []).slice().sort((a,b) => (a.number||0) - (b.number||0));
   if (!eps.length) { showToast('Нет эпизодов'); return; }
-  let from = parseInt(fromEl?.value, 10);
-  let to   = parseInt(toEl?.value, 10);
-  if (!Number.isFinite(from)) from = eps[0].number;
-  if (!Number.isFinite(to))   to   = eps[eps.length - 1].number;
-  if (from > to) [from, to] = [to, from];
-  const onlyReady = !!onlyReadyEl?.checked;
-  const queue = eps
-    .filter(ep => ep.number >= from && ep.number <= to)
-    .filter(ep => onlyReady ? !!ep.gen_ready : true)
-    .map(ep => ep.number);
+  if (!S._genSelected) _restoreGenSelection();
+  // Build the queue from the user's checkbox selection. Filter to only those
+  // that are actually ready (in case selection got stale — e.g. assets were
+  // deleted after the user ticked the checkbox) and aren't already done /
+  // generating right now.
+  let queue = [];
+  for (const num of [...S._genSelected].sort((a, b) => a - b)) {
+    const ep = eps.find(e => e.number === num);
+    if (!ep) continue;
+    const info = _episodeReadyInfo(ep);
+    const gs = ep.gen_status || '';
+    if (info.ready && gs !== 'done' && gs !== 'generating') {
+      queue.push(num);
+    }
+  }
   if (!queue.length) {
-    showToast(onlyReady
-      ? `⚠ В диапазоне ${from}–${to} нет серий с флагом «Готова к генерации»`
-      : `⚠ Диапазон ${from}–${to} пуст`, 6000);
+    showToast('⚠ Не выделено ни одной серии готовой к генерации', 6000);
     return;
   }
   if (!confirm(
-    `Запустить очередь генерации?\n\n` +
+    `Запустить генерацию выделенных серий?\n\n` +
     `Серий в очереди: ${queue.length} (${queue.join(', ')})\n` +
     `Авто-сборка финала: ${aaEl?.checked ? 'да' : 'нет'}\n\n` +
     `Каждая серия по очереди прогонится через Auto-mode (Sequential).\n` +
@@ -6748,33 +6857,6 @@ async function acceptScript(opts = {}) {
   } finally {
     btn.disabled = false;
     btn.innerHTML = orig;
-  }
-}
-
-// Toggle the per-episode `gen_ready` flag. The flag is what the series-level
-// "Сгенерировать диапазон" picker uses to decide which episodes go into the
-// queue — marking an episode ready signals "сценарий принят, ассеты на месте,
-// можно запускать сидансу пакетно". The button lives next to ep-accept-btn
-// and only surfaces when the episode is already accepted.
-async function toggleGenReady() {
-  if (!S.episode || !S.episodeNum) return;
-  const newVal = !S.episode.gen_ready;
-  const btn = document.getElementById('ep-gen-ready-btn');
-  if (btn) btn.disabled = true;
-  try {
-    const updated = await api.put(`/api/series/${S.seriesId}/episodes/${S.episodeNum}`, { gen_ready: newVal });
-    if (updated) S.episode = updated;
-    if (btn) {
-      btn.innerHTML = newVal ? '✓ Готова к генерации' : '▶ Готова к генерации';
-      btn.style.background = newVal ? 'linear-gradient(135deg,#10b981,#059669)' : '';
-      btn.style.color = newVal ? '#fff' : '';
-      btn.style.fontWeight = newVal ? '700' : '';
-    }
-    showToast(newVal ? '✓ Серия помечена готовой к генерации' : 'Серия снята с очереди генерации');
-  } catch (e) {
-    showToast('Ошибка: ' + (e?.message || e));
-  } finally {
-    if (btn) btn.disabled = false;
   }
 }
 
