@@ -527,18 +527,23 @@ def _log_uncaught(e):
 
 @app.route('/api/admin/logs')
 def admin_logs():
-    """Read recent log lines for any user. Gated to PRIMARY_USER_EMAIL only.
+    """Read recent log lines.
+    - Primary user (operator): can read ANY user's logs via ?email=...
+    - Regular user: can read ONLY their own logs — email param is forced
+      to their own email regardless of what they pass.
     Query params:
-      email   = user email or slug (defaults to current user)
+      email   = user email or slug (primary only — non-primary forced to self)
       date    = YYYY-MM-DD (defaults to today)
       lines   = max lines to return (default 500, max 5000)
       level   = ERROR | WARN | INFO (filter)
       grep    = case-insensitive substring filter on the JSON line
     Returns {lines: [parsed_json, ...], total_lines, file}."""
     actor = current_user_email() or ''
-    if actor != PRIMARY_USER_EMAIL and not (not AUTH_ENABLED):
-        return jsonify({'error': 'admin only'}), 403
-    target_email = (request.args.get('email') or actor).strip()
+    if not actor and AUTH_ENABLED:
+        return jsonify({'error': 'auth required'}), 401
+    is_primary = (actor == PRIMARY_USER_EMAIL) or (not AUTH_ENABLED)
+    requested = (request.args.get('email') or actor).strip()
+    target_email = requested if is_primary else actor
     date_str = (request.args.get('date') or datetime.datetime.utcnow().strftime('%Y-%m-%d')).strip()
     try:
         max_lines = max(1, min(5000, int(request.args.get('lines') or 500)))

@@ -251,10 +251,15 @@ async function _checkApiKeysOnBoot() {
     const me = await fetch('/api/me').then(r => r.ok ? r.json() : null);
     if (!me || !me.authenticated) return;
     window._currentUser = me;
-    // Show the admin logs button only to the primary user (operator).
-    if (me.is_primary) {
-      const btn = document.getElementById('admin-logs-btn');
-      if (btn) btn.style.display = '';
+    // Show the logs button to ALL authenticated users (their own logs are
+    // visible to them). Primary user additionally gets the user dropdown
+    // inside the modal so they can switch between users.
+    const logBtn = document.getElementById('admin-logs-btn');
+    if (logBtn) {
+      logBtn.style.display = '';
+      logBtn.title = me.is_primary
+        ? 'Логи всех пользователей (admin view)'
+        : 'Мои логи — здесь видны мои ошибки и события';
     }
     if (!me.has_avai_key) {
       _showApiKeySetupModal('avai', { firstTime: true });
@@ -296,10 +301,30 @@ async function recheckAvaiKey() {
 
 async function openAdminLogs() {
   openModal('modal-admin-logs');
-  // Populate user dropdown
+  const isPrimary = !!(window._currentUser && window._currentUser.is_primary);
+  const titleEl = document.getElementById('admin-logs-title');
+  if (titleEl) {
+    titleEl.textContent = isPrimary ? '📋 Логи пользователей (admin view)' : '📋 Мои логи';
+  }
+  const userPicker = document.getElementById('admin-logs-user-wrap')
+    || document.getElementById('admin-logs-user')?.closest('label');
+  const sel = document.getElementById('admin-logs-user');
+  // Non-primary: hide user-picker entirely (always self); primary: populate.
+  if (!isPrimary) {
+    if (userPicker) userPicker.style.display = 'none';
+    if (sel) {
+      // Stub option so loadAdminLogs() has a value (even though backend
+      // ignores ?email= for non-primary anyway).
+      sel.innerHTML = `<option value="${esc((window._currentUser || {}).email || '')}">Мои логи</option>`;
+    }
+    // Populate the date dropdown with last 14 days for self.
+    _adminLogsBuildDateRange(14);
+    loadAdminLogs();
+    return;
+  }
+  if (userPicker) userPicker.style.display = '';
   try {
     const r = await fetch('/api/admin/users').then(x => x.json());
-    const sel = document.getElementById('admin-logs-user');
     if (sel) {
       sel.innerHTML = (r.users || []).map(u => {
         const date = u.log_dates?.[0] || '—';
@@ -312,6 +337,20 @@ async function openAdminLogs() {
   } catch (e) {
     document.getElementById('admin-logs-table').textContent = 'Ошибка: ' + (e.message || e);
   }
+}
+
+// Builds last N days into the date dropdown — used for non-primary users
+// who can't query /api/admin/users to discover available dates.
+function _adminLogsBuildDateRange(days) {
+  const dateSel = document.getElementById('admin-logs-date');
+  if (!dateSel) return;
+  const opts = [];
+  for (let i = 0; i < days; i++) {
+    const d = new Date(Date.now() - i * 86400000);
+    const iso = d.toISOString().slice(0, 10);
+    opts.push(`<option value="${iso}">${iso}${i === 0 ? ' · сегодня' : ''}</option>`);
+  }
+  dateSel.innerHTML = opts.join('');
 }
 
 function _adminLogsRebuildDateDropdown() {
