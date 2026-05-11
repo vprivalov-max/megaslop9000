@@ -5985,6 +5985,33 @@ const AUTO = {
   lastStatus: '',
 };
 
+// ── Multi-episode parallel auto-mode registry ──────────────────────────────
+// `AUTO` is the primary (single-episode page button) run. `AUTO_RUNS` adds
+// extra concurrent runs spawned by range-gen with concurrency > 1. Each entry
+// has the same shape as AUTO; the floating widget aggregates across all.
+// Key = `${sid}:${epNum}`.
+const AUTO_RUNS = new Map();
+function _autoRegisterRun(R) {
+  if (!R || !R._epSid || R._epNumber == null) return;
+  AUTO_RUNS.set(`${R._epSid}:${R._epNumber}`, R);
+  _autoUpdateFloatingWidget();
+}
+function _autoUnregisterRun(R) {
+  if (!R) return;
+  AUTO_RUNS.delete(`${R._epSid}:${R._epNumber}`);
+  _autoUpdateFloatingWidget();
+}
+function _autoAllRuns() {
+  // Primary AUTO + any extras. Filtered to active=true.
+  const out = [];
+  if (AUTO.active) out.push(AUTO);
+  for (const r of AUTO_RUNS.values()) {
+    if (r === AUTO) continue;
+    if (r.active) out.push(r);
+  }
+  return out;
+}
+
 function _autoSaveErrMode(mode) {
   if (mode !== 'heal' && mode !== 'stop') return;
   localStorage.setItem('auto_error_mode', mode);
@@ -6086,54 +6113,84 @@ function _autoEnsureFloatingWidget() {
   w = document.createElement('div');
   w.id = 'auto-float';
   w.className = 'auto-float';
-  w.innerHTML = `
-    <div class="auto-float-head" id="auto-float-head" title="Открыть серию которая генерится">
-      <span class="auto-float-spin"></span>
-      <span class="auto-float-title">Auto-mode</span>
-      <span class="auto-float-count" id="auto-float-count">—</span>
-      <button class="auto-float-stop" id="auto-float-stop" title="Остановить генерацию">⏸</button>
-    </div>
-    <div class="auto-float-bar"><div class="auto-float-bar-fill" id="auto-float-bar-fill"></div></div>
-    <div class="auto-float-status" id="auto-float-status"></div>
-  `;
   document.body.appendChild(w);
-  // Wire — head jumps to source episode (closure captures sid/number — store
-  // them on the widget itself), stop kills AUTO. RANGE-gen also stops if
-  // active so the queue doesn't keep firing.
-  w.querySelector('#auto-float-stop').addEventListener('click', (ev) => {
-    ev.stopPropagation();
-    try { if (typeof stopRangeGen === 'function' && (typeof RANGE !== 'undefined') && RANGE.active) stopRangeGen(); } catch {}
-    try { if (typeof stopAutoMode === 'function') stopAutoMode(); } catch {}
-  });
-  w.querySelector('#auto-float-head').addEventListener('click', () => {
-    const sid = w.dataset.sid, ep = w.dataset.ep;
-    if (sid && ep) {
-      try { navigate('episode', { seriesId: sid, episodeNum: parseInt(ep, 10) }); } catch {}
-    }
-  });
   return w;
 }
 function _autoUpdateFloatingWidget() {
   const rangeActive = (typeof RANGE !== 'undefined') && RANGE.active;
-  const active = !!AUTO.active || rangeActive;
+  const runs = _autoAllRuns();
+  const active = runs.length > 0 || rangeActive;
   if (!active) {
     const w = document.getElementById('auto-float');
     if (w) w.remove();
     return;
   }
   const w = _autoEnsureFloatingWidget();
-  const total = AUTO.total || 0;
-  const done = AUTO.completedCount || 0;
-  const pct = total ? Math.round((done / total) * 100) : 0;
-  const sid = (typeof AUTO._epSid === 'string') ? AUTO._epSid : (S.seriesId || '');
-  const ep = (typeof AUTO._epNumber === 'number') ? AUTO._epNumber : (S.episode?.number || '');
-  if (sid) w.dataset.sid = sid;
-  if (ep)  w.dataset.ep = String(ep);
-  const countEl = document.getElementById('auto-float-count');
-  const fillEl  = document.getElementById('auto-float-bar-fill');
-  const statusEl = document.getElementById('auto-float-status');
-  if (countEl) countEl.textContent = total ? `${done}/${total} · ${pct}%` : '…';
-  if (fillEl)  fillEl.style.width = `${pct}%`;
+  // Aggregate totals across all active runs (range-gen with parallel
+  // episodes shows N rows). When only one run is active, looks like the
+  // old single-line widget.
+  const totalAgg = runs.reduce((s, r) => s + (r.total || 0), 0);
+  const doneAgg  = runs.reduce((s, r) => s + (r.completedCount || 0), 0);
+  const pctAgg   = totalAgg ? Math.round((doneAgg / totalAgg) * 100) : 0;
+  const queueBit = (rangeActive && Array.isArray(RANGE.queue) && RANGE.queue.length)
+    ? ` · очередь ${Math.min(RANGE.curIdx + 1, RANGE.queue.length)}/${RANGE.queue.length}`
+    : '';
+  const headLabel = runs.length > 1
+    ? `Auto-mode × ${runs.length}`
+    : 'Auto-mode';
+  const rowsHtml = runs.map(r => {
+    const total = r.total || 0;
+    const done = r.completedCount || 0;
+    const pct  = total ? Math.round((done / total) * 100) : 0;
+    let mode;
+    if (r.parallel) mode = 'паралл.';
+    else if ((r.activeChains || 0) > 1) mode = `сцены × ${r.activeChains}`;
+    else mode = 'последов.';
+    const ep = r._epNumber != null ? `Эп.${r._epNumber}` : '';
+    return `
+      <div class="auto-float-row" data-sid="${esc(r._epSid || '')}" data-ep="${esc(String(r._epNumber || ''))}">
+        <div class="auto-float-row-head">
+          <span class="auto-float-spin"></span>
+          <span class="auto-float-row-label">${esc(ep)}</span>
+          <span class="auto-float-row-count">${total ? `${done}/${total} · ${pct}%` : '…'}</span>
+        </div>
+        <div class="auto-float-bar"><div class="auto-float-bar-fill" style="width:${pct}%"></div></div>
+        <div class="auto-float-status">${esc(mode)} · ${esc(r.lastStatus || '...')}</div>
+      </div>`;
+  }).join('');
+  w.innerHTML = `
+    <div class="auto-float-head">
+      <span class="auto-float-spin"></span>
+      <span class="auto-float-title">${esc(headLabel)}</span>
+      <span class="auto-float-count">${totalAgg ? `${doneAgg}/${totalAgg} · ${pctAgg}%${queueBit}` : (queueBit || '…')}</span>
+      <button class="auto-float-stop" title="Остановить генерацию">⏸</button>
+    </div>
+    ${runs.length > 0 ? `<div class="auto-float-rows">${rowsHtml}</div>` : ''}
+  `;
+  // Wire stop + click-to-navigate. Each row's head click navigates to that ep.
+  w.querySelector('.auto-float-stop')?.addEventListener('click', (ev) => {
+    ev.stopPropagation();
+    try { if (typeof stopRangeGen === 'function' && (typeof RANGE !== 'undefined') && RANGE.active) stopRangeGen(); } catch {}
+    try { if (typeof stopAutoMode === 'function') stopAutoMode(); } catch {}
+  });
+  w.querySelectorAll('.auto-float-row').forEach(row => {
+    row.addEventListener('click', () => {
+      const sid = row.dataset.sid, ep = row.dataset.ep;
+      if (sid && ep) {
+        try { navigate('episode', { seriesId: sid, episodeNum: parseInt(ep, 10) }); } catch {}
+      }
+    });
+  });
+  // Keep the old single-run dataset fields populated for backward-compat
+  // navigation (when widget is shown for RANGE only without active runs).
+  if (runs.length === 1) {
+    w.dataset.sid = runs[0]._epSid || '';
+    w.dataset.ep  = String(runs[0]._epNumber || '');
+  }
+}
+function _autoUpdateFloatingWidget_LEGACY_HEAD_NOT_USED() {
+  // Stub — original code path that referenced AUTO directly. Kept for safety
+  // in case any external caller pokes at it; the real widget is above.
   let mode;
   if (AUTO.parallel) mode = 'паралл.';
   else if ((AUTO.activeChains || 0) > 1) mode = `сцены × ${AUTO.activeChains}`;
@@ -6396,6 +6453,7 @@ async function startAutoMode() {
   // Stash on AUTO so the floating widget knows what episode this run targets.
   AUTO._epSid = epSid;
   AUTO._epNumber = epNumber;
+  _autoRegisterRun(AUTO);
 
   // Read params from sd panel (used for /seedance/start)
   const duration = parseInt(document.getElementById('sd-duration').value) || 15;
@@ -6686,6 +6744,7 @@ async function startAutoMode() {
     // All done
     AUTO.active = false;
     AUTO.lastStatus = '';
+    _autoUnregisterRun(AUTO);
     if (!AUTO.cancelRequested) {
       // Voice-only announcement on whole-episode completion. Fanfare was
       // removed by request — too startling. The TTS phrase already tells the
@@ -6702,11 +6761,253 @@ async function startAutoMode() {
     _autoUpdateStatusUI();
   } catch (e) {
     AUTO.active = false;
+    _autoUnregisterRun(AUTO);
     _autoUpdateStatusUI();
     Sounds.playError();
     clog('ERROR', 'auto.crash', { msg: (e?.message || String(e)).slice(0, 400) });
     showToast(`✗ Auto-mode упал: ${e.message || e}`, 8000);
   }
+}
+
+// ── Standalone parallel auto-run for range-gen (concurrency > 1) ──────────
+// Self-contained per-episode auto-mode runner. Doesn't touch global AUTO so
+// multiple episodes can run concurrently without state collisions. Mirrors
+// the sequential-mode logic of startAutoMode (scene-parallel internally, up
+// to 3 scene-chains per episode), but uses a fresh Run object per call and
+// registers it into AUTO_RUNS for the floating widget.
+//
+// Inputs: sid (string), num (int), opts {
+//   useLastframe, useCutframes, useStyle, styleVal, baseOnly, closeUpOnly,
+//   duration, resolution, moderation_bypass, errorMode, maxParallelScenes
+// }
+// Returns: { ok: bool, completed: int, total: int, errors: int }
+async function _runEpisodeAutoStandalone(sid, num, opts = {}) {
+  const epSid = sid;
+  const epNumber = num;
+  // Per-run state, same shape as AUTO. Lives in AUTO_RUNS until done.
+  const R = {
+    active: true, parallel: false, cancelRequested: false,
+    completedCount: 0, cursor: 0, total: 0, activeChains: 0,
+    errorMode: opts.errorMode || 'heal',
+    lastStatus: '⚙ загружаю серию...',
+    segments: [],
+    _epSid: epSid, _epNumber: epNumber,
+  };
+  _autoRegisterRun(R);
+
+  let errorsCount = 0;
+
+  try {
+    // 1. Fetch episode JSON to get the script text.
+    R.lastStatus = '⚙ загружаю серию...';
+    _autoUpdateFloatingWidget();
+    let ep;
+    try {
+      ep = await api.get(`/api/series/${epSid}/episodes/${epNumber}`);
+    } catch (e) {
+      clog('ERROR', 'parallel.fetch_fail', { sid: epSid, ep: epNumber, msg: (e?.message || String(e)).slice(0, 200) });
+      return { ok: false, completed: 0, total: 0, errors: 1 };
+    }
+    const scriptText = (ep?.script || '').trim();
+    if (!scriptText) {
+      clog('WARN', 'parallel.no_script', { sid: epSid, ep: epNumber });
+      return { ok: false, completed: 0, total: 0, errors: 1 };
+    }
+
+    // 2. Build segments from script text directly (bypass DOM-bound
+    //    _autoCollectSegments). Reuses _parseScriptScenes which is pure.
+    R.lastStatus = '⚙ строю сегменты...';
+    _autoUpdateFloatingWidget();
+    const scenes = _parseScriptScenes(scriptText, {});  // no overrides in parallel mode
+    const allSegs = [];
+    scenes.forEach((sc, sIdx) => {
+      for (let g = 0; g < sc.segCount; g++) {
+        const lines = sc.lines.filter(l => l.segIdx === g);
+        if (!lines.length) continue;
+        const head = sc.heading ? sc.heading + '\n\n' : '';
+        const text = head + lines.map(l => l.text).join('\n');
+        const hasCloseUp = lines.some(l => _isLineCloseUp(l.text));
+        const anchor = _lineAnchor(lines[0].text);
+        const isFirstOfScene = (g === 0);
+        const contentSec = lines.reduce((s, l) => s + (l.duration || 0), 0);
+        const targetSec = Math.ceil(contentSec + 1.5) + (isFirstOfScene ? 2 : 0);
+        const durationSec = Math.max(5, Math.min(15, targetSec));
+        allSegs.push({
+          sceneIdx: sIdx, segIdx: g, text, anchor,
+          has_close_up: hasCloseUp, durationSec,
+          establishing_shot: isFirstOfScene,
+          scriptOrder: allSegs.length,
+        });
+      }
+    });
+    if (!allSegs.length) {
+      clog('WARN', 'parallel.no_segments', { sid: epSid, ep: epNumber, script_len: scriptText.length });
+      return { ok: false, completed: 0, total: 0, errors: 1 };
+    }
+    R.segments = allSegs;
+    R.total = allSegs.length;
+
+    // Group by scene for scene-parallel execution within the episode.
+    const sceneGroups = (() => {
+      const m = new Map();
+      for (const s of allSegs) {
+        if (!m.has(s.sceneIdx)) m.set(s.sceneIdx, []);
+        m.get(s.sceneIdx).push(s);
+      }
+      return [...m.values()];
+    })();
+
+    const POLL_INTERVAL_MS = 8000;
+    const MAX_HEAL_RETRIES = 1;
+    const MAX_PARALLEL_SCENES = opts.maxParallelScenes || 2;
+    const shared = {
+      useLastframe: opts.useLastframe !== false,
+      useCutframes: opts.useCutframes !== false,
+      useStyle: !!opts.useStyle,
+      styleVal: opts.styleVal || '',
+      baseOnly: !!opts.baseOnly,
+      closeUpOnly: !!opts.closeUpOnly,
+      duration: opts.duration || 15,
+      resolution: opts.resolution || '720p',
+      moderation_bypass: opts.moderation_bypass || 'collage_grid',
+    };
+
+    async function pollUntilDone(chunkIdx, composeRes, segText, segDuration) {
+      let healAttempts = 0;
+      let curIdx = chunkIdx;
+      while (true) {
+        if (R.cancelRequested) return { ok: false, error: 'cancelled' };
+        await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+        let polled;
+        try {
+          const res = await api.post(`/api/series/${epSid}/episodes/${epNumber}/seedance/poll`, {});
+          polled = res.chunks || [];
+        } catch (e) { polled = []; }
+        const chunk = polled.find(c => c.idx === curIdx);
+        if (!chunk) { R.lastStatus = `… не вижу #${curIdx}`; _autoUpdateFloatingWidget(); continue; }
+        R.lastStatus = chunk.status === 'processing' && chunk.progress != null
+          ? `⏳ #${curIdx} ${chunk.progress}%` : `⏳ #${curIdx} ${chunk.status}`;
+        _autoUpdateFloatingWidget();
+        if (chunk.status === 'completed') return { ok: true, chunk };
+        if (chunk.status === 'failed') {
+          if (R.errorMode === 'heal' && healAttempts < MAX_HEAL_RETRIES) {
+            healAttempts++;
+            R.lastStatus = `🩹 лечу #${curIdx}...`;
+            _autoUpdateFloatingWidget();
+            try {
+              const healRes = await api.post(`/api/series/${epSid}/episodes/${epNumber}/seedance/${curIdx}/heal-prompt`, {});
+              const restart = await api.post(`/api/series/${epSid}/episodes/${epNumber}/seedance/start`, {
+                prompt: healRes.prompt || composeRes.prompt,
+                chunk_text: healRes.chunk_text || segText,
+                duration: segDuration || shared.duration,
+                resolution: shared.resolution,
+                moderation_bypass: shared.moderation_bypass,
+                refs: (composeRes.refs || []).map(r => ({
+                  kind: r.kind, id: r.id, outfit: r.outfit || null, url: r.url || null,
+                  source: r.source, prev_idx: r.prev_idx, name: r.name,
+                  cut_index: r.cut_index, cut_time: r.cut_time,
+                })),
+              });
+              if (restart?.chunk?.idx != null) curIdx = restart.chunk.idx;
+              continue;
+            } catch (e) {
+              return { ok: false, error: e?.message || 'heal-failed' };
+            }
+          }
+          return { ok: false, chunk, error: chunk.error || 'failed' };
+        }
+      }
+    }
+
+    async function composeAndStart(seg) {
+      const segCloseUp = shared.closeUpOnly || !!seg.has_close_up;
+      R.lastStatus = segCloseUp ? '⚙ compose (close-up)...' : '⚙ compose...';
+      _autoUpdateFloatingWidget();
+      const composeRes = await api.post(
+        `/api/series/${epSid}/episodes/${epNumber}/seedance/compose`,
+        {
+          chunk_text: seg.text,
+          use_prev_lastframe: shared.useLastframe,
+          use_prev_cutframes: shared.useCutframes,
+          style: shared.useStyle ? shared.styleVal : '',
+          base_outfits_only: shared.baseOnly,
+          close_up_only: segCloseUp,
+        }
+      );
+      R.lastStatus = '▶ start...';
+      _autoUpdateFloatingWidget();
+      const startRes = await api.post(
+        `/api/series/${epSid}/episodes/${epNumber}/seedance/start`,
+        {
+          prompt: composeRes.prompt,
+          chunk_text: seg.text,
+          duration: seg.durationSec || shared.duration,
+          resolution: shared.resolution,
+          moderation_bypass: shared.moderation_bypass,
+          script_order: seg.scriptOrder,
+          refs: (composeRes.refs || []).map(r => ({
+            kind: r.kind, id: r.id, outfit: r.outfit || null, url: r.url || null,
+            source: r.source, prev_idx: r.prev_idx, name: r.name,
+            cut_index: r.cut_index, cut_time: r.cut_time,
+          })),
+        }
+      );
+      return { composeRes, startRes };
+    }
+
+    async function runSceneChain(sceneSegs) {
+      R.activeChains++;
+      _autoUpdateFloatingWidget();
+      try {
+        for (const seg of sceneSegs) {
+          if (R.cancelRequested) return 'cancelled';
+          let cs;
+          try { cs = await composeAndStart(seg); }
+          catch (e) { errorsCount++; return 'failed'; }
+          const chunkIdx = cs.startRes?.chunk?.idx;
+          if (chunkIdx == null) { errorsCount++; return 'failed'; }
+          const poll = await pollUntilDone(chunkIdx, cs.composeRes, seg.text, seg.durationSec);
+          if (poll.error === 'cancelled') return 'cancelled';
+          if (!poll.ok) { errorsCount++; return 'failed'; }
+          R.completedCount++;
+          R.cursor = R.completedCount;
+          _autoUpdateFloatingWidget();
+        }
+        return 'completed';
+      } finally {
+        R.activeChains--;
+        _autoUpdateFloatingWidget();
+      }
+    }
+
+    // Concurrency-capped runner for scene chains.
+    const queue = sceneGroups.slice();
+    async function worker() {
+      while (queue.length) {
+        if (R.cancelRequested) return;
+        const item = queue.shift();
+        await runSceneChain(item);
+      }
+    }
+    const workers = [];
+    for (let i = 0; i < Math.min(MAX_PARALLEL_SCENES, sceneGroups.length); i++) workers.push(worker());
+    await Promise.all(workers);
+
+    return {
+      ok: !R.cancelRequested && errorsCount === 0,
+      completed: R.completedCount,
+      total: R.total,
+      errors: errorsCount,
+    };
+  } finally {
+    R.active = false;
+    _autoUnregisterRun(R);
+  }
+}
+
+function _stopAllAutoRuns() {
+  if (AUTO.active) AUTO.cancelRequested = true;
+  for (const r of AUTO_RUNS.values()) r.cancelRequested = true;
 }
 
 // ── Range-generation queue ─────────────────────────────────────────────────
@@ -6753,6 +7054,8 @@ async function startRangeGen() {
   if (RANGE.active) { showToast('Очередь уже идёт'); return; }
   if (!S.series) { showToast('Открой сериал'); return; }
   const aaEl = document.getElementById('range-gen-auto-assemble');
+  const concEl = document.getElementById('range-gen-concurrency');
+  const concurrency = Math.max(1, Math.min(3, parseInt(concEl?.value, 10) || 1));
   const eps = (S.episodes || S.series.episodes || []).slice().sort((a,b) => (a.number||0) - (b.number||0));
   if (!eps.length) { showToast('Нет эпизодов'); return; }
   if (!S._genSelected) _restoreGenSelection();
@@ -6774,13 +7077,18 @@ async function startRangeGen() {
     showToast('⚠ Не выделено ни одной серии готовой к генерации', 6000);
     return;
   }
+  const concWord = concurrency > 1 ? `параллельно по ${concurrency}` : 'последовательно';
   if (!await appConfirm({
     title: '▶ Пакетная генерация',
     message:
       `Серий в очереди: ${queue.length} (${queue.join(', ')})\n` +
+      `Режим: ${concWord}\n` +
       `Авто-сборка финала: ${aaEl?.checked ? 'да' : 'нет'}\n\n` +
-      `Каждая серия по очереди прогонится через Auto-mode (Sequential).\n` +
-      `Остановить — кнопка «Остановить»: текущая серия добежит, дальше очередь встанет.`,
+      (concurrency > 1
+        ? `Серии будут стартовать одновременно (до ${concurrency}). Внутри каждой ` +
+          `серии сцены тоже параллельные. Видеть прогресс — в виджете в правом нижнем углу.`
+        : `Каждая серия по очереди прогонится через Auto-mode (Sequential).`) +
+      `\nОстановить — кнопка «Остановить»: текущие серии добегут, дальше очередь встанет.`,
     okText: '▶ Запустить очередь',
     cancelText: 'Отмена',
     okStyle: 'accent',
@@ -6792,8 +7100,9 @@ async function startRangeGen() {
   RANGE.cancelRequested = false;
   RANGE.autoAssemble = !!aaEl?.checked;
   RANGE.seriesId = S.seriesId;
+  RANGE.concurrency = concurrency;
   _rangeGenUI();
-  _rangeGenSetStatus(`▶ В очереди: ${queue.length}`);
+  _rangeGenSetStatus(`▶ В очереди: ${queue.length}${concurrency > 1 ? ` · параллельно ${concurrency}` : ''}`);
   _autoUpdateFloatingWidget();
 
   // Suppress modal confirms / missing-asset warnings inside the loop. We restore
@@ -6806,82 +7115,110 @@ async function startRangeGen() {
   // actually shows a dialog.
   window.appConfirm = () => Promise.resolve(true);
 
-  try {
-    for (let i = 0; i < queue.length; i++) {
-      if (RANGE.cancelRequested) break;
-      RANGE.curIdx = i;
-      const epNum = queue[i];
-      _rangeGenSetStatus(`▶ ${i + 1}/${queue.length} · серия ${epNum} · открываю…`);
+  // Track how many episodes have been claimed from the queue (next-up index).
+  // Cursor is shared across workers; each worker grabs the next number atomic.
+  let claimed = 0;
+  let finished = 0;
 
-      // Navigate to the episode and wait for loadEpisodeView to finish.
+  // Per-episode runner. Either uses the navigation+startAutoMode path
+  // (concurrency=1, preserves visible episode-page UI) or the headless
+  // standalone runner (concurrency>1, runs without changing S.episode).
+  async function _rangeRunEpisode(epNum, idxInQueue) {
+    _rangeGenSetStatus(`▶ ${idxInQueue + 1}/${queue.length} · серия ${epNum} · старт…`);
+
+    // Mark as generating in series state so badges update.
+    try {
+      await api.put(`/api/series/${RANGE.seriesId}/episodes/${epNum}`, { gen_status: 'generating' });
+      const ep = (S.series.episodes || []).find(e => e.number === epNum);
+      if (ep) ep.gen_status = 'generating';
+      if (S.episode?.number === epNum) S.episode.gen_status = 'generating';
+      if (typeof renderEpisodesList === 'function') renderEpisodesList();
+    } catch {}
+
+    let result = { ok: false, completed: 0, total: 0, errors: 0 };
+
+    if (concurrency === 1) {
+      // Legacy path: navigate to the episode + use startAutoMode (so the user
+      // sees the visible episode page with chunks ticking in).
       try {
         navigate('episode', { seriesId: RANGE.seriesId, episodeNum: epNum });
       } catch (e) { console.warn('[range-gen] navigate failed', e); }
-      // Wait until S.episode reflects the new episode (loadEpisodeView is async).
       const navStart = Date.now();
       while (Date.now() - navStart < 30000) {
         if (S.seriesId === RANGE.seriesId && S.episode?.number === epNum) break;
         await new Promise(r => setTimeout(r, 250));
       }
       if (S.episode?.number !== epNum) {
-        _rangeGenSetStatus(`⚠ ${i+1}/${queue.length} · серия ${epNum} не открылась — пропуск`);
-        continue;
+        _rangeGenSetStatus(`⚠ серия ${epNum} не открылась — пропуск`);
+        return { ok: false, completed: 0, total: 0, errors: 1 };
       }
-
-      // Mark as generating in series state so badges update.
-      try {
-        await api.put(`/api/series/${RANGE.seriesId}/episodes/${epNum}`, { gen_status: 'generating' });
-        S.episode.gen_status = 'generating';
-        const ep = (S.series.episodes || []).find(e => e.number === epNum);
-        if (ep) ep.gen_status = 'generating';
-        if (typeof renderEpisodesList === 'function') renderEpisodesList();
-      } catch {}
-
-      _rangeGenSetStatus(`▶ ${i + 1}/${queue.length} · серия ${epNum} · Auto-mode…`);
-
-      // Kick off Auto-mode and wait for AUTO.active = false.
-      try {
-        await startAutoMode();
-      } catch (e) {
-        console.warn('[range-gen] startAutoMode failed', e);
-      }
+      try { await startAutoMode(); } catch (e) { console.warn('[range-gen] startAutoMode failed', e); }
       while (AUTO?.active) {
-        if (RANGE.cancelRequested) {
-          try { stopAutoMode(); } catch {}
-        }
+        if (RANGE.cancelRequested) { try { stopAutoMode(); } catch {} }
         await new Promise(r => setTimeout(r, 2000));
       }
-
-      const completedAll = (AUTO?.completedCount || 0) >= (AUTO?.total || 0) && (AUTO?.total || 0) > 0;
-      let assembleNote = '';
-      if (RANGE.autoAssemble && completedAll && !RANGE.cancelRequested) {
-        _rangeGenSetStatus(`▶ ${i + 1}/${queue.length} · серия ${epNum} · собираю финал…`);
-        try {
-          const r = await api.post(
-            `/api/series/${RANGE.seriesId}/episodes/${epNum}/auto-assemble`,
-            { require_all: true, expected_segments: AUTO.total },
-          );
-          if (r && r.ok) {
-            assembleNote = ` · 🎬 ${r.filename} (${r.size_mb}MB)`;
-          } else if (r?.error) {
-            assembleNote = ` · ⚠ авто-сборка: ${r.error}`;
-          }
-        } catch (e) {
-          assembleNote = ` · ⚠ авто-сборка упала: ${e.message || e}`;
-        }
-      }
-
-      // Mark gen_status: done / failed.
-      try {
-        const finalStatus = completedAll ? 'done' : (RANGE.cancelRequested ? 'queued' : 'failed');
-        await api.put(`/api/series/${RANGE.seriesId}/episodes/${epNum}`, { gen_status: finalStatus });
-        if (S.episode?.number === epNum) S.episode.gen_status = finalStatus;
-        const ep = (S.series.episodes || []).find(e => e.number === epNum);
-        if (ep) ep.gen_status = finalStatus;
-      } catch {}
-
-      _rangeGenSetStatus(`✓ ${i + 1}/${queue.length} · серия ${epNum}${assembleNote}`);
+      result = {
+        ok: !RANGE.cancelRequested && (AUTO?.completedCount || 0) >= (AUTO?.total || 0) && (AUTO?.total || 0) > 0,
+        completed: AUTO?.completedCount || 0,
+        total: AUTO?.total || 0,
+        errors: 0,
+      };
+    } else {
+      // Parallel path: standalone runner, no navigation. Multiple of these
+      // can run concurrently because each has its own Run state.
+      result = await _runEpisodeAutoStandalone(RANGE.seriesId, epNum, {
+        useLastframe: true, useCutframes: true,
+        useStyle: false, styleVal: '',
+        baseOnly: false, closeUpOnly: false,
+        duration: 15, resolution: '720p', moderation_bypass: 'collage_grid',
+        errorMode: 'heal',
+        maxParallelScenes: 2,   // cap a bit lower so concurrent eps don't oversubscribe Seedance
+      });
     }
+
+    const completedAll = result.ok;
+    let assembleNote = '';
+    if (RANGE.autoAssemble && completedAll && !RANGE.cancelRequested) {
+      try {
+        const r = await api.post(
+          `/api/series/${RANGE.seriesId}/episodes/${epNum}/auto-assemble`,
+          { require_all: true, expected_segments: result.total },
+        );
+        if (r && r.ok) assembleNote = ` · 🎬 ${r.filename} (${r.size_mb}MB)`;
+        else if (r?.error) assembleNote = ` · ⚠ авто-сборка: ${r.error}`;
+      } catch (e) {
+        assembleNote = ` · ⚠ авто-сборка упала: ${e.message || e}`;
+      }
+    }
+
+    try {
+      const finalStatus = completedAll ? 'done' : (RANGE.cancelRequested ? 'queued' : 'failed');
+      await api.put(`/api/series/${RANGE.seriesId}/episodes/${epNum}`, { gen_status: finalStatus });
+      if (S.episode?.number === epNum) S.episode.gen_status = finalStatus;
+      const ep = (S.series.episodes || []).find(e => e.number === epNum);
+      if (ep) ep.gen_status = finalStatus;
+    } catch {}
+
+    _rangeGenSetStatus(`✓ ${idxInQueue + 1}/${queue.length} · серия ${epNum}${assembleNote}`);
+    return result;
+  }
+
+  try {
+    // Worker pool: N workers each pull the next un-claimed episode off the
+    // queue, run it, then loop. Total throughput = min(N, queue.length).
+    async function worker() {
+      while (!RANGE.cancelRequested && claimed < queue.length) {
+        const idx = claimed++;
+        const epNum = queue[idx];
+        RANGE.curIdx = Math.max(RANGE.curIdx, idx);
+        try { await _rangeRunEpisode(epNum, idx); }
+        catch (e) { console.warn('[range-gen] episode crashed', epNum, e); }
+        finished++;
+      }
+    }
+    const workers = [];
+    for (let i = 0; i < Math.min(concurrency, queue.length); i++) workers.push(worker());
+    await Promise.all(workers);
   } finally {
     window.confirm = origConfirm;
     window.appConfirm = origAppConfirm;

@@ -2490,6 +2490,26 @@ body.seedance-mode .ep-loc-card:active { cursor: grabbing; }
   font-size: 0.76rem; opacity: 0.88;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
+.auto-float-rows {
+  margin-top: 6px;
+  display: flex; flex-direction: column; gap: 6px;
+  max-height: 260px; overflow-y: auto;
+}
+.auto-float-row {
+  background: rgba(0,0,0,0.18);
+  border: 1px solid rgba(255,255,255,0.10);
+  border-radius: 8px;
+  padding: 6px 8px;
+  cursor: pointer;
+  transition: background 0.12s;
+}
+.auto-float-row:hover { background: rgba(0,0,0,0.30); }
+.auto-float-row-head {
+  display: flex; align-items: center; gap: 6px; font-size: 0.78rem;
+  margin-bottom: 3px;
+}
+.auto-float-row-label { font-weight: 700; }
+.auto-float-row-count { margin-left: auto; font-variant-numeric: tabular-nums; opacity: 0.92; }
 
 /* ── In-app confirm modal ───────────────────────────────────────────────── */
 .app-confirm-modal {
