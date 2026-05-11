@@ -5720,13 +5720,44 @@ function _parseScriptScenes(scriptText, overrides) {
   const SOFT_MAX = 13.0;        // normal break threshold (2s buffer below 15s chunk)
   const MIN_SEGMENT_SEC = 5.0;  // smaller than this = wasted Seedance chunk
   const HARD_MAX_SEC = 14.5;    // absolute ceiling — Seedance chunk is 15s
+  // Speaker cue detector — bare ALL-CAPS character-name line (1-4 tokens,
+  // optional «(CONT'D)» / «(V.O.)» / «(to X)» suffix). These must NEVER be
+  // separated from the dialogue line that follows — otherwise Seedance gets
+  // the dialogue without a speaker attached and lipsync goes to a random
+  // character.
+  const _isSpeakerCue = (text) => {
+    const t = (text || '').trim();
+    if (!t || t.length > 40) return false;
+    const base = t.replace(/\s*\([^)]+\)\s*$/, '').trim();   // strip (CONT'D) etc
+    if (!base || base.length > 30) return false;
+    if (/[a-zа-яё]/.test(base)) return false;                // no lowercase
+    if (!/[A-ZА-ЯЁ]/.test(base)) return false;
+    const tokens = base.split(/\s+/);
+    if (tokens.length > 4) return false;
+    if (/^(INT|EXT|FADE|CUT|MATCH|DISSOLVE|TIME|END|FIN|SCENE|FLASHBACK)\b/i.test(base)) return false;
+    return true;
+  };
   for (const sc of scenes) {
-    // Pass 1: greedy, never break before MIN_SEGMENT
+    // Pass 1: greedy, never break before MIN_SEGMENT. When a break would
+    // land BETWEEN a speaker cue and its dialogue, pull the cue forward
+    // into the new segment along with the dialogue.
     let acc = 0, seg = 0;
-    for (const l of sc.lines) {
+    for (let i = 0; i < sc.lines.length; i++) {
+      const l = sc.lines[i];
+      const prev = i > 0 ? sc.lines[i - 1] : null;
       if (acc >= MIN_SEGMENT_SEC && acc + l.duration > SOFT_MAX) {
-        seg += 1;
-        acc = 0;
+        // If the previous line was a speaker cue and is currently in the
+        // CURRENT segment, move it forward to the new segment so cue+dialogue
+        // stay together. Decrement acc accordingly.
+        if (prev && _isSpeakerCue(prev.text) && prev.segIdx === seg) {
+          prev.segIdx = seg + 1;
+          acc -= prev.duration;
+          seg += 1;
+          acc = prev.duration;   // new segment already has the cue
+        } else {
+          seg += 1;
+          acc = 0;
+        }
       }
       l.segIdx = seg;
       acc += l.duration;
