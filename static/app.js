@@ -6791,27 +6791,71 @@ async function startAutoMode() {
   // Turbo prerequisites: episodeBlocking + batch_prompts must exist.
   // If empty — auto-fill them before starting the parallel run, so the user
   // doesn't have to hit two extra buttons every time.
+  //
+  // These two Claude calls take ~10-30s each. Without a visible widget the
+  // user thinks nothing's happening between clicking «Auto-mode» and the
+  // first chunk creating itself (~60s of silence). Show the floating widget
+  // in a «preparing» state for the duration of these prereqs so progress is
+  // always visible.
   if (isTurbo) {
     const blockingEl = document.getElementById('ep-scene-blocking');
     const blocking = (blockingEl?.value || '').trim();
     const hasBatchPrompts = !!(S.episode?.batch_prompts && Object.keys(S.episode.batch_prompts).length);
-    if (!blocking) {
-      showToast('⚙ Турбо-режим: сначала генерю scene blocking...', 4000);
-      try {
-        if (typeof generateSceneBlocking === 'function') await generateSceneBlocking();
-      } catch (e) {
-        showToast('✗ Не удалось сгенерить blocking: ' + (e.message || e), 6000);
-        return;
-      }
+    const needPrep = !blocking || !hasBatchPrompts;
+    if (needPrep) {
+      // Mark AUTO as active so the floating widget appears immediately.
+      // _epSid/_epNumber stash so the widget header navigates to this ep.
+      AUTO.active = true;
+      AUTO.parallel = true;
+      AUTO.total = 0;
+      AUTO.completedCount = 0;
+      AUTO._epSid = S.seriesId;
+      AUTO._epNumber = S.episode.number;
+      AUTO.lastStatus = '⚙ Турбо: подготовка…';
+      _autoRegisterRun(AUTO);
+      _autoUpdateStatusUI();
     }
-    if (!hasBatchPrompts) {
-      showToast('⚙ Турбо-режим: собираю batch JSON эпизода...', 4000);
-      try {
-        if (typeof rebuildBatchPrompts === 'function') await rebuildBatchPrompts();
-      } catch (e) {
-        showToast('✗ Не удалось собрать batch JSON: ' + (e.message || e), 6000);
-        return;
+    try {
+      if (!blocking) {
+        AUTO.lastStatus = '⚙ Турбо 1/2: scene blocking (~10-30с)…';
+        _autoUpdateFloatingWidget();
+        showToast('⚙ Турбо 1/2: scene blocking…', 4000);
+        try {
+          if (typeof generateSceneBlocking === 'function') await generateSceneBlocking();
+        } catch (e) {
+          // Clean up the floating widget before bailing.
+          AUTO.active = false;
+          _autoUnregisterRun(AUTO);
+          _autoUpdateStatusUI();
+          showToast('✗ Не удалось сгенерить blocking: ' + (e.message || e), 6000);
+          return;
+        }
       }
+      if (!hasBatchPrompts) {
+        AUTO.lastStatus = '⚙ Турбо 2/2: batch JSON (~15-30с)…';
+        _autoUpdateFloatingWidget();
+        showToast('⚙ Турбо 2/2: batch JSON эпизода…', 4000);
+        try {
+          if (typeof rebuildBatchPrompts === 'function') await rebuildBatchPrompts();
+        } catch (e) {
+          AUTO.active = false;
+          _autoUnregisterRun(AUTO);
+          _autoUpdateStatusUI();
+          showToast('✗ Не удалось собрать batch JSON: ' + (e.message || e), 6000);
+          return;
+        }
+      }
+      // Final prep tick before segment-building / confirm dialog.
+      if (needPrep) {
+        AUTO.lastStatus = '⚙ Турбо: считаю сегменты…';
+        _autoUpdateFloatingWidget();
+      }
+    } catch (e) {
+      // Shouldn't reach here (inner try/catch handles per-step), but defense.
+      AUTO.active = false;
+      _autoUnregisterRun(AUTO);
+      _autoUpdateStatusUI();
+      throw e;
     }
   }
   AUTO.errorMode = (localStorage.getItem('auto_error_mode') || 'heal');
@@ -6838,6 +6882,11 @@ async function startAutoMode() {
       skipped: skippedCount,
       script_len: (document.getElementById('ep-script')?.value || '').length,
     });
+    // If we registered the AUTO run for Turbo prep, unregister so the
+    // floating widget disappears.
+    AUTO.active = false;
+    _autoUnregisterRun(AUTO);
+    _autoUpdateStatusUI();
     showToast(`⚠ Нет сегментов для генерации${skippedCount ? ` (${skippedCount} помечены как skip)` : ''}`);
     return;
   }
@@ -6875,6 +6924,10 @@ async function startAutoMode() {
     okStyle: 'accent',
   })) {
     clog('WARN', 'auto.bail', { reason: 'main_confirm_cancelled', total: AUTO.total });
+    // Unregister the Turbo-prep run if we registered one upstairs.
+    AUTO.active = false;
+    _autoUnregisterRun(AUTO);
+    _autoUpdateStatusUI();
     return;
   }
 
