@@ -2971,16 +2971,21 @@ def generate_script_batch(sid):
 
     # Pull existing episodes for context. Cap content to keep prompt sane:
     # last 8 episodes verbatim, earlier ones as synopsis-only.
+    # `from_scratch` mode kicks in when the series has no episodes yet — we
+    # write from Эп.1 using ONLY the series bible (title, genre, tone,
+    # audience, world, roster) + user-provided direction.
     existing = sorted([e for e in list_episodes(sid) if e.get('script')], key=lambda e: e.get('number', 0))
-    if not existing:
-        return jsonify({'error': 'в сериале нет существующих эпизодов с написанным сценарием — нечего продолжать'}), 400
-    last_num = existing[-1].get('number', 0)
+    from_scratch = not existing
+    if from_scratch:
+        last_num = 0
+    else:
+        last_num = existing[-1].get('number', 0)
     first_new_num = last_num + 1
     last_new_num = last_num + count
 
-    # Context window
-    verbatim_window = existing[-8:]
-    earlier = existing[:-8]
+    # Context window (skipped in from-scratch mode — no prior episodes)
+    verbatim_window = existing[-8:] if not from_scratch else []
+    earlier = existing[:-8] if not from_scratch else []
     earlier_block = ''
     if earlier:
         earlier_lines = []
@@ -2994,60 +2999,109 @@ def generate_script_batch(sid):
     verbatim_block = '\n\n'.join(
         f"=== Эп.{e.get('number')}: {(e.get('title') or '').strip()} ===\n{(e.get('script') or '')[:6000]}"
         for e in verbatim_window
-    )
+    ) if verbatim_window else ''
 
     # Roster of known entities so the generated script reuses them by name.
     chars_list = ', '.join(c.get('name', '') for c in (s.get('characters') or []) if c.get('name'))[:1000]
     locs_list  = ', '.join(l.get('name', '') for l in (s.get('locations') or []) if l.get('name'))[:1000]
     items_list = ', '.join(it.get('name', '') for it in (s.get('items') or []) if it.get('name'))[:1000]
 
-    direction_block = f"\nЖЕЛАЕМОЕ НАПРАВЛЕНИЕ СЮЖЕТА ОТ ПОЛЬЗОВАТЕЛЯ:\n{direction}\n" if direction else (
-        "\nПОЛЬЗОВАТЕЛЬ НЕ УКАЗАЛ НАПРАВЛЕНИЕ — придумай развитие сам, опираясь на открытые сюжетные линии "
-        "из последних серий, нерешённые загадки, и эмоциональные арки персонажей. Не повторяй уже произошедшее.\n"
-    )
+    if from_scratch:
+        # From-scratch needs a real direction OR a decent synopsis — without
+        # either we're writing fanfic with no idea what the series is about.
+        if not direction and not (s.get('synopsis') or '').strip():
+            return jsonify({
+                'error': 'У сериала нет ни синопсиса в Bible, ни направления от тебя — '
+                         'не из чего писать первую серию. Заполни синопсис в Bible '
+                         'или укажи направление сюжета в поле «Куда сюжет идёт дальше».'
+            }), 400
+        direction_block = (
+            f"\nЭТО СТАРТ СЕРИАЛА — пишешь С НУЛЯ, Эп.1–{count}.\n"
+            f"СИНОПСИС / IDEA СЕРИАЛА:\n{(s.get('synopsis') or '').strip() or '(не задан в Bible)'}\n"
+        )
+        if direction:
+            direction_block += f"\nНАПРАВЛЕНИЕ ОТ ПОЛЬЗОВАТЕЛЯ:\n{direction}\n"
+        direction_block += (
+            "\nТРЕБОВАНИЯ К ПИЛОТУ (Эп.1):\n"
+            "- Открой сериал hook'ом за первые 5 секунд (визуальный шок, провокационная фраза, "
+            "  острый конфликт). НЕ начинай с экспозиции.\n"
+            "- Представь главных героев через действие, не через рассказ о них.\n"
+            "- Заложи центральный конфликт + 1-2 побочные сюжетные линии для будущих серий.\n"
+            "- Финал пилота — мощный cliffhanger, после которого хочется смотреть Эп.2.\n"
+        )
+        if count > 1:
+            direction_block += (
+                "\nТРЕБОВАНИЯ К ДУГЕ:\n"
+                f"- За {count} серий построй полный мини-арк: пилот → нарастающие осложнения → "
+                "точка невозврата → кульминация → финал последней серии (либо завершение арки, "
+                "либо большой cliffhanger для продолжения).\n"
+                "- Каждая серия развивает не менее одной сюжетной линии. Не дублируй конфликты.\n"
+            )
+    elif direction:
+        direction_block = f"\nЖЕЛАЕМОЕ НАПРАВЛЕНИЕ СЮЖЕТА ОТ ПОЛЬЗОВАТЕЛЯ:\n{direction}\n"
+    else:
+        direction_block = (
+            "\nПОЛЬЗОВАТЕЛЬ НЕ УКАЗАЛ НАПРАВЛЕНИЕ — придумай развитие сам, опираясь на открытые сюжетные линии "
+            "из последних серий, нерешённые загадки, и эмоциональные арки персонажей. Не повторяй уже произошедшее.\n"
+        )
 
+    mode_label = 'старт сериала с нуля' if from_scratch else 'продолжение существующего сериала'
     system = (
-        "Ты — сценарист короткой драмы для вертикального TikTok/Reels. Пишешь продолжение существующего "
-        "сериала на N серий. Каждая серия = ~1 минута экрана = ~12-15 чанков диалога/действия. Формат: "
+        f"Ты — сценарист короткой драмы для вертикального TikTok/Reels. Пишешь {mode_label} на N серий. "
+        "Каждая серия = ~1 минута экрана = ~12-15 чанков диалога/действия. Формат: "
         "имена ВЕРХНИМ регистром перед репликами, диалог короткий и накалённый, обязательный cliffhanger "
         "в конце КАЖДОЙ серии (открытый вопрос или новая угроза которая толкает к следующей).\n\n"
-        "ПРАВИЛА ПРОДОЛЖЕНИЯ:\n"
-        "1. Используй СУЩЕСТВУЮЩИХ персонажей и локации из roster (имена дословно). Новых вводи только "
-        "если без них не обойтись по сюжету.\n"
-        "2. Сохраняй tone и стиль предыдущих серий — посмотри последние 8 серий для калибровки.\n"
-        "3. Каждая серия должна иметь свой arc (начало → обострение → cliffhanger), но быть частью общей дуги.\n"
-        "4. Не повторяй уже произошедшие события дословно — двигай сюжет вперёд.\n"
-        "5. Используй существующие сюжетные предметы (items) когда они уместны.\n"
-        "6. Открытые линии из предыдущих серий — либо двигай их, либо логично откладывай.\n\n"
-        "ФОРМАТ ВЫХОДА — СТРОГО:\n"
-        f"Episode {first_new_num}: <короткое название серии>\n"
-        f"Кратко: <1-2 предложения о чём серия>\n"
-        f"<реплики и действия персонажей — диалог, action lines>\n"
-        f"\n"
-        f"Episode {first_new_num + 1}: <название>\n"
-        f"Кратко: <синопсис>\n"
-        f"<содержимое>\n"
-        f"\n"
-        f"... и так далее до Episode {last_new_num}.\n\n"
-        f"Каждая серия начинается с СТРОГО строки 'Episode N: <title>' — без других маркеров. "
-        f"Никакой markdown, никаких '===', никаких '#'. Только plain text. Язык — тот же что в "
-        f"предыдущих сериях (русский/английский/смесь — сохраняй стиль).\n\n"
-        f"ВАЖНО: возвращай ТОЛЬКО сценарий, без преамбулы 'Вот сценарий:' и без post-комментариев."
+        + ("ПРАВИЛА ПИЛОТА И СТАРТОВОЙ ДУГИ:\n"
+           "1. Если в roster уже есть персонажи — используй их имена дословно. Если roster пустой — "
+           "сам придумай героев, дай каждому отчётливое имя и личность.\n"
+           "2. Локации: если в roster есть — используй. Если нет — придумай простые однозначные "
+           "(КОФЕЙНЯ, ОФИС, КВАРТИРА БРАТА). Не уходи в фэнтези-сеттинг если жанр reality/драма.\n"
+           "3. Стиль/тон бери из жанра + tone из Bible. Если они пустые — пиши как короткая драма "
+           "для соцсетей: высокая эмоция, простые конфликты, неожиданные повороты.\n"
+           "4. Каждая серия имеет свой arc (начало → обострение → cliffhanger).\n"
+           "5. За {count} серий построй мини-арк со сквозным конфликтом.\n\n"
+            if from_scratch else
+           "ПРАВИЛА ПРОДОЛЖЕНИЯ:\n"
+           "1. Используй СУЩЕСТВУЮЩИХ персонажей и локации из roster (имена дословно). Новых вводи только "
+           "если без них не обойтись по сюжету.\n"
+           "2. Сохраняй tone и стиль предыдущих серий — посмотри последние 8 серий для калибровки.\n"
+           "3. Каждая серия должна иметь свой arc (начало → обострение → cliffhanger), но быть частью общей дуги.\n"
+           "4. Не повторяй уже произошедшие события дословно — двигай сюжет вперёд.\n"
+           "5. Используй существующие сюжетные предметы (items) когда они уместны.\n"
+           "6. Открытые линии из предыдущих серий — либо двигай их, либо логично откладывай.\n\n")
+        + "ФОРМАТ ВЫХОДА — СТРОГО:\n"
+        + f"Episode {first_new_num}: <короткое название серии>\n"
+        + f"Кратко: <1-2 предложения о чём серия>\n"
+        + f"<реплики и действия персонажей — диалог, action lines>\n"
+        + "\n"
+        + f"Episode {first_new_num + 1}: <название>\n"
+        + f"Кратко: <синопсис>\n"
+        + f"<содержимое>\n"
+        + "\n"
+        + f"... и так далее до Episode {last_new_num}.\n\n"
+        + "Каждая серия начинается с СТРОГО строки 'Episode N: <title>' — без других маркеров. "
+        + "Никакой markdown, никаких '===', никаких '#'. Только plain text. "
+        + ("Язык по контексту: если синопсис/направление на русском — пишем по-русски; "
+           "если на английском — по-английски.\n\n" if from_scratch else
+           "Язык — тот же что в предыдущих сериях (русский/английский/смесь — сохраняй стиль).\n\n")
+        + "ВАЖНО: возвращай ТОЛЬКО сценарий, без преамбулы 'Вот сценарий:' и без post-комментариев."
     )
     user_msg = (
         f"СЕРИАЛ: «{s.get('title') or 'untitled'}»\n"
         f"Жанр: {s.get('genre') or '?'} · Тон: {s.get('tone') or '?'} · "
         f"Аудитория: {s.get('target_audience') or '?'}\n"
-        f"{('Мир: ' + s.get('world_description')[:300] + chr(10)) if s.get('world_description') else ''}\n"
-        f"ROSTER ПЕРСОНАЖЕЙ: {chars_list or '(пусто)'}\n"
-        f"ROSTER ЛОКАЦИЙ:    {locs_list or '(пусто)'}\n"
+        f"{('Мир: ' + (s.get('world_description') or '')[:300] + chr(10)) if s.get('world_description') else ''}"
+        f"ROSTER ПЕРСОНАЖЕЙ: {chars_list or '(пусто — можешь придумать сам)' if from_scratch else (chars_list or '(пусто)')}\n"
+        f"ROSTER ЛОКАЦИЙ:    {locs_list or '(пусто — придумай простые)' if from_scratch else (locs_list or '(пусто)')}\n"
         f"СЮЖЕТНЫЕ ПРЕДМЕТЫ: {items_list or '(пусто)'}\n\n"
         f"{earlier_block}"
-        f"ПОСЛЕДНИЕ {len(verbatim_window)} СЕРИЙ (verbatim, для тонкой калибровки стиля и continuity):\n"
-        f"```\n{verbatim_block}\n```\n\n"
-        f"{direction_block}\n"
-        f"НАПИШИ СЛЕДУЮЩИЕ {count} СЕРИЙ (Эп.{first_new_num}–{last_new_num}). "
-        f"Каждая ~12-15 коротких реплик/действий, обязательно cliffhanger в конце."
+        + (f"ПОСЛЕДНИЕ {len(verbatim_window)} СЕРИЙ (verbatim, для тонкой калибровки стиля и continuity):\n```\n{verbatim_block}\n```\n\n"
+           if verbatim_block else '')
+        + f"{direction_block}\n"
+        + (f"НАПИШИ ПЕРВЫЕ {count} СЕРИЙ (Эп.{first_new_num}–{last_new_num}). "
+            if from_scratch else
+           f"НАПИШИ СЛЕДУЮЩИЕ {count} СЕРИЙ (Эп.{first_new_num}–{last_new_num}). ")
+        + "Каждая ~12-15 коротких реплик/действий, обязательно cliffhanger в конце."
     )
     try:
         # Allow up to 24K output for 5+ episodes.
@@ -3065,6 +3119,7 @@ def generate_script_batch(sid):
             'first_episode': first_new_num,
             'last_episode':  last_new_num,
             'count': count,
+            'from_scratch': from_scratch,
         })
     except Exception as e:
         _log_event('WARN', 'generate_script_batch_fail', err=str(e)[:200])

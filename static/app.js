@@ -1210,6 +1210,45 @@ function setAppendMode(mode) {
   if (genBtn)   genBtn.classList.toggle('active', isGen);
   if (genBlock) genBlock.style.display = isGen ? '' : 'none';
   if (pasteHelp) pasteHelp.style.display = isGen ? 'none' : '';
+
+  // Adapt the generate-mode help text + direction-field label/placeholder
+  // based on whether the series already has episodes. From-scratch (no eps)
+  // needs a starting brief; continuation needs a direction hint.
+  if (isGen) {
+    const existingCount = (S.episodes || []).filter(e => (e.script || '').trim()).length;
+    const fromScratch = existingCount === 0;
+    const help = document.getElementById('append-gen-help');
+    const dirLabel = document.getElementById('append-gen-direction-label');
+    const dirField = document.getElementById('append-gen-direction');
+    const dirHint = document.getElementById('append-gen-direction-hint');
+    if (fromScratch) {
+      if (help) help.innerHTML =
+        '<strong style="color:#fbbf24">🆕 Сериал пустой — будем писать с нуля.</strong> ' +
+        'Claude напишет первые серии используя жанр / тон / синопсис из Bible (если заполнены) + твоё описание. ' +
+        'После генерации текст ляжет в textarea — можно его проверить на логику, отредактировать и добавить в сериал.';
+      if (dirLabel) dirLabel.textContent = 'О чём сериал · какая завязка · кто герои';
+      if (dirField) dirField.placeholder =
+        'Опиши идею сериала и старт сюжета. Например:\n' +
+        '«Молодая мать узнаёт что её ребёнок поменян в роддоме. Настоящего ребёнка воспитывает богатая семья. ' +
+        'Она устраивается к ним домработницей чтобы быть рядом — но влюбляется в отчима. Cliffhanger пилота: ' +
+        'муж богатой семьи узнаёт её, потому что это его бывшая.»\n\n' +
+        'Чем конкретнее — тем точнее. Можно указать главных героев, центральный конфликт, тон.';
+      if (dirHint) dirHint.innerHTML =
+        '💡 Если оставить пустым — Claude возьмёт <strong>синопсис из Bible</strong> сериала. ' +
+        'Если и там пусто — запрос не пройдёт.';
+    } else {
+      if (help) help.innerHTML =
+        `Claude напишет ${existingCount > 0 ? '<strong>продолжение существующих ' + existingCount + ' серий</strong>' : 'сценарий'} — ` +
+        'использует тех же персонажей и локации, сохранит твой стиль, добавит cliffhanger в каждую серию. ' +
+        'После генерации текст подставится в textarea ниже — там можно его проверить на логику, отредактировать и затем добавить в сериал.';
+      if (dirLabel) dirLabel.textContent = 'Куда сюжет идёт дальше (опционально)';
+      if (dirField) dirField.placeholder =
+        'Например: «Vivian арестовывают, но открывается что её прикрывал Lawrence Cole — Adrian копает компромат на Cole, ' +
+        'Sophie начинает работать с Adrian-ом. Cliffhanger финала: появляется завещание которое никто не видел.»\n\n' +
+        'Если оставить пустым — Claude сам придумает развитие из контекста уже написанных серий.';
+      if (dirHint) dirHint.textContent = 'Чем конкретнее — тем точнее. Можно указать беды/повороты/cliffhanger финала.';
+    }
+  }
 }
 
 // Call Claude to write N new episodes continuing the series. Result lands in
