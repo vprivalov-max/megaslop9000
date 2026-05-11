@@ -2781,6 +2781,72 @@ def import_from_script_logic_check():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/series/import-from-script/apply-fixes', methods=['POST'])
+def import_from_script_apply_fixes():
+    """Apply selected logic-check fixes to the script. Body:
+      {script: str, issues: [{summary, type, episodes, evidence, fix, ...}]}
+    Claude rewrites the script with MINIMAL edits — only addressing the listed
+    issues, preserving everything else verbatim. Returns {script: <new>,
+    changes_summary: <1-line per issue what was changed>}.
+    UI puts the rewritten text back into the textarea and lets the user
+    re-run logic-check until clean."""
+    data = request.json or {}
+    script = (data.get('script') or '').strip()
+    issues = data.get('issues') or []
+    if not script:
+        return jsonify({'error': 'script required'}), 400
+    if not issues or not isinstance(issues, list):
+        return jsonify({'error': 'issues required (non-empty list)'}), 400
+    # Render the fix-list as compact instructions for Claude.
+    fix_lines = []
+    for i, it in enumerate(issues, 1):
+        if not isinstance(it, dict):
+            continue
+        eps = it.get('episodes') or []
+        fix_lines.append(
+            f"{i}. [{it.get('severity','?').upper()}] {it.get('type','?')} · Эп.{','.join(map(str, eps))}\n"
+            f"   PROBLEM:  {it.get('summary','')}\n"
+            f"   EVIDENCE: {it.get('evidence','')}\n"
+            f"   FIX:      {it.get('fix','')}"
+        )
+    fixes_block = '\n\n'.join(fix_lines) or '(no fixes provided)'
+    system = (
+        "You are a surgical script editor for a short-drama TV series. "
+        "Apply the listed logic-fixes to the script with MINIMAL edits. "
+        "Preserve episode boundaries (lines like «Episode 17: Title»), preserve every "
+        "other character and dialogue line verbatim. Only change what's strictly "
+        "needed to address each listed issue (rewrite, add 1-2 lines for setup, "
+        "remove a contradictory line — whichever is most surgical). "
+        "Keep the same language as the original script (Russian if Russian, English if English). "
+        "Output STRICT JSON, no prose, no markdown:\n"
+        '{\n'
+        '  "script":  "the full rewritten script as one string with \\n line breaks",\n'
+        '  "changes": [{"issue_index": int, "summary": "1 sentence what you changed"}]\n'
+        '}\n'
+        "issue_index is the 1-based number from the input list."
+    )
+    user_msg = (
+        f"=== SCRIPT TO PATCH ===\n{script[:60000]}\n\n"
+        f"=== ISSUES TO FIX ===\n{fixes_block}\n\n"
+        "Return the corrected full script + a short list of what you changed. JSON only."
+    )
+    try:
+        raw = claude_ask(user_msg, system=system, max_tokens=16000)
+        parsed = loads_lenient(raw)
+        new_script = parsed.get('script') if isinstance(parsed, dict) else None
+        changes = parsed.get('changes') if isinstance(parsed, dict) else []
+        if not isinstance(new_script, str) or not new_script.strip():
+            return jsonify({'error': 'LLM returned no script', 'raw': raw[:400]}), 500
+        return jsonify({
+            'script':  new_script,
+            'changes': changes if isinstance(changes, list) else [],
+            'applied_count': len(issues),
+        })
+    except Exception as e:
+        _log_event('WARN', 'logic_fix_fail', err=str(e)[:200])
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/series/import-from-script/preview', methods=['POST'])
 def import_from_script_preview():
     """Returns the proposed episode breakdown for a pasted script WITHOUT

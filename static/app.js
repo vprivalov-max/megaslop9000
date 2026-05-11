@@ -1243,15 +1243,21 @@ async function appendPreviewSplit() {
     previewEl.innerHTML = `<div style="color:var(--danger);font-size:0.85rem">Ошибка: ${esc(e?.message || e)}</div>`;
   }
 }
+// Last logic-check result, held in module scope so the «Применить» button can
+// look up which issues are ticked. Cleared every time check re-runs.
+let _appendLogicIssues = [];
+
 async function appendLogicCheck() {
   const script = (document.getElementById('append-script-text')?.value || '').trim();
   const out = document.getElementById('append-script-logic');
   if (!script) { out.innerHTML = '<div style="color:var(--warning);font-size:0.85rem">Сценарий пустой</div>'; return; }
   out.innerHTML = '<div style="font-size:0.85rem;color:var(--muted)"><span class="spinner"></span> Claude читает все серии и ищет противоречия… ~15-40 сек</div>';
+  _appendLogicIssues = [];
   try {
     const r = await api.post('/api/series/import-from-script/logic-check', { script }, { timeoutMs: 120000 });
     if (r.error) throw new Error(r.error);
     const issues = r.issues || [];
+    _appendLogicIssues = issues;
     if (!issues.length) {
       out.innerHTML = `<div style="padding:10px;background:rgba(74,222,128,0.12);border:1px solid rgba(74,222,128,0.35);border-radius:6px;color:#4ade80;font-size:0.85rem">✅ Логика чистая — проанализировано серий: <strong>${r.episodes_analyzed}</strong>. Противоречий не найдено.</div>`;
       return;
@@ -1262,34 +1268,120 @@ async function appendLogicCheck() {
       contradiction:    '⚡ Противоречие',
       plot_hole:        '🕳 Плот-хол',
       forgotten_thread: '🧵 Забытая линия',
-      continuity:      '🔗 Continuity',
-      timeline:        '⏱ Таймлайн',
+      continuity:       '🔗 Continuity',
+      timeline:         '⏱ Таймлайн',
     };
     out.innerHTML = `
-      <div style="font-size:0.85rem;color:var(--muted);margin-bottom:6px">
-        🧠 Найдено проблем: <strong style="color:#fbbf24">${issues.length}</strong>
-        (проанализировано серий: ${r.episodes_analyzed})
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:6px;font-size:0.85rem">
+        <span style="color:var(--muted)">🧠 Найдено проблем:</span>
+        <strong style="color:#fbbf24">${issues.length}</strong>
+        <span style="color:var(--muted)">(серий: ${r.episodes_analyzed})</span>
+        <button class="btn-ghost btn-sm" onclick="appendLogicSelectAll(true)" style="margin-left:auto">✓ Все</button>
+        <button class="btn-ghost btn-sm" onclick="appendLogicSelectAll(false)">✕ Снять</button>
+        <button class="btn-accent btn-sm" onclick="appendLogicApply(this)" title="Claude перепишет сценарий минимально, только исправив выделенные проблемы. Результат подставится в textarea — после этого можно снова «Проверить логику».">🩹 Полечить выбранные</button>
       </div>
-      <div style="max-height:320px;overflow-y:auto;border:1px solid var(--border);border-radius:6px;background:var(--surface2)">
-        ${issues.map((it, i) => `
-          <div style="padding:10px 12px;border-bottom:1px solid var(--border);font-size:0.82rem">
-            <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
-              <span style="background:${sevColor[it.severity] || '#9ca3af'};color:#000;padding:2px 6px;border-radius:4px;font-weight:700;font-size:0.7rem">${sevLabel[it.severity] || it.severity || '?'}</span>
-              <span style="color:var(--muted)">${esc(typeLabel[it.type] || it.type || '')}</span>
-              <span style="color:var(--accent);font-weight:600;margin-left:auto">Эп. ${(it.episodes || []).join(', ')}</span>
+      <div style="max-height:340px;overflow-y:auto;border:1px solid var(--border);border-radius:6px;background:var(--surface2)">
+        ${issues.map((it, i) => {
+          const presetChecked = (it.severity === 'critical' || it.severity === 'high') ? 'checked' : '';
+          return `
+          <label style="display:flex;gap:10px;padding:10px 12px;border-bottom:1px solid var(--border);font-size:0.82rem;cursor:pointer" data-logic-issue="${i}">
+            <input type="checkbox" class="logic-issue-cb" data-idx="${i}" ${presetChecked} style="margin-top:3px;width:16px;height:16px;flex:0 0 16px;accent-color:#10b981">
+            <div style="flex:1;min-width:0">
+              <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;flex-wrap:wrap">
+                <span style="background:${sevColor[it.severity] || '#9ca3af'};color:#000;padding:2px 6px;border-radius:4px;font-weight:700;font-size:0.7rem">${sevLabel[it.severity] || it.severity || '?'}</span>
+                <span style="color:var(--muted)">${esc(typeLabel[it.type] || it.type || '')}</span>
+                <span style="color:var(--accent);font-weight:600;margin-left:auto">Эп. ${(it.episodes || []).join(', ')}</span>
+              </div>
+              <div style="color:var(--text);font-weight:600;margin-bottom:3px">${esc(it.summary || '')}</div>
+              ${it.evidence ? `<div style="color:var(--muted);font-style:italic;font-size:0.78rem;margin-bottom:3px">«${esc(it.evidence)}»</div>` : ''}
+              ${it.fix ? `<div style="color:#4ade80;font-size:0.78rem">→ ${esc(it.fix)}</div>` : ''}
             </div>
-            <div style="color:var(--text);font-weight:600;margin-bottom:3px">${esc(it.summary || '')}</div>
-            ${it.evidence ? `<div style="color:var(--muted);font-style:italic;font-size:0.78rem;margin-bottom:3px">«${esc(it.evidence)}»</div>` : ''}
-            ${it.fix ? `<div style="color:#4ade80;font-size:0.78rem">→ ${esc(it.fix)}</div>` : ''}
-          </div>
-        `).join('')}
+          </label>`;
+        }).join('')}
       </div>
       <div style="margin-top:6px;font-size:0.78rem;color:var(--muted)">
-        💡 Поправь сценарий в textarea выше, потом снова жми «Проверить логику» или просто «Добавить серии» если ок.
+        💡 Поставь галочки на тех проблемах что хочешь починить → «🩹 Полечить выбранные». Critical/High по умолчанию уже отмечены. Можно править textarea вручную и снова жать «Проверить логику».
       </div>`;
   } catch (e) {
     out.innerHTML = `<div style="color:var(--danger);font-size:0.85rem">Ошибка: ${esc(e?.message || e)}</div>`;
   }
+}
+
+function appendLogicSelectAll(val) {
+  document.querySelectorAll('.logic-issue-cb').forEach(cb => { cb.checked = val; });
+}
+
+async function appendLogicApply(btn) {
+  const ta = document.getElementById('append-script-text');
+  const script = (ta?.value || '').trim();
+  if (!script) { showToast('Сценарий пустой', 3000); return; }
+  const selected = [...document.querySelectorAll('.logic-issue-cb:checked')]
+    .map(cb => _appendLogicIssues[parseInt(cb.dataset.idx, 10)])
+    .filter(Boolean);
+  if (!selected.length) {
+    showToast('Не выделено ни одной проблемы для лечения', 3000);
+    return;
+  }
+  if (!await appConfirm({
+    title: '🩹 Полечить выделенные проблемы?',
+    message: `Будет переписано: ${selected.length} проблем(ы).\n\n` +
+             `Claude сделает минимальные правки — оставит всё остальное как есть. ` +
+             `Получившийся сценарий заменит текущий в textarea (но в любой момент можно нажать Cmd+Z).`,
+    okText: '🩹 Полечить',
+    cancelText: 'Отмена',
+    okStyle: 'accent',
+  })) return;
+  const orig = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span> Claude переписывает… ~30-60 сек';
+  try {
+    const r = await api.post('/api/series/import-from-script/apply-fixes',
+      { script, issues: selected },
+      { timeoutMs: 180000 });
+    if (r.error) throw new Error(r.error);
+    if (!r.script) throw new Error('пустой ответ');
+    // Save undo snapshot (Cmd+Z would only undo characters typed by user; this
+    // is a programmatic replace and bypasses native undo). Stash in dataset.
+    ta.dataset.preFixSnapshot = script;
+    ta.value = r.script;
+    appendUpdateStats();
+    const changes = r.changes || [];
+    const changesHtml = changes.length
+      ? changes.map(c => `<li><strong>#${c.issue_index || '?'}:</strong> ${esc(c.summary || '')}</li>`).join('')
+      : '<li>(no per-issue summary returned)</li>';
+    const out = document.getElementById('append-script-logic');
+    if (out) {
+      out.innerHTML = `
+        <div style="padding:10px 12px;background:rgba(16,185,129,0.10);border:1px solid rgba(16,185,129,0.35);border-radius:6px;font-size:0.82rem">
+          <div style="color:#10b981;font-weight:700;margin-bottom:6px">✓ Применено ${r.applied_count} правок. Что изменилось:</div>
+          <ul style="margin:6px 0 6px 18px;color:var(--text)">${changesHtml}</ul>
+          <div style="display:flex;gap:8px;margin-top:8px">
+            <button class="btn-ghost btn-sm" onclick="appendLogicUndo()" title="Вернуть текст до правок">↶ Отменить</button>
+            <button class="btn-accent btn-sm" onclick="appendLogicCheck()" title="Перепроверить новый текст на оставшиеся проблемы">🧠 Проверить ещё раз</button>
+          </div>
+        </div>`;
+    }
+    showToast(`✓ Применено ${r.applied_count} правок`, 5000);
+  } catch (e) {
+    showToast('Ошибка лечения: ' + (e?.message || e), 6000);
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = orig;
+  }
+}
+
+function appendLogicUndo() {
+  const ta = document.getElementById('append-script-text');
+  if (!ta || !ta.dataset.preFixSnapshot) {
+    showToast('Нет снапшота для отката', 3000);
+    return;
+  }
+  ta.value = ta.dataset.preFixSnapshot;
+  delete ta.dataset.preFixSnapshot;
+  appendUpdateStats();
+  showToast('↶ Откачено к версии до правок', 3000);
+  const out = document.getElementById('append-script-logic');
+  if (out) out.innerHTML = '';
 }
 
 async function appendScriptGo() {
