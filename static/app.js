@@ -1259,6 +1259,12 @@ async function appendGenerateScript(btn) {
   const count = parseInt(document.getElementById('append-gen-count')?.value, 10) || 5;
   if (count < 1 || count > 20) { showToast('Количество серий: 1-20', 4000); return; }
   const direction = (document.getElementById('append-gen-direction')?.value || '').trim();
+  // Optional advanced parameters — empty = let Claude decide.
+  const durationSecRaw = (document.getElementById('append-gen-duration-sec')?.value || '').trim();
+  const linesCountRaw  = (document.getElementById('append-gen-lines-count')?.value || '').trim();
+  const styleVal = (document.getElementById('append-gen-style')?.value || '').trim();
+  const durationSec = durationSecRaw ? Math.max(30, Math.min(240, parseInt(durationSecRaw, 10))) : null;
+  const linesCount  = linesCountRaw  ? Math.max(3, Math.min(40, parseInt(linesCountRaw, 10)))   : null;
   const ta = document.getElementById('append-script-text');
   const statusEl = document.getElementById('append-gen-status');
   if (ta && ta.value.trim() && !await appConfirm({
@@ -1277,7 +1283,7 @@ async function appendGenerateScript(btn) {
   try {
     const r = await api.post(
       `/api/series/${S.seriesId}/generate-script-batch`,
-      { count, direction },
+      { count, direction, duration_sec: durationSec, lines_count: linesCount, style: styleVal },
       { timeoutMs: 600_000 },
     );
     if (r.error) throw new Error(r.error);

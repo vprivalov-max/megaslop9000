@@ -1188,6 +1188,30 @@
           <input type="number" id="append-gen-count" min="1" max="20" value="5" style="width:80px">
           <span style="font-size:0.78rem;color:var(--muted);margin-left:8px">~30-90с на серию · до 20 за раз</span>
         </div>
+        <details style="margin:0 0 12px;background:rgba(132,94,247,0.04);border:1px solid rgba(132,94,247,0.15);border-radius:8px;padding:8px 12px">
+          <summary style="cursor:pointer;font-size:0.85rem;color:var(--muted);user-select:none">⚙ Дополнительные параметры (длина серии, кол-во реплик)</summary>
+          <div style="display:flex;gap:14px;flex-wrap:wrap;margin-top:10px;align-items:flex-end">
+            <div class="field-group" style="margin:0">
+              <label style="font-size:0.82rem">⏱ Длина серии (сек)</label>
+              <input type="number" id="append-gen-duration-sec" min="30" max="240" placeholder="auto" style="width:100px">
+              <div style="font-size:0.74rem;color:var(--muted);margin-top:3px">по умолчанию ~60с (1 минута)</div>
+            </div>
+            <div class="field-group" style="margin:0">
+              <label style="font-size:0.82rem">💬 Реплик на серию</label>
+              <input type="number" id="append-gen-lines-count" min="3" max="40" placeholder="auto" style="width:100px">
+              <div style="font-size:0.74rem;color:var(--muted);margin-top:3px">по умолчанию ~12-15</div>
+            </div>
+            <div class="field-group" style="margin:0;flex:1;min-width:200px">
+              <label style="font-size:0.82rem">🎬 Стиль реплик</label>
+              <select id="append-gen-style" style="width:100%">
+                <option value="">auto — Claude решает</option>
+                <option value="short_punchy">короткие, рваные (TikTok ритм)</option>
+                <option value="balanced">сбалансированные</option>
+                <option value="long_meaty">длинные, насыщенные</option>
+              </select>
+            </div>
+          </div>
+        </details>
         <div class="field-group">
           <label id="append-gen-direction-label">Куда сюжет идёт дальше (опционально)</label>
           <textarea id="append-gen-direction" rows="4"></textarea>

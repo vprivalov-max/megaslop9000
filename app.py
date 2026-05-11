@@ -3247,6 +3247,30 @@ def generate_script_batch(sid):
     body = request.json or {}
     count = max(1, min(20, int(body.get('count') or 5)))
     direction = (body.get('direction') or '').strip()
+    # Optional advanced parameters — empty/None = Claude decides.
+    duration_sec_raw = body.get('duration_sec')
+    lines_count_raw  = body.get('lines_count')
+    try:
+        duration_sec = int(duration_sec_raw) if duration_sec_raw not in (None, '', 0) else None
+        if duration_sec is not None: duration_sec = max(30, min(240, duration_sec))
+    except (TypeError, ValueError):
+        duration_sec = None
+    try:
+        lines_count = int(lines_count_raw) if lines_count_raw not in (None, '', 0) else None
+        if lines_count is not None: lines_count = max(3, min(40, lines_count))
+    except (TypeError, ValueError):
+        lines_count = None
+    style_preset = (body.get('style') or '').strip()
+    # Style presets translated to Claude-friendly directives.
+    _STYLE_PRESETS = {
+        'short_punchy': 'Реплики КОРОТКИЕ и рваные (1-7 слов). TikTok-ритм: быстрые удары, шок-фразы, paus'
+                        'е через действие. Никаких длинных монологов. Цель — макс эмоциональная плотность.',
+        'balanced':     'Реплики СБАЛАНСИРОВАННЫЕ (5-15 слов). Средний темп. Можно изредка длинные эмоциональные '
+                        'удары, основное — короткие.',
+        'long_meaty':   'Реплики ДЛИННЫЕ и насыщенные (10-25 слов). Эмоциональные монологи, развёрнутые откровения, '
+                        'весомые угрозы. Подходит для драматических кульминаций.',
+    }
+    style_clause = _STYLE_PRESETS.get(style_preset, '')
 
     # Pull existing episodes for context. Cap content to keep prompt sane:
     # last 8 episodes verbatim, earlier ones as synopsis-only.
@@ -3325,11 +3349,33 @@ def generate_script_batch(sid):
         )
 
     mode_label = 'старт сериала с нуля' if from_scratch else 'продолжение существующего сериала'
+    # Compute effective length / lines targets. Speech delivery ≈ 3.8 wps
+    # (matches the SPEECH_WPS calibration in the segmenter). Default episode
+    # = ~60s ≈ 12-15 lines (user-tunable). If user specifies one but not the
+    # other, we derive a sensible default for the missing one so Claude has
+    # a coherent target.
+    eff_duration = duration_sec if duration_sec else 60
+    if lines_count:
+        eff_lines = lines_count
+    else:
+        # Roughly: 1 line ≈ 4-5s of screen (dialogue + action beat). So a
+        # 60s episode ~ 12-15 lines; 90s ~ 18-22; 30s ~ 6-8.
+        eff_lines = max(3, min(40, round(eff_duration / 4.5)))
+    lines_range_word = (
+        f"{max(3, eff_lines-2)}-{eff_lines+2}"  # ±2 wiggle so Claude isn't pinned to exact number
+    )
+    length_clause = (
+        f"Каждая серия ≈ {eff_duration}с экрана ≈ {lines_range_word} реплик/действий. "
+        if (duration_sec or lines_count) else
+        f"Каждая серия = ~1 минута экрана ≈ {lines_range_word} реплик/действий. "
+    )
+    style_block = (f"\nСТИЛЬ РЕПЛИК: {style_clause}\n" if style_clause else '')
     system = (
         f"Ты — сценарист короткой драмы для вертикального TikTok/Reels. Пишешь {mode_label} на N серий. "
-        "Каждая серия = ~1 минута экрана = ~12-15 чанков диалога/действия. Формат: "
+        f"{length_clause}Формат: "
         "имена ВЕРХНИМ регистром перед репликами, диалог короткий и накалённый, обязательный cliffhanger "
-        "в конце КАЖДОЙ серии (открытый вопрос или новая угроза которая толкает к следующей).\n\n"
+        "в конце КАЖДОЙ серии (открытый вопрос или новая угроза которая толкает к следующей).\n"
+        f"{style_block}\n"
         + ("ПРАВИЛА ПИЛОТА И СТАРТОВОЙ ДУГИ:\n"
            "1. Если в roster уже есть персонажи — используй их имена дословно. Если roster пустой — "
            "сам придумай героев, дай каждому отчётливое имя и личность.\n"
@@ -3380,7 +3426,7 @@ def generate_script_batch(sid):
         + (f"НАПИШИ ПЕРВЫЕ {count} СЕРИЙ (Эп.{first_new_num}–{last_new_num}). "
             if from_scratch else
            f"НАПИШИ СЛЕДУЮЩИЕ {count} СЕРИЙ (Эп.{first_new_num}–{last_new_num}). ")
-        + "Каждая ~12-15 коротких реплик/действий, обязательно cliffhanger в конце."
+        + f"Каждая ≈ {eff_duration}с экрана / {lines_range_word} реплик-действий, обязательно cliffhanger в конце."
     )
     try:
         # Allow up to 24K output for 5+ episodes.
