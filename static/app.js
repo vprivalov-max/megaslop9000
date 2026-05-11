@@ -1186,8 +1186,81 @@ function openAppendScript() {
   if (ta) ta.value = '';
   const previewEl = document.getElementById('append-script-preview');
   if (previewEl) previewEl.innerHTML = '';
+  const logicEl = document.getElementById('append-script-logic');
+  if (logicEl) logicEl.innerHTML = '';
+  const statusEl = document.getElementById('append-gen-status');
+  if (statusEl) statusEl.textContent = '';
+  // Default to paste mode each time the modal opens.
+  setAppendMode('paste');
   appendUpdateStats();
   openModal('modal-append-script');
+}
+
+// Switch between «📋 Вставить готовый» and «✨ Сгенерировать новые» modes.
+// In generate mode the top section unfolds with form + ✨ button. The bottom
+// textarea+preview+logic-check stays visible in BOTH modes because generated
+// script lands in the same textarea — user reviews/edits it before commit.
+function setAppendMode(mode) {
+  const pasteBtn = document.getElementById('append-mode-paste-btn');
+  const genBtn   = document.getElementById('append-mode-generate-btn');
+  const genBlock = document.getElementById('append-generate-block');
+  const pasteHelp = document.getElementById('append-paste-help');
+  const isGen = mode === 'generate';
+  if (pasteBtn) pasteBtn.classList.toggle('active', !isGen);
+  if (genBtn)   genBtn.classList.toggle('active', isGen);
+  if (genBlock) genBlock.style.display = isGen ? '' : 'none';
+  if (pasteHelp) pasteHelp.style.display = isGen ? 'none' : '';
+}
+
+// Call Claude to write N new episodes continuing the series. Result lands in
+// the textarea so user can preview/logic-check/edit/commit via the existing
+// paste-flow buttons (no separate commit path — same «Добавить серии»).
+async function appendGenerateScript(btn) {
+  if (!S.seriesId) { showToast('Открой сериал'); return; }
+  const count = parseInt(document.getElementById('append-gen-count')?.value, 10) || 5;
+  if (count < 1 || count > 20) { showToast('Количество серий: 1-20', 4000); return; }
+  const direction = (document.getElementById('append-gen-direction')?.value || '').trim();
+  const ta = document.getElementById('append-script-text');
+  const statusEl = document.getElementById('append-gen-status');
+  if (ta && ta.value.trim() && !await appConfirm({
+    title: 'Перезаписать содержимое textarea?',
+    message: `В textarea ниже уже есть текст (${ta.value.length} символов). Сгенерированный сценарий заменит его. Продолжить?`,
+    okText: 'Да, перезаписать',
+    cancelText: 'Отмена',
+    okStyle: 'accent',
+  })) return;
+
+  const orig = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span> Claude пишет…';
+  if (statusEl) statusEl.innerHTML = `<span class="spinner"></span> Генерирую ${count} серий… ~${30 * count}-${90 * count}с`;
+
+  try {
+    const r = await api.post(
+      `/api/series/${S.seriesId}/generate-script-batch`,
+      { count, direction },
+      { timeoutMs: 600_000 },
+    );
+    if (r.error) throw new Error(r.error);
+    if (!r.script) throw new Error('пустой ответ');
+    if (ta) {
+      ta.value = r.script;
+      appendUpdateStats();
+    }
+    if (statusEl) {
+      statusEl.innerHTML = `<span style="color:#4ade80">✓ Сгенерировано ${r.count} серий (№${r.first_episode}–${r.last_episode}). ` +
+                          `Можно: 🧠 Проверить логику · 👁 Превью разбивки · 📜 Добавить серии</span>`;
+    }
+    // Auto-switch to paste mode so user sees the textarea + preview/logic buttons.
+    setAppendMode('paste');
+    showToast(`✓ Сгенерировано ${r.count} серий — проверяй и добавляй`, 6000);
+  } catch (e) {
+    if (statusEl) statusEl.innerHTML = `<span style="color:#f87171">✗ Ошибка: ${esc(e?.message || e)}</span>`;
+    showToast('Ошибка генерации: ' + (e?.message || e), 6000);
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = orig;
+  }
 }
 function appendDropFile(ev) {
   const file = ev.dataTransfer?.files?.[0];

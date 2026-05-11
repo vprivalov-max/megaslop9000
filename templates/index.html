@@ -1166,7 +1166,39 @@
       <button class="btn-icon" onclick="closeModal('modal-append-script')">✕</button>
     </div>
     <div class="modal-body">
-      <p style="color:var(--muted);font-size:0.85rem;margin-top:0">
+      <!-- Mode toggle: paste existing vs generate new -->
+      <div style="display:flex;gap:6px;margin-bottom:14px;background:var(--surface2);padding:4px;border-radius:8px;border:1px solid var(--border)">
+        <button type="button" class="btn-mode-pill active" id="append-mode-paste-btn" onclick="setAppendMode('paste')" style="flex:1">
+          📋 Вставить готовый
+        </button>
+        <button type="button" class="btn-mode-pill" id="append-mode-generate-btn" onclick="setAppendMode('generate')" style="flex:1">
+          ✨ Сгенерировать новые
+        </button>
+      </div>
+
+      <!-- ─── GENERATE MODE ─── (hidden by default) -->
+      <div id="append-generate-block" style="display:none">
+        <p style="color:var(--muted);font-size:0.85rem;margin-top:0">
+          Claude напишет сценарий на нужное количество серий — продолжит сюжет существующих, использует тех же персонажей и локации, и сохранит твой стиль. После генерации текст подставится в textarea ниже — там можно его проверить на логику, отредактировать и затем добавить в сериал.
+        </p>
+        <div class="field-group">
+          <label>Сколько серий сгенерировать</label>
+          <input type="number" id="append-gen-count" min="1" max="20" value="5" style="width:80px">
+          <span style="font-size:0.78rem;color:var(--muted);margin-left:8px">~30-90с на серию · до 20 за раз</span>
+        </div>
+        <div class="field-group">
+          <label>Куда сюжет идёт дальше (опционально)</label>
+          <textarea id="append-gen-direction" rows="4" placeholder="Например: «Vivian арестовывают, но открывается что её прикрывал Lawrence Cole — Adrian копает компромат на Cole, Sophie начинает работать с Adrian-ом. Cliffhanger финала: появляется завещание которое никто не видел.»&#10;&#10;Если оставить пустым — Claude сам придумает развитие из контекста уже написанных серий."></textarea>
+          <div style="font-size:0.76rem;color:var(--muted);margin-top:4px">Чем конкретнее — тем точнее. Можно указать беды/повороты/cliffhanger финала.</div>
+        </div>
+        <div style="display:flex;gap:8px;justify-content:flex-end;margin-bottom:14px">
+          <button class="btn-accent" id="append-gen-start-btn" onclick="appendGenerateScript(this)">✨ Сгенерировать сценарий</button>
+        </div>
+        <div id="append-gen-status" style="font-size:0.85rem;color:var(--muted);margin-bottom:10px"></div>
+      </div>
+
+      <!-- ─── PASTE MODE / GENERATED RESULT ─── -->
+      <p id="append-paste-help" style="color:var(--muted);font-size:0.85rem;margin-top:0">
         Вставь готовый сценарий — он автоматически разобьётся на серии (нумерация продолжится с текущей),
         в фоне извлекутся персонажи, локации и предметы. Когда экстракция закончится — серии готовы к видео-генерации.
       </p>

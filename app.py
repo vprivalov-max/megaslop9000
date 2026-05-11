@@ -2948,6 +2948,126 @@ def import_status(sid):
     return jsonify(_import_status(sid))
 
 
+@app.route('/api/series/<sid>/generate-script-batch', methods=['POST'])
+def generate_script_batch(sid):
+    """Generate N new episodes for an existing series. Returns the generated
+    text as ONE multi-episode script (with «Episode N:» headers) ready to be
+    pasted into the append-flow textarea. After generation user can preview-
+    split, logic-check, fix, and commit via /append-from-script.
+
+    Body: {count: int, direction?: str}
+      - count: how many episodes to write (1-20)
+      - direction: optional plot-direction hint
+    """
+    s = load_series(sid)
+    if not s:
+        return jsonify({'error': 'series not found'}), 404
+    body = request.json or {}
+    count = max(1, min(20, int(body.get('count') or 5)))
+    direction = (body.get('direction') or '').strip()
+
+    # Pull existing episodes for context. Cap content to keep prompt sane:
+    # last 8 episodes verbatim, earlier ones as synopsis-only.
+    existing = sorted([e for e in list_episodes(sid) if e.get('script')], key=lambda e: e.get('number', 0))
+    if not existing:
+        return jsonify({'error': 'в сериале нет существующих эпизодов с написанным сценарием — нечего продолжать'}), 400
+    last_num = existing[-1].get('number', 0)
+    first_new_num = last_num + 1
+    last_new_num = last_num + count
+
+    # Context window
+    verbatim_window = existing[-8:]
+    earlier = existing[:-8]
+    earlier_block = ''
+    if earlier:
+        earlier_lines = []
+        for e in earlier:
+            syn = (e.get('synopsis') or '').strip()[:200]
+            if not syn:
+                syn = (e.get('script') or '')[:200].replace('\n', ' ').strip()
+            earlier_lines.append(f"Эп.{e.get('number')}: {syn}")
+        earlier_block = "СИНОПСИСЫ РАННИХ СЕРИЙ (краткий контекст):\n" + '\n'.join(earlier_lines) + '\n\n'
+
+    verbatim_block = '\n\n'.join(
+        f"=== Эп.{e.get('number')}: {(e.get('title') or '').strip()} ===\n{(e.get('script') or '')[:6000]}"
+        for e in verbatim_window
+    )
+
+    # Roster of known entities so the generated script reuses them by name.
+    chars_list = ', '.join(c.get('name', '') for c in (s.get('characters') or []) if c.get('name'))[:1000]
+    locs_list  = ', '.join(l.get('name', '') for l in (s.get('locations') or []) if l.get('name'))[:1000]
+    items_list = ', '.join(it.get('name', '') for it in (s.get('items') or []) if it.get('name'))[:1000]
+
+    direction_block = f"\nЖЕЛАЕМОЕ НАПРАВЛЕНИЕ СЮЖЕТА ОТ ПОЛЬЗОВАТЕЛЯ:\n{direction}\n" if direction else (
+        "\nПОЛЬЗОВАТЕЛЬ НЕ УКАЗАЛ НАПРАВЛЕНИЕ — придумай развитие сам, опираясь на открытые сюжетные линии "
+        "из последних серий, нерешённые загадки, и эмоциональные арки персонажей. Не повторяй уже произошедшее.\n"
+    )
+
+    system = (
+        "Ты — сценарист короткой драмы для вертикального TikTok/Reels. Пишешь продолжение существующего "
+        "сериала на N серий. Каждая серия = ~1 минута экрана = ~12-15 чанков диалога/действия. Формат: "
+        "имена ВЕРХНИМ регистром перед репликами, диалог короткий и накалённый, обязательный cliffhanger "
+        "в конце КАЖДОЙ серии (открытый вопрос или новая угроза которая толкает к следующей).\n\n"
+        "ПРАВИЛА ПРОДОЛЖЕНИЯ:\n"
+        "1. Используй СУЩЕСТВУЮЩИХ персонажей и локации из roster (имена дословно). Новых вводи только "
+        "если без них не обойтись по сюжету.\n"
+        "2. Сохраняй tone и стиль предыдущих серий — посмотри последние 8 серий для калибровки.\n"
+        "3. Каждая серия должна иметь свой arc (начало → обострение → cliffhanger), но быть частью общей дуги.\n"
+        "4. Не повторяй уже произошедшие события дословно — двигай сюжет вперёд.\n"
+        "5. Используй существующие сюжетные предметы (items) когда они уместны.\n"
+        "6. Открытые линии из предыдущих серий — либо двигай их, либо логично откладывай.\n\n"
+        "ФОРМАТ ВЫХОДА — СТРОГО:\n"
+        f"Episode {first_new_num}: <короткое название серии>\n"
+        f"Кратко: <1-2 предложения о чём серия>\n"
+        f"<реплики и действия персонажей — диалог, action lines>\n"
+        f"\n"
+        f"Episode {first_new_num + 1}: <название>\n"
+        f"Кратко: <синопсис>\n"
+        f"<содержимое>\n"
+        f"\n"
+        f"... и так далее до Episode {last_new_num}.\n\n"
+        f"Каждая серия начинается с СТРОГО строки 'Episode N: <title>' — без других маркеров. "
+        f"Никакой markdown, никаких '===', никаких '#'. Только plain text. Язык — тот же что в "
+        f"предыдущих сериях (русский/английский/смесь — сохраняй стиль).\n\n"
+        f"ВАЖНО: возвращай ТОЛЬКО сценарий, без преамбулы 'Вот сценарий:' и без post-комментариев."
+    )
+    user_msg = (
+        f"СЕРИАЛ: «{s.get('title') or 'untitled'}»\n"
+        f"Жанр: {s.get('genre') or '?'} · Тон: {s.get('tone') or '?'} · "
+        f"Аудитория: {s.get('target_audience') or '?'}\n"
+        f"{('Мир: ' + s.get('world_description')[:300] + chr(10)) if s.get('world_description') else ''}\n"
+        f"ROSTER ПЕРСОНАЖЕЙ: {chars_list or '(пусто)'}\n"
+        f"ROSTER ЛОКАЦИЙ:    {locs_list or '(пусто)'}\n"
+        f"СЮЖЕТНЫЕ ПРЕДМЕТЫ: {items_list or '(пусто)'}\n\n"
+        f"{earlier_block}"
+        f"ПОСЛЕДНИЕ {len(verbatim_window)} СЕРИЙ (verbatim, для тонкой калибровки стиля и continuity):\n"
+        f"```\n{verbatim_block}\n```\n\n"
+        f"{direction_block}\n"
+        f"НАПИШИ СЛЕДУЮЩИЕ {count} СЕРИЙ (Эп.{first_new_num}–{last_new_num}). "
+        f"Каждая ~12-15 коротких реплик/действий, обязательно cliffhanger в конце."
+    )
+    try:
+        # Allow up to 24K output for 5+ episodes.
+        raw = claude_ask(user_msg, system=system, max_tokens=24000)
+        # Strip any code-fence accidents
+        text = raw.strip()
+        if text.startswith('```'):
+            # Drop first line + last line if they're fence markers
+            lines = text.split('\n')
+            if lines[0].startswith('```'): lines = lines[1:]
+            if lines and lines[-1].startswith('```'): lines = lines[:-1]
+            text = '\n'.join(lines).strip()
+        return jsonify({
+            'script': text,
+            'first_episode': first_new_num,
+            'last_episode':  last_new_num,
+            'count': count,
+        })
+    except Exception as e:
+        _log_event('WARN', 'generate_script_batch_fail', err=str(e)[:200])
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/series/<sid>/append-from-script', methods=['POST'])
 def append_from_script(sid):
     """Append a multi-episode script to an EXISTING series. Splits the pasted
