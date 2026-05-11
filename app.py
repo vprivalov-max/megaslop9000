@@ -4412,12 +4412,60 @@ def regenerate_character(sid, char_id):
     # also respect them. Empty wishes => clear them.
     char['image_constraints'] = wishes
 
+    # ── PROMPT CLEANUP — fix the «приходит constraint но в appearance уже
+    # сидит конфликтующая фраза» class of bugs.
+    #
+    # Real case (Mia Chen): appearance = "Young fashion blogger with multiple
+    # monitors", constraints = "Убери мониторы". Image model sees both
+    # «multiple monitors» (positive) and «убери мониторы» (negative). Negatives
+    # are weak signal — model renders monitors regardless. After 3-4 regen
+    # attempts user gives up.
+    #
+    # When the user passes wishes/constraints, run a fast Claude pass to:
+    # 1. Detect if `appearance` contains scene/context-words that conflict
+    #    with constraints (props/locations/objects, not person looks).
+    # 2. Rewrite appearance to person-only (face, hair, build, vibe, age,
+    #    typical clothing if relevant). Persist the cleaned version.
+    # 3. Use the cleaned appearance in the generation prompt.
+    appearance_raw = (char.get('appearance') or '').strip()
+    appearance_for_prompt = appearance_raw
+    if wishes and appearance_raw:
+        try:
+            cleaned = claude_ask_fast(
+                f"CHARACTER APPEARANCE FIELD: {appearance_raw}\n"
+                f"USER CONSTRAINTS FOR IMAGE GENERATION: {wishes}\n\n"
+                "Task: rewrite the appearance field so it (a) describes ONLY the "
+                "person's physical traits (face, hair, build, age, characteristic "
+                "clothing), NOT scene/context (props in background, locations, "
+                "moods, activities); AND (b) does not contradict the user's "
+                "constraints (if user said «убери мониторы», don't mention monitors).\n\n"
+                "Output: 1-2 short sentences, plain text, no preamble, no quotes. "
+                "Keep the language of the original appearance text.",
+                system="You are a surgical text editor. Output the rewritten sentence(s) and nothing else.",
+            ).strip()
+            # Sanity: must be shorter or comparable, no JSON / no quotes
+            cleaned = cleaned.strip('"\'`')
+            if cleaned and len(cleaned) < len(appearance_raw) * 2 and len(cleaned) > 5:
+                appearance_for_prompt = cleaned
+                # Persist the cleaned appearance so subsequent regens (outfit
+                # variants, future bumps) use the fixed version.
+                char['appearance'] = cleaned
+                _log_event('INFO', 'appearance_cleaned',
+                           char_id=char_id, name=char.get('name', ''),
+                           before=appearance_raw[:200], after=cleaned[:200],
+                           wishes=wishes[:200])
+        except Exception as e:
+            # Don't block regeneration on the cleanup failing — just use the
+            # original appearance text.
+            _log_event('WARN', 'appearance_cleanup_failed',
+                       char_id=char_id, err=str(e)[:200])
+
     gender = 'woman' if char.get('gender') == 'female' else 'man'
     constraints_clause = f" IMPORTANT — strictly follow these constraints: {wishes}." if wishes else ""
     style_clause = _series_style_clause(s)
     prompt = (
         f"Full body portrait of {char['name']}, a {gender}. "
-        f"{char.get('appearance', '')}. {char.get('description', '')}.{constraints_clause} "
+        f"{appearance_for_prompt}. {char.get('description', '')}.{constraints_clause} "
         f"Standing facing camera, slight 3/4 angle. Neutral relaxed pose, arms at sides. "
         f"Uniform solid gray background, #808080. No shadows or reflections on background. "
         f"Studio lighting, soft and even, no harsh shadows on face or body. "
