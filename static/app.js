@@ -8222,8 +8222,8 @@ function _showAcceptScriptModal({ newChars, newLocs, newItems }) {
   overlay.dataset.newItems = JSON.stringify(newItems.map(it => it.id));
   overlay.innerHTML = `
     <button class="lb-close" onclick="closeAcceptModal()">✕</button>
-    <div class="lightbox-content" onclick="event.stopPropagation()" style="max-width:880px;flex-direction:column">
-      <div class="lightbox-panel" style="width:100%;max-height:none;overflow-y:auto">
+    <div class="lightbox-content" onclick="event.stopPropagation()" style="max-width:880px;flex-direction:column;max-height:92vh">
+      <div class="lightbox-panel" style="width:100%;max-height:92vh;overflow-y:auto">
         <h3>В сценарии нашлось новое</h3>
         <div class="hint">
           Можешь перетащить готовые фотки (drag &amp; drop) на любую карточку — те, на которые не закинешь, сгенерируются автоматически.
