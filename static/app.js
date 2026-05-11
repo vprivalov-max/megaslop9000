@@ -1243,6 +1243,55 @@ async function appendPreviewSplit() {
     previewEl.innerHTML = `<div style="color:var(--danger);font-size:0.85rem">Ошибка: ${esc(e?.message || e)}</div>`;
   }
 }
+async function appendLogicCheck() {
+  const script = (document.getElementById('append-script-text')?.value || '').trim();
+  const out = document.getElementById('append-script-logic');
+  if (!script) { out.innerHTML = '<div style="color:var(--warning);font-size:0.85rem">Сценарий пустой</div>'; return; }
+  out.innerHTML = '<div style="font-size:0.85rem;color:var(--muted)"><span class="spinner"></span> Claude читает все серии и ищет противоречия… ~15-40 сек</div>';
+  try {
+    const r = await api.post('/api/series/import-from-script/logic-check', { script }, { timeoutMs: 120000 });
+    if (r.error) throw new Error(r.error);
+    const issues = r.issues || [];
+    if (!issues.length) {
+      out.innerHTML = `<div style="padding:10px;background:rgba(74,222,128,0.12);border:1px solid rgba(74,222,128,0.35);border-radius:6px;color:#4ade80;font-size:0.85rem">✅ Логика чистая — проанализировано серий: <strong>${r.episodes_analyzed}</strong>. Противоречий не найдено.</div>`;
+      return;
+    }
+    const sevColor = { critical: '#f87171', high: '#fbbf24', medium: '#a78bfa', low: '#9ca3af' };
+    const sevLabel = { critical: 'CRIT', high: 'HIGH', medium: 'MED', low: 'LOW' };
+    const typeLabel = {
+      contradiction:    '⚡ Противоречие',
+      plot_hole:        '🕳 Плот-хол',
+      forgotten_thread: '🧵 Забытая линия',
+      continuity:      '🔗 Continuity',
+      timeline:        '⏱ Таймлайн',
+    };
+    out.innerHTML = `
+      <div style="font-size:0.85rem;color:var(--muted);margin-bottom:6px">
+        🧠 Найдено проблем: <strong style="color:#fbbf24">${issues.length}</strong>
+        (проанализировано серий: ${r.episodes_analyzed})
+      </div>
+      <div style="max-height:320px;overflow-y:auto;border:1px solid var(--border);border-radius:6px;background:var(--surface2)">
+        ${issues.map((it, i) => `
+          <div style="padding:10px 12px;border-bottom:1px solid var(--border);font-size:0.82rem">
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
+              <span style="background:${sevColor[it.severity] || '#9ca3af'};color:#000;padding:2px 6px;border-radius:4px;font-weight:700;font-size:0.7rem">${sevLabel[it.severity] || it.severity || '?'}</span>
+              <span style="color:var(--muted)">${esc(typeLabel[it.type] || it.type || '')}</span>
+              <span style="color:var(--accent);font-weight:600;margin-left:auto">Эп. ${(it.episodes || []).join(', ')}</span>
+            </div>
+            <div style="color:var(--text);font-weight:600;margin-bottom:3px">${esc(it.summary || '')}</div>
+            ${it.evidence ? `<div style="color:var(--muted);font-style:italic;font-size:0.78rem;margin-bottom:3px">«${esc(it.evidence)}»</div>` : ''}
+            ${it.fix ? `<div style="color:#4ade80;font-size:0.78rem">→ ${esc(it.fix)}</div>` : ''}
+          </div>
+        `).join('')}
+      </div>
+      <div style="margin-top:6px;font-size:0.78rem;color:var(--muted)">
+        💡 Поправь сценарий в textarea выше, потом снова жми «Проверить логику» или просто «Добавить серии» если ок.
+      </div>`;
+  } catch (e) {
+    out.innerHTML = `<div style="color:var(--danger);font-size:0.85rem">Ошибка: ${esc(e?.message || e)}</div>`;
+  }
+}
+
 async function appendScriptGo() {
   const script = (document.getElementById('append-script-text')?.value || '').trim();
   const extract = !!document.getElementById('append-extract-entities')?.checked;

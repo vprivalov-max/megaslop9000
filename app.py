@@ -2491,6 +2491,29 @@ def _split_script_into_episodes(text):
         if len(matches) < 2:
             continue
         episodes = []
+        # Prefix content — anything before the FIRST marker. Often the user
+        # pastes a series where the very first episode has no «Episode N:»
+        # header (just a body or «Кратко: …» summary). Previously this got
+        # silently dropped. Now: if the prefix has more than 50 non-whitespace
+        # chars, treat it as a leading episode (number = first_match_num - 1,
+        # or 1 if that goes < 1). Title is taken from the first non-empty line.
+        first_start = matches[0].start()
+        prefix = text[:first_start].strip()
+        if len(re.sub(r'\s+', '', prefix)) > 50:
+            try:
+                first_num = int(matches[0].group(1))
+            except (ValueError, IndexError):
+                first_num = 2
+            prefix_num = max(1, first_num - 1)
+            # Title from first non-empty line of prefix (strip «Кратко:» etc).
+            prefix_title = ''
+            for ln in prefix.split('\n'):
+                t = ln.strip()
+                if t:
+                    t = re.sub(r'^(кратко|brief|summary|синопсис)\s*[:\-—]\s*', '', t, flags=re.IGNORECASE)
+                    prefix_title = t[:80]
+                    break
+            episodes.append({'number': prefix_num, 'title': prefix_title, 'body': prefix})
         for i, m in enumerate(matches):
             try:
                 num = int(m.group(1))
@@ -2696,6 +2719,66 @@ def _import_worker(sid, episode_records):
         st['running'] = False
         st['current'] = None
         st['finished_at'] = datetime.datetime.utcnow().isoformat()
+
+
+@app.route('/api/series/import-from-script/logic-check', methods=['POST'])
+def import_from_script_logic_check():
+    """Cross-episode logic audit BEFORE creating/appending. Splits the pasted
+    script the same way as /preview, then asks Claude to read every episode in
+    order and surface inconsistencies — contradictions, plot holes, forgotten
+    threads, character continuity issues. Returns structured list of issues
+    with severity + episode references. The user fixes the script in the
+    textarea and re-runs, or accepts as-is and clicks «Добавить серии»."""
+    data = request.json or {}
+    script = (data.get('script') or '').strip()
+    if not script:
+        return jsonify({'error': 'script required'}), 400
+    eps = _split_script_into_episodes(script)
+    if not eps:
+        return jsonify({'error': 'не удалось разбить сценарий на серии'}), 400
+    # Cap to first 18000 chars per episode to keep prompt sane on huge series.
+    blocks = []
+    for e in eps:
+        head = f"--- Episode {e['number']}: {e.get('title') or ''} ---"
+        body = (e.get('body') or '')[:18000]
+        blocks.append(f"{head}\n{body}")
+    joined = '\n\n'.join(blocks)
+    system = (
+        "You are a strict logic auditor for a short-drama TV series. "
+        "Read all episodes in order and find INCONSISTENCIES: "
+        "(a) factual contradictions between episodes (character was dead, then alive), "
+        "(b) plot holes (an action has no setup or no consequence), "
+        "(c) forgotten threads (a question/promise/item introduced and never resolved), "
+        "(d) character continuity (knowledge/state/location jumps without explanation), "
+        "(e) timeline errors (event order impossible). "
+        "Output STRICT JSON, no prose, no markdown:\n"
+        '{\n'
+        '  "issues": [\n'
+        '    {\n'
+        '      "severity": "critical|high|medium|low",\n'
+        '      "type":     "contradiction|plot_hole|forgotten_thread|continuity|timeline",\n'
+        '      "episodes": [int, int],   // episode numbers involved\n'
+        '      "summary":  "1 sentence — what is wrong",\n'
+        '      "evidence": "short direct quote(s) showing it",\n'
+        '      "fix":      "1 concrete suggestion how to fix"\n'
+        '    }\n'
+        '  ]\n'
+        '}\n'
+        'No commentary outside JSON. Empty issues list is valid. Output in the language of the script (Russian if Russian, English if English).'
+    )
+    try:
+        raw = claude_ask(joined, system=system, max_tokens=4000)
+        parsed = loads_lenient(raw)
+        issues = parsed.get('issues') if isinstance(parsed, dict) else None
+        if not isinstance(issues, list):
+            return jsonify({'error': 'LLM returned malformed JSON', 'raw': raw[:400]}), 500
+        return jsonify({
+            'episodes_analyzed': len(eps),
+            'issues': issues,
+        })
+    except Exception as e:
+        _log_event('WARN', 'logic_check_fail', err=str(e)[:200])
+        return jsonify({'error': str(e)}), 500
 
 
 @app.route('/api/series/import-from-script/preview', methods=['POST'])

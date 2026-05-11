@@ -1177,8 +1177,12 @@
         </div>
       </div>
       <div class="field-group">
-        <button type="button" class="btn-ghost btn-sm" onclick="appendPreviewSplit()">👁 Превью разбивки на серии</button>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <button type="button" class="btn-ghost btn-sm" onclick="appendPreviewSplit()">👁 Превью разбивки на серии</button>
+          <button type="button" class="btn-ghost btn-sm" onclick="appendLogicCheck()" title="Claude прочитает все серии по порядку и найдёт противоречия, плот-холы, забытые сюжетные линии — до того как сценарий ляжет в сериал">🧠 Проверить логику</button>
+        </div>
         <div id="append-script-preview" style="margin-top:8px"></div>
+        <div id="append-script-logic" style="margin-top:8px"></div>
       </div>
       <label class="cb" style="display:flex;align-items:flex-start;gap:8px;background:rgba(132,94,247,0.06);border:1px solid rgba(132,94,247,0.2);border-radius:8px;padding:10px 12px">
         <input type="checkbox" id="append-extract-entities" checked style="margin-top:3px">
