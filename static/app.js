@@ -5474,6 +5474,13 @@ const _SCRIPT_SKIP_PATTERNS = [
   /^Hook type:/i, /^Reversal type:/i, /^Cliffhanger type:/i,
   /^Escalation rung:/i, /^Spoken word count:/i,
   /^Estimated runtime:/i, /^Setup for next episode:/i,
+  // Episode synopsis prefixes — these are meta-description that scriptwriters
+  // (and our own /generate-script-batch) put at the top of each episode body.
+  // They are NOT screen content and must not become Seedance segments.
+  // Captures both «Кратко: ...» (one-liner) and any continuation lines
+  // until the next script-style line — handled in the loop via a tracker
+  // flag, not just regex match here.
+  /^(?:кратко|синопсис|summary|brief|logline|premise|tldr)\s*[:\-—]/i,
 ];
 
 // Heuristic per-line duration in seconds (only counts what's actually on screen).
@@ -5601,8 +5608,19 @@ function _parseScriptScenes(scriptText, overrides) {
   const scenes = [];
   let inCast = false;
   let inNotes = false;
+  let inSynopsis = false;   // tracks multi-line «Кратко: …» / «Summary: …» blocks
   let cur = null;
   let runningOffset = 0;
+  // Heuristic for «is this line a real script-style content line?» — used to
+  // decide when to exit a multi-line synopsis block. Dialogue («NAME:») /
+  // bracketed action / parenthetical / dash-led line all count.
+  const _isScriptLine = (s) => (
+    /^[A-ZА-ЯЁ][A-ZА-ЯЁ\s\.\-']{1,40}:\s/.test(s) ||   // CHAR:
+    /^\[[^\]]+\]/.test(s) ||                            // [stage direction]
+    /^\([^)]+\)/.test(s) ||                             // (parenthetical)
+    /^[-–—]\s/.test(s) ||                               // — line
+    /^(?:int\.|ext\.|инт\.|экст\.|нат\.|сцена)\s/i.test(s)  // scene heading
+  );
   for (const rawLine of rawLines) {
     const lineStart = runningOffset;
     const lineEnd = runningOffset + rawLine.length;
@@ -5612,6 +5630,19 @@ function _parseScriptScenes(scriptText, overrides) {
     if (/^={3,}\s*EPISODE CAST/i.test(t)) { inCast = true;  continue; }
     if (/^={3,}\s*END CAST/i.test(t))     { inCast = false; continue; }
     if (inCast) continue;
+    // Synopsis block — enter on «Кратко:» / «Summary:» / «Brief:» / etc.
+    // Stay inside until we hit either a blank line OR a real script-style
+    // line (CHAR: / [action] / scene heading). Meant for the 1-3 sentences
+    // of episode synopsis that wrap onto multiple lines without re-prefix.
+    if (/^(?:кратко|синопсис|summary|brief|logline|premise|tldr)\s*[:\-—]/i.test(t)) {
+      inSynopsis = true;
+      continue;
+    }
+    if (inSynopsis) {
+      if (!t) { inSynopsis = false; continue; }   // blank line ends synopsis
+      if (_isScriptLine(t)) { inSynopsis = false; /* fall through, process this line */ }
+      else continue;   // still inside synopsis, skip
+    }
     // Episode notes / trailer block — once we hit it, stop processing
     if (_SCRIPT_SKIP_PATTERNS.some(re => re.test(t))) {
       if (/^(EPISODE NOTES|━+|Hook type:|Reversal type:|Cliffhanger type:|Escalation rung:|Spoken word count:|Estimated runtime:|Setup for next episode:)/i.test(t)) {
