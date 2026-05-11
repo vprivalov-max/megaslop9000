@@ -2771,6 +2771,30 @@ def _import_worker(sid, episode_records):
                 ep['cast_extracted'] = True
                 save_series(sid, s)
                 save_episode(sid, num, ep)
+
+                # ── Canon update: per-episode extraction of timeline events,
+                # canon facts (locked story-truths), character knowledge state,
+                # and open story-threads. Without this the series canon stays
+                # empty when user adds episodes via «📜 Добавить сценарий» or
+                # «✨ Сгенерировать новые» — only manual /reaccept rebuilds it.
+                # Best-effort: failures logged but don't block the worker.
+                try:
+                    st['current'] = f'Эп. {num} · обновляю канон…'
+                    rollback_canon_for_episode(sid, num)   # idempotent re-imports
+                    upd = extract_canon_updates(sid, num, ep.get('script', ''))
+                    if upd and not upd.get('error'):
+                        # Annotate stats so the frontend pipeline banner can
+                        # surface canon-update progress if it wants to.
+                        st.setdefault('canon', {'updated': 0, 'facts': 0, 'threads': 0, 'errors': 0})
+                        st['canon']['updated']  = st['canon'].get('updated', 0) + 1
+                        st['canon']['facts']   += int(upd.get('new_facts')   or 0)
+                        st['canon']['threads'] += int(upd.get('new_threads') or 0)
+                    elif upd and upd.get('error'):
+                        st.setdefault('canon', {'updated': 0, 'facts': 0, 'threads': 0, 'errors': 0})
+                        st['canon']['errors'] = st['canon'].get('errors', 0) + 1
+                        print(f'[import-worker] canon ep{num} error: {upd.get("error")}', flush=True)
+                except Exception as e:
+                    print(f'[import-worker] canon update ep{num} crashed: {e}', flush=True)
             except Exception as e:
                 import traceback
                 print(f'[import-worker] ep {num} crashed: {e}', flush=True)

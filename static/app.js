@@ -1561,6 +1561,10 @@ async function pollImportStatus(sid) {
         PIPE.importDoneCount = st.done || 0;
         PIPE.importTotal = st.total || 0;
         PIPE.importErrors = (st.errors || []).length;
+        PIPE.importCurrent = st.current || '';
+        PIPE.canonFacts = (st.canon && st.canon.facts) || 0;
+        PIPE.canonThreads = (st.canon && st.canon.threads) || 0;
+        PIPE.canonErrors = (st.canon && st.canon.errors) || 0;
         if (!st.running && st.done > 0) {
           // Phase 1 done. Refresh series state so chars/locs/items show in
           // the sidebar, then transition to phase 2.
@@ -1687,10 +1691,12 @@ function _renderPipelineBanner(P) {
       <div style="display:flex;align-items:center;gap:10px;font-size:0.85rem">
         <span style="width:18px;display:inline-flex;justify-content:center">${icon(P.stage === 'analyzing', step1Done)}</span>
         <div style="flex:1;min-width:0">
-          <div><strong>1.</strong> 🧠 Анализ сценариев — извлечение персонажей, локаций, предметов
+          <div><strong>1.</strong> 🧠 Анализ сценариев — персонажи, локации, предметы + канон сериала
             ${P.stage === 'analyzing' ? `<span style="color:var(--muted)"> · ${P.importDoneCount}/${P.importTotal}${importErrsBit}</span>` : ''}
             ${step1Done && P.stage !== 'analyzing' ? `<span style="color:var(--muted)"> · обработано ${P.importDoneCount} сер${P.importErrors ? ` (ошибок ${P.importErrors})` : ''}</span>` : ''}
           </div>
+          ${P.stage === 'analyzing' && P.importCurrent ? `<div style="color:var(--muted);font-size:0.76rem;margin-top:2px">сейчас: ${esc(P.importCurrent)}</div>` : ''}
+          ${(P.canonFacts || P.canonThreads) ? `<div style="color:var(--muted);font-size:0.76rem;margin-top:2px">📚 канон: <strong>${P.canonFacts}</strong> фактов · <strong>${P.canonThreads}</strong> сюжетных линий${P.canonErrors ? ` · <span style="color:var(--warning)">ошибок ${P.canonErrors}</span>` : ''}</div>` : ''}
           ${importBar}
         </div>
       </div>
