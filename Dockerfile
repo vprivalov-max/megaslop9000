@@ -27,7 +27,13 @@ VOLUME ["/data"]
 EXPOSE 8080
 
 # Health check — Caddy/orchestrator can poll this.
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl -fsS http://localhost:8080/healthz || exit 1
+# IMPORTANT: use 127.0.0.1 (not «localhost») because curl on slim images
+# resolves «localhost» to ::1 (IPv6) first, but gunicorn binds to 0.0.0.0
+# (IPv4 only by default). Without explicit IPv4 → «Connection refused»
+# → container shows «Running (unhealthy)» even though app is fine.
+# --start-period bumped to 40s so cold-start of recover routines and log-
+# cleanup loop don't race the first healthcheck.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+    CMD curl -fsS --max-time 8 http://127.0.0.1:8080/healthz || exit 1
 
 CMD ["gunicorn", "-c", "gunicorn.conf.py", "app:app"]
