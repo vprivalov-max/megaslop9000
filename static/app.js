@@ -11233,6 +11233,72 @@ async function sdGenerate() {
   }
 }
 
+// Show «🎬 Собрать серию» button when there's at least one completed chunk,
+// and the «⬇ Скачать финал» link when an assembled mp4 already exists.
+function _sdUpdateAssembleUI(chunks) {
+  const btn = document.getElementById('sd-assemble-btn');
+  const link = document.getElementById('sd-assembled-link');
+  if (!btn || !link) return;
+  const completed = (chunks || []).filter(c => c.status === 'completed' && c.video_path);
+  btn.style.display = completed.length > 0 ? '' : 'none';
+  if (completed.length > 0) {
+    btn.innerHTML = `🎬 Собрать серию · ${completed.length} чанк${completed.length === 1 ? '' : (completed.length < 5 ? 'а' : 'ов')}`;
+  }
+  const assembledRel = S.episode?.assembled_path;
+  if (assembledRel && S.seriesId) {
+    link.style.display = '';
+    link.href = `/assets/${S.seriesId}/${assembledRel}?v=${S.episode.assembled_at || ''}`;
+    link.title = `Скачать ${assembledRel.split('/').pop()}`;
+  } else {
+    link.style.display = 'none';
+  }
+}
+
+async function sdAssembleEpisode(btn) {
+  if (!S.seriesId || !S.episode) { showToast('Открой серию'); return; }
+  const chunks = (SD._lastChunks || []).filter(c => c.status === 'completed' && c.video_path);
+  if (!chunks.length) { showToast('Нет готовых чанков для сборки', 3000); return; }
+  // Warn if some segments are missing (not all rendered yet).
+  const segmentCount = _autoCollectSegments({ forceEstablishing: true }).length || chunks.length;
+  if (chunks.length < segmentCount) {
+    const proceed = await appConfirm({
+      title: '⚠ Серия собрана не полностью',
+      message: `Готовых чанков: ${chunks.length}, а сегментов в сценарии: ${segmentCount}.\n\n` +
+               `Можно собрать всё равно — получится короче чем полный эпизод. Или сначала ` +
+               `догенерировать недостающие чанки.`,
+      okText: 'Всё равно собрать',
+      cancelText: 'Отмена',
+      okStyle: 'accent',
+    });
+    if (!proceed) return;
+  }
+  const orig = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span> Склейка ffmpeg…';
+  try {
+    const r = await api.post(
+      `/api/series/${S.seriesId}/episodes/${S.episode.number}/auto-assemble`,
+      { require_all: false, expected_segments: segmentCount },
+      { timeoutMs: 900_000 }
+    );
+    if (r.error) throw new Error(r.error);
+    // Refresh episode so we get the new assembled_path.
+    try {
+      S.episode = await api.get(`/api/series/${S.seriesId}/episodes/${S.episode.number}`);
+    } catch {}
+    _sdUpdateAssembleUI(SD._lastChunks || []);
+    showToast(`✓ Собрано: ${r.filename} (${r.size_mb}MB, ${r.chunks} чанков)`, 8000);
+    // Auto-trigger download.
+    const link = document.getElementById('sd-assembled-link');
+    if (link && link.style.display !== 'none') link.click();
+  } catch (e) {
+    showToast('Ошибка сборки: ' + (e?.message || e), 6000);
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = orig;
+  }
+}
+
 async function sdRefreshList() {
   // Guard against the race where S.episode is set (e.g. by a prior route)
   // before S.seriesId — without this we hit /api/series/null/.../seedance/list
@@ -11308,6 +11374,11 @@ function sdRenderList(chunks) {
   if (!el) return;
   // cache the last server-state list so optimistic adds can stack on top
   if (!chunks.some(c => c._optimistic)) SD._lastChunks = chunks;
+  // Show/hide the «🎬 Собрать серию» button + «⬇ Скачать финал» link based
+  // on chunk state. Button visible if there's at least 1 completed chunk
+  // with a video_path. Link visible if the episode already has an assembled
+  // file on disk (assembled_path on S.episode).
+  _sdUpdateAssembleUI(chunks);
   // Show/hide the always-visible bulk toolbar above the list. Renders the
   // chunk count so user sees "5 / 12 selected" at a glance without diving
   // into the floating bulk-bar (which only appears after first selection).
