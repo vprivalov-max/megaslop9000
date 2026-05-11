@@ -2656,9 +2656,42 @@ def _import_worker(sid, episode_records):
                 known_chars = {c['name'] for c in s.get('characters', [])}
                 known_locs  = {l['name'] for l in s.get('locations', [])}
                 known_items = {it['name'] for it in s.get('items', [])}
-                extracted = _llm_extract_episode_entities(
-                    ep.get('script', ''), known_chars, known_locs, known_items
-                )
+                # Retry LLM extraction up to 3 times. Common failure modes:
+                # - claude returned a markdown-fenced JSON we couldn't parse
+                # - rate-limit retry inside claude_ask ran out (rare but happens)
+                # - random empty-list result on transient overload
+                # Each retry waits a few seconds. If all 3 fail, mark the
+                # episode as cast_extracted=True anyway BUT with empty used
+                # arrays, and append a clear error so the user knows to retry
+                # extraction manually via the «🔁 Принять заново» path.
+                extracted = None
+                last_err = None
+                for try_idx in range(3):
+                    try:
+                        extracted = _llm_extract_episode_entities(
+                            ep.get('script', ''), known_chars, known_locs, known_items
+                        )
+                        # A valid response has at least one of the three lists
+                        # populated (rare to have an episode with literally no
+                        # entities). If all empty, it's almost certainly a
+                        # parse error swallowed by the lenient loader.
+                        nonempty = (
+                            len(extracted.get('characters') or []) +
+                            len(extracted.get('locations')  or []) +
+                            len(extracted.get('items')      or [])
+                        )
+                        if nonempty > 0 or len((ep.get('script') or '').strip()) < 200:
+                            break  # accept (short scripts may legit have no entities)
+                        last_err = 'LLM returned empty entity lists for non-trivial script'
+                    except Exception as e:
+                        last_err = str(e)[:300]
+                        print(f'[import-worker] ep {num} LLM try {try_idx+1}/3 failed: {last_err}', flush=True)
+                    if try_idx < 2:
+                        time.sleep(3 + try_idx * 2)   # 3s, 5s
+                if extracted is None:
+                    # All retries threw — leave script as-is, log, skip merge.
+                    st['errors'].append({'episode': num, 'error': f'LLM extract failed after 3 tries: {last_err}'})
+                    extracted = {'characters': [], 'locations': [], 'items': []}
 
                 # Merge characters
                 ep_char_ids = []
@@ -2761,6 +2794,189 @@ def _import_worker(sid, episode_records):
             _spawn_with_keys(auto_generate_missing_assets, sid)
     except Exception as e:
         print(f'[import-worker] autogen handoff failed: {e}', flush=True)
+
+
+@app.route('/api/series/<sid>/episodes/logic-check-multi', methods=['POST'])
+def episodes_logic_check_multi(sid):
+    """Cross-episode logic audit on a SELECTED set of already-saved episodes.
+    Mirrors /import-from-script/logic-check but reads scripts from disk
+    instead of taking a pasted script. Body: {episode_numbers: [int, ...]}.
+    Returns the same {issues, episodes_analyzed} shape so the same UI can
+    render results."""
+    s = load_series(sid)
+    if not s:
+        return jsonify({'error': 'series not found'}), 404
+    body = request.json or {}
+    nums = body.get('episode_numbers') or []
+    if not isinstance(nums, list) or not nums:
+        return jsonify({'error': 'episode_numbers required (non-empty list of ints)'}), 400
+    nums = sorted({int(n) for n in nums if isinstance(n, (int, float)) or (isinstance(n, str) and n.strip().isdigit())})
+    eps = []
+    for n in nums:
+        e = load_episode(sid, n)
+        if e and (e.get('script') or '').strip():
+            eps.append(e)
+    if not eps:
+        return jsonify({'error': 'у выбранных серий нет сценариев'}), 400
+    blocks = []
+    for e in eps:
+        head = f"--- Episode {e.get('number')}: {(e.get('title') or '').strip()} ---"
+        body_txt = (e.get('script') or '')[:18000]
+        blocks.append(f"{head}\n{body_txt}")
+    joined = '\n\n'.join(blocks)
+    system = (
+        "You are a strict logic auditor for a short-drama TV series. "
+        "Read all episodes in order and find INCONSISTENCIES: "
+        "(a) factual contradictions between episodes, "
+        "(b) plot holes, "
+        "(c) forgotten threads, "
+        "(d) character continuity (knowledge/state/location jumps), "
+        "(e) timeline errors. "
+        "Output STRICT JSON, no prose, no markdown:\n"
+        '{"issues": [{"severity":"critical|high|medium|low","type":"contradiction|plot_hole|forgotten_thread|continuity|timeline","episodes":[int],"summary":"...","evidence":"...","fix":"..."}]}\n'
+        "No commentary outside JSON. Empty issues list is valid. Output in the language of the script."
+    )
+    try:
+        raw = claude_ask(joined, system=system, max_tokens=4000)
+        parsed = loads_lenient(raw)
+        issues = parsed.get('issues') if isinstance(parsed, dict) else None
+        if not isinstance(issues, list):
+            return jsonify({'error': 'LLM returned malformed JSON', 'raw': raw[:400]}), 500
+        return jsonify({
+            'episodes_analyzed': len(eps),
+            'episode_numbers':   [e.get('number') for e in eps],
+            'issues':            issues,
+        })
+    except Exception as e:
+        _log_event('WARN', 'logic_check_multi_fail', err=str(e)[:200])
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/series/<sid>/episodes/logic-apply-multi', methods=['POST'])
+def episodes_logic_apply_multi(sid):
+    """Apply selected logic fixes to a SET of already-saved episodes. Body:
+    {episode_numbers: [int...], issues: [{...}]}. Pipeline:
+      1. Re-read each episode's script
+      2. Build the same Episode-N-headered concat as /logic-check-multi
+      3. Ask Claude to rewrite minimally addressing the listed issues
+      4. Split the rewritten text back into per-episode scripts
+      5. Write each updated script to disk (preserving everything else on ep)
+      6. Return per-episode before/after lengths + which were modified
+    """
+    s = load_series(sid)
+    if not s:
+        return jsonify({'error': 'series not found'}), 404
+    body = request.json or {}
+    nums = body.get('episode_numbers') or []
+    issues = body.get('issues') or []
+    if not isinstance(nums, list) or not nums:
+        return jsonify({'error': 'episode_numbers required'}), 400
+    if not isinstance(issues, list) or not issues:
+        return jsonify({'error': 'issues required (non-empty list)'}), 400
+    nums = sorted({int(n) for n in nums if isinstance(n, (int, float)) or (isinstance(n, str) and n.strip().isdigit())})
+
+    eps_by_num = {}
+    blocks = []
+    for n in nums:
+        e = load_episode(sid, n)
+        if not e or not (e.get('script') or '').strip():
+            continue
+        eps_by_num[n] = e
+        head = f"--- Episode {e.get('number')}: {(e.get('title') or '').strip()} ---"
+        blocks.append(f"{head}\n{(e.get('script') or '')[:18000]}")
+    if not eps_by_num:
+        return jsonify({'error': 'у выбранных серий нет сценариев'}), 400
+    joined = '\n\n'.join(blocks)
+
+    fix_lines = []
+    for i, it in enumerate(issues, 1):
+        if not isinstance(it, dict):
+            continue
+        eps_ref = it.get('episodes') or []
+        fix_lines.append(
+            f"{i}. [{(it.get('severity') or '?').upper()}] {it.get('type','?')} · Эп.{','.join(map(str, eps_ref))}\n"
+            f"   PROBLEM:  {it.get('summary','')}\n"
+            f"   EVIDENCE: {it.get('evidence','')}\n"
+            f"   FIX:      {it.get('fix','')}"
+        )
+    fixes_block = '\n\n'.join(fix_lines) or '(no fixes provided)'
+    system = (
+        "You are a surgical script editor for a short-drama TV series. "
+        "Apply the listed logic-fixes to the MULTI-EPISODE script with MINIMAL edits. "
+        "Preserve EVERY '--- Episode N: Title ---' header line exactly. "
+        "Preserve every other character and dialogue line verbatim. Only change what's "
+        "strictly needed to address each listed issue. Keep the same language as the "
+        "original script. Output STRICT JSON, no prose, no markdown:\n"
+        '{"script": "full rewritten multi-episode text with \\n line breaks", '
+        '"changes": [{"issue_index": int, "summary": "1 sentence what you changed"}]}\n'
+        "issue_index is the 1-based number from the input list."
+    )
+    user_msg = (
+        f"=== MULTI-EPISODE SCRIPT TO PATCH ===\n{joined[:90000]}\n\n"
+        f"=== ISSUES TO FIX ===\n{fixes_block}\n\n"
+        "Return the corrected full multi-episode text + per-issue change summary. JSON only."
+    )
+    try:
+        raw = claude_ask(user_msg, system=system, max_tokens=20000)
+        parsed = loads_lenient(raw)
+        new_script = parsed.get('script') if isinstance(parsed, dict) else None
+        changes = parsed.get('changes') if isinstance(parsed, dict) else []
+        if not isinstance(new_script, str) or not new_script.strip():
+            return jsonify({'error': 'LLM returned no script', 'raw': raw[:400]}), 500
+    except Exception as e:
+        _log_event('WARN', 'logic_apply_multi_llm_fail', err=str(e)[:200])
+        return jsonify({'error': str(e)}), 500
+
+    # Split rewritten multi-episode text by «--- Episode N: ... ---» headers.
+    # Tolerant: matches lines starting with «---» that have «Episode <N>» token.
+    pattern = re.compile(r'^\s*---\s*Episode\s+(\d+)[^\n-]*---\s*$', re.IGNORECASE | re.MULTILINE)
+    matches = list(pattern.finditer(new_script))
+    if not matches:
+        # Fallback — maybe Claude dropped the «---» fences. Try plain «Episode N:» markers.
+        pattern2 = re.compile(r'(?im)^[ \t]*episode[ \t]+(\d+)[ \t]*[:\-—]?[^\n]*$')
+        matches = list(pattern2.finditer(new_script))
+        if not matches:
+            return jsonify({'error': 'Не удалось разбить переписанный сценарий по сериям — Claude сломал разметку. Попробуй ещё раз или применяй фиксы по одному.'}), 500
+
+    updated = []
+    skipped = []
+    for i, m in enumerate(matches):
+        try:
+            num = int(m.group(1))
+        except (ValueError, IndexError):
+            continue
+        if num not in eps_by_num:
+            skipped.append({'number': num, 'reason': 'not in selected set'})
+            continue
+        start = m.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(new_script)
+        body_txt = new_script[start:end].strip()
+        if not body_txt:
+            skipped.append({'number': num, 'reason': 'empty body'})
+            continue
+        ep = eps_by_num[num]
+        before_len = len(ep.get('script') or '')
+        # Archive previous script as a history entry so the user can revert.
+        try:
+            history = ep.setdefault('script_history', [])
+            history.append({
+                'script': ep.get('script') or '',
+                'saved_at': datetime.datetime.utcnow().isoformat(),
+                'reason': 'logic-apply-multi',
+            })
+            ep['script_history'] = history[-15:]   # cap history
+        except Exception:
+            pass
+        ep['script'] = body_txt
+        save_episode(sid, num, ep)
+        updated.append({'number': num, 'before_len': before_len, 'after_len': len(body_txt)})
+
+    return jsonify({
+        'updated':       updated,
+        'skipped':       skipped,
+        'applied_count': len(issues),
+        'changes':       changes if isinstance(changes, list) else [],
+    })
 
 
 @app.route('/api/series/import-from-script/logic-check', methods=['POST'])

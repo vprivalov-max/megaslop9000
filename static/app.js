@@ -2897,6 +2897,180 @@ function clearEpisodeSelection() {
   renderEpisodesList();
 }
 
+// ── Logic check on selected episodes ─────────────────────────────────────
+// Mirrors the «🧠 Проверить логику» button in the append-script modal but
+// works on already-saved episodes selected via checkboxes in the series view.
+// On apply, fixes are written DIRECTLY to ep.script on disk (with history
+// snapshot for undo via the script-history endpoint).
+let _logicMultiIssues = [];
+let _logicMultiEpNums = [];
+
+async function checkLogicOnSelected() {
+  if (!S.seriesId) { showToast('Открой сериал'); return; }
+  if (!S._genSelected) _restoreGenSelection();
+  const nums = [...(S._genSelected || [])].sort((a, b) => a - b);
+  if (!nums.length) {
+    showToast('Сначала отметь галочками серии для проверки', 4000);
+    return;
+  }
+  // Filter: only those that have a script (cast_extracted not required —
+  // we work on raw script text).
+  const eps = (S.episodes || []);
+  const validNums = nums.filter(n => {
+    const ep = eps.find(e => e.number === n);
+    return ep && (ep.script || '').trim().length > 0;
+  });
+  if (!validNums.length) {
+    showToast('У выделенных серий нет сценариев для проверки', 4000);
+    return;
+  }
+  _logicMultiEpNums = validNums;
+  _logicMultiIssues = [];
+  const statusEl = document.getElementById('logic-multi-status');
+  const issuesEl = document.getElementById('logic-multi-issues');
+  if (statusEl) statusEl.innerHTML = `<span class="spinner"></span> Claude читает ${validNums.length} серий: ${validNums.map(n => '№' + n).join(', ')}…  ~${Math.max(15, validNums.length * 6)}-${validNums.length * 12}с`;
+  if (issuesEl) issuesEl.innerHTML = '';
+  openModal('modal-logic-multi');
+  try {
+    const r = await api.post(
+      `/api/series/${S.seriesId}/episodes/logic-check-multi`,
+      { episode_numbers: validNums },
+      { timeoutMs: 240_000 }
+    );
+    if (r.error) throw new Error(r.error);
+    const issues = r.issues || [];
+    _logicMultiIssues = issues;
+    _logicMultiRenderIssues(issues, r.episodes_analyzed || validNums.length);
+  } catch (e) {
+    if (statusEl) statusEl.innerHTML = `<span style="color:#f87171">Ошибка: ${esc(e?.message || e)}</span>`;
+  }
+}
+
+function _logicMultiRenderIssues(issues, analyzedCount) {
+  const statusEl = document.getElementById('logic-multi-status');
+  const issuesEl = document.getElementById('logic-multi-issues');
+  if (!issues.length) {
+    if (statusEl) statusEl.innerHTML = `<span style="color:#4ade80">✅ Логика чистая — проанализировано серий: <strong>${analyzedCount}</strong>. Противоречий не найдено.</span>`;
+    if (issuesEl) issuesEl.innerHTML = '';
+    return;
+  }
+  const sevColor = { critical: '#f87171', high: '#fbbf24', medium: '#a78bfa', low: '#9ca3af' };
+  const sevLabel = { critical: 'CRIT', high: 'HIGH', medium: 'MED', low: 'LOW' };
+  const typeLabel = {
+    contradiction:    '⚡ Противоречие',
+    plot_hole:        '🕳 Плот-хол',
+    forgotten_thread: '🧵 Забытая линия',
+    continuity:       '🔗 Continuity',
+    timeline:         '⏱ Таймлайн',
+  };
+  if (statusEl) {
+    statusEl.innerHTML = `
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+        <span style="color:var(--muted)">🧠 Найдено:</span>
+        <strong style="color:#fbbf24">${issues.length} проблем</strong>
+        <span style="color:var(--muted)">(серий: ${analyzedCount})</span>
+        <button class="btn-ghost btn-sm" onclick="_logicMultiSelectAll(true)" style="margin-left:auto">✓ Все</button>
+        <button class="btn-ghost btn-sm" onclick="_logicMultiSelectAll(false)">✕ Снять</button>
+        <button class="btn-accent btn-sm" onclick="_logicMultiApply(this)" title="Claude перепишет соответствующие серии минимально, только исправив выделенные проблемы. Старые версии сохранятся в истории сценариев — можно откатить.">🩹 Полечить выбранные</button>
+      </div>
+    `;
+  }
+  if (issuesEl) {
+    issuesEl.innerHTML = `
+      <div style="max-height:380px;overflow-y:auto;border:1px solid var(--border);border-radius:6px;background:var(--surface2);margin-top:8px">
+        ${issues.map((it, i) => {
+          const preset = (it.severity === 'critical' || it.severity === 'high') ? 'checked' : '';
+          return `
+            <label style="display:flex;gap:10px;padding:10px 12px;border-bottom:1px solid var(--border);font-size:0.82rem;cursor:pointer">
+              <input type="checkbox" class="logic-multi-cb" data-idx="${i}" ${preset} style="margin-top:3px;width:16px;height:16px;flex:0 0 16px;accent-color:#10b981">
+              <div style="flex:1;min-width:0">
+                <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;flex-wrap:wrap">
+                  <span style="background:${sevColor[it.severity] || '#9ca3af'};color:#000;padding:2px 6px;border-radius:4px;font-weight:700;font-size:0.7rem">${sevLabel[it.severity] || it.severity || '?'}</span>
+                  <span style="color:var(--muted)">${esc(typeLabel[it.type] || it.type || '')}</span>
+                  <span style="color:var(--accent);font-weight:600;margin-left:auto">Эп. ${(it.episodes || []).join(', ')}</span>
+                </div>
+                <div style="color:var(--text);font-weight:600;margin-bottom:3px">${esc(it.summary || '')}</div>
+                ${it.evidence ? `<div style="color:var(--muted);font-style:italic;font-size:0.78rem;margin-bottom:3px">«${esc(it.evidence)}»</div>` : ''}
+                ${it.fix ? `<div style="color:#4ade80;font-size:0.78rem">→ ${esc(it.fix)}</div>` : ''}
+              </div>
+            </label>`;
+        }).join('')}
+      </div>
+      <div style="margin-top:8px;font-size:0.78rem;color:var(--muted)">
+        💡 CRIT и HIGH предчекнуты автоматически. После «🩹 Полечить» Claude перепишет соответствующие серии и сохранит старые версии в истории.
+      </div>
+    `;
+  }
+}
+
+function _logicMultiSelectAll(val) {
+  document.querySelectorAll('.logic-multi-cb').forEach(cb => { cb.checked = val; });
+}
+
+async function _logicMultiApply(btn) {
+  const selected = [...document.querySelectorAll('.logic-multi-cb:checked')]
+    .map(cb => _logicMultiIssues[parseInt(cb.dataset.idx, 10)])
+    .filter(Boolean);
+  if (!selected.length) { showToast('Не отмечено ни одной проблемы', 3000); return; }
+  if (!await appConfirm({
+    title: '🩹 Полечить выделенные проблемы?',
+    message: `Будет переписано: ${selected.length} проблем(ы) в ${_logicMultiEpNums.length} сериях.\n\n` +
+             `Claude перепишет затронутые серии минимально — остальные строки сохранятся дословно. ` +
+             `Старые версии сценариев попадут в историю — откатить можно через «📜 История сценария» на странице эпизода.`,
+    okText: '🩹 Полечить',
+    cancelText: 'Отмена',
+    okStyle: 'accent',
+  })) return;
+  const orig = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span> Claude переписывает…';
+  try {
+    const r = await api.post(
+      `/api/series/${S.seriesId}/episodes/logic-apply-multi`,
+      { episode_numbers: _logicMultiEpNums, issues: selected },
+      { timeoutMs: 300_000 }
+    );
+    if (r.error) throw new Error(r.error);
+    const updated = r.updated || [];
+    const skipped = r.skipped || [];
+    const changes = r.changes || [];
+    const statusEl = document.getElementById('logic-multi-status');
+    const issuesEl = document.getElementById('logic-multi-issues');
+    if (statusEl) {
+      statusEl.innerHTML = `<span style="color:#4ade80">✓ Переписано ${updated.length} серий${skipped.length ? ` (пропущено ${skipped.length})` : ''}. Применено ${r.applied_count} правок.</span>`;
+    }
+    if (issuesEl) {
+      const updRows = updated.map(u =>
+        `<li><strong>Эп. ${u.number}:</strong> ${u.before_len} → ${u.after_len} символов</li>`
+      ).join('');
+      const skipRows = skipped.map(s => `<li>Эп. ${s.number}: ${esc(s.reason)}</li>`).join('');
+      const chgRows = changes.map(c => `<li><strong>#${c.issue_index || '?'}:</strong> ${esc(c.summary || '')}</li>`).join('');
+      issuesEl.innerHTML = `
+        <div style="padding:10px 12px;background:rgba(16,185,129,0.10);border:1px solid rgba(16,185,129,0.35);border-radius:6px;font-size:0.82rem;margin-top:8px">
+          <div style="color:#10b981;font-weight:700;margin-bottom:6px">✓ Что переписано:</div>
+          <ul style="margin:4px 0 8px 18px;color:var(--text)">${updRows || '<li>(ничего)</li>'}</ul>
+          ${skipped.length ? `<div style="color:#fbbf24;margin-top:6px">⚠ Пропущено:</div><ul style="margin:4px 0 0 18px">${skipRows}</ul>` : ''}
+          ${chgRows ? `<div style="color:var(--muted);margin-top:8px;font-size:0.78rem">Правки по проблемам:</div><ul style="margin:4px 0 0 18px;color:var(--muted);font-size:0.78rem">${chgRows}</ul>` : ''}
+          <div style="display:flex;gap:8px;margin-top:10px">
+            <button class="btn-accent btn-sm" onclick="checkLogicOnSelected()">🧠 Проверить ещё раз</button>
+            <button class="btn-ghost btn-sm" onclick="closeModal('modal-logic-multi')">Закрыть</button>
+          </div>
+        </div>`;
+    }
+    // Reload episodes so UI sees the rewritten scripts.
+    try {
+      S.episodes = await api.get(`/api/series/${S.seriesId}/episodes`);
+      if (typeof renderEpisodesList === 'function') renderEpisodesList();
+    } catch {}
+    showToast(`✓ Переписано ${updated.length} серий`, 6000);
+  } catch (e) {
+    showToast('Ошибка: ' + (e?.message || e), 6000);
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = orig;
+  }
+}
+
 // Force-reset gen_status on episodes that are stuck in 'generating' but have
 // no actual generation in progress (no in-flight chunks). Useful after a
 // browser crash or range-gen crash that left orphan «generating» markers.
