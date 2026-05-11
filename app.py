@@ -10840,16 +10840,39 @@ def auto_assemble_episode(sid, num):
     require_all = body.get('require_all', True)
     expected_segments = body.get('expected_segments')   # optional, set by frontend from script
 
-    chunks = [c for c in (_seedance_chunks(ep) or [])
-              if c.get('status') == 'completed' and c.get('video_path')]
-    if not chunks:
+    all_chunks = [c for c in (_seedance_chunks(ep) or [])
+                  if c.get('status') == 'completed' and c.get('video_path')]
+    if not all_chunks:
         return jsonify({'error': 'нет готовых чанков для сборки'}), 400
 
-    # Sort: script_order asc → idx asc (stable for chunks lacking the field).
-    def _sort_key(c):
+    # Dedup: when the user retried/healed a chunk that already had a video,
+    # we get multiple completed chunks with the SAME script_order. Pick the
+    # NEWEST per position (highest idx, since idx is monotonically increasing
+    # per /seedance/start; created_at as tiebreak for chunks that share idx
+    # across legacy data). Previously we kept the FIRST (oldest), which meant
+    # auto-assemble ignored user's manual reruns.
+    #
+    # Chunks lacking script_order go after the indexed ones, in their own
+    # order by idx (legacy behavior — preserved so old data still assembles).
+    by_order = {}
+    no_order = []
+    for c in all_chunks:
         so = c.get('script_order')
-        return (0, so) if isinstance(so, int) else (1, c.get('idx', 0))
-    chunks.sort(key=_sort_key)
+        if isinstance(so, int):
+            prev = by_order.get(so)
+            if prev is None:
+                by_order[so] = c
+            else:
+                # Prefer the one with bigger idx; tie-break with created_at.
+                cur_key = (c.get('idx') or 0, c.get('created_at') or 0)
+                prev_key = (prev.get('idx') or 0, prev.get('created_at') or 0)
+                if cur_key > prev_key:
+                    by_order[so] = c
+        else:
+            no_order.append(c)
+    chunks = [by_order[k] for k in sorted(by_order.keys())] + sorted(
+        no_order, key=lambda c: c.get('idx') or 0
+    )
 
     if require_all and isinstance(expected_segments, int) and expected_segments > 0:
         if len(chunks) < expected_segments:
