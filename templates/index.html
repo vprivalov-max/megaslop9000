@@ -187,6 +187,7 @@
           <span style="color:var(--muted);font-size:0.78rem">отметь галочками серии справа от их номеров</span>
           <button class="btn-ghost btn-sm" onclick="selectAllReadyEpisodes()" title="Выделить все серии готовые к генерации (есть сценарий, все ассеты на месте)">✓ Все готовые</button>
           <button class="btn-ghost btn-sm" onclick="clearEpisodeSelection()" title="Снять все галочки">✕ Снять</button>
+          <button class="btn-ghost btn-sm" onclick="resetStuckGenStatuses()" title="Если какие-то серии застряли в статусе «🎬 Генерится…» (упал range-gen, потеряна сеть, и т.п.) — это сбросит их в нормальное состояние. Чанки которые реально генерятся НЕ трогает.">🔄 Сбросить зависшие</button>
           <span id="range-gen-selected-count" style="font-size:0.82rem;color:#10b981;font-weight:600"></span>
           <label style="display:flex;align-items:center;gap:6px;margin-left:auto" title="Сколько серий генерить одновременно. 1 = последовательно (безопасно, поштучно). 2-3 = параллельно (≈2× быстрее, но Seedance получает больше одновременных джоб). Внутри каждой серии всё равно сцены идут параллельно по локациям.">
             <span style="color:var(--muted);font-size:0.82rem">⚡ параллельно:</span>

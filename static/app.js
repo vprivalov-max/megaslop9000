@@ -2741,6 +2741,37 @@ function clearEpisodeSelection() {
   renderEpisodesList();
 }
 
+// Force-reset gen_status on episodes that are stuck in 'generating' but have
+// no actual generation in progress (no in-flight chunks). Useful after a
+// browser crash or range-gen crash that left orphan «generating» markers.
+async function resetStuckGenStatuses() {
+  if (!S.seriesId) return;
+  const stuck = (S.episodes || []).filter(e => e.gen_status === 'generating');
+  if (!stuck.length) {
+    showToast('Нет серий со статусом «генерится»', 3000);
+    return;
+  }
+  if (!await appConfirm({
+    title: '🔄 Сбросить статус генерации',
+    message: `Найдено ${stuck.length} серий со статусом «🎬 Генерится…»: ${stuck.map(e => '№' + e.number).join(', ')}.\n\n` +
+             `Сбросить им статус? Это нужно делать если генерация на самом деле НЕ идёт (упал range-gen или закрылась вкладка). ` +
+             `Если генерация ИДЁТ в данный момент — нажми «Остановить» в виджете внизу справа, а не эту кнопку.`,
+    okText: '🔄 Сбросить',
+    cancelText: 'Отмена',
+    okStyle: 'accent',
+  })) return;
+  let reset = 0, failed = 0;
+  for (const ep of stuck) {
+    try {
+      await api.put(`/api/series/${S.seriesId}/episodes/${ep.number}`, { gen_status: null });
+      ep.gen_status = null;
+      reset++;
+    } catch (e) { failed++; }
+  }
+  renderEpisodesList();
+  showToast(`✓ Сброшено ${reset} серий${failed ? ` (${failed} не удалось)` : ''}`, 5000);
+}
+
 function renderCharactersList() {
   const s = S.series;
   const el = document.getElementById('characters-list');
@@ -6914,11 +6945,12 @@ async function _runEpisodeAutoStandalone(sid, num, opts = {}) {
       }
     });
     if (!allSegs.length) {
-      clog('WARN', 'parallel.no_segments', { sid: epSid, ep: epNumber, script_len: scriptText.length });
+      clog('WARN', 'parallel.no_segments', { sid: epSid, ep: epNumber, script_len: scriptText.length, scene_count: scenes.length });
       return { ok: false, completed: 0, total: 0, errors: 1 };
     }
     R.segments = allSegs;
     R.total = allSegs.length;
+    clog('INFO', 'parallel.built', { sid: epSid, ep: epNumber, total: allSegs.length, scenes: scenes.length });
 
     // Group by scene for scene-parallel execution within the episode.
     const sceneGroups = (() => {
@@ -6948,8 +6980,22 @@ async function _runEpisodeAutoStandalone(sid, num, opts = {}) {
     async function pollUntilDone(chunkIdx, composeRes, segText, segDuration) {
       let healAttempts = 0;
       let curIdx = chunkIdx;
+      // Hard ceiling on how long we wait for ONE chunk to terminate. Without
+      // this, a chunk stuck in 'submitting' forever (server submit-thread
+      // crashed silently, AVAI returned but our handler dropped the response,
+      // user deleted the chunk) would spin the poll-loop indefinitely — runner
+      // never returns → range-gen worker never exits → user sees endless
+      // «Auto-mode крутится».
+      const HARD_TIMEOUT_MS = 12 * 60 * 1000;   // 12 minutes per chunk
+      const NO_CHUNK_TOLERANCE_MS = 90 * 1000;  // 90s grace if chunk disappears
+      const t0 = Date.now();
+      let firstMissingAt = 0;
       while (true) {
         if (R.cancelRequested) return { ok: false, error: 'cancelled' };
+        if (Date.now() - t0 > HARD_TIMEOUT_MS) {
+          clog('ERROR', 'parallel.poll_timeout', { sid: epSid, ep: epNumber, idx: curIdx });
+          return { ok: false, error: 'poll timeout 12min' };
+        }
         await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
         let polled;
         try {
@@ -6957,7 +7003,17 @@ async function _runEpisodeAutoStandalone(sid, num, opts = {}) {
           polled = res.chunks || [];
         } catch (e) { polled = []; }
         const chunk = polled.find(c => c.idx === curIdx);
-        if (!chunk) { R.lastStatus = `… не вижу #${curIdx}`; _autoUpdateFloatingWidget(); continue; }
+        if (!chunk) {
+          if (!firstMissingAt) firstMissingAt = Date.now();
+          if (Date.now() - firstMissingAt > NO_CHUNK_TOLERANCE_MS) {
+            clog('ERROR', 'parallel.chunk_vanished', { sid: epSid, ep: epNumber, idx: curIdx });
+            return { ok: false, error: 'chunk vanished from list' };
+          }
+          R.lastStatus = `… не вижу #${curIdx}`;
+          _autoUpdateFloatingWidget();
+          continue;
+        }
+        firstMissingAt = 0;
         R.lastStatus = chunk.status === 'processing' && chunk.progress != null
           ? `⏳ #${curIdx} ${chunk.progress}%` : `⏳ #${curIdx} ${chunk.status}`;
         _autoUpdateFloatingWidget();
@@ -6996,35 +7052,65 @@ async function _runEpisodeAutoStandalone(sid, num, opts = {}) {
       const segCloseUp = shared.closeUpOnly || !!seg.has_close_up;
       R.lastStatus = segCloseUp ? '⚙ compose (close-up)...' : '⚙ compose...';
       _autoUpdateFloatingWidget();
-      const composeRes = await api.post(
-        `/api/series/${epSid}/episodes/${epNumber}/seedance/compose`,
-        {
-          chunk_text: seg.text,
-          use_prev_lastframe: shared.useLastframe,
-          use_prev_cutframes: shared.useCutframes,
-          style: shared.useStyle ? shared.styleVal : '',
-          base_outfits_only: shared.baseOnly,
-          close_up_only: segCloseUp,
-        }
-      );
+      let composeRes;
+      try {
+        composeRes = await api.post(
+          `/api/series/${epSid}/episodes/${epNumber}/seedance/compose`,
+          {
+            chunk_text: seg.text,
+            use_prev_lastframe: shared.useLastframe,
+            use_prev_cutframes: shared.useCutframes,
+            style: shared.useStyle ? shared.styleVal : '',
+            base_outfits_only: shared.baseOnly,
+            close_up_only: segCloseUp,
+          }, { timeoutMs: 300_000 }
+        );
+      } catch (e) {
+        clog('ERROR', 'parallel.compose_throw', {
+          sid: epSid, ep: epNumber, seg_anchor: (seg.anchor || '').slice(0, 60),
+          msg: (e?.message || String(e)).slice(0, 300),
+        });
+        throw e;
+      }
+      if (composeRes?.error) {
+        clog('ERROR', 'parallel.compose_error', { sid: epSid, ep: epNumber, err: String(composeRes.error).slice(0, 300) });
+        throw new Error('compose: ' + composeRes.error);
+      }
       R.lastStatus = '▶ start...';
       _autoUpdateFloatingWidget();
-      const startRes = await api.post(
-        `/api/series/${epSid}/episodes/${epNumber}/seedance/start`,
-        {
-          prompt: composeRes.prompt,
-          chunk_text: seg.text,
-          duration: seg.durationSec || shared.duration,
-          resolution: shared.resolution,
-          moderation_bypass: shared.moderation_bypass,
-          script_order: seg.scriptOrder,
-          refs: (composeRes.refs || []).map(r => ({
-            kind: r.kind, id: r.id, outfit: r.outfit || null, url: r.url || null,
-            source: r.source, prev_idx: r.prev_idx, name: r.name,
-            cut_index: r.cut_index, cut_time: r.cut_time,
-          })),
-        }
-      );
+      let startRes;
+      try {
+        startRes = await api.post(
+          `/api/series/${epSid}/episodes/${epNumber}/seedance/start`,
+          {
+            prompt: composeRes.prompt,
+            chunk_text: seg.text,
+            duration: seg.durationSec || shared.duration,
+            resolution: shared.resolution,
+            moderation_bypass: shared.moderation_bypass,
+            script_order: seg.scriptOrder,
+            refs: (composeRes.refs || []).map(r => ({
+              kind: r.kind, id: r.id, outfit: r.outfit || null, url: r.url || null,
+              source: r.source, prev_idx: r.prev_idx, name: r.name,
+              cut_index: r.cut_index, cut_time: r.cut_time,
+            })),
+          }, { timeoutMs: 60_000 }
+        );
+      } catch (e) {
+        clog('ERROR', 'parallel.start_throw', {
+          sid: epSid, ep: epNumber, seg_anchor: (seg.anchor || '').slice(0, 60),
+          msg: (e?.message || String(e)).slice(0, 300),
+        });
+        throw e;
+      }
+      if (startRes?.error) {
+        clog('ERROR', 'parallel.start_error', { sid: epSid, ep: epNumber, err: String(startRes.error).slice(0, 300) });
+        throw new Error('start: ' + startRes.error);
+      }
+      if (startRes?.chunk?.idx == null) {
+        clog('ERROR', 'parallel.start_no_idx', { sid: epSid, ep: epNumber, startRes_keys: Object.keys(startRes || {}).join(',') });
+        throw new Error('start вернул пустой chunk_idx');
+      }
       return { composeRes, startRes };
     }
 
@@ -7066,12 +7152,25 @@ async function _runEpisodeAutoStandalone(sid, num, opts = {}) {
     for (let i = 0; i < Math.min(MAX_PARALLEL_SCENES, sceneGroups.length); i++) workers.push(worker());
     await Promise.all(workers);
 
+    clog('INFO', 'parallel.finished', {
+      sid: epSid, ep: epNumber,
+      completed: R.completedCount, total: R.total, errors: errorsCount,
+      cancelled: !!R.cancelRequested,
+    });
     return {
       ok: !R.cancelRequested && errorsCount === 0,
       completed: R.completedCount,
       total: R.total,
       errors: errorsCount,
     };
+  } catch (e) {
+    // Anything that bubbled past the per-scene catches above lands here.
+    // Without this branch a throw would skip finally→cleanup and leave R in
+    // AUTO_RUNS spinning forever.
+    clog('ERROR', 'parallel.crash', {
+      sid: epSid, ep: epNumber, msg: (e?.message || String(e)).slice(0, 400),
+    });
+    return { ok: false, completed: R.completedCount, total: R.total, errors: errorsCount + 1 };
   } finally {
     R.active = false;
     _autoUnregisterRun(R);

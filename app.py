@@ -9030,15 +9030,23 @@ def get_episodes(sid):
         if ep.get('gen_status') != 'generating':
             continue
         chunks = ep.get('seedance_chunks') or []
+        # Skip mid-startup (status='generating' just set by a fresh range-gen
+        # worker, no chunks yet) — we can't tell from the server whether the
+        # client is still working. False-positive heal would race with the
+        # active runner.
+        if not chunks:
+            continue
         any_inflight = any(
             c.get('status') in ('submitting', 'pending', 'processing') for c in chunks
         )
         if any_inflight:
             continue   # real run in flight, leave alone
-        # Latest chunk activity timestamp (created_at). Empty = forever stale.
-        last_activity = max((c.get('created_at') or 0) for c in chunks) if chunks else 0
-        if last_activity and (now - last_activity) < 600:
-            continue   # very recent — might be mid-startup, give it 10min grace
+        # All chunks settled. Only heal if the last chunk was created more
+        # than 10 minutes ago — a recent finished chunk could mean the client
+        # is between chunks (compose for the next one).
+        last_activity = max((c.get('created_at') or 0) for c in chunks)
+        if (now - last_activity) < 600:
+            continue
         healed.append(ep.get('number'))
         ep.pop('gen_status', None)
         try:
