@@ -5432,6 +5432,11 @@ const _SLUG_BLOCKLIST_RE = /^(REVERSAL|END|FIN|КОНЕЦ|TBD|TBC|БИТ|BIT|HOO
 
 // Standalone ALL-CAPS slug like "ДОМ АННЫ — НОЧЬ" or "OFFICE — DAY".
 // Must look like a place/time tag: 5..80 chars, no lowercase letters, no colon.
+// CRITICAL: bare single-word ALL-CAPS lines (SOPHIE, ISABELLE, MIA, etc.) are
+// speaker labels in standard screenplay format — NOT scene slugs. Real scene
+// slugs almost always have at least a dash (location + time-of-day) or 2+
+// words. Single token = name cue. This guard fixes the common bug where
+// every speaker label opened a new "scene".
 function _isAllCapsSlug(t) {
   if (!t) return false;
   if (t.length < 5 || t.length > 80) return false;
@@ -5440,6 +5445,16 @@ function _isAllCapsSlug(t) {
   if (!/[A-ZА-ЯЁ]/.test(t)) return false;       // need at least one letter
   if (/^(FADE|CUT|DISSOLVE|SMASH|MATCH)\b/i.test(t)) return false;
   if (_SLUG_BLOCKLIST_RE.test(t.replace(/[\.\—\-\s]+$/, ''))) return false;
+  // Need either a dash (—/–/-) OR 2+ space-separated tokens. Otherwise
+  // it's most likely a speaker cue like "SOPHIE" / "ISABELLE".
+  const hasDash = /[—–\-]/.test(t);
+  const tokens = t.split(/\s+/).filter(Boolean);
+  if (!hasDash && tokens.length < 2) return false;
+  // Even with 2 tokens, both can be a name+lastname («JANE DOE»). Require
+  // at least one «time-of-day» / «scene-context» keyword OR a dash to avoid
+  // false-positives for char cues with surnames.
+  const hasContext = /\b(DAY|NIGHT|MORNING|EVENING|DAWN|DUSK|AFTERNOON|MIDNIGHT|ДЕНЬ|НОЧЬ|УТРО|ВЕЧЕР|ПОЛДЕНЬ|РАССВЕТ|ЗАКАТ|СУМЕРКИ|ПОЛНОЧЬ|CONTINUOUS|LATER|MOMENTS LATER|FLASHBACK|ROOM|HOUSE|OFFICE|STREET|КОМНАТА|ДОМ|ОФИС|УЛИЦА|ИНТ|ЭКСТ|КВАРТИРА|КАФЕ|САД|БАР|ПАЛАЦ|ДВОРЕЦ|БАЛЬНАЯ|СПАЛЬНЯ|КУХНЯ|ГОСТИНАЯ|КОРИДОР|ЛЕСТНИЦА|САЛОН|ХОЛЛ|КАБИНЕТ|ВАННАЯ)\b/i.test(t);
+  if (!hasDash && !hasContext) return false;
   return true;
 }
 
