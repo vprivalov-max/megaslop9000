@@ -7209,70 +7209,112 @@ async function startRangeGen() {
     } catch {}
 
     let result = { ok: false, completed: 0, total: 0, errors: 0 };
-
-    if (concurrency === 1) {
-      // Legacy path: navigate to the episode + use startAutoMode (so the user
-      // sees the visible episode page with chunks ticking in).
-      try {
-        navigate('episode', { seriesId: RANGE.seriesId, episodeNum: epNum });
-      } catch (e) { console.warn('[range-gen] navigate failed', e); }
-      const navStart = Date.now();
-      while (Date.now() - navStart < 30000) {
-        if (S.seriesId === RANGE.seriesId && S.episode?.number === epNum) break;
-        await new Promise(r => setTimeout(r, 250));
-      }
-      if (S.episode?.number !== epNum) {
-        _rangeGenSetStatus(`⚠ серия ${epNum} не открылась — пропуск`);
-        return { ok: false, completed: 0, total: 0, errors: 1 };
-      }
-      try { await startAutoMode(); } catch (e) { console.warn('[range-gen] startAutoMode failed', e); }
-      while (AUTO?.active) {
-        if (RANGE.cancelRequested) { try { stopAutoMode(); } catch {} }
-        await new Promise(r => setTimeout(r, 2000));
-      }
-      result = {
-        ok: !RANGE.cancelRequested && (AUTO?.completedCount || 0) >= (AUTO?.total || 0) && (AUTO?.total || 0) > 0,
-        completed: AUTO?.completedCount || 0,
-        total: AUTO?.total || 0,
-        errors: 0,
-      };
-    } else {
-      // Parallel path: standalone runner, no navigation. Multiple of these
-      // can run concurrently because each has its own Run state.
-      result = await _runEpisodeAutoStandalone(RANGE.seriesId, epNum, {
-        useLastframe: true, useCutframes: true,
-        useStyle: false, styleVal: '',
-        baseOnly: false, closeUpOnly: false,
-        duration: 15, resolution: '720p', moderation_bypass: 'collage_grid',
-        errorMode: 'heal',
-        maxParallelScenes: 2,   // cap a bit lower so concurrent eps don't oversubscribe Seedance
-      });
-    }
-
-    const completedAll = result.ok;
     let assembleNote = '';
-    if (RANGE.autoAssemble && completedAll && !RANGE.cancelRequested) {
-      try {
-        const r = await api.post(
-          `/api/series/${RANGE.seriesId}/episodes/${epNum}/auto-assemble`,
-          { require_all: true, expected_segments: result.total },
-        );
-        if (r && r.ok) assembleNote = ` · 🎬 ${r.filename} (${r.size_mb}MB)`;
-        else if (r?.error) assembleNote = ` · ⚠ авто-сборка: ${r.error}`;
-      } catch (e) {
-        assembleNote = ` · ⚠ авто-сборка упала: ${e.message || e}`;
-      }
-    }
+    let finalStatus = 'failed';   // default — if anything below throws, we still flip away from 'generating'
 
     try {
-      const finalStatus = completedAll ? 'done' : (RANGE.cancelRequested ? 'queued' : 'failed');
-      await api.put(`/api/series/${RANGE.seriesId}/episodes/${epNum}`, { gen_status: finalStatus });
-      if (S.episode?.number === epNum) S.episode.gen_status = finalStatus;
-      const ep = (S.series.episodes || []).find(e => e.number === epNum);
-      if (ep) ep.gen_status = finalStatus;
-    } catch {}
+      if (concurrency === 1) {
+        // Legacy path: navigate to the episode + use startAutoMode (so the user
+        // sees the visible episode page with chunks ticking in).
+        try {
+          navigate('episode', { seriesId: RANGE.seriesId, episodeNum: epNum });
+        } catch (e) { console.warn('[range-gen] navigate failed', e); }
+        const navStart = Date.now();
+        while (Date.now() - navStart < 30000) {
+          if (S.seriesId === RANGE.seriesId && S.episode?.number === epNum) break;
+          await new Promise(r => setTimeout(r, 250));
+        }
+        if (S.episode?.number !== epNum) {
+          _rangeGenSetStatus(`⚠ серия ${epNum} не открылась — пропуск`);
+          clog('WARN', 'range.ep_nav_fail', { sid: RANGE.seriesId, ep: epNum });
+          result = { ok: false, completed: 0, total: 0, errors: 1 };
+        } else {
+          try { await startAutoMode(); }
+          catch (e) {
+            clog('ERROR', 'range.ep_startAuto_throw', { sid: RANGE.seriesId, ep: epNum, msg: (e?.message || String(e)).slice(0, 300) });
+          }
+          while (AUTO?.active) {
+            if (RANGE.cancelRequested) { try { stopAutoMode(); } catch {} }
+            await new Promise(r => setTimeout(r, 2000));
+          }
+          result = {
+            ok: !RANGE.cancelRequested && (AUTO?.completedCount || 0) >= (AUTO?.total || 0) && (AUTO?.total || 0) > 0,
+            completed: AUTO?.completedCount || 0,
+            total: AUTO?.total || 0,
+            errors: 0,
+          };
+        }
+      } else {
+        // Parallel path: standalone runner, no navigation. Multiple of these
+        // can run concurrently because each has its own Run state.
+        result = await _runEpisodeAutoStandalone(RANGE.seriesId, epNum, {
+          useLastframe: true, useCutframes: true,
+          useStyle: false, styleVal: '',
+          baseOnly: false, closeUpOnly: false,
+          duration: 15, resolution: '720p', moderation_bypass: 'collage_grid',
+          errorMode: 'heal',
+          maxParallelScenes: 2,
+        });
+      }
 
-    _rangeGenSetStatus(`✓ ${idxInQueue + 1}/${queue.length} · серия ${epNum}${assembleNote}`);
+      // Log near-instant returns — they're almost always a real bug (segment
+      // count zero, episode JSON fetch failure, etc.) and we want to see
+      // which one it was without DevTools.
+      if (result.total === 0 && result.completed === 0) {
+        clog('WARN', 'range.ep_empty_result', {
+          sid: RANGE.seriesId, ep: epNum,
+          errors: result.errors || 0, ok: !!result.ok,
+        });
+      }
+
+      const completedAll = result.ok;
+      finalStatus = completedAll ? 'done' : (RANGE.cancelRequested ? 'queued' : 'failed');
+
+      if (RANGE.autoAssemble && completedAll && !RANGE.cancelRequested) {
+        try {
+          const r = await api.post(
+            `/api/series/${RANGE.seriesId}/episodes/${epNum}/auto-assemble`,
+            { require_all: true, expected_segments: result.total },
+          );
+          if (r && r.ok) assembleNote = ` · 🎬 ${r.filename} (${r.size_mb}MB)`;
+          else if (r?.error) assembleNote = ` · ⚠ авто-сборка: ${r.error}`;
+        } catch (e) {
+          assembleNote = ` · ⚠ авто-сборка упала: ${e.message || e}`;
+        }
+      }
+    } catch (e) {
+      // Anything thrown mid-run: log it and fall through to the finally that
+      // still flips gen_status away from 'generating'. Without this guard,
+      // a thrown exception would skip the status-update PUT below and leave
+      // the episode permanently stuck.
+      clog('ERROR', 'range.ep_run_throw', {
+        sid: RANGE.seriesId, ep: epNum,
+        msg: (e?.message || String(e)).slice(0, 400),
+      });
+      console.error('[range-gen] _rangeRunEpisode body threw', epNum, e);
+      finalStatus = 'failed';
+    } finally {
+      // ALWAYS flip away from 'generating'. Use a fire-and-forget retry on
+      // failure so a transient network blip doesn't leave the episode stuck.
+      const tryUpdate = async () => {
+        try {
+          await api.put(`/api/series/${RANGE.seriesId}/episodes/${epNum}`, { gen_status: finalStatus });
+          if (S.episode?.number === epNum) S.episode.gen_status = finalStatus;
+          const ep = (S.series.episodes || []).find(e => e.number === epNum);
+          if (ep) ep.gen_status = finalStatus;
+          return true;
+        } catch (e) {
+          return false;
+        }
+      };
+      const ok1 = await tryUpdate();
+      if (!ok1) {
+        // One retry after 1.5s — covers a transient 5xx during heavy load.
+        await new Promise(r => setTimeout(r, 1500));
+        await tryUpdate();
+      }
+      _rangeGenSetStatus(`✓ ${idxInQueue + 1}/${queue.length} · серия ${epNum}${assembleNote || (finalStatus === 'failed' ? ' · ⚠ упало' : '')}`);
+    }
     return result;
   }
 
@@ -7292,6 +7334,22 @@ async function startRangeGen() {
     const workers = [];
     for (let i = 0; i < Math.min(concurrency, queue.length); i++) workers.push(worker());
     await Promise.all(workers);
+
+    // Safety sweep: scan every episode in the queue and force-reset any still
+    // sitting at gen_status='generating'. Belt-and-suspenders for cases where
+    // _rangeRunEpisode's own finally-block managed to throw before its PUT.
+    try {
+      const fresh = await api.get(`/api/series/${RANGE.seriesId}/episodes`);
+      for (const num of queue) {
+        const ep = fresh.find(e => e.number === num);
+        if (ep && ep.gen_status === 'generating') {
+          clog('WARN', 'range.stuck_status_swept', { sid: RANGE.seriesId, ep: num });
+          try {
+            await api.put(`/api/series/${RANGE.seriesId}/episodes/${num}`, { gen_status: 'failed' });
+          } catch {}
+        }
+      }
+    } catch {}
   } finally {
     window.confirm = origConfirm;
     window.appConfirm = origAppConfirm;

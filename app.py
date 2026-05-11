@@ -9017,7 +9017,37 @@ def range_reteller_prompt(sid):
 
 @app.route('/api/series/<sid>/episodes', methods=['GET'])
 def get_episodes(sid):
-    return jsonify(list_episodes(sid))
+    eps = list_episodes(sid)
+    # Self-heal stuck gen_status='generating' — if an episode hasn't had a new
+    # seedance chunk added in the last 10 minutes AND has no in-flight chunks,
+    # it's almost certainly leftover from a crashed range-gen worker that
+    # forgot to flip the status away from 'generating'. Without this sweep
+    # the UI hides the «ready» checkbox forever and user has to manually edit
+    # the JSON. Cheap: runs only over eps marked 'generating', no LLM calls.
+    healed = []
+    now = int(time.time())
+    for ep in eps:
+        if ep.get('gen_status') != 'generating':
+            continue
+        chunks = ep.get('seedance_chunks') or []
+        any_inflight = any(
+            c.get('status') in ('submitting', 'pending', 'processing') for c in chunks
+        )
+        if any_inflight:
+            continue   # real run in flight, leave alone
+        # Latest chunk activity timestamp (created_at). Empty = forever stale.
+        last_activity = max((c.get('created_at') or 0) for c in chunks) if chunks else 0
+        if last_activity and (now - last_activity) < 600:
+            continue   # very recent — might be mid-startup, give it 10min grace
+        healed.append(ep.get('number'))
+        ep.pop('gen_status', None)
+        try:
+            save_episode(sid, ep.get('number'), ep)
+        except Exception as e:
+            print(f'[gen_status self-heal] save failed ep{ep.get("number")}: {e}', flush=True)
+    if healed:
+        print(f'[gen_status self-heal] {sid}: cleared stuck \'generating\' on episodes {healed}', flush=True)
+    return jsonify(eps)
 
 _CREATE_EP_LOCKS = {}
 # Per-episode lock for serializing seedance chunks mutations (start / submit /
