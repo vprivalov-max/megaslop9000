@@ -10545,13 +10545,39 @@ def _avai_seedance_start(prompt, ref_urls, duration, resolution, moderation_bypa
 
 def _avai_seedance_status(job_id, status_url=None, avai_key=None):
     """Poll job. Returns dict {status, progress, video_url, cost, error, raw}.
-    avai_key: optional explicit override for callers outside request context."""
+    avai_key: optional explicit override for callers outside request context.
+
+    Retries on transient network errors (SSL EOF, connection reset, timeout)
+    — common when AVAI restarts a worker or an intermediate proxy hiccups.
+    Without retry a SINGLE network blip during poll permanently marks the
+    chunk as failed (caller catches the exception and writes status='failed'),
+    erasing minutes of actual work."""
     key = avai_key if avai_key is not None else _get_user_avai_key()
     headers = {'x-api-key': key}
     url = status_url or f'https://avai-gen.com/api/public/generate/jobs/{job_id}'
     if url.startswith('/'):
         url = 'https://avai-gen.com' + url
-    resp = requests.get(url, headers=headers, timeout=30)
+    last_err = None
+    for attempt in range(3):   # 3 attempts total
+        try:
+            resp = requests.get(url, headers=headers, timeout=30)
+            break
+        except (
+            requests.exceptions.SSLError,
+            requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout,
+            requests.exceptions.ChunkedEncodingError,
+        ) as e:
+            last_err = e
+            if attempt == 2:
+                # Final attempt failed — surface as a structured «pending» so
+                # the caller treats it as «check again later» instead of a
+                # hard failure. The reaper in /seedance/poll will eventually
+                # mark it failed if the job genuinely never recovers.
+                print(f'[avai-status] {job_id} network fail after 3 tries: {e.__class__.__name__}: {str(e)[:200]}', flush=True)
+                return {'status': 'pending', 'progress': None, 'video_url': '', 'cost': None,
+                        'error': f'transient network error: {e.__class__.__name__}', 'raw': {}}
+            time.sleep(1.5 * (attempt + 1))   # 1.5s, 3s
     if not resp.ok:
         return {'status': 'error', 'error': f'{resp.status_code}: {resp.text[:200]}'}
     data = resp.json()
