@@ -2422,6 +2422,9 @@ def build_trajectory_block(s, current_ep):
 
     lines.append('═══════════════════════════════════════════════════')
     return '\n'.join(lines) + '\n\n'
+
+
+@app.route('/api/series/<sid>/archive', methods=['POST'])
 def toggle_archive(sid):
     s = load_series(sid)
     if not s:
