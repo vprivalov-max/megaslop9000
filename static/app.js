@@ -7469,8 +7469,21 @@ async function startRangeGen() {
         finished++;
       }
     }
+    // Stagger worker startup so 3 concurrent compose calls don't fire in
+    // the same JS turn. Anthropic API throttles bursts pretty aggressively
+    // even with backoff retry — staggering 2s apart smooths the load. With
+    // concurrency=3 the third worker starts at +4s, by which time the
+    // first one's compose is already mid-flight.
+    const STAGGER_MS = 2000;
     const workers = [];
-    for (let i = 0; i < Math.min(concurrency, queue.length); i++) workers.push(worker());
+    const workerCount = Math.min(concurrency, queue.length);
+    for (let i = 0; i < workerCount; i++) {
+      const delay = i * STAGGER_MS;
+      workers.push((async () => {
+        if (delay > 0) await new Promise(r => setTimeout(r, delay));
+        await worker();
+      })());
+    }
     await Promise.all(workers);
 
     // Safety sweep: scan every episode in the queue and force-reset any still

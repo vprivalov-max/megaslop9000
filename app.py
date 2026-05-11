@@ -912,7 +912,10 @@ def _get_anthropic_client():
 
 def claude_ask(prompt: str, system: str = '', model: str = '', timeout: int = 1200, idle_timeout: int = 180, max_tokens: int = 8192) -> str:
     """Anthropic API call. Signature kept compatible with old CLI version —
-    `timeout`/`idle_timeout` are accepted but ignored (SDK handles its own timeouts)."""
+    `timeout`/`idle_timeout` are accepted but ignored (SDK handles its own timeouts).
+    Retries up to 3 times on 429 (rate-limit) / 529 (overloaded) with
+    exponential backoff — critical for parallel range-gen where 3 concurrent
+    compose calls used to fail 2/3 because Anthropic throttled the burst."""
     sdk_model = _MODEL_ALIAS.get(model, model) if model else 'claude-sonnet-4-5'
     prompt_kb = len((system + prompt).encode('utf-8')) / 1024
     t0 = time.time()
@@ -921,24 +924,48 @@ def claude_ask(prompt: str, system: str = '', model: str = '', timeout: int = 12
     kwargs = {'model': sdk_model, 'max_tokens': max_tokens, 'messages': [{'role': 'user', 'content': prompt}]}
     if system:
         kwargs['system'] = system
-    # SDK requires streaming for any request that may exceed 10min — kick in for large max_tokens
-    if max_tokens >= 16000:
-        text_parts = []
-        stop_reason = None
-        with client.messages.stream(**kwargs) as stream:
-            for chunk in stream.text_stream:
-                text_parts.append(chunk)
-            final = stream.get_final_message()
-            stop_reason = getattr(final, 'stop_reason', None)
-        text = ''.join(text_parts).strip()
-        out_kb = len(text.encode('utf-8')) / 1024
-        print(f'[claude_ask] done(stream) in {time.time()-t0:.1f}s ({prompt_kb:.1f}KB→{out_kb:.1f}KB, stop={stop_reason})', flush=True)
-        return text
-    msg = client.messages.create(**kwargs)
-    text = ''.join(b.text for b in msg.content if getattr(b, 'type', '') == 'text').strip()
-    out_kb = len(text.encode('utf-8')) / 1024
-    print(f'[claude_ask] done in {time.time()-t0:.1f}s ({prompt_kb:.1f}KB→{out_kb:.1f}KB, stop={msg.stop_reason})', flush=True)
-    return text
+
+    last_err = None
+    for attempt in range(4):   # 4 attempts total: 0 + 3 retries
+        try:
+            if max_tokens >= 16000:
+                text_parts = []
+                stop_reason = None
+                with client.messages.stream(**kwargs) as stream:
+                    for chunk in stream.text_stream:
+                        text_parts.append(chunk)
+                    final = stream.get_final_message()
+                    stop_reason = getattr(final, 'stop_reason', None)
+                text = ''.join(text_parts).strip()
+                out_kb = len(text.encode('utf-8')) / 1024
+                print(f'[claude_ask] done(stream) in {time.time()-t0:.1f}s ({prompt_kb:.1f}KB→{out_kb:.1f}KB, stop={stop_reason}, try={attempt+1})', flush=True)
+                return text
+            msg = client.messages.create(**kwargs)
+            text = ''.join(b.text for b in msg.content if getattr(b, 'type', '') == 'text').strip()
+            out_kb = len(text.encode('utf-8')) / 1024
+            print(f'[claude_ask] done in {time.time()-t0:.1f}s ({prompt_kb:.1f}KB→{out_kb:.1f}KB, stop={msg.stop_reason}, try={attempt+1})', flush=True)
+            return text
+        except Exception as e:
+            last_err = e
+            # Anthropic SDK exposes status_code on its API errors. 429 (rate
+            # limit), 529 (overloaded), 500-503 (transient) all worth retrying.
+            sc = getattr(e, 'status_code', None) or (e.response.status_code if hasattr(e, 'response') and hasattr(e.response, 'status_code') else None)
+            err_name = e.__class__.__name__
+            retryable = sc in (408, 429, 500, 502, 503, 504, 529) or err_name in (
+                'RateLimitError', 'APIConnectionError', 'APITimeoutError',
+                'InternalServerError', 'OverloadedError', 'APIStatusError',
+            )
+            if not retryable or attempt == 3:
+                print(f'[claude_ask] FAIL after {attempt+1} tries ({time.time()-t0:.1f}s): {err_name}: {str(e)[:200]}', flush=True)
+                raise
+            # Exponential backoff with jitter: 2s, 6s, 14s
+            delay = (2 ** attempt) * 2 + (random.random() * 1.5)
+            print(f'[claude_ask] retry {attempt+1}/3 after {delay:.1f}s ({err_name}: {str(e)[:120]})', flush=True)
+            time.sleep(delay)
+    # Defensive: if loop exits without return/raise (shouldn't happen)
+    if last_err:
+        raise last_err
+    raise RuntimeError('claude_ask: exhausted retries with no error captured')
 
 
 def anthropic_ask(prompt: str, system: str = '', model: str = 'claude-haiku-4-5') -> str:
