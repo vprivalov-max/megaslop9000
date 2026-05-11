@@ -1533,27 +1533,92 @@ async function appendScriptGo() {
 // series page (#import-progress-banner) with X/Y counter + progress bar +
 // current episode label.
 let _importStatusTimer = null;
+// Pipeline progress banner. Three-stage flow:
+//   1. ANALYZING — _import_worker extracts chars/locs/items per episode
+//   2. GENERATING — autogen sweep creates portraits/outfits/locations/items
+//   3. READY     — all done, episode list rebuilds with «▶ Готова» badges
+// Each stage owns its own progress bar; banner transitions automatically.
 async function pollImportStatus(sid) {
   if (_importStatusTimer) { clearInterval(_importStatusTimer); _importStatusTimer = null; }
+  // Stage tracking — captured here so _renderImportBanner can drive proper
+  // state transitions across many polls.
+  const PIPE = {
+    sid,
+    stage: 'analyzing',         // 'analyzing' | 'generating' | 'ready'
+    importDoneCount: 0,
+    importTotal: 0,
+    importErrors: 0,
+    autogenDone: 0,
+    autogenTotal: 0,
+    autogenErrors: 0,
+    autogenSeen: false,         // becomes true on first running=true tick
+  };
   const tick = async () => {
     try {
-      const st = await fetch(`/api/series/${sid}/import-status`).then(r => r.json());
-      _renderImportBanner(st);
-      if (!st.running && st.done > 0) {
-        if (_importStatusTimer) { clearInterval(_importStatusTimer); _importStatusTimer = null; }
-        // Final refresh so chars/locs/items show up.
+      // Phase 1 / 2 query depending on current stage
+      if (PIPE.stage === 'analyzing') {
+        const st = await fetch(`/api/series/${sid}/import-status`).then(r => r.json());
+        PIPE.importDoneCount = st.done || 0;
+        PIPE.importTotal = st.total || 0;
+        PIPE.importErrors = (st.errors || []).length;
+        if (!st.running && st.done > 0) {
+          // Phase 1 done. Refresh series state so chars/locs/items show in
+          // the sidebar, then transition to phase 2.
+          try {
+            const fresh = await api.get(`/api/series/${sid}`);
+            if (fresh && S.seriesId === sid) {
+              S.series = fresh;
+              renderCharactersList && renderCharactersList();
+              renderLocationsList && renderLocationsList();
+              renderItemsList && renderItemsList();
+            }
+          } catch {}
+          PIPE.stage = 'generating';
+        }
+        _renderPipelineBanner(PIPE);
+      }
+      if (PIPE.stage === 'generating') {
+        let agst = null;
         try {
-          const fresh = await api.get(`/api/series/${sid}`);
-          if (fresh && S.seriesId === sid) {
-            S.series = fresh;
-            renderCharactersList && renderCharactersList();
-            renderLocationsList && renderLocationsList();
-            renderItemsList && renderItemsList();
-          }
+          agst = await fetch(`/api/series/${sid}/auto-generate/status`).then(r => r.json());
         } catch {}
-        // Banner already shows "✓ Готово" with counts — no need for an
-        // additional toast. Was the second "import finished" indicator
-        // user reported as «дёргается / показывает дважды».
+        if (agst) {
+          PIPE.autogenDone = agst.done || 0;
+          PIPE.autogenTotal = agst.queue || 0;
+          PIPE.autogenErrors = (agst.errors || []).length;
+          if (agst.running) PIPE.autogenSeen = true;
+          // Stage 2 → stage 3:
+          //   • we saw autogen running at some point AND it has now stopped,
+          //   • OR we never saw it running but >5s passed since stage entry
+          //     (no autogen at all — e.g. all assets were pre-generated, or
+          //     auto_generate_assets is off). Don't hang in stage 2 forever.
+          PIPE.generatingEnteredAt = PIPE.generatingEnteredAt || Date.now();
+          const enoughGrace = Date.now() - PIPE.generatingEnteredAt > 6000;
+          if ((PIPE.autogenSeen && !agst.running) || (!PIPE.autogenSeen && enoughGrace)) {
+            PIPE.stage = 'ready';
+          }
+        }
+        _renderPipelineBanner(PIPE);
+        if (PIPE.stage === 'ready') {
+          // Final refresh so «▶ Готова» badges + chars-with-photos render.
+          try {
+            const fresh = await api.get(`/api/series/${sid}`);
+            if (fresh && S.seriesId === sid) {
+              S.series = fresh;
+              renderCharactersList && renderCharactersList();
+              renderLocationsList && renderLocationsList();
+              renderItemsList && renderItemsList();
+            }
+            if (S.seriesId === sid) {
+              S.episodes = await api.get(`/api/series/${sid}/episodes`);
+              if (typeof renderEpisodesList === 'function') renderEpisodesList();
+            }
+          } catch {}
+        }
+      }
+      if (PIPE.stage === 'ready') {
+        // Auto-hide after 12s (the banner already shows ✅ summary).
+        if (_importStatusTimer) { clearInterval(_importStatusTimer); _importStatusTimer = null; }
       }
     } catch {}
   };
@@ -1561,70 +1626,122 @@ async function pollImportStatus(sid) {
   _importStatusTimer = setInterval(tick, 3000);
 }
 
-// Single hide-timeout id so we don't stack multiple hide-trigger setTimeouts
-// across poll ticks.
+// Auto-hide timer (single instance — multiple ticks would otherwise queue
+// multiple removals).
 let _importBannerHideTimer = null;
-function _renderImportBanner(st) {
-  // Banner lives at #import-progress-banner pinned to body so it survives
-  // renderSeriesView() rebuilding .series-main (the previous host). Multiple
-  // ticks reuse the SAME element — only inner text/width update, not full
-  // innerHTML rebuild (which restarted the spinner CSS animation each tick
-  // and looked like flicker).
+function _renderPipelineBanner(P) {
   let el = document.getElementById('import-progress-banner');
-  const wasNew = !el;
   if (!el) {
     el = document.createElement('div');
     el.id = 'import-progress-banner';
     el.className = 'import-progress-banner';
-    el.style.cssText = 'position:fixed;top:60px;left:50%;transform:translateX(-50%);max-width:720px;width:90vw;z-index:1500';
+    el.style.cssText = 'position:fixed;top:60px;left:50%;transform:translateX(-50%);max-width:760px;width:92vw;z-index:1500;background:var(--surface,#1a1a1f);border:1px solid var(--border,#333);border-radius:12px;padding:14px 18px;box-shadow:0 12px 36px rgba(0,0,0,0.5)';
     document.body.appendChild(el);
   }
-  if (!st.running && st.done === 0) {
-    el.classList.add('hidden');
-    return;
+  // Step descriptors — color & icon per stage.
+  const step1Done = P.stage !== 'analyzing';
+  const step2Done = P.stage === 'ready';
+  const step3Done = P.stage === 'ready';
+
+  const importPct = P.importTotal ? Math.round(100 * P.importDoneCount / P.importTotal) : (step1Done ? 100 : 0);
+  const autogenPct = P.autogenTotal ? Math.round(100 * P.autogenDone / P.autogenTotal) : (step2Done ? 100 : 0);
+
+  const importBar = P.stage === 'analyzing'
+    ? `<div class="ipb-bar"><div class="ipb-bar-fill" style="width:${importPct}%"></div></div>`
+    : '';
+  const autogenBar = P.stage === 'generating'
+    ? `<div class="ipb-bar"><div class="ipb-bar-fill" style="width:${autogenPct}%"></div></div>`
+    : '';
+
+  const importErrsBit = P.importErrors ? ` · <span style="color:var(--warning,#fbbf24)">ошибок ${P.importErrors}</span>` : '';
+  const autogenErrsBit = P.autogenErrors ? ` · <span style="color:var(--warning,#fbbf24)">ошибок ${P.autogenErrors}</span>` : '';
+
+  const icon = (active, done) => active ? '<span class="ipb-spinner"></span>'
+                                        : (done ? '<span style="color:#10b981;font-weight:700">✓</span>'
+                                                : '<span style="color:var(--muted,#888)">·</span>');
+
+  // Final-ready summary stats from S.series.
+  let readyStats = '';
+  if (P.stage === 'ready' && S.series && S.seriesId === P.sid) {
+    const totalEps = (S.episodes || []).length;
+    const newEps = P.importTotal;
+    const chars = (S.series.characters || []).filter(c => (c.ref_images || []).length).length;
+    const locs  = (S.series.locations  || []).filter(l => (l.ref_images || []).length).length;
+    const items = (S.series.items      || []).filter(i => (i.ref_images || []).length).length;
+    const totalChars = (S.series.characters || []).length;
+    const totalLocs  = (S.series.locations  || []).length;
+    const totalItems = (S.series.items      || []).length;
+    readyStats = `
+      <div style="margin-top:10px;padding:10px 12px;background:rgba(16,185,129,0.10);border:1px solid rgba(16,185,129,0.35);border-radius:8px;font-size:0.85rem">
+        <div style="color:#10b981;font-weight:700;margin-bottom:4px">✅ Серии готовы к видео-генерации</div>
+        <div style="color:var(--muted)">
+          Добавлено: <strong>${newEps}</strong> сер · в сериале сейчас: <strong>${totalEps}</strong> сер<br>
+          Ассетов сгенерировано: 👤 ${chars}/${totalChars} персонажей · 🏛 ${locs}/${totalLocs} локаций · 📦 ${items}/${totalItems} предметов
+        </div>
+      </div>`;
   }
-  el.classList.remove('hidden');
-  const pct = st.total ? Math.round(100 * st.done / st.total) : 0;
-  const errCount = (st.errors || []).length;
-  if (wasNew || !el.querySelector('.ipb-row')) {
-    // Build skeleton ONCE per banner instance.
-    el.innerHTML = `
-      <div class="ipb-row">
-        <span class="ipb-spinner-slot"></span>
-        <span class="ipb-text"></span>
+
+  el.innerHTML = `
+    <div style="font-size:0.92rem;font-weight:700;margin-bottom:10px">🎬 Подготовка серий</div>
+    <div style="display:flex;flex-direction:column;gap:8px">
+      <div style="display:flex;align-items:center;gap:10px;font-size:0.85rem">
+        <span style="width:18px;display:inline-flex;justify-content:center">${icon(P.stage === 'analyzing', step1Done)}</span>
+        <div style="flex:1;min-width:0">
+          <div><strong>1.</strong> 🧠 Анализ сценариев — извлечение персонажей, локаций, предметов
+            ${P.stage === 'analyzing' ? `<span style="color:var(--muted)"> · ${P.importDoneCount}/${P.importTotal}${importErrsBit}</span>` : ''}
+            ${step1Done && P.stage !== 'analyzing' ? `<span style="color:var(--muted)"> · обработано ${P.importDoneCount} сер${P.importErrors ? ` (ошибок ${P.importErrors})` : ''}</span>` : ''}
+          </div>
+          ${importBar}
+        </div>
       </div>
-      <div class="ipb-bar"><div class="ipb-bar-fill" style="width:0%"></div></div>
-    `;
-  }
-  // Targeted updates: spinner / done state, text, bar width. Pure text/style
-  // mutations — no DOM teardown, no spinner-animation restart.
-  const spinSlot = el.querySelector('.ipb-spinner-slot');
-  if (spinSlot) {
-    if (st.running && !spinSlot.querySelector('.ipb-spinner')) {
-      spinSlot.innerHTML = '<span class="ipb-spinner"></span>';
-    } else if (!st.running) {
-      spinSlot.innerHTML = '<span style="color:#10b981">✓</span>';
-    }
-  }
-  const textEl = el.querySelector('.ipb-text');
-  if (textEl) {
-    const cur = st.current ? `· сейчас: <span style="color:var(--muted)">${esc(st.current)}</span>` : '';
-    const errs = errCount ? ` · <span style="color:var(--warning)">ошибок: ${errCount}</span>` : '';
-    textEl.innerHTML = `<strong>Импорт сценария:</strong> ${st.done} / ${st.total} серий обработано ${cur}${errs}`;
-  }
-  const fill = el.querySelector('.ipb-bar-fill');
-  if (fill) fill.style.width = `${pct}%`;
-  if (!st.running) {
+      <div style="display:flex;align-items:center;gap:10px;font-size:0.85rem">
+        <span style="width:18px;display:inline-flex;justify-content:center">${icon(P.stage === 'generating', step2Done)}</span>
+        <div style="flex:1;min-width:0">
+          <div><strong>2.</strong> 🎨 Генерация ассетов — портреты, костюмы, локации, предметы
+            ${P.stage === 'generating'
+              ? (P.autogenTotal
+                  ? `<span style="color:var(--muted)"> · ${P.autogenDone}/${P.autogenTotal}${autogenErrsBit}</span>`
+                  : `<span style="color:var(--muted)"> · ждём очередь…</span>`)
+              : ''}
+            ${step2Done && P.autogenTotal ? `<span style="color:var(--muted)"> · сгенерировано ${P.autogenDone} ассет${P.autogenDone === 1 ? '' : (P.autogenDone < 5 ? 'а' : 'ов')}${P.autogenErrors ? ` (ошибок ${P.autogenErrors})` : ''}</span>` : ''}
+            ${step2Done && !P.autogenTotal ? `<span style="color:var(--muted)"> · ничего не понадобилось</span>` : ''}
+          </div>
+          ${autogenBar}
+        </div>
+      </div>
+      <div style="display:flex;align-items:center;gap:10px;font-size:0.85rem">
+        <span style="width:18px;display:inline-flex;justify-content:center">${icon(false, step3Done)}</span>
+        <div style="flex:1;min-width:0">
+          <div><strong>3.</strong> ${step3Done ? '✅ Готово — серии можно отправить в видео-генерацию' : 'Готовность серий'}</div>
+        </div>
+      </div>
+    </div>
+    ${readyStats}
+  `;
+
+  if (P.stage === 'ready') {
     if (_importBannerHideTimer) clearTimeout(_importBannerHideTimer);
     _importBannerHideTimer = setTimeout(() => {
       const cur = document.getElementById('import-progress-banner');
       if (cur) cur.remove();
       _importBannerHideTimer = null;
-    }, 8000);
+    }, 18000);
   } else if (_importBannerHideTimer) {
     clearTimeout(_importBannerHideTimer);
     _importBannerHideTimer = null;
   }
+}
+
+// Back-compat shim — anyone still calling the old name gets the new pipeline.
+function _renderImportBanner(st) {
+  _renderPipelineBanner({
+    sid: S.seriesId,
+    stage: st.running ? 'analyzing' : 'ready',
+    importDoneCount: st.done || 0,
+    importTotal: st.total || 0,
+    importErrors: (st.errors || []).length,
+    autogenDone: 0, autogenTotal: 0, autogenErrors: 0,
+  });
 }
 
 async function generateFromIdea() {

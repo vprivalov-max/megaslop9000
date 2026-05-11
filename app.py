@@ -2749,6 +2749,18 @@ def _import_worker(sid, episode_records):
         st['running'] = False
         st['current'] = None
         st['finished_at'] = datetime.datetime.utcnow().isoformat()
+    # Hand off to autogen sweep: now that every episode has its
+    # characters_used / locations_used / items_used populated, fire the asset
+    # sweep so portraits / outfit shots / location stills / item images all
+    # start generating in the background. Frontend transitions its progress
+    # banner to «🎨 Генерация ассетов» when it sees autogen-status running.
+    try:
+        s = load_series(sid)
+        if s and s.get('auto_generate_assets'):
+            print(f'[import-worker] {sid}: handoff → autogen sweep', flush=True)
+            _spawn_with_keys(auto_generate_missing_assets, sid)
+    except Exception as e:
+        print(f'[import-worker] autogen handoff failed: {e}', flush=True)
 
 
 @app.route('/api/series/import-from-script/logic-check', methods=['POST'])
