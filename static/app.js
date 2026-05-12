@@ -7218,9 +7218,6 @@ async function startAutoMode() {
         style: sharedOpts.useStyle ? sharedOpts.styleVal : '',
         base_outfits_only: sharedOpts.baseOnly,
         close_up_only: segCloseUp,
-        // Mandatory 2s establishing wide of the location at chunk start when
-        // this segment opens a NEW scene (first segment after a scene heading).
-        establishing_shot: !!seg.establishing_shot,
       }
     );
     AUTO.lastStatus = '▶ запускаю генерацию...';
@@ -7700,7 +7697,6 @@ async function _runEpisodeAutoStandalone(sid, num, opts = {}) {
             style: shared.useStyle ? shared.styleVal : '',
             base_outfits_only: shared.baseOnly,
             close_up_only: segCloseUp,
-            establishing_shot: !!seg.establishing_shot,
           }, { timeoutMs: 300_000 }
         );
       } catch (e) {

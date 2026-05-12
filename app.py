@@ -12241,12 +12241,6 @@ def seedance_compose(sid, num):
     use_prev_cutframes = bool(body.get('use_prev_cutframes', False))
     base_outfits_only  = bool(body.get('base_outfits_only', False))
     close_up_only      = bool(body.get('close_up_only', False))
-    # Mandatory 2-second establishing wide of the location at chunk start
-    # (no people). Set by the frontend on the FIRST segment after every
-    # scene heading. Without this flag every chunk opens on a medium close-up
-    # and the viewer never sees the venue — repeated dialogue scenes inside
-    # «Father's Study» end up indistinguishable from each other.
-    establishing_shot  = bool(body.get('establishing_shot', False))
     # Optional: caller hands in a FIXED list of refs (kind/id/outfit) — Claude
     # must use ONLY these as the visible roster. Used by "🔄 Перекомпоновать
     # с текущими рефами" — user manually pruned some refs and wants the prompt
@@ -13146,43 +13140,6 @@ def seedance_compose(sid, num):
         if it.get('id') in active_item_ids and it.get('avai_url')
     ) or '  (none)'
 
-    # ── Establishing-shot mandate ──────────────────────────────────────────
-    # When the frontend marks this chunk as «first segment after scene heading»
-    # we inject a directive that OVERRIDES any other framing default — the
-    # composer MUST open the chunk on 2 seconds of wide-shot of the location
-    # (exterior facade if outdoor, interior wide if indoor) BEFORE any character
-    # appears. Without this every new scene opens on a medium close-up of the
-    # speaker and the venue is never shown.
-    establishing_block = ''
-    if establishing_shot:
-        establishing_block = (
-            "\n\n=== УСТАНОВОЧНЫЙ ПЛАН ЛОКАЦИИ — ОБЯЗАТЕЛЕН (ПЕРЕОПРЕДЕЛЯЕТ ВСЕ FRAMING-ДЕФОЛТЫ) ===\n"
-            "ЭТОТ CHUNK — ПЕРВЫЙ после смены сцены / новой локации. Зритель впервые видит это место "
-            "в этой серии. ОБЯЗАТЕЛЬНО открой клип 2 секундами УСТАНОВОЧНОГО плана локации, ДО появления "
-            "людей и диалога:\n"
-            "  • EXTERIOR (улица, дом, поместье, ресторан, церковь и т.п. снаружи) → ФАСАД / wide-shot "
-            "    здания целиком: «Establishing wide shot — фасад [Location name] днём/ночью, 2 секунды, "
-            "    без людей в кадре, лёгкий статичный план или медленный push-in». Используй ref-картинку "
-            "    локации.\n"
-            "  • INTERIOR (комната, офис, кабинет, кухня, ресторан внутри) → wide interior shot "
-            "    пространства БЕЗ людей или с фигурами в спине/дальнем плане: «Establishing wide shot "
-            "    интерьера [Location name] — стол, книжные полки, тусклый свет, 2 секунды без основных "
-            "    персонажей в кадре». Дать зрителю увидеть масштаб и атмосферу комнаты.\n"
-            "  • После 2-секундного wide — slow dolly-in / cut на medium close-up первого спикера, "
-            "    дальше обычный диалог по правилам.\n"
-            "ФОРМАТ В CAMERA: первая фраза CAMERA блока ОБЯЗАТЕЛЬНО — «Establishing wide shot of "
-            "[Location] для первых 2 секунд, без людей / с фигурами в дальнем плане, статичная камера "
-            "или slow push-in. Затем cut/наезд на medium close-up [имя спикера].»\n"
-            "ФОРМАТ В CONSTRAINTS: добавь «no people in establishing shot 0-2s» (для exterior) или "
-            "«main characters appear after second 2» (для interior).\n"
-            "РЕФЕРЕНСЫ: ОБЯЗАТЕЛЬНО прикрепи локацию (она будет последним @Image), даже если в обычном "
-            "диалоге могла бы быть опущена. БЕЗ ЛОКАЦИИ wide не родится корректно.\n"
-            "САМОПРОВЕРКА: первая фраза CAMERA-блока содержит слова «establishing wide» / «wide shot of "
-            "[Location]»? Если нет — переписать. Это правило ОТМЕНЯЕТ дефолт «вся серия в medium "
-            "close-up'ах».\n"
-            "===\n"
-        )
-
     userprompt = (
         f"AVAILABLE CHARACTERS (весь roster серии):\n{chr(10).join(chars_lines) or '(none)'}\n\n"
         f"AVAILABLE LOCATIONS (весь roster серии):\n{chr(10).join(locs_lines) or '(none)'}\n\n"
@@ -13196,7 +13153,6 @@ def seedance_compose(sid, num):
         f"{auto_close_up_block}"
         f"{locked_refs_block}"
         f"{style_block}"
-        f"{establishing_block}"
         f"{prev_block}\n"
         f"FULL EPISODE SCRIPT (читай ВЕСЬ — тут scene headings, ремарки, кто где находится):\n"
         f"```\n{full_script_block}\n```\n\n"
