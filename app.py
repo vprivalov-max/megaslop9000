@@ -105,6 +105,20 @@ def is_scene_heading(line: str) -> bool:
     return False
 
 app = Flask(__name__, static_folder='static', template_folder='templates')
+
+# Cache-bust token for /static/* — bumped automatically on every deploy/
+# restart via the mtime of the most-recently-modified static file. Without
+# this the browser holds onto stale app.js / style.css after a deploy and
+# users keep seeing the previous bug forever («не помогло чет, так же всё»).
+try:
+    _static_dir = Path(__file__).parent / 'static'
+    _static_mtime = max(
+        (_p.stat().st_mtime for _p in _static_dir.glob('*') if _p.is_file()),
+        default=0.0,
+    )
+    STATIC_VERSION = str(int(_static_mtime))
+except Exception:
+    STATIC_VERSION = str(int(time.time()))
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB
 
 # Behind Coolify/Traefik/Caddy reverse proxy — trust X-Forwarded-* headers so
@@ -2026,7 +2040,7 @@ WORLD_RULES = {
 
 @app.route('/')
 def index():
-    return render_template('index.html')
+    return render_template('index.html', static_v=STATIC_VERSION)
 
 @app.route('/api/translate', methods=['POST'])
 def translate_text():
