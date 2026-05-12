@@ -6421,18 +6421,28 @@ function _renderScenesHTML(scenes, coverage = []) {
         const overflowWarn = segTotal > 14.5
           ? `<span class="ep-seg-warn" title="Содержимое выходит за 15-сек лимит Seedance">${segTotal.toFixed(1)}с ⚠</span>`
           : `<span class="ep-seg-dur" title="Расчётная длительность сегмента">${segTotal.toFixed(1)}с</span>`;
-        // First-line anchor of this segment = target for merge + auto-skip identity
+        // First-line anchor of this segment for the MERGE button (per-line, OK
+        // if it shifts when the user edits text — merge is a local operation).
         const firstAnchor = _lineAnchor(l.text);
         const safeFirstAnchor = firstAnchor.replace(/'/g, "\\'");
+        // Per-segment AUTO-SKIP anchor MUST be unique across the episode.
+        // Bug 2026-05-12: using firstAnchor here collapsed all segments whose
+        // first line started with the same text (e.g. several segments
+        // starting with «Elena:» or «MARCUS») onto a single skip key — un-
+        // ticking one's AUTO checkbox flipped them all. Use the scene/segment
+        // coordinate as the stable identity. Old skip entries written with
+        // the previous (text-based) format silently fall through — segments
+        // default to «included» and the user can re-skip if needed.
+        const autoSkipKey = `s${sIdx}g${l.segIdx}`;
         const isMergedHere = l._override === 'merge';
-        const isAutoSkipped = _isSegmentAutoSkipped(firstAnchor);
+        const isAutoSkipped = _isSegmentAutoSkipped(autoSkipKey);
         const editBtns = editMode && lIdx > 0
           ? `<button class="ep-seg-mini" onclick="toggleSegmentMerge('${safeFirstAnchor}')"
               title="${isMergedHere ? 'Восстановить разделение' : 'Объединить с предыдущим сегментом'}"
             >${isMergedHere ? '↩ разъединить' : '🔗 ↑ объединить'}</button>`
           : '';
         const autoCb = `<label class="ep-seg-auto-cb" title="${isAutoSkipped ? 'Сегмент пропускается в Auto-mode — клик включит обратно' : 'Сегмент будет сгенерён при запуске Auto-mode — клик исключит его'}">
-            <input type="checkbox" ${isAutoSkipped ? '' : 'checked'} onchange="toggleSegmentAutoInclude('${safeFirstAnchor}')">
+            <input type="checkbox" ${isAutoSkipped ? '' : 'checked'} onchange="toggleSegmentAutoInclude('${autoSkipKey}')">
             <span>auto</span>
           </label>`;
         html += `<div class="ep-seg${isAutoSkipped ? ' auto-skipped' : ''}" data-seg="${l.segIdx + 1}">
@@ -7058,6 +7068,11 @@ function _autoCollectSegments(opts = {}) {
       const durationSec = Math.max(5, Math.min(15, targetSec));
       out.push({
         sceneIdx: sIdx, segIdx: g, text, anchor,
+        // Stable identity used by the AUTO-skip filter. Must match the key
+        // written by toggleSegmentAutoInclude (`s{sceneIdx}g{segIdx}`) so that
+        // segments with duplicate first-line text don't get collapsed onto
+        // one skip flag.
+        autoSkipKey: `s${sIdx}g${g}`,
         has_close_up: hasCloseUp, durationSec,
         establishing_shot: !!wantsEstablishing,
       });
@@ -7413,9 +7428,11 @@ async function startAutoMode() {
   // Both auto-mode flavors force establishing shots ON (2s location intro
    // on every new scene), regardless of the manual checkbox.
   const allSegs  = _autoCollectSegments({ forceEstablishing: true });
-  // Per-segment auto-mode skip filter
-  const skippedCount = allSegs.filter(s => _isSegmentAutoSkipped(s.anchor)).length;
-  AUTO.segments = allSegs.filter(s => !_isSegmentAutoSkipped(s.anchor));
+  // Per-segment auto-mode skip filter. Uses the unique-per-episode
+  // autoSkipKey (`s{sceneIdx}g{segIdx}`), NOT the first-line text — see
+  // toggleSegmentAutoInclude for why.
+  const skippedCount = allSegs.filter(s => _isSegmentAutoSkipped(s.autoSkipKey)).length;
+  AUTO.segments = allSegs.filter(s => !_isSegmentAutoSkipped(s.autoSkipKey));
   // Annotate each segment with its script-order index so /seedance/start can
   // record the canonical position regardless of network arrival order.
   AUTO.segments.forEach((s, i) => { s.scriptOrder = i; });
