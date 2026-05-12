@@ -12616,6 +12616,21 @@ function sdRenderList(chunks) {
       }
       prevNode = node;
     }
+    // Force-sync every visible checkbox to SD.selected. Bug fix 2026-05-12:
+    // toggling a single chunk's CB was visually un-checking unrelated chunks
+    // because innerHTML rewrites (triggered by sig changes on those other
+    // chunks during poll) re-rendered their checkbox attribute from a stale
+    // `isSelected` value. By re-asserting every CB's `.checked` after the
+    // diff loop, we make CB state authoritative-from-SD.selected regardless
+    // of when/why the card's HTML was last regenerated.
+    el.querySelectorAll('.sd-gen-card[data-idx]').forEach(card => {
+      const idxNum = Number(card.getAttribute('data-idx'));
+      const cb = card.querySelector('input.sd-card-cb');
+      if (cb) {
+        const want = !!(SD.selected && SD.selected.has(idxNum));
+        if (cb.checked !== want) cb.checked = want;
+      }
+    });
     // Refresh bulk bar in case server removed/added chunks
     _sdUpdateBulkBar();
   } catch (err) {
@@ -12675,11 +12690,19 @@ async function sdRetry(idx, btn) {
 // ── Bulk-select for chunk cards ────────────────────────────────────────────
 function sdToggleSelect(idx) {
   if (!SD.selected) SD.selected = new Set();
-  if (SD.selected.has(idx)) SD.selected.delete(idx);
-  else SD.selected.add(idx);
+  // Normalize to Number so the Set is type-consistent — otherwise mixing
+  // string/number variants of the same idx silently splits selection state.
+  const n = Number(idx);
+  if (SD.selected.has(n)) SD.selected.delete(n);
+  else SD.selected.add(n);
   // Toggle visual class on the card
-  const card = document.querySelector(`.sd-gen-card[data-idx="${idx}"]`);
-  if (card) card.classList.toggle('sd-card-selected', SD.selected.has(idx));
+  const card = document.querySelector(`.sd-gen-card[data-idx="${n}"]`);
+  if (card) card.classList.toggle('sd-card-selected', SD.selected.has(n));
+  // Sync this card's CB to authoritative state (handles the case where the
+  // user clicked the wrapping <label> twice or a re-render landed between
+  // browser-native toggle and our handler).
+  const cb = card && card.querySelector('input.sd-card-cb');
+  if (cb) cb.checked = SD.selected.has(n);
   _sdUpdateBulkBar();
 }
 
@@ -12694,7 +12717,7 @@ function sdBulkClearSelection() {
 function sdBulkSelectAll() {
   if (!SD.selected) SD.selected = new Set();
   const list = SD._lastChunks || [];
-  for (const c of list) SD.selected.add(c.idx);
+  for (const c of list) SD.selected.add(Number(c.idx));
   document.querySelectorAll('.sd-gen-card[data-idx]').forEach(card => {
     card.classList.add('sd-card-selected');
     const cb = card.querySelector('input.sd-card-cb');
