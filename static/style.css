@@ -2047,6 +2047,22 @@ body:not(.seedance-mode) .seedance-only { display: none !important; }
   .sd-modal-side { min-width: 0; width: 100%; }
 }
 
+/* Chunk-modal neighbour-navigation arrows. */
+.sd-modal-nav {
+  width: 28px; height: 28px;
+  border: 1px solid var(--border);
+  background: var(--surface2);
+  color: var(--text);
+  border-radius: 6px;
+  cursor: pointer;
+  display: inline-flex; align-items: center; justify-content: center;
+  font-size: 1rem; font-weight: 600;
+  transition: background 0.12s, transform 0.12s;
+}
+.sd-modal-nav:hover:not(:disabled) { background: var(--accent, #00d4aa); color: #000; }
+.sd-modal-nav:active:not(:disabled) { transform: scale(0.95); }
+.sd-modal-nav:disabled { opacity: 0.25; cursor: not-allowed; }
+
 /* Sort toggle above the chunk strip — radio-pill style, persists in
    localStorage so user keeps their preferred view across episodes. */
 .sd-sort-toggle {

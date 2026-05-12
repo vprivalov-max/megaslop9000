@@ -12601,36 +12601,112 @@ function _sdSyncSortButtons() {
   if (n) n.classList.toggle('active', mode === 'newest');
 }
 
-// Compute display labels for chunks. Chunks with `script_order` get a
-// 1-indexed scene number («#1», «#2», ...). Retries of the same script
-// position get a «v2», «v3» suffix in creation order. Chunks without
-// script_order keep raw idx for label («#?N»). Returns Map<idx, {label,take}>.
+// Compute display labels for chunks. Three kinds:
+//   • Regular (chunk has script_order N) → «#N+1» + «v2/v3» for retries
+//   • Additional / orphan (no script_order, but chunk_text overlaps a known
+//     parent segment) → «#N+1» + «доп.1/доп.2» appended to that parent
+//   • True orphan (no script_order, no line-overlap match) → «#?idx»
+// Orphan→parent attribution by counting how many trimmed non-empty lines of
+// the orphan's chunk_text also appear in each parent's chunk_text. Parent
+// with the most overlapping lines wins; ties go to the lower script_order.
 function _sdComputeLabels(chunks) {
-  const byOrder = new Map();   // script_order → array of chunks (creation order)
-  const noOrder = [];
+  // 1. Bucket by script_order — these are «regular» take-1 onwards entries.
+  const byOrder = new Map();
+  const orphans = [];
   for (const c of chunks) {
     if (typeof c.script_order === 'number') {
       if (!byOrder.has(c.script_order)) byOrder.set(c.script_order, []);
       byOrder.get(c.script_order).push(c);
     } else {
-      noOrder.push(c);
+      orphans.push(c);
     }
   }
-  // Sort each group by idx ASC so the FIRST chunk submitted is take 1.
-  // Tiebreak by created_at for legacy data without monotonic idx.
+  for (const grp of byOrder.values()) {
+    grp.sort((a, b) => (a.idx ?? 0) - (b.idx ?? 0) || (a.created_at ?? 0) - (b.created_at ?? 0));
+  }
+  // 2. Pre-compute line sets for every potential parent (one chunk per order
+  //    is enough — pick the take-1 because retries share chunk_text).
+  const parentLineSets = new Map();   // script_order → Set<string>
+  for (const [order, group] of byOrder.entries()) {
+    const head = group[0];
+    const lines = (head?.chunk_text || '').split('\n')
+      .map(l => l.trim()).filter(l => l.length >= 3);
+    parentLineSets.set(order, new Set(lines));
+  }
+  // 3. Attribute each orphan to its best-matching parent script_order.
+  const orphanByParent = new Map();   // parent_order → orphan chunks (creation order)
+  const trulyOrphan = [];
+  for (const o of orphans) {
+    const oLines = (o.chunk_text || '').split('\n')
+      .map(l => l.trim()).filter(l => l.length >= 3);
+    if (!oLines.length) { trulyOrphan.push(o); continue; }
+    let bestOrder = null, bestScore = 0;
+    for (const [order, set] of parentLineSets.entries()) {
+      let score = 0;
+      for (const l of oLines) if (set.has(l)) score++;
+      // Lower script_order wins ties so attribution is deterministic.
+      if (score > bestScore || (score === bestScore && bestOrder !== null && order < bestOrder)) {
+        bestScore = score; bestOrder = order;
+      }
+    }
+    if (bestOrder !== null && bestScore > 0) {
+      if (!orphanByParent.has(bestOrder)) orphanByParent.set(bestOrder, []);
+      orphanByParent.get(bestOrder).push(o);
+    } else {
+      trulyOrphan.push(o);
+    }
+  }
+  for (const grp of orphanByParent.values()) {
+    grp.sort((a, b) => (a.idx ?? 0) - (b.idx ?? 0) || (a.created_at ?? 0) - (b.created_at ?? 0));
+  }
+  // 4. Emit labels.
   const labels = new Map();
   for (const [order, group] of byOrder.entries()) {
-    group.sort((a, b) => (a.idx ?? 0) - (b.idx ?? 0) || (a.created_at ?? 0) - (b.created_at ?? 0));
     group.forEach((c, takeIdx) => {
-      const label = `#${order + 1}`;
-      const take = takeIdx > 0 ? `v${takeIdx + 1}` : '';
-      labels.set(c.idx, { label, take, order, takeNum: takeIdx + 1 });
+      labels.set(c.idx, {
+        label: `#${order + 1}`,
+        take: takeIdx > 0 ? `v${takeIdx + 1}` : '',
+        order,
+        takeNum: takeIdx + 1,
+        isAdditional: false,
+        parentOrder: order,
+      });
     });
   }
-  for (const c of noOrder) {
-    labels.set(c.idx, { label: `#?${c.idx}`, take: '', order: Infinity, takeNum: 1 });
+  for (const [order, group] of orphanByParent.entries()) {
+    group.forEach((c, addIdx) => {
+      labels.set(c.idx, {
+        label: `#${order + 1}`,
+        take: `доп.${addIdx + 1}`,
+        order,
+        takeNum: addIdx + 1,
+        isAdditional: true,
+        parentOrder: order,
+      });
+    });
+  }
+  for (const c of trulyOrphan) {
+    labels.set(c.idx, {
+      label: `#?${c.idx}`, take: '',
+      order: Infinity, takeNum: 1,
+      isAdditional: true, parentOrder: null,
+    });
   }
   return labels;
+}
+
+// Sort key for a chunk in chronological mode. Regular chunks of order N
+// sit first, their retries (v2, v3) after, then additionals (доп.1, доп.2)
+// of the same parent_order. Then the next parent_order, and so on. Truly
+// orphan chunks (no parent overlap) drop to the end.
+function _sdChronoKey(chunk, labelInfo) {
+  const li = labelInfo || {};
+  return [
+    li.parentOrder ?? Infinity,
+    li.isAdditional ? 1 : 0,
+    li.takeNum ?? 0,
+    chunk.idx ?? 0,
+  ];
 }
 
 function _sdCardHTML(c, labelInfo) {
@@ -12736,6 +12812,10 @@ function _sdCardSig(c, labelInfo) {
   ].join('|');
 }
 
+// State used by arrow-key navigation in the chunk-detail modal. Holds the
+// idx currently shown and the ordered list of idxs that ←/→ walks through.
+let _SD_MODAL_CTX = null;
+
 // Open a chunk in a detail modal: large player + full prompt + all actions.
 // Stops any thumbnail that was hover-playing first, so audio from the modal
 // player is the only thing audible.
@@ -12746,12 +12826,27 @@ function sdOpenChunkModal(idx) {
   const list = SD._lastChunks || [];
   const c = list.find(x => x.idx === idx);
   if (!c) return;
+  // Snapshot the current DOM order so ←/→ walks chunks in whatever sort
+  // mode the user is actually looking at (chrono / newest).
+  _SD_MODAL_CTX = {
+    idx,
+    orderedIdxs: Array.from(
+      document.querySelectorAll('#sd-gen-list .sd-gen-card[data-idx]')
+    ).map(card => Number(card.getAttribute('data-idx'))),
+  };
+  // De-dupe: addEventListener with the same fn is a no-op, so this can run
+  // every open without leaking handlers.
+  document.addEventListener('keydown', _sdModalKeyHandler);
   const labels = _sdComputeLabels(list);
   const lbl = labels.get(c.idx) || { label: `#?${c.idx}`, take: '' };
   const videoUrl = c.video_path ? assetUrl(c.video_path) : '';
   const stCls = `sd-status-${c.status || 'pending'}`;
   const cost = c.cost != null ? `$${Number(c.cost).toFixed(2)}` : '';
   const canRetry = !!(c.prompt && (c.refs || []).length && c.status !== 'submitting');
+  // Neighbour navigation arrows — disabled at strip edges.
+  const pos = _SD_MODAL_CTX.orderedIdxs.indexOf(c.idx);
+  const hasPrev = pos > 0;
+  const hasNext = pos >= 0 && pos < _SD_MODAL_CTX.orderedIdxs.length - 1;
   const modal = document.getElementById('modal-chunk-detail');
   if (!modal) return;
   const body = modal.querySelector('.sd-modal-body');
@@ -12762,7 +12857,12 @@ function sdOpenChunkModal(idx) {
         : `<div style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--muted);text-align:center;padding:12px">Видео ещё нет — ${esc(c.status || 'pending')}</div>`}
     </div>
     <div class="sd-modal-side">
-      <div style="font-size:1.15rem;font-weight:700">${esc(lbl.label)}${lbl.take ? `<span class="sd-take">  ${esc(lbl.take)}</span>` : ''}</div>
+      <div style="display:flex;align-items:center;gap:8px">
+        <button class="btn-icon sd-modal-nav" onclick="_sdModalNav(-1)" ${hasPrev ? '' : 'disabled'} title="Предыдущий чанк (←)">←</button>
+        <div style="flex:1;font-size:1.15rem;font-weight:700">${esc(lbl.label)}${lbl.take ? `<span class="sd-take">  ${esc(lbl.take)}</span>` : ''}</div>
+        <span style="font-size:0.72rem;color:var(--muted)">${pos + 1} / ${_SD_MODAL_CTX.orderedIdxs.length}</span>
+        <button class="btn-icon sd-modal-nav" onclick="_sdModalNav(+1)" ${hasNext ? '' : 'disabled'} title="Следующий чанк (→)">→</button>
+      </div>
       <div class="sd-modal-meta">
         <span class="sd-meta-pill"><span class="${stCls}">●</span> ${esc(c.status || '')}</span>
         <span class="sd-meta-pill">${c.duration}с</span>
@@ -12797,7 +12897,32 @@ function _sdCloseChunkModal() {
     const body = modal.querySelector('.sd-modal-body');
     if (body) body.innerHTML = '';
   }
+  document.removeEventListener('keydown', _sdModalKeyHandler);
+  _SD_MODAL_CTX = null;
   closeModal('modal-chunk-detail');
+}
+
+// Walk neighbours in the order they appear on screen. `delta` = -1 for ←,
+// +1 for →. Stops at strip edges. Re-uses sdOpenChunkModal which tears down
+// the existing <video> via innerHTML rewrite, so no decoder leak.
+function _sdModalNav(delta) {
+  if (!_SD_MODAL_CTX) return;
+  const ord = _SD_MODAL_CTX.orderedIdxs;
+  const pos = ord.indexOf(_SD_MODAL_CTX.idx);
+  if (pos < 0) return;
+  const next = pos + delta;
+  if (next < 0 || next >= ord.length) return;
+  sdOpenChunkModal(ord[next]);
+}
+
+function _sdModalKeyHandler(e) {
+  if (!_SD_MODAL_CTX) return;
+  // Don't hijack arrow keys while user is typing in a focused control.
+  const tag = (e.target?.tagName || '').toLowerCase();
+  if (tag === 'input' || tag === 'textarea' || e.target?.isContentEditable) return;
+  if (e.key === 'ArrowLeft')      { e.preventDefault(); _sdModalNav(-1); }
+  else if (e.key === 'ArrowRight'){ e.preventDefault(); _sdModalNav(+1); }
+  else if (e.key === 'Escape')    { e.preventDefault(); _sdCloseChunkModal(); }
 }
 
 function sdRenderList(chunks) {
@@ -12831,6 +12956,10 @@ function sdRenderList(chunks) {
   // the user's preferred view. Default: «chrono» — by script position.
   _sdSyncSortButtons();
   const sortMode = _sdGetSort();
+  // Labels (and their parent-attribution for «доп.N») are pre-computed once
+  // off the unsorted list — take/доп counters depend on the global view, not
+  // on whichever sort mode the user is in.
+  const labels = _sdComputeLabels(chunks);
   try {
     const ordered = chunks.slice().sort((a, b) => {
       if (sortMode === 'newest') {
@@ -12838,22 +12967,15 @@ function sdRenderList(chunks) {
         // /seedance/start), tiebreak by created_at for legacy data.
         return (b.idx ?? 0) - (a.idx ?? 0) || (b.created_at ?? 0) - (a.created_at ?? 0);
       }
-      // Chronological: script_order ASC, then idx ASC so retries land
-      // immediately after the original take of the same scene.
-      const ao = (typeof a.script_order === 'number') ? a.script_order : Infinity;
-      const bo = (typeof b.script_order === 'number') ? b.script_order : Infinity;
-      if (ao !== bo) return ao - bo;
-      return (a.idx ?? 0) - (b.idx ?? 0);
+      // Chronological: regulars of order N, then their additionals, then
+      // order N+1. Encoded via _sdChronoKey for stability.
+      const ka = _sdChronoKey(a, labels.get(a.idx));
+      const kb = _sdChronoKey(b, labels.get(b.idx));
+      for (let i = 0; i < ka.length; i++) {
+        if (ka[i] !== kb[i]) return ka[i] - kb[i];
+      }
+      return 0;
     });
-    // Labels always computed in chronological order so take-numbers are
-    // stable («v2», «v3») regardless of which sort the user is viewing.
-    const chronoForLabels = chunks.slice().sort((a, b) => {
-      const ao = (typeof a.script_order === 'number') ? a.script_order : Infinity;
-      const bo = (typeof b.script_order === 'number') ? b.script_order : Infinity;
-      if (ao !== bo) return ao - bo;
-      return (a.idx ?? 0) - (b.idx ?? 0);
-    });
-    const labels = _sdComputeLabels(chronoForLabels);
     const wantedIdxs = new Set(ordered.map(c => String(c.idx)));
     const existing = new Map();
     el.querySelectorAll('.sd-gen-card[data-idx]').forEach(node => {
@@ -12909,16 +13031,17 @@ function sdRenderList(chunks) {
   } catch (err) {
     console.error('[sdRenderList] diff failed, falling back to full render:', err);
     const mode = _sdGetSort();
-    const chronoForLabels = chunks.slice().sort((a, b) => {
-      const ao = (typeof a.script_order === 'number') ? a.script_order : Infinity;
-      const bo = (typeof b.script_order === 'number') ? b.script_order : Infinity;
-      if (ao !== bo) return ao - bo;
-      return (a.idx ?? 0) - (b.idx ?? 0);
+    const ordered = chunks.slice().sort((a, b) => {
+      if (mode === 'newest') {
+        return (b.idx ?? 0) - (a.idx ?? 0) || (b.created_at ?? 0) - (a.created_at ?? 0);
+      }
+      const ka = _sdChronoKey(a, labels.get(a.idx));
+      const kb = _sdChronoKey(b, labels.get(b.idx));
+      for (let i = 0; i < ka.length; i++) {
+        if (ka[i] !== kb[i]) return ka[i] - kb[i];
+      }
+      return 0;
     });
-    const ordered = mode === 'newest'
-      ? chunks.slice().sort((a, b) => (b.idx ?? 0) - (a.idx ?? 0) || (b.created_at ?? 0) - (a.created_at ?? 0))
-      : chronoForLabels;
-    const labels = _sdComputeLabels(chronoForLabels);
     el.innerHTML = ordered.map(c => `<div class="sd-gen-card" data-idx="${c.idx}">${_sdCardHTML(c, labels.get(c.idx))}</div>`).join('');
   }
 }
