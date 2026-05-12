@@ -1921,7 +1921,7 @@ body:not(.seedance-mode) .seedance-only { display: none !important; }
   padding: 8px; border: 1px solid var(--border, #2a2a30);
   border-radius: 8px; background: var(--surface, #0f0f12);
   position: relative;
-  width: 200px; flex-shrink: 0;
+  width: 240px; flex-shrink: 0;
   transition: outline 0.15s, background 0.15s, transform 0.15s;
 }
 .sd-gen-card:hover { transform: translateY(-2px); }
@@ -2001,39 +2001,65 @@ body:not(.seedance-mode) .seedance-only { display: none !important; }
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .sd-gen-actions {
-  display: grid; grid-template-columns: 1fr 1fr; gap: 4px;
+  display: grid; grid-template-columns: 1fr 1fr; gap: 5px;
 }
 .sd-gen-actions .btn-ghost.btn-sm {
-  font-size: 0.7rem; padding: 4px 6px;
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  font-size: 0.74rem; padding: 5px 8px;
+  white-space: nowrap;
+  text-align: center;
 }
 .sd-gen-actions .full-row { grid-column: 1 / -1; }
 
-/* Chunk-detail modal — big player + full prompt + all actions. */
+/* Chunk-detail modal — big player on top, side panel below on narrow viewports,
+   side-by-side on wide ones. Player width is responsive; side gets a real
+   min-width so labels never wrap one-character-per-line. */
 .sd-modal-body {
   display: flex; gap: 16px; align-items: flex-start;
+  flex-wrap: wrap;
 }
 .sd-modal-player {
-  flex-shrink: 0; width: 360px;
+  flex: 0 0 auto;
+  width: clamp(260px, 38vw, 360px);
   aspect-ratio: 9 / 16; background: #000; border-radius: 8px; overflow: hidden;
 }
-.sd-modal-player video { width: 100%; height: 100%; object-fit: contain; }
-.sd-modal-side { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 10px; }
+.sd-modal-player video { width: 100%; height: 100%; object-fit: contain; display: block; }
+.sd-modal-side {
+  flex: 1 1 320px; min-width: 280px;
+  display: flex; flex-direction: column; gap: 10px;
+}
 .sd-modal-side .sd-modal-prompt {
   background: var(--surface2); border: 1px solid var(--border);
-  border-radius: 6px; padding: 8px 10px;
+  border-radius: 6px; padding: 10px 12px;
   font-family: ui-monospace, monospace; font-size: 0.78rem;
   white-space: pre-wrap; word-break: break-word;
-  max-height: 360px; overflow-y: auto;
+  max-height: 320px; overflow-y: auto;
   color: var(--text);
+  line-height: 1.4;
 }
-.sd-modal-side .sd-modal-meta { font-size: 0.82rem; color: var(--muted); }
+.sd-modal-side .sd-modal-meta { font-size: 0.82rem; color: var(--muted); line-height: 1.5; }
+.sd-modal-side .sd-modal-meta .sd-meta-pill { display: inline-block; margin-right: 4px; }
 .sd-modal-side .sd-modal-actions {
   display: flex; gap: 6px; flex-wrap: wrap;
 }
 @media (max-width: 720px) {
   .sd-modal-body { flex-direction: column; }
-  .sd-modal-player { width: 100%; max-width: 320px; }
+  .sd-modal-player { width: 100%; max-width: 320px; align-self: center; }
+  .sd-modal-side { min-width: 0; width: 100%; }
+}
+
+/* Sort toggle above the chunk strip — radio-pill style, persists in
+   localStorage so user keeps their preferred view across episodes. */
+.sd-sort-toggle {
+  display: inline-flex; gap: 0; margin-left: 8px;
+  background: var(--surface2); border: 1px solid var(--border); border-radius: 6px;
+  overflow: hidden;
+}
+.sd-sort-toggle button {
+  padding: 4px 10px; font-size: 0.74rem;
+  background: transparent; border: 0; color: var(--muted); cursor: pointer;
+}
+.sd-sort-toggle button.active {
+  background: var(--accent, #00d4aa); color: #000; font-weight: 600;
 }
 
 /* Drag handles in sidebar (only meaningful in seedance-mode) */

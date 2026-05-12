@@ -12580,6 +12580,27 @@ async function sdRefreshList() {
   } catch (e) { /* ignore */ }
 }
 
+// Chunk-list sort: 'chrono' (default, by script_order) | 'newest' (by idx
+// DESC). Persisted in localStorage so the preference survives reloads and
+// applies on every episode page.
+function _sdGetSort() {
+  try { return localStorage.getItem('sd_sort') === 'newest' ? 'newest' : 'chrono'; }
+  catch { return 'chrono'; }
+}
+function sdSetSort(mode) {
+  if (mode !== 'newest') mode = 'chrono';
+  try { localStorage.setItem('sd_sort', mode); } catch {}
+  // Re-render the strip from cached chunks — no network round-trip needed.
+  if (SD._lastChunks) sdRenderList(SD._lastChunks);
+}
+function _sdSyncSortButtons() {
+  const mode = _sdGetSort();
+  const c = document.getElementById('sd-sort-chrono');
+  const n = document.getElementById('sd-sort-newest');
+  if (c) c.classList.toggle('active', mode === 'chrono');
+  if (n) n.classList.toggle('active', mode === 'newest');
+}
+
 // Compute display labels for chunks. Chunks with `script_order` get a
 // 1-indexed scene number («#1», «#2», ...). Retries of the same script
 // position get a «v2», «v3» suffix in creation order. Chunks without
@@ -12630,9 +12651,13 @@ function _sdCardHTML(c, labelInfo) {
       <input type="checkbox" class="sd-card-cb" ${isSelected ? 'checked' : ''}
         onclick="event.stopPropagation();sdToggleSelect(${c.idx})">
     </label>
-    <div class="sd-thumb" onclick="sdOpenChunkModal(${c.idx})" title="Открыть в большом плеере с промптом">
+    <div class="sd-thumb"
+         onclick="sdOpenChunkModal(${c.idx})"
+         onmouseenter="_sdThumbHoverPlay(this)"
+         onmouseleave="_sdThumbHoverStop(this)"
+         title="Наведи — превью играет с начала. Клик — большой плеер + промпт.">
       ${videoUrl
-        ? `<video src="${videoUrl}" muted preload="metadata"></video>`
+        ? `<video src="${videoUrl}" muted preload="metadata" playsinline></video>`
         : `<span>${esc(placeholderText)}</span>`}
       <span class="sd-thumb-hint">⛶ Открыть</span>
     </div>
@@ -12648,14 +12673,32 @@ function _sdCardHTML(c, labelInfo) {
       ${c.error && c.status !== 'completed' ? `<div class="sd-card-err" title="${esc(c.error)}">${esc(c.error)}</div>` : ''}
     </div>
     <div class="sd-gen-actions">
-      ${videoUrl ? `<a class="btn-ghost btn-sm" href="${videoUrl}" download onclick="event.stopPropagation()">⬇ DL</a>` : '<span></span>'}
-      ${videoUrl ? `<button class="btn-ghost btn-sm" onclick="event.stopPropagation();sdAddToTimeline(${c.idx}, this)">➕ TL</button>` : '<span></span>'}
+      ${videoUrl ? `<a class="btn-ghost btn-sm" href="${videoUrl}" download onclick="event.stopPropagation()">⬇ Скачать</a>` : '<span></span>'}
+      ${videoUrl ? `<button class="btn-ghost btn-sm" onclick="event.stopPropagation();sdAddToTimeline(${c.idx}, this)">➕ На таймлайн</button>` : '<span></span>'}
       ${canRetry ? `<button class="btn-ghost btn-sm" onclick="event.stopPropagation();sdRetry(${c.idx}, this)" title="Retry: тот же промпт+refs, новый чанк">🔁 Retry</button>` : '<span></span>'}
       <button class="btn-ghost btn-sm" onclick="event.stopPropagation();sdReuse(${c.idx})" title="Подставить параметры в форму выше">↻ Reuse</button>
       ${c.status === 'failed' ? `<button class="btn-ghost btn-sm full-row" onclick="event.stopPropagation();sdHealAndReuse(${c.idx}, this)" title="Переписать промпт чтобы прошёл модерацию + Reuse">🩹 Лечить промпт</button>` : ''}
       <button class="btn-ghost btn-sm full-row" onclick="event.stopPropagation();sdDelete(${c.idx})">🗑 Удалить</button>
     </div>
   `;
+}
+
+// Thumbnail hover: start the muted preview from frame 0. Leaving the thumb
+// (or clicking it open the modal) stops playback completely and resets to
+// frame 0 — not «paused», so next hover starts fresh.
+function _sdThumbHoverPlay(el) {
+  const v = el && el.querySelector('video');
+  if (!v) return;
+  try {
+    v.currentTime = 0;
+    const p = v.play();
+    if (p && p.catch) p.catch(() => {});   // ignore «play interrupted» rejections
+  } catch (_) {}
+}
+function _sdThumbHoverStop(el) {
+  const v = el && el.querySelector('video');
+  if (!v) return;
+  try { v.pause(); v.currentTime = 0; } catch (_) {}
 }
 
 function _sdCardSig(c, labelInfo) {
@@ -12672,7 +12715,12 @@ function _sdCardSig(c, labelInfo) {
 }
 
 // Open a chunk in a detail modal: large player + full prompt + all actions.
+// Stops any thumbnail that was hover-playing first, so audio from the modal
+// player is the only thing audible.
 function sdOpenChunkModal(idx) {
+  document.querySelectorAll('.sd-thumb video').forEach(v => {
+    try { v.pause(); v.currentTime = 0; } catch (_) {}
+  });
   const list = SD._lastChunks || [];
   const c = list.find(x => x.idx === idx);
   if (!c) return;
@@ -12688,27 +12736,46 @@ function sdOpenChunkModal(idx) {
   body.innerHTML = `
     <div class="sd-modal-player">
       ${videoUrl
-        ? `<video src="${videoUrl}" controls autoplay preload="metadata"></video>`
-        : `<div style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--muted)">Видео ещё нет — ${esc(c.status || 'pending')}</div>`}
+        ? `<video src="${videoUrl}" controls autoplay preload="metadata" playsinline></video>`
+        : `<div style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--muted);text-align:center;padding:12px">Видео ещё нет — ${esc(c.status || 'pending')}</div>`}
     </div>
     <div class="sd-modal-side">
-      <div style="font-size:1.05rem;font-weight:600">${esc(lbl.label)}${lbl.take ? `<span class="sd-take">  ${esc(lbl.take)}</span>` : ''}</div>
+      <div style="font-size:1.15rem;font-weight:700">${esc(lbl.label)}${lbl.take ? `<span class="sd-take">  ${esc(lbl.take)}</span>` : ''}</div>
       <div class="sd-modal-meta">
-        <span class="${stCls}">●</span> ${esc(c.status || '')} · ${c.duration}s · ${esc(c.resolution || '')} · ${esc(c.moderation_bypass || '')}${cost ? ' · ' + cost : ''}
+        <span class="sd-meta-pill"><span class="${stCls}">●</span> ${esc(c.status || '')}</span>
+        <span class="sd-meta-pill">${c.duration}с</span>
+        <span class="sd-meta-pill">${esc(c.resolution || '')}</span>
+        <span class="sd-meta-pill">${esc(c.moderation_bypass || '')}</span>
+        ${cost ? `<span class="sd-meta-pill">${cost}</span>` : ''}
       </div>
       ${c.error && c.status !== 'completed' ? `<div style="color:#e74c3c;font-size:0.84rem">${esc(c.error)}</div>` : ''}
       <div class="sd-modal-actions">
         ${videoUrl ? `<a class="btn-ghost btn-sm" href="${videoUrl}" download>⬇ Скачать</a>` : ''}
         ${videoUrl ? `<button class="btn-ghost btn-sm" onclick="sdAddToTimeline(${c.idx}, this)">➕ На таймлайн</button>` : ''}
         ${canRetry ? `<button class="btn-ghost btn-sm" onclick="sdRetry(${c.idx}, this)">🔁 Retry</button>` : ''}
-        <button class="btn-ghost btn-sm" onclick="sdReuse(${c.idx});closeModal('modal-chunk-detail')">↻ Reuse</button>
+        <button class="btn-ghost btn-sm" onclick="sdReuse(${c.idx});_sdCloseChunkModal()">↻ Reuse</button>
         ${c.status === 'failed' ? `<button class="btn-ghost btn-sm" onclick="sdHealAndReuse(${c.idx}, this)">🩹 Лечить</button>` : ''}
-        <button class="btn-ghost btn-sm" onclick="if(confirm('Удалить эту генерацию?')){sdDelete(${c.idx});closeModal('modal-chunk-detail')}" style="color:var(--danger)">🗑 Удалить</button>
+        <button class="btn-ghost btn-sm" onclick="if(confirm('Удалить эту генерацию?')){sdDelete(${c.idx});_sdCloseChunkModal()}" style="color:var(--danger)">🗑 Удалить</button>
       </div>
       <div style="font-size:0.78rem;color:var(--muted);margin-top:4px">Промпт, отправленный в Seedance:</div>
       <div class="sd-modal-prompt">${esc(c.prompt || '(промпт не сохранён)')}</div>
     </div>`;
   openModal('modal-chunk-detail');
+}
+
+// Close handler: stops the player so audio doesn't keep playing in the
+// background after the user dismisses the modal. Also clears the body so
+// the video element is destroyed (otherwise its decoder lingers).
+function _sdCloseChunkModal() {
+  const modal = document.getElementById('modal-chunk-detail');
+  if (modal) {
+    modal.querySelectorAll('video').forEach(v => {
+      try { v.pause(); v.removeAttribute('src'); v.load(); } catch (_) {}
+    });
+    const body = modal.querySelector('.sd-modal-body');
+    if (body) body.innerHTML = '';
+  }
+  closeModal('modal-chunk-detail');
 }
 
 function sdRenderList(chunks) {
@@ -12738,17 +12805,33 @@ function sdRenderList(chunks) {
     }
   }
   if (!chunks.length) { el.innerHTML = ''; return; }
+  // Sort UI toggle. Sort mode is persisted in localStorage so reloads keep
+  // the user's preferred view. Default: «chrono» — by script position.
+  _sdSyncSortButtons();
+  const sortMode = _sdGetSort();
   try {
-    // Chronological order: by script_order ASC (so chunk #1 comes first even
-    // if user generated #3 in parallel first), then by idx ASC within the
-    // same script_order so retries appear right after their original.
     const ordered = chunks.slice().sort((a, b) => {
+      if (sortMode === 'newest') {
+        // Newest first — by idx DESC (idx is monotonically increasing per
+        // /seedance/start), tiebreak by created_at for legacy data.
+        return (b.idx ?? 0) - (a.idx ?? 0) || (b.created_at ?? 0) - (a.created_at ?? 0);
+      }
+      // Chronological: script_order ASC, then idx ASC so retries land
+      // immediately after the original take of the same scene.
       const ao = (typeof a.script_order === 'number') ? a.script_order : Infinity;
       const bo = (typeof b.script_order === 'number') ? b.script_order : Infinity;
       if (ao !== bo) return ao - bo;
       return (a.idx ?? 0) - (b.idx ?? 0);
     });
-    const labels = _sdComputeLabels(ordered);
+    // Labels always computed in chronological order so take-numbers are
+    // stable («v2», «v3») regardless of which sort the user is viewing.
+    const chronoForLabels = chunks.slice().sort((a, b) => {
+      const ao = (typeof a.script_order === 'number') ? a.script_order : Infinity;
+      const bo = (typeof b.script_order === 'number') ? b.script_order : Infinity;
+      if (ao !== bo) return ao - bo;
+      return (a.idx ?? 0) - (b.idx ?? 0);
+    });
+    const labels = _sdComputeLabels(chronoForLabels);
     const wantedIdxs = new Set(ordered.map(c => String(c.idx)));
     const existing = new Map();
     el.querySelectorAll('.sd-gen-card[data-idx]').forEach(node => {
@@ -12803,13 +12886,17 @@ function sdRenderList(chunks) {
     _sdUpdateBulkBar();
   } catch (err) {
     console.error('[sdRenderList] diff failed, falling back to full render:', err);
-    const ordered = chunks.slice().sort((a, b) => {
+    const mode = _sdGetSort();
+    const chronoForLabels = chunks.slice().sort((a, b) => {
       const ao = (typeof a.script_order === 'number') ? a.script_order : Infinity;
       const bo = (typeof b.script_order === 'number') ? b.script_order : Infinity;
       if (ao !== bo) return ao - bo;
       return (a.idx ?? 0) - (b.idx ?? 0);
     });
-    const labels = _sdComputeLabels(ordered);
+    const ordered = mode === 'newest'
+      ? chunks.slice().sort((a, b) => (b.idx ?? 0) - (a.idx ?? 0) || (b.created_at ?? 0) - (a.created_at ?? 0))
+      : chronoForLabels;
+    const labels = _sdComputeLabels(chronoForLabels);
     el.innerHTML = ordered.map(c => `<div class="sd-gen-card" data-idx="${c.idx}">${_sdCardHTML(c, labels.get(c.idx))}</div>`).join('');
   }
 }
