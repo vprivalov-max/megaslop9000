@@ -11658,6 +11658,10 @@ def auto_assemble_episode(sid, num):
     body = request.json or {}
     require_all = body.get('require_all', True)
     expected_segments = body.get('expected_segments')   # optional, set by frontend from script
+    # Auto-insert facade clip at each scene boundary. Defaults ON so newly
+    # assembled episodes naturally open every venue with its building shot.
+    # User can pass false to get the pure chunk concat (legacy behaviour).
+    insert_facades = body.get('insert_facades', True)
 
     all_chunks = [c for c in (_seedance_chunks(ep) or [])
                   if c.get('status') == 'completed' and c.get('video_path')]
@@ -11702,11 +11706,51 @@ def auto_assemble_episode(sid, num):
             }), 409
 
     base = series_path(sid)
+
+    # ── Facade auto-insert ────────────────────────────────────────────────
+    # Build loc_id → facade record map. A facade «owns» the locations listed
+    # in its member_loc_ids[]. If a chunk's primary loc transitions to one
+    # owned by a different facade than the previous chunk used, we prepend
+    # the new facade's video clip to introduce the venue. The very first
+    # chunk also triggers an insert (scene opens from nothing).
+    facade_by_loc = {}
+    facades_inserted = 0
+    if insert_facades:
+        for f in (s.get('location_facades') or []):
+            if (f.get('status') in ('ready',)) and f.get('video_path'):
+                for lid in (f.get('member_loc_ids') or []):
+                    facade_by_loc[lid] = f
+    def _chunk_primary_loc(c):
+        for r in (c.get('refs') or []):
+            if r.get('kind') == 'loc' and r.get('id'):
+                return r['id']
+        return None
+
     seg_paths = []
+    prev_facade_id = None   # which facade we last opened with (None at start)
     for c in chunks:
         p = base / c['video_path']
         if not p.exists():
             return jsonify({'error': f"file missing: {c['video_path']}"}), 400
+        # Decide whether to drop in a facade BEFORE this chunk
+        if insert_facades:
+            loc_id = _chunk_primary_loc(c)
+            fac = facade_by_loc.get(loc_id) if loc_id else None
+            if fac and fac.get('id') != prev_facade_id:
+                fac_video = base / fac['video_path']
+                if fac_video.exists():
+                    seg_paths.append(str(fac_video))
+                    facades_inserted += 1
+                prev_facade_id = fac.get('id')
+            elif fac:
+                # Same facade as last chunk — same scene continues, no insert.
+                pass
+            else:
+                # Chunk's loc has no facade → don't reset prev_facade_id; treat
+                # as continuation of the previous scene visually. (Exterior
+                # locations typically don't need a facade intro since the
+                # location image itself shows the surroundings.)
+                pass
         seg_paths.append(str(p))
 
     ffmpeg_bin = shutil.which('ffmpeg')
@@ -11794,6 +11838,7 @@ def auto_assemble_episode(sid, num):
         'url': f'/assets/{sid}/{rel}',
         'size_mb': size_mb,
         'chunks': len(seg_paths),
+        'facades_inserted': facades_inserted,
         'filename': out_name,
     })
 
