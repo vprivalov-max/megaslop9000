@@ -12655,9 +12655,9 @@ function _sdCardHTML(c, labelInfo) {
          onclick="sdOpenChunkModal(${c.idx})"
          onmouseenter="_sdThumbHoverPlay(this)"
          onmouseleave="_sdThumbHoverStop(this)"
-         title="Наведи — превью играет с начала. Клик — большой плеер + промпт.">
+         title="Наведи — превью играет с начала со звуком. Клик — большой плеер + промпт.">
       ${videoUrl
-        ? `<video src="${videoUrl}" muted preload="metadata" playsinline></video>`
+        ? `<video src="${videoUrl}" preload="metadata" playsinline></video>`
         : `<span>${esc(placeholderText)}</span>`}
       <span class="sd-thumb-hint">⛶ Открыть</span>
     </div>
@@ -12683,16 +12683,38 @@ function _sdCardHTML(c, labelInfo) {
   `;
 }
 
-// Thumbnail hover: start the muted preview from frame 0. Leaving the thumb
-// (or clicking it open the modal) stops playback completely and resets to
-// frame 0 — not «paused», so next hover starts fresh.
+// Thumbnail hover: play the preview from frame 0 WITH sound. Stops every
+// other thumbnail first so only one preview is audible at a time. Leaving
+// the thumb (or click to open the modal) stops playback completely and
+// resets to frame 0 — full stop, not «paused», so next hover starts fresh.
 function _sdThumbHoverPlay(el) {
   const v = el && el.querySelector('video');
   if (!v) return;
+  // Single-audio guarantee: silence every OTHER thumbnail so the user never
+  // hears two clips overlapping when the cursor races across the strip.
+  document.querySelectorAll('.sd-thumb video').forEach(other => {
+    if (other !== v) {
+      try { other.pause(); other.currentTime = 0; } catch (_) {}
+    }
+  });
   try {
+    v.muted = false;
+    v.volume = 1.0;
     v.currentTime = 0;
     const p = v.play();
-    if (p && p.catch) p.catch(() => {});   // ignore «play interrupted» rejections
+    if (p && p.catch) {
+      // Some browsers block unmuted autoplay until the user has actually
+      // clicked something on the page. Fall back to muted playback so the
+      // preview at least animates — sound will start working on subsequent
+      // hovers once the user clicks anywhere.
+      p.catch(() => {
+        try {
+          v.muted = true;
+          const p2 = v.play();
+          if (p2 && p2.catch) p2.catch(() => {});
+        } catch (_) {}
+      });
+    }
   } catch (_) {}
 }
 function _sdThumbHoverStop(el) {
