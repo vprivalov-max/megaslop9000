@@ -2627,11 +2627,19 @@ def _llm_extract_episode_entities(script_text, known_chars, known_locs, known_it
         return {'characters': [], 'locations': [], 'items': []}
 
 
-def _import_worker(sid, episode_records):
+def _import_worker(sid, episode_records, create_chars=True, create_locs=True, create_items=True):
     """Background worker: walks every episode, runs one LLM extraction per ep,
     merges results into series.characters/locations/items + ep.characters_used /
     locations_used / items_used. Updates _IMPORT_STATUS as it goes so the UI
-    can show progress."""
+    can show progress.
+
+    create_{chars,locs,items}: when False, the worker still RUNS the LLM
+    extraction (so per-episode *_used lists get linked to existing roster
+    entries by name), but it will NOT create NEW entities of that type. Used
+    by the import-from-script flow when the user pre-uploaded their own
+    characters/locations and only wants their explicit roster — extracted
+    names that don't match existing get silently dropped from *_used.
+    """
     st = _import_status(sid)
     st.update({
         'running': True, 'total': len(episode_records), 'done': 0,
@@ -2702,7 +2710,7 @@ def _import_worker(sid, episode_records):
                     existing = next((x for x in s['characters'] if x['name'].lower() == name.lower()), None)
                     if existing:
                         ep_char_ids.append(existing['id'])
-                    else:
+                    elif create_chars:
                         new_c = {
                             'id': str(uuid.uuid4())[:8],
                             'name': name,
@@ -2716,6 +2724,7 @@ def _import_worker(sid, episode_records):
                         }
                         s['characters'].append(new_c)
                         ep_char_ids.append(new_c['id'])
+                    # else: create_chars=False and no roster match → drop
 
                 # Merge locations
                 ep_loc_ids = []
@@ -2726,7 +2735,7 @@ def _import_worker(sid, episode_records):
                     existing = next((x for x in s['locations'] if x['name'].lower() == name.lower()), None)
                     if existing:
                         ep_loc_ids.append(existing['id'])
-                    else:
+                    elif create_locs:
                         new_l = {
                             'id': str(uuid.uuid4())[:8],
                             'name': name,
@@ -2736,6 +2745,7 @@ def _import_worker(sid, episode_records):
                         }
                         s['locations'].append(new_l)
                         ep_loc_ids.append(new_l['id'])
+                    # else: create_locs=False and no roster match → drop
 
                 # Merge items — fuzzy dedup so cross-language re-imports of the
                 # same prop don't make duplicates ("Hidden Recorder" / "скрытый
@@ -2749,7 +2759,7 @@ def _import_worker(sid, episode_records):
                     existing = _fuzzy_find_item(s['items'], name, desc)
                     if existing:
                         ep_item_ids.append(existing['id'])
-                    else:
+                    elif create_items:
                         new_it = {
                             'id': str(uuid.uuid4())[:8],
                             'name': name,
@@ -3152,15 +3162,49 @@ def import_from_script_preview():
 def import_from_script():
     """Two-phase commit: create series + episodes (synchronous, fast),
     then kick off background extraction. Returns immediately so UI can
-    redirect to the new series page and start polling /import-status."""
-    data = request.json or {}
-    title = (data.get('title') or '').strip()
-    script = (data.get('script') or '').strip()
+    redirect to the new series page and start polling /import-status.
+
+    Accepts EITHER:
+      • JSON body { title, script, extract_entities?, synopsis? } — classic path.
+      • multipart/form-data with the same fields + optional file uploads:
+          character_files[]  — image files; name = filename stem (uppercased)
+          location_files[]   — same, for locations
+          extract_characters / extract_locations / extract_items — per-type bool
+            flags (each defaults to extract_entities). When false, the worker
+            still links existing roster entries by name but won't CREATE new
+            entities of that type — so the user's pre-uploaded set is final.
+    """
+    is_multipart = request.content_type and request.content_type.startswith('multipart/')
+    if is_multipart:
+        form = request.form
+        title = (form.get('title') or '').strip()
+        script = (form.get('script') or '').strip()
+        synopsis = form.get('synopsis') or ''
+        def _flag(name, default):
+            v = form.get(name)
+            if v is None or v == '': return default
+            return v not in ('0', 'false', 'False', 'off', 'no')
+        do_extract        = _flag('extract_entities', True)
+        do_extract_chars  = _flag('extract_characters', do_extract)
+        do_extract_locs   = _flag('extract_locations',  do_extract)
+        do_extract_items  = _flag('extract_items',      do_extract)
+        char_files = request.files.getlist('character_files') or request.files.getlist('character_files[]')
+        loc_files  = request.files.getlist('location_files')  or request.files.getlist('location_files[]')
+    else:
+        data = request.json or {}
+        title = (data.get('title') or '').strip()
+        script = (data.get('script') or '').strip()
+        synopsis = data.get('synopsis', '')
+        do_extract = bool(data.get('extract_entities', True))
+        do_extract_chars = bool(data.get('extract_characters', do_extract))
+        do_extract_locs  = bool(data.get('extract_locations',  do_extract))
+        do_extract_items = bool(data.get('extract_items',      do_extract))
+        char_files, loc_files = [], []
+
     if not title:
         return jsonify({'error': 'title required'}), 400
     if not script:
         return jsonify({'error': 'script required'}), 400
-    do_extract = bool(data.get('extract_entities', True))
 
     eps = _split_script_into_episodes(script)
     if not eps:
@@ -3172,7 +3216,7 @@ def import_from_script():
     series_data = {
         'id': sid, 'title': title,
         'genre': '', 'tone': '', 'target_audience': '', 'world_description': '',
-        'synopsis': data.get('synopsis', ''),
+        'synopsis': synopsis,
         'auto_generate_assets': True, 'batch_mode': False, 'batch_size': 1,
         'stage': 4, 'arc': None, 'milestone_synopses': {},
         'checkpoints': [], 'finale': None,
@@ -3195,6 +3239,81 @@ def import_from_script():
     save_series(sid, series_data)
     scaffold_series_folders(sid, title)
 
+    # ── Persist pre-uploaded characters / locations BEFORE the worker runs.
+    # Filename stem becomes the entity name (so the worker's name-based dedup
+    # picks them up when the script mentions them). Image saved as the canonical
+    # asset → user sees their character/location with an image right away,
+    # before any AI generation.
+    def _stem_to_name(filename):
+        # «mia_chen.jpg» → «Mia Chen»; «ОСОБНЯК БЕЛЛАКУРТОВ.png» → «Особняк
+        # Беллакуртов» (Title-cased — looks better in roster than ALL-CAPS).
+        # Strip extension, replace separators with spaces, collapse, title-case.
+        stem = re.sub(r'\.[^.]+$', '', filename or '').strip()
+        stem = re.sub(r'[._\-]+', ' ', stem).strip()
+        stem = re.sub(r'\s+', ' ', stem)
+        if not stem: return ''
+        # If user typed ALL CAPS, preserve as Title Case for legibility.
+        if stem.isupper(): stem = stem.title()
+        return stem
+
+    uploaded_chars_count = 0
+    for f in (char_files or []):
+        if not f or not getattr(f, 'filename', ''): continue
+        if not allowed_file(f.filename):
+            _log_event('WARN', 'import_char_skip_badtype', name=f.filename); continue
+        name = _stem_to_name(f.filename)
+        if not name: continue
+        # Skip name duplicates within this batch.
+        if any(c['name'].lower() == name.lower() for c in series_data['characters']):
+            continue
+        cid = str(uuid.uuid4())[:8]
+        char_dir = assets_dir(sid) / 'characters' / cid
+        char_dir.mkdir(parents=True, exist_ok=True)
+        safe = secure_filename(f.filename) or f'{cid}.jpg'
+        dst = char_dir / safe
+        try: f.save(dst)
+        except Exception as e:
+            _log_event('WARN', 'import_char_save_failed', name=name, err=str(e)[:160]); continue
+        rel_path = str(dst.relative_to(series_path(sid)))
+        series_data['characters'].append({
+            'id': cid, 'name': name,
+            'description': '', 'appearance': '',
+            'gender': 'female', 'voice_id': '',
+            'ref_images': [rel_path],
+            'outfits': [], 'base_outfit_label': 'base',
+        })
+        uploaded_chars_count += 1
+
+    uploaded_locs_count = 0
+    for f in (loc_files or []):
+        if not f or not getattr(f, 'filename', ''): continue
+        if not allowed_file(f.filename):
+            _log_event('WARN', 'import_loc_skip_badtype', name=f.filename); continue
+        name = _stem_to_name(f.filename)
+        if not name: continue
+        if any(l['name'].lower() == name.lower() for l in series_data['locations']):
+            continue
+        lid = str(uuid.uuid4())[:8]
+        loc_dir = assets_dir(sid) / 'locations' / lid
+        loc_dir.mkdir(parents=True, exist_ok=True)
+        safe = secure_filename(f.filename) or f'{lid}.jpg'
+        dst = loc_dir / safe
+        try: f.save(dst)
+        except Exception as e:
+            _log_event('WARN', 'import_loc_save_failed', name=name, err=str(e)[:160]); continue
+        rel_path = str(dst.relative_to(series_path(sid)))
+        series_data['locations'].append({
+            'id': lid, 'name': name,
+            'description': '',
+            'ref_images': [rel_path], 'avai_url': '',
+        })
+        uploaded_locs_count += 1
+
+    # Re-save now that pre-uploaded entities are baked in. The worker will pick
+    # this up via load_series() inside its per-episode loop.
+    if uploaded_chars_count or uploaded_locs_count:
+        save_series(sid, series_data)
+
     # Create each episode with the script body pre-filled.
     ep_records = []
     for e in eps:
@@ -3214,14 +3333,28 @@ def import_from_script():
         ep_records.append({'number': e['number']})
 
     # Kick off the extraction worker in the background. _spawn_with_keys
-    # carries the user's auth context across the thread boundary.
-    if do_extract:
-        _spawn_with_keys(_import_worker, sid, ep_records)
+    # carries the user's auth context across the thread boundary. We always
+    # run the worker if ANY per-type extraction is enabled (so episode
+    # *_used arrays get populated by name-matching against pre-uploaded
+    # roster) — even when no new-entity creation is allowed of that type.
+    worker_should_run = do_extract_chars or do_extract_locs or do_extract_items
+    if worker_should_run:
+        _spawn_with_keys(
+            _import_worker, sid, ep_records,
+            create_chars=do_extract_chars,
+            create_locs=do_extract_locs,
+            create_items=do_extract_items,
+        )
 
     return jsonify({
         'sid': sid,
         'episodes_created': len(eps),
-        'extraction_started': do_extract,
+        'extraction_started': worker_should_run,
+        'characters_uploaded': uploaded_chars_count,
+        'locations_uploaded': uploaded_locs_count,
+        'extract_characters': do_extract_chars,
+        'extract_locations':  do_extract_locs,
+        'extract_items':      do_extract_items,
     }), 201
 
 
@@ -3395,13 +3528,54 @@ def generate_script_batch(sid):
         )
     else:
         crowd_block = ''
+    # HARD numeric caps + banned soap-opera tropes. Without this Claude
+    # defaults to «voiceover-narrated paperwork-reveal» style and triples the
+    # line count. Mirrors the DIALOGUE-FIRST rule from _IDEAS_SYSTEM but
+    # applied at the script-writing stage where it actually constrains output.
+    if eff_duration <= 35:
+        max_scenes = 1
+        scene_clause = "1 СЦЕНА на серию (одна локация, без переездов)."
+    elif eff_duration <= 75:
+        max_scenes = 2
+        scene_clause = "МАКСИМУМ 2 сцены/локации на серию. Лучше — 1 непрерывная сцена."
+    elif eff_duration <= 120:
+        max_scenes = 3
+        scene_clause = "МАКСИМУМ 3 сцены на серию. Не разбрасывайся локациями."
+    else:
+        max_scenes = 4
+        scene_clause = f"МАКСИМУМ {max_scenes} сцены — не больше."
+    hard_caps_block = (
+        "\n=== ЖЁСТКИЕ ЛИМИТЫ (обязательные, проверяй САМ перед выводом) ===\n"
+        f"1. РЕПЛИКИ: ровно {eff_lines} (±2). Реплика = одна строка диалога ИЛИ закадровый VO ИЛИ короткое действие (action line). "
+        f"VOICEOVER считается как обычная реплика — он жрёт хронометраж так же. Если насчитал больше {eff_lines + 2} — режь беспощадно (включая VO). "
+        "НЕ ВЫХОДИ за лимит «у меня важная сцена не помещается» — значит сцена слишком жирная, упрощай.\n"
+        f"2. СЦЕНЫ: {scene_clause} Сцена = одна локация/время. Переезд = новая сцена. Каждая дополнительная сцена жрёт 3-4 реплики только на сетап.\n"
+        "3. VOICEOVER: разрешён точечно (1-2 на серию максимум, как стилистический приём — открытие/закрытие). "
+        "НЕ строй сюжет через закадр: откровения, эмоции, мотивацию персонажа показывай через диалог и действие, не через монолог в камеру. "
+        "Если в серии 3+ VO-блока — это уже не сериал, а аудиокнига, переписывай.\n"
+        "4. ЗАПРЕЩЕНО (нарушение = переписать с нуля):\n"
+        "   • БУМАЖНЫЕ РАСКРЫТИЯ (paperwork reveals): нельзя двигать сюжет через письмо/завещание/документ/email/SMS/курьерский конверт/папку с бумагами/фото на телефоне/«экран ноутбука прокручивает документы». "
+        "Откровения должны звучать ВСЛУХ из уст персонажа, не читаться с бумаги.\n"
+        "   • ФЛЭШБЕКИ и сны в первой серии. Только настоящее время.\n"
+        "   • «Тем временем в…» / «А в это время…» — параллельный монтаж сложен и жрёт хронометраж.\n"
+        "5. CLIFFHANGER в конце — да, но НЕ через прибывшее письмо/звонок/тайный документ. "
+        "Лучше: фраза которая меняет всё, неожиданное появление человека, прямая угроза в лицо, действие которое нельзя отменить.\n"
+        "6. САМОПРОВЕРКА перед выводом каждой серии — посчитай:\n"
+        f"   – Сколько реплик/строк действия/VO суммарно? (должно быть {eff_lines} ±2)\n"
+        f"   – Сколько разных локаций/сцен? (должно быть ≤ {max_scenes})\n"
+        "   – Сколько VO-блоков? (≤ 2, и сюжет НЕ должен ими двигаться)\n"
+        "   – Двигается ли сюжет через бумагу? (должно быть НЕТ)\n"
+        "   Если хоть один тест провален — перепиши серию до вывода.\n"
+        "===\n"
+    )
     system = (
         f"Ты — сценарист короткой драмы для вертикального TikTok/Reels. Пишешь {mode_label} на N серий. "
         f"{length_clause}Формат: "
         "имена ВЕРХНИМ регистром перед репликами, диалог короткий и накалённый, обязательный cliffhanger "
         "в конце КАЖДОЙ серии (открытый вопрос или новая угроза которая толкает к следующей).\n"
         f"{style_block}"
-        f"{crowd_block}\n"
+        f"{crowd_block}"
+        f"{hard_caps_block}\n"
         + ("ПРАВИЛА ПИЛОТА И СТАРТОВОЙ ДУГИ:\n"
            "1. Если в roster уже есть персонажи — используй их имена дословно. Если roster пустой — "
            "сам придумай героев, дай каждому отчётливое имя и личность.\n"

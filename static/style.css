@@ -811,6 +811,46 @@ body.sidebar-dragging * {
   box-shadow: inset 0 0 0 1px rgba(168,85,247,0.45);
 }
 
+/* Import-from-script: per-entity row in the create-series modal — checkbox
+   on top, file-upload + thumbnail chips below. */
+.import-entity-row {
+  padding: 8px 10px;
+  background: rgba(255,255,255,0.02);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.import-files-preview {
+  display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px;
+}
+.import-files-preview:empty { display: none; }
+.import-file-chip {
+  display: flex; align-items: center; gap: 6px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 6px 4px 4px;
+  max-width: 240px;
+}
+.import-file-chip img {
+  width: 36px; height: 36px; object-fit: cover; border-radius: 4px; flex-shrink: 0;
+}
+.import-file-chip-meta { flex: 1; min-width: 0; }
+.import-file-chip-meta input {
+  width: 100%; padding: 2px 4px;
+  font-size: 0.82rem; background: var(--surface); border: 1px solid var(--border);
+  border-radius: 4px; color: var(--text);
+}
+.import-file-chip-fname {
+  font-size: 0.66rem; color: var(--muted); margin-top: 2px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.import-file-chip-x {
+  width: 20px; height: 20px; padding: 0; border: 0;
+  background: transparent; color: var(--muted); cursor: pointer;
+  font-size: 1.1rem; line-height: 1;
+}
+.import-file-chip-x:hover { color: var(--danger); }
+
 /* Import-from-script: progress banner shown on series page during extraction */
 .import-progress-banner {
   margin: 10px 0; padding: 12px 14px;

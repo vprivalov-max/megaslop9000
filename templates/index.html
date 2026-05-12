@@ -814,13 +814,60 @@
           <button type="button" class="btn-ghost btn-sm" onclick="importPreviewSplit()">👁 Превью разбивки на серии</button>
           <div id="import-series-preview" style="margin-top:8px"></div>
         </div>
-        <label class="cb" style="display:flex;align-items:flex-start;gap:8px;background:rgba(132,94,247,0.06);border:1px solid rgba(132,94,247,0.2);border-radius:8px;padding:10px 12px">
-          <input type="checkbox" id="import-extract-entities" checked style="margin-top:3px">
-          <div style="flex:1">
-            <div style="font-weight:600;color:var(--text)">🤖 Извлечь персонажей, локации, предметы</div>
-            <div style="font-size:0.78rem;color:var(--muted)">Запустится в фоне после создания. На 70 серий ≈ 5-15 минут (зависит от длины каждой серии). Можно сразу заходить в созданный сериал — будет видно прогресс.</div>
+        <!-- ─── Per-type extraction toggles + manual uploads ─── -->
+        <div style="background:rgba(132,94,247,0.06);border:1px solid rgba(132,94,247,0.2);border-radius:8px;padding:12px 14px;margin-top:6px">
+          <div style="font-weight:600;color:var(--text);margin-bottom:8px">🤖 Извлечение и ручная подгрузка</div>
+          <div style="font-size:0.78rem;color:var(--muted);margin-bottom:10px">
+            Сними галочку и подгрузи свои файлы — имена возьмутся из названий файлов (например <code>mia_chen.jpg</code> → «Mia Chen»). Можно комбинировать: подгрузить пару своих + остальное пусть достанет AI.
           </div>
-        </label>
+
+          <!-- Characters row -->
+          <div class="import-entity-row">
+            <label class="cb" style="display:flex;align-items:flex-start;gap:8px;flex:1">
+              <input type="checkbox" id="import-extract-characters" checked style="margin-top:3px">
+              <div style="flex:1">
+                <div style="font-weight:600;color:var(--text);font-size:0.92rem">👤 Извлекать персонажей</div>
+                <div style="font-size:0.74rem;color:var(--muted)">AI прочитает сценарий и достанет всех. Если выкл — только подгруженные ниже.</div>
+              </div>
+            </label>
+            <div style="margin-top:8px">
+              <button type="button" class="btn-ghost btn-sm" onclick="document.getElementById('import-char-files').click()">📁 Подгрузить персов</button>
+              <input type="file" id="import-char-files" accept="image/*" multiple style="display:none" onchange="importPickedCharFiles(this)">
+              <div id="import-char-files-preview" class="import-files-preview"></div>
+            </div>
+          </div>
+
+          <!-- Locations row -->
+          <div class="import-entity-row" style="margin-top:10px">
+            <label class="cb" style="display:flex;align-items:flex-start;gap:8px;flex:1">
+              <input type="checkbox" id="import-extract-locations" checked style="margin-top:3px">
+              <div style="flex:1">
+                <div style="font-weight:600;color:var(--text);font-size:0.92rem">🏙 Извлекать локации</div>
+                <div style="font-size:0.74rem;color:var(--muted)">AI достанет места действия. Если выкл — только подгруженные ниже.</div>
+              </div>
+            </label>
+            <div style="margin-top:8px">
+              <button type="button" class="btn-ghost btn-sm" onclick="document.getElementById('import-loc-files').click()">📁 Подгрузить локации</button>
+              <input type="file" id="import-loc-files" accept="image/*" multiple style="display:none" onchange="importPickedLocFiles(this)">
+              <div id="import-loc-files-preview" class="import-files-preview"></div>
+            </div>
+          </div>
+
+          <!-- Items row (no upload — items are usually small props, easier to add via UI later) -->
+          <div class="import-entity-row" style="margin-top:10px">
+            <label class="cb" style="display:flex;align-items:flex-start;gap:8px;flex:1">
+              <input type="checkbox" id="import-extract-items" checked style="margin-top:3px">
+              <div style="flex:1">
+                <div style="font-weight:600;color:var(--text);font-size:0.92rem">🎒 Извлекать сюжетные предметы</div>
+                <div style="font-size:0.74rem;color:var(--muted)">Револьвер, конверт с фото, медальон — что играет роль в сюжете.</div>
+              </div>
+            </label>
+          </div>
+
+          <div style="font-size:0.72rem;color:var(--muted);margin-top:10px;padding-top:8px;border-top:1px dashed var(--border)">
+            ⏱ Извлечение на 70 серий ≈ 5-15 минут (в фоне). Можно сразу заходить в сериал.
+          </div>
+        </div>
         <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:14px">
           <button class="btn-primary" onclick="importCreateSeries()" id="import-create-btn" style="background:linear-gradient(135deg,#10b981,#059669)">📜 Создать из сценария</button>
         </div>

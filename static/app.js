@@ -93,6 +93,17 @@ const api = {
     if (!r.ok) throw new Error(await r.text());
     return r.json();
   },
+  // Multipart POST with optional timeout — mirrors post() ergonomics but for
+  // FormData payloads (file uploads alongside text fields).
+  async postForm(url, formData, { timeoutMs } = {}) {
+    const opts = { method: 'POST', body: formData };
+    if (timeoutMs) opts.signal = AbortSignal.timeout(timeoutMs);
+    let r;
+    try { r = await fetch(url, opts); }
+    catch (e) { throw new Error(e.name === 'TimeoutError' ? `Таймаут (${Math.round(timeoutMs/1000)}с) — сервер не ответил` : e.message); }
+    if (!r.ok) throw new Error(await parseApiError(r));
+    return r.json();
+  },
 };
 
 // ── Task monitor (floating progress widget) ───────────────────────────────────
@@ -1052,6 +1063,12 @@ function openCreateSeries() {
   setVal('import-series-script', '');
   document.getElementById('import-series-script-stats').textContent = '0 символов';
   document.getElementById('import-series-preview').innerHTML = '';
+  // Reset per-type extraction toggles + picked-file chips when modal reopens
+  // so the previous session's state doesn't leak into the next series.
+  for (const id of ['import-extract-characters','import-extract-locations','import-extract-items']) {
+    const el = document.getElementById(id); if (el) el.checked = true;
+  }
+  try { _importResetPickedFiles(); } catch (_) {}
   setSeriesCreateMode('generate');
   // Hydrate the «🚫 Не предлагать» field from localStorage so user sees their
   // persisted blocked-tropes list immediately on modal open (no need to
@@ -1148,29 +1165,125 @@ async function importPreviewSplit() {
   }
 }
 
+// ── Pre-upload state for the create-from-script flow ───────────────────────
+// Two arrays of File objects + their filename-derived display names. Built up
+// as the user picks files in the modal, replayed when they hit «Создать».
+const IMPORT_PICKED = { chars: [], locs: [] };
+function _importStemToName(filename) {
+  let stem = (filename || '').replace(/\.[^.]+$/, '').trim();
+  stem = stem.replace(/[._\-]+/g, ' ').trim();
+  stem = stem.replace(/\s+/g, ' ');
+  if (!stem) return '';
+  if (stem === stem.toUpperCase()) {
+    // ALL CAPS → Title Case for readability.
+    stem = stem.replace(/\w\S*/g, (w) => w[0].toUpperCase() + w.slice(1).toLowerCase());
+  }
+  return stem;
+}
+function _renderImportPickedList(kind) {
+  const arr = IMPORT_PICKED[kind] || [];
+  const host = document.getElementById(kind === 'chars' ? 'import-char-files-preview' : 'import-loc-files-preview');
+  if (!host) return;
+  if (!arr.length) { host.innerHTML = ''; return; }
+  host.innerHTML = arr.map((entry, i) => `
+    <div class="import-file-chip" title="${esc(entry.file.name)}">
+      <img src="${esc(entry.previewUrl)}" alt="">
+      <div class="import-file-chip-meta">
+        <input type="text" value="${esc(entry.name)}" oninput="importRenameFile('${kind}', ${i}, this.value)">
+        <div class="import-file-chip-fname">${esc(entry.file.name)}</div>
+      </div>
+      <button type="button" class="import-file-chip-x" onclick="importRemoveFile('${kind}', ${i})" title="Убрать">×</button>
+    </div>`).join('');
+}
+function importRenameFile(kind, idx, value) {
+  const arr = IMPORT_PICKED[kind] || [];
+  if (arr[idx]) arr[idx].name = (value || '').trim();
+}
+function importRemoveFile(kind, idx) {
+  const arr = IMPORT_PICKED[kind] || [];
+  const entry = arr[idx];
+  if (entry && entry.previewUrl) { try { URL.revokeObjectURL(entry.previewUrl); } catch (_) {} }
+  arr.splice(idx, 1);
+  _renderImportPickedList(kind);
+}
+function _importPickedFiles(kind, inputEl) {
+  const files = Array.from(inputEl.files || []);
+  for (const f of files) {
+    if (!f.type || !f.type.startsWith('image/')) continue;
+    const name = _importStemToName(f.name);
+    if (!name) continue;
+    // Dedup by name within the picker.
+    if (IMPORT_PICKED[kind].some(e => e.name.toLowerCase() === name.toLowerCase())) continue;
+    IMPORT_PICKED[kind].push({ file: f, name, previewUrl: URL.createObjectURL(f) });
+  }
+  inputEl.value = '';  // allow re-picking the same file after removal
+  _renderImportPickedList(kind);
+}
+function importPickedCharFiles(el) { _importPickedFiles('chars', el); }
+function importPickedLocFiles(el)  { _importPickedFiles('locs',  el); }
+function _importResetPickedFiles() {
+  for (const kind of ['chars', 'locs']) {
+    for (const e of IMPORT_PICKED[kind]) { try { URL.revokeObjectURL(e.previewUrl); } catch (_) {} }
+    IMPORT_PICKED[kind] = [];
+    _renderImportPickedList(kind);
+  }
+}
+
 async function importCreateSeries() {
   const title = (document.getElementById('import-series-title')?.value || '').trim();
   const script = (document.getElementById('import-series-script')?.value || '').trim();
-  const extract = !!document.getElementById('import-extract-entities')?.checked;
+  const extractChars = !!document.getElementById('import-extract-characters')?.checked;
+  const extractLocs  = !!document.getElementById('import-extract-locations')?.checked;
+  const extractItems = !!document.getElementById('import-extract-items')?.checked;
   if (!title) { alert('Введи название сериала'); return; }
   if (!script) { alert('Сценарий пустой — вставь текст или подгрузи файл'); return; }
+  // Sanity: if user disabled char extraction AND didn't upload any → warn
+  // (the series will have zero characters until they add them manually).
+  if (!extractChars && !IMPORT_PICKED.chars.length) {
+    if (!confirm('Извлечение персонажей выключено и ни одного файла не подгружено — серия будет без персонажей. Продолжить?')) return;
+  }
   const btn = document.getElementById('import-create-btn');
   const orig = btn.innerHTML;
   btn.disabled = true;
   btn.innerHTML = '<span class="spinner"></span> Создаю сериал...';
   try {
-    const r = await api.post('/api/series/import-from-script', {
-      title, script, extract_entities: extract,
-    });
+    const hasFiles = IMPORT_PICKED.chars.length + IMPORT_PICKED.locs.length > 0;
+    let r;
+    if (hasFiles) {
+      // Multipart path — pre-upload files alongside the script.
+      const fd = new FormData();
+      fd.append('title', title);
+      fd.append('script', script);
+      fd.append('extract_characters', extractChars ? '1' : '0');
+      fd.append('extract_locations',  extractLocs  ? '1' : '0');
+      fd.append('extract_items',      extractItems ? '1' : '0');
+      // Rename file to the user-edited name (preserving extension) so the
+      // backend stem→name converter picks up edits made in the chip UI.
+      const _renamed = (entry) => {
+        const ext = (entry.file.name.match(/\.[^.]+$/) || [''])[0];
+        const safe = entry.name.replace(/[\/\\<>:"|?*]/g, '_');
+        return new File([entry.file], `${safe}${ext}`, { type: entry.file.type });
+      };
+      for (const e of IMPORT_PICKED.chars) fd.append('character_files', _renamed(e));
+      for (const e of IMPORT_PICKED.locs)  fd.append('location_files',  _renamed(e));
+      r = await api.postForm('/api/series/import-from-script', fd, { timeoutMs: 180000 });
+    } else {
+      r = await api.post('/api/series/import-from-script', {
+        title, script,
+        extract_characters: extractChars,
+        extract_locations:  extractLocs,
+        extract_items:      extractItems,
+      });
+    }
     if (r.error) throw new Error(r.error);
     closeModal('modal-create-series');
-    showToast(`✓ Создано: сериал + ${r.episodes_created} эпизодов${extract ? ' · извлечение запущено в фоне' : ''}`, 5000);
+    const summaryBits = [`${r.episodes_created} эпизодов`];
+    if (r.characters_uploaded) summaryBits.push(`${r.characters_uploaded} персов`);
+    if (r.locations_uploaded)  summaryBits.push(`${r.locations_uploaded} локаций`);
+    showToast(`✓ Создано: ${summaryBits.join(' + ')}${r.extraction_started ? ' · извлечение в фоне' : ''}`, 5000);
+    _importResetPickedFiles();
     navigate('series', { seriesId: r.sid });
-    // The series view will pick up the import-status banner via pollImportStatus.
-    if (extract) setTimeout(() => pollImportStatus(r.sid), 600);
-    // First-time choice: ask for visual style right after the user creates the
-    // series. They can dismiss to use cinematic default; saving locks in choice
-    // for all character/loc/item generations + Seedance video.
+    if (r.extraction_started) setTimeout(() => pollImportStatus(r.sid), 600);
     setTimeout(() => maybePromptForStyle(true), 900);
   } catch (e) {
     alert('Ошибка импорта: ' + (e?.message || e));
