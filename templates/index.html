@@ -1219,6 +1219,19 @@
   </div>
 </div>
 
+<!-- Chunk detail modal — opened by clicking a chunk thumbnail in the list -->
+<div id="modal-chunk-detail" class="modal hidden">
+  <div class="modal-box" style="max-width:780px;max-height:92vh;display:flex;flex-direction:column">
+    <div class="modal-header">
+      <h2>Чанк · детали</h2>
+      <button class="btn-icon" onclick="closeModal('modal-chunk-detail')">✕</button>
+    </div>
+    <div class="modal-body" style="overflow-y:auto">
+      <div class="sd-modal-body"></div>
+    </div>
+  </div>
+</div>
+
 <!-- Building facades panel — generate one exterior shot per parent building -->
 <div id="modal-facades" class="modal hidden">
   <div class="modal-box" style="max-width:900px;max-height:92vh;display:flex;flex-direction:column">

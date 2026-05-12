@@ -1900,13 +1900,31 @@ body:not(.seedance-mode) .seedance-only { display: none !important; }
   background: #c0392b; color: #fff; border-radius: 50%; border: 0;
   font-size: 11px; line-height: 18px; cursor: pointer; padding: 0;
 }
-.sd-gen-list { margin-top: 12px; display: flex; flex-direction: column; gap: 8px; }
-.sd-gen-card {
-  display: flex; gap: 10px; padding: 8px; border: 1px solid var(--border, #2a2a30);
-  border-radius: 8px; background: var(--surface, #0f0f12);
-  position: relative;                        /* anchor for absolutely-positioned checkbox */
-  transition: outline 0.15s, background 0.15s;
+/* Horizontal strip: vertical 9:16 cards side-by-side, scroll sideways instead
+   of pushing everything else down the page. */
+.sd-gen-list {
+  margin-top: 12px;
+  display: flex; flex-direction: row; gap: 12px;
+  overflow-x: auto; overflow-y: hidden;
+  padding-bottom: 10px;
+  scroll-behavior: smooth;
+  scrollbar-color: var(--accent, #00d4aa) transparent;
 }
+.sd-gen-list::-webkit-scrollbar { height: 10px; }
+.sd-gen-list::-webkit-scrollbar-thumb {
+  background: var(--border, #2a2a30); border-radius: 5px;
+}
+.sd-gen-list::-webkit-scrollbar-thumb:hover { background: var(--accent, #00d4aa); }
+
+.sd-gen-card {
+  display: flex; flex-direction: column; gap: 8px;
+  padding: 8px; border: 1px solid var(--border, #2a2a30);
+  border-radius: 8px; background: var(--surface, #0f0f12);
+  position: relative;
+  width: 200px; flex-shrink: 0;
+  transition: outline 0.15s, background 0.15s, transform 0.15s;
+}
+.sd-gen-card:hover { transform: translateY(-2px); }
 .sd-gen-card.sd-card-selected {
   outline: 2px solid var(--accent, #00d4aa);
   outline-offset: -2px;
@@ -1941,17 +1959,82 @@ body:not(.seedance-mode) .seedance-only { display: none !important; }
   font-size: 0.84rem;
 }
 .sd-bulk-bar button[disabled] { opacity: 0.4; cursor: not-allowed; }
-.sd-gen-card video, .sd-gen-card .sd-placeholder {
-  width: 220px; height: 124px; background: #000; border-radius: 4px; flex-shrink: 0;
-  display: flex; align-items: center; justify-content: center; color: var(--muted, #888); font-size: 0.85rem;
+/* 9:16 vertical preview — fills full card width. Click opens the chunk modal
+   with a bigger player and the full prompt. */
+.sd-gen-card .sd-thumb {
+  width: 100%; aspect-ratio: 9 / 16;
+  background: #000; border-radius: 6px;
+  display: flex; align-items: center; justify-content: center;
+  color: var(--muted, #888); font-size: 0.85rem;
+  cursor: pointer; overflow: hidden;
+  position: relative;
 }
-.sd-gen-meta { flex: 1; display: flex; flex-direction: column; gap: 4px; font-size: 0.78rem; min-width: 0; }
-.sd-gen-meta .sd-prompt { color: var(--muted, #aaa); white-space: pre-wrap; word-break: break-word; max-height: 50px; overflow: hidden; }
+.sd-gen-card .sd-thumb video {
+  width: 100%; height: 100%; object-fit: cover; display: block;
+  pointer-events: none;   /* let the wrapper handle clicks → open modal */
+}
+.sd-gen-card .sd-thumb-hint {
+  position: absolute; bottom: 6px; right: 6px;
+  font-size: 0.66rem; color: #fff;
+  background: rgba(0,0,0,0.55); padding: 2px 6px; border-radius: 3px;
+  opacity: 0; transition: opacity 0.15s;
+  pointer-events: none;
+}
+.sd-gen-card .sd-thumb:hover .sd-thumb-hint { opacity: 1; }
+.sd-gen-meta { display: flex; flex-direction: column; gap: 3px; font-size: 0.74rem; min-width: 0; }
+.sd-gen-meta .sd-label {
+  font-weight: 600; color: var(--text, #fff); font-size: 0.84rem;
+}
+.sd-gen-meta .sd-label .sd-take {
+  color: var(--accent, #00d4aa); font-size: 0.74rem; font-weight: 400; margin-left: 4px;
+}
+.sd-gen-meta .sd-meta-row {
+  display: flex; gap: 5px; align-items: center; flex-wrap: wrap;
+  color: var(--muted, #aaa); font-size: 0.7rem;
+}
 .sd-gen-meta .sd-status-running { color: #f39c12; }
 .sd-gen-meta .sd-status-completed { color: #27ae60; }
 .sd-gen-meta .sd-status-failed { color: #e74c3c; }
 .sd-gen-meta .sd-status-pending { color: #888; }
-.sd-gen-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.sd-gen-meta .sd-card-err {
+  color: #e74c3c; font-size: 0.7rem;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.sd-gen-actions {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 4px;
+}
+.sd-gen-actions .btn-ghost.btn-sm {
+  font-size: 0.7rem; padding: 4px 6px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.sd-gen-actions .full-row { grid-column: 1 / -1; }
+
+/* Chunk-detail modal — big player + full prompt + all actions. */
+.sd-modal-body {
+  display: flex; gap: 16px; align-items: flex-start;
+}
+.sd-modal-player {
+  flex-shrink: 0; width: 360px;
+  aspect-ratio: 9 / 16; background: #000; border-radius: 8px; overflow: hidden;
+}
+.sd-modal-player video { width: 100%; height: 100%; object-fit: contain; }
+.sd-modal-side { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 10px; }
+.sd-modal-side .sd-modal-prompt {
+  background: var(--surface2); border: 1px solid var(--border);
+  border-radius: 6px; padding: 8px 10px;
+  font-family: ui-monospace, monospace; font-size: 0.78rem;
+  white-space: pre-wrap; word-break: break-word;
+  max-height: 360px; overflow-y: auto;
+  color: var(--text);
+}
+.sd-modal-side .sd-modal-meta { font-size: 0.82rem; color: var(--muted); }
+.sd-modal-side .sd-modal-actions {
+  display: flex; gap: 6px; flex-wrap: wrap;
+}
+@media (max-width: 720px) {
+  .sd-modal-body { flex-direction: column; }
+  .sd-modal-player { width: 100%; max-width: 320px; }
+}
 
 /* Drag handles in sidebar (only meaningful in seedance-mode) */
 body.seedance-mode .ep-char-card,

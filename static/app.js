@@ -12580,51 +12580,135 @@ async function sdRefreshList() {
   } catch (e) { /* ignore */ }
 }
 
-function _sdCardHTML(c) {
+// Compute display labels for chunks. Chunks with `script_order` get a
+// 1-indexed scene number («#1», «#2», ...). Retries of the same script
+// position get a «v2», «v3» suffix in creation order. Chunks without
+// script_order keep raw idx for label («#?N»). Returns Map<idx, {label,take}>.
+function _sdComputeLabels(chunks) {
+  const byOrder = new Map();   // script_order → array of chunks (creation order)
+  const noOrder = [];
+  for (const c of chunks) {
+    if (typeof c.script_order === 'number') {
+      if (!byOrder.has(c.script_order)) byOrder.set(c.script_order, []);
+      byOrder.get(c.script_order).push(c);
+    } else {
+      noOrder.push(c);
+    }
+  }
+  // Sort each group by idx ASC so the FIRST chunk submitted is take 1.
+  // Tiebreak by created_at for legacy data without monotonic idx.
+  const labels = new Map();
+  for (const [order, group] of byOrder.entries()) {
+    group.sort((a, b) => (a.idx ?? 0) - (b.idx ?? 0) || (a.created_at ?? 0) - (b.created_at ?? 0));
+    group.forEach((c, takeIdx) => {
+      const label = `#${order + 1}`;
+      const take = takeIdx > 0 ? `v${takeIdx + 1}` : '';
+      labels.set(c.idx, { label, take, order, takeNum: takeIdx + 1 });
+    });
+  }
+  for (const c of noOrder) {
+    labels.set(c.idx, { label: `#?${c.idx}`, take: '', order: Infinity, takeNum: 1 });
+  }
+  return labels;
+}
+
+function _sdCardHTML(c, labelInfo) {
   const stCls = `sd-status-${c.status || 'pending'}`;
   const videoUrl = c.video_path ? `${assetUrl(c.video_path)}` : '';
-  const cost = c.cost != null ? `· $${Number(c.cost).toFixed(2)}` : '';
+  const cost = c.cost != null ? `$${Number(c.cost).toFixed(2)}` : '';
   let placeholderText;
   if (c.status === 'failed') placeholderText = '✗ failed';
-  else if (c.status === 'submitting') placeholderText = '📤 отправляю...';
+  else if (c.status === 'submitting') placeholderText = '📤 отправляю…';
   else if (c.progress != null) placeholderText = c.progress + '%';
   else placeholderText = '⏳ генерируется';
   const isSelected = SD.selected && SD.selected.has(c.idx);
-  // Retry only makes sense if we have stored prompt + refs
   const canRetry = !!(c.prompt && (c.refs || []).length && c.status !== 'submitting');
+  const lbl = labelInfo || { label: `#?${c.idx}`, take: '' };
+  const takeBit = lbl.take ? `<span class="sd-take" title="Повторная генерация той же сцены">${esc(lbl.take)}</span>` : '';
   return `
     <label class="sd-card-cb-wrap" title="Выбрать для bulk-действий">
       <input type="checkbox" class="sd-card-cb" ${isSelected ? 'checked' : ''}
         onclick="event.stopPropagation();sdToggleSelect(${c.idx})">
     </label>
-    ${videoUrl
-      ? `<video src="${videoUrl}" controls preload="metadata"></video>`
-      : `<div class="sd-placeholder">${placeholderText}</div>`}
+    <div class="sd-thumb" onclick="sdOpenChunkModal(${c.idx})" title="Открыть в большом плеере с промптом">
+      ${videoUrl
+        ? `<video src="${videoUrl}" muted preload="metadata"></video>`
+        : `<span>${esc(placeholderText)}</span>`}
+      <span class="sd-thumb-hint">⛶ Открыть</span>
+    </div>
     <div class="sd-gen-meta">
-      <div><span class="${stCls}">●</span> #${c.idx} · ${c.status} · ${c.duration}s ${c.resolution} · ${c.moderation_bypass} ${cost}</div>
-      <div class="sd-prompt">${esc(c.prompt || '')}</div>
-      ${c.error && c.status !== 'completed' ? `<div style="color:#e74c3c">${esc(c.error)}</div>` : ''}
-      <div class="sd-gen-actions">
-        ${videoUrl ? `<a class="btn-ghost btn-sm" href="${videoUrl}" download>⬇ Скачать</a>` : ''}
-        ${videoUrl ? `<button class="btn-ghost btn-sm" onclick="sdAddToTimeline(${c.idx}, this)">➕ На таймлайн</button>` : ''}
-        ${canRetry ? `<button class="btn-ghost btn-sm" onclick="sdRetry(${c.idx}, this)" title="Перезапустить генерацию с тем же промптом и refs (без compose) — мгновенно создаёт новый чанк">🔁 Retry</button>` : ''}
-        <button class="btn-ghost btn-sm" onclick="sdReuse(${c.idx})" title="Подставить параметры этого чанка в форму выше — для ручной правки и повторной генерации">↻ Reuse</button>
-        ${c.status === 'failed' ? `<button class="btn-ghost btn-sm" onclick="sdHealAndReuse(${c.idx}, this)" title="Переписать промпт чтобы прошёл модерацию + Reuse">🩹 Лечить</button>` : ''}
-        <button class="btn-ghost btn-sm" onclick="sdDelete(${c.idx})">🗑</button>
+      <div class="sd-label">${esc(lbl.label)}${takeBit}</div>
+      <div class="sd-meta-row">
+        <span class="${stCls}">●</span>
+        <span>${esc(c.status || '')}</span>
+        <span>· ${c.duration}s</span>
+        <span>· ${esc(c.resolution || '')}</span>
+        ${cost ? `<span>· ${cost}</span>` : ''}
       </div>
+      ${c.error && c.status !== 'completed' ? `<div class="sd-card-err" title="${esc(c.error)}">${esc(c.error)}</div>` : ''}
+    </div>
+    <div class="sd-gen-actions">
+      ${videoUrl ? `<a class="btn-ghost btn-sm" href="${videoUrl}" download onclick="event.stopPropagation()">⬇ DL</a>` : '<span></span>'}
+      ${videoUrl ? `<button class="btn-ghost btn-sm" onclick="event.stopPropagation();sdAddToTimeline(${c.idx}, this)">➕ TL</button>` : '<span></span>'}
+      ${canRetry ? `<button class="btn-ghost btn-sm" onclick="event.stopPropagation();sdRetry(${c.idx}, this)" title="Retry: тот же промпт+refs, новый чанк">🔁 Retry</button>` : '<span></span>'}
+      <button class="btn-ghost btn-sm" onclick="event.stopPropagation();sdReuse(${c.idx})" title="Подставить параметры в форму выше">↻ Reuse</button>
+      ${c.status === 'failed' ? `<button class="btn-ghost btn-sm full-row" onclick="event.stopPropagation();sdHealAndReuse(${c.idx}, this)" title="Переписать промпт чтобы прошёл модерацию + Reuse">🩹 Лечить промпт</button>` : ''}
+      <button class="btn-ghost btn-sm full-row" onclick="event.stopPropagation();sdDelete(${c.idx})">🗑 Удалить</button>
     </div>
   `;
 }
 
-function _sdCardSig(c) {
-  // Signature changes only on something user-visible — so playback isn't reset
-  // when the poll just brought the same card back.
+function _sdCardSig(c, labelInfo) {
+  // Signature changes only on something user-visible. Include label so retry-
+  // numbering shifts (v2/v3) trigger re-render. Playback isn't reset on a poll
+  // when nothing user-visible changed.
+  const lblKey = labelInfo ? `${labelInfo.label}|${labelInfo.take}` : '';
   return [
     c.idx, c.status, c.video_path || '',
     c.progress ?? '', c.error || '',
     c.prompt || '', c.duration, c.resolution, c.moderation_bypass,
-    c.cost ?? '',
+    c.cost ?? '', lblKey,
   ].join('|');
+}
+
+// Open a chunk in a detail modal: large player + full prompt + all actions.
+function sdOpenChunkModal(idx) {
+  const list = SD._lastChunks || [];
+  const c = list.find(x => x.idx === idx);
+  if (!c) return;
+  const labels = _sdComputeLabels(list);
+  const lbl = labels.get(c.idx) || { label: `#?${c.idx}`, take: '' };
+  const videoUrl = c.video_path ? assetUrl(c.video_path) : '';
+  const stCls = `sd-status-${c.status || 'pending'}`;
+  const cost = c.cost != null ? `$${Number(c.cost).toFixed(2)}` : '';
+  const canRetry = !!(c.prompt && (c.refs || []).length && c.status !== 'submitting');
+  const modal = document.getElementById('modal-chunk-detail');
+  if (!modal) return;
+  const body = modal.querySelector('.sd-modal-body');
+  body.innerHTML = `
+    <div class="sd-modal-player">
+      ${videoUrl
+        ? `<video src="${videoUrl}" controls autoplay preload="metadata"></video>`
+        : `<div style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--muted)">Видео ещё нет — ${esc(c.status || 'pending')}</div>`}
+    </div>
+    <div class="sd-modal-side">
+      <div style="font-size:1.05rem;font-weight:600">${esc(lbl.label)}${lbl.take ? `<span class="sd-take">  ${esc(lbl.take)}</span>` : ''}</div>
+      <div class="sd-modal-meta">
+        <span class="${stCls}">●</span> ${esc(c.status || '')} · ${c.duration}s · ${esc(c.resolution || '')} · ${esc(c.moderation_bypass || '')}${cost ? ' · ' + cost : ''}
+      </div>
+      ${c.error && c.status !== 'completed' ? `<div style="color:#e74c3c;font-size:0.84rem">${esc(c.error)}</div>` : ''}
+      <div class="sd-modal-actions">
+        ${videoUrl ? `<a class="btn-ghost btn-sm" href="${videoUrl}" download>⬇ Скачать</a>` : ''}
+        ${videoUrl ? `<button class="btn-ghost btn-sm" onclick="sdAddToTimeline(${c.idx}, this)">➕ На таймлайн</button>` : ''}
+        ${canRetry ? `<button class="btn-ghost btn-sm" onclick="sdRetry(${c.idx}, this)">🔁 Retry</button>` : ''}
+        <button class="btn-ghost btn-sm" onclick="sdReuse(${c.idx});closeModal('modal-chunk-detail')">↻ Reuse</button>
+        ${c.status === 'failed' ? `<button class="btn-ghost btn-sm" onclick="sdHealAndReuse(${c.idx}, this)">🩹 Лечить</button>` : ''}
+        <button class="btn-ghost btn-sm" onclick="if(confirm('Удалить эту генерацию?')){sdDelete(${c.idx});closeModal('modal-chunk-detail')}" style="color:var(--danger)">🗑 Удалить</button>
+      </div>
+      <div style="font-size:0.78rem;color:var(--muted);margin-top:4px">Промпт, отправленный в Seedance:</div>
+      <div class="sd-modal-prompt">${esc(c.prompt || '(промпт не сохранён)')}</div>
+    </div>`;
+  openModal('modal-chunk-detail');
 }
 
 function sdRenderList(chunks) {
@@ -12655,8 +12739,16 @@ function sdRenderList(chunks) {
   }
   if (!chunks.length) { el.innerHTML = ''; return; }
   try {
-    // Order in DOM: newest (highest idx) first — same as before (.slice().reverse()).
-    const ordered = chunks.slice().reverse();
+    // Chronological order: by script_order ASC (so chunk #1 comes first even
+    // if user generated #3 in parallel first), then by idx ASC within the
+    // same script_order so retries appear right after their original.
+    const ordered = chunks.slice().sort((a, b) => {
+      const ao = (typeof a.script_order === 'number') ? a.script_order : Infinity;
+      const bo = (typeof b.script_order === 'number') ? b.script_order : Infinity;
+      if (ao !== bo) return ao - bo;
+      return (a.idx ?? 0) - (b.idx ?? 0);
+    });
+    const labels = _sdComputeLabels(ordered);
     const wantedIdxs = new Set(ordered.map(c => String(c.idx)));
     const existing = new Map();
     el.querySelectorAll('.sd-gen-card[data-idx]').forEach(node => {
@@ -12668,17 +12760,18 @@ function sdRenderList(chunks) {
     let prevNode = null;
     for (const c of ordered) {
       const idx = String(c.idx);
-      const sig = _sdCardSig(c);
+      const lbl = labels.get(c.idx);
+      const sig = _sdCardSig(c, lbl);
       let node = existing.get(idx);
       if (!node) {
         node = document.createElement('div');
         node.className = 'sd-gen-card';
         node.setAttribute('data-idx', idx);
         node.setAttribute('data-sig', sig);
-        node.innerHTML = _sdCardHTML(c);
+        node.innerHTML = _sdCardHTML(c, lbl);
       } else if (node.getAttribute('data-sig') !== sig) {
         node.setAttribute('data-sig', sig);
-        node.innerHTML = _sdCardHTML(c);
+        node.innerHTML = _sdCardHTML(c, lbl);
       }
       // Selection class survives polling re-renders
       if (SD.selected && SD.selected.has(c.idx)) node.classList.add('sd-card-selected');
@@ -12710,9 +12803,14 @@ function sdRenderList(chunks) {
     _sdUpdateBulkBar();
   } catch (err) {
     console.error('[sdRenderList] diff failed, falling back to full render:', err);
-    el.innerHTML = chunks.slice().reverse().map(c => {
-      return `<div class="sd-gen-card" data-idx="${c.idx}">${_sdCardHTML(c)}</div>`;
-    }).join('');
+    const ordered = chunks.slice().sort((a, b) => {
+      const ao = (typeof a.script_order === 'number') ? a.script_order : Infinity;
+      const bo = (typeof b.script_order === 'number') ? b.script_order : Infinity;
+      if (ao !== bo) return ao - bo;
+      return (a.idx ?? 0) - (b.idx ?? 0);
+    });
+    const labels = _sdComputeLabels(ordered);
+    el.innerHTML = ordered.map(c => `<div class="sd-gen-card" data-idx="${c.idx}">${_sdCardHTML(c, labels.get(c.idx))}</div>`).join('');
   }
 }
 
