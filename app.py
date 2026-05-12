@@ -2,6 +2,7 @@ import json
 import os
 import re
 import uuid
+import collections
 import random
 import secrets
 import shutil
@@ -6497,6 +6498,13 @@ def generate_asset_prompt(sid):
 
 # ── AI: Series idea generation ───────────────────────────────────────────────
 
+# Per-user deque of recently generated idea titles, used to de-duplicate
+# across consecutive «show me 5 ideas» calls within a session. In-memory only —
+# acceptable trade-off; on restart the prompt-level blacklist still catches
+# the most exhausted phrasings.
+_RECENT_IDEA_TITLES = {}  # user_email → deque[str]
+
+
 _IDEAS_SYSTEM = """You are a creative producer for TikTok/Reels short drama series — the addictive, over-the-top format from apps like ReelShort and DramaBox.
 
 LANGUAGE RULE — NON-NEGOTIABLE:
@@ -6508,35 +6516,69 @@ LANGUAGE RULE — NON-NEGOTIABLE:
 TITLE RULES — CRITICAL. Titles in this format are LITERAL PREMISES, not artistic names.
 The audience must instantly picture the entire premise from the title alone.
 
-Title templates that work — VARIETY IS REQUIRED. Among any 5 generated ideas, use AT LEAST 4 DIFFERENT templates from this list. Do not start every title with "My" or "Pregnant by":
+Title templates that work — VARIETY IS REQUIRED. Among any 5 generated ideas, use AT LEAST 4 DIFFERENT templates from this list. ABSTRACT SLOT PATTERNS ONLY — do NOT lift example phrasings, INVENT new ones from the slot definitions:
 
   Power-imbalance templates (use at most 2 out of 5 ideas):
-  • "Never [Verb] a [Hidden Identity]" → "Never Divorce a Secret Billionaire Heiress"
-  • "My [Dismissible Role] Is Actually a [Shocking Reality]" → "My Poor Husband Is a Billionaire"
-  • "Pregnant by [Powerful/Forbidden Person]" → "Pregnant by My Billionaire Stepbrother"
-  • "[Contract/Flash/Fake] [Marriage/Dating] with [Twist]" → "Flash Marriage with My Bodyguard Boss"
+  • "Never [Verb] a [Hidden Identity]"
+  • "My [Dismissible Role] Is Actually a [Shocking Reality]"
+  • "Pregnant by [Powerful/Forbidden Person]"
+  • "[Contract/Flash/Fake] [Marriage/Dating] with [Twist]"
+  • "Sold to [Powerful Other] by [Family/Boss/Captor]"
+  • "Married to [Position] for [Reason That Becomes Wrong]"
 
   Time-anchor templates (great for second-chance, comeback, fall-from-grace):
-  • "After [Time], [Shocking Comeback]" → "After 10 Years, I'm Coming Back as His Wife"
-  • "[Number] Years [Status]" → "Five Years Hidden as His Maid"
-  • "[Number] Days to [Stake]" → "Seven Days to Stop My Wedding"
-  • "When [Trigger], He [Realized Truth]" → "When She Walked In, He Knew He'd Made a Mistake"
+  • "After [Time], [Shocking Comeback Action]"
+  • "[Number] Years [Hidden Status / Mistaken Identity]"
+  • "[Number] Days to [Stake / Deadline]"
+  • "When [Trigger], He/She [Realized Truth]"
+  • "The [Day/Night] [Specific Event] Happened"
+  • "[Time Unit] After [Inciting Incident], [Reveal]"
 
   First-person-extreme templates (great for revenge, found-family, survival):
-  • "I [Did Extreme Thing] Just to [Goal]" → "I Faked My Death to See Who'd Cry"
-  • "I Wasn't Supposed to [Outcome]" → "I Wasn't Supposed to Survive That Night"
-  • "[Verb]-ing My [Forbidden/Unlikely Person]" → "Craving My Brother's Best Friend"
+  • "I [Did Extreme Thing] Just to [Goal]"
+  • "I [Verb]-ed My Way Into [Forbidden Place/Role]"
+  • "[Verb]-ing My [Forbidden/Unlikely Person]"
+  • "I'm the [Role] My [Powerful Person] [Verb-ed] and Forgot"
+  • "I Married My [Enemy/Boss/Target] for [Reason]"
+  • "They Said I Was [Label]. They Were Wrong About [Twist]"
 
   Statement-as-hook templates (great for cold revenge, quiet menace):
-  • "[Quiet Statement Reframing Power]" → "He Calls Me His Mistake. He's Wrong."
-  • "The [Person] Who [Extreme Action]" → "The Maid Who Owns This Building"
-  • "[Possessive Sequence]" → "Her CEO. Her Brother. Her Worst Mistake."
-  • "[Question Demanding Answer]" → "Why Did My Husband Vanish?"
+  • "[Quiet Statement Reframing Power]"
+  • "The [Person] Who [Extreme Action]"
+  • "[Possessive Sequence]" — three short noun-phrases punctuated, each escalating
+  • "[Question Demanding Answer]"
+  • "[Pronoun] [Did Something]. [Pronoun] Didn't Know [Twist]."
 
   Situational-shock templates (great for mystery, found-family, courtroom):
-  • "[Shocking Premise in One Line]" → "I Got Pregnant at My Ex's Wedding"
-  • "[Exclamation about situation]" → "Oh No, I Married the Mafia King!"
-  • "[Character] [Does Extreme Thing]" → "I Went to the Mafia Boss for a Baby"
+  • "[Shocking Premise in One Line]"
+  • "[Character] [Does Extreme Thing] at [Setting]"
+  • "[Profession/Role] for [Powerful Other]'s [Secret Need]"
+  • "[Concrete Object/Action] Was Never Supposed to [Outcome]"
+
+═══════════════════════════════════════════════════════════════════════
+🚫 EXHAUSTED PHRASINGS — DO NOT USE OR PARAPHRASE THESE (HARD BAN)
+The user has seen these specific opening patterns too many times. Pick a
+different template + different vocabulary. Treat as a blacklist:
+  ✗ "I Wasn't Supposed to ..." (any continuation)
+  ✗ "After 10 Years, ..." (or any "After [N] Years" where N is exactly 10)
+  ✗ "Oh No, I Married ..." / "Oh No, I ..."
+  ✗ "After 10 Years in Prison, ..." or near-variants
+  ✗ Titles beginning with "Pregnant by" — used too often, swap for another power-imbalance template
+  ✗ "I Faked My Death to See ..." — exhausted, find a new I-verb hook
+  ✗ "Never Divorce a Secret Billionaire ..."
+  ✗ "My Poor Husband Is a Billionaire"
+  ✗ "Flash Marriage with My Bodyguard ..."
+If your title even RHYMES with one of these — rewrite it with a different
+verb, time-anchor, or whole template.
+
+OPENING WORD DIVERSITY (within one batch of 5 ideas):
+  • No more than ONE title starting with "I" (any pronoun-led first-person).
+  • No more than ONE title starting with "After" or "When" or any time-anchor.
+  • No more than ONE title starting with "My".
+  • No more than ONE title starting with "The".
+  • Force at least 2 titles to start with a fresh template — a verb-noun pun,
+    an exclamation, a question, a single name + colon, or a noun.
+═══════════════════════════════════════════════════════════════════════
 
 Power nouns (mix freely, do NOT pile multiple on one title): Billionaire, CEO, Mafia Boss, Alpha, King, Heiress, Surgeon, Detective, Heiress, Pilot, Soldier, Bodyguard, Coach, Tutor, Pastor, Therapist, Judge, Driver, Nanny, Chef, Architect, Influencer, Twin
 Relationship modifiers: my husband, my ex, my boss, my stepbrother, my brother's best friend, my enemy, my therapist, my doctor, my driver, my landlord, my tutor, my coach, my mentor, my mother, my sister, my fiance, my late husband (alive), my fake husband, my contract wife
@@ -7009,6 +7051,25 @@ def generate_series_ideas():
     # any of the 5 ideas (titles, synopses, character roles). Comma-separated
     # or newline-separated. E.g. «близнецы, пастор, billionaire CEO».
     avoid_raw = (data_in.get('avoid') or '').strip()
+    # Recent-titles dedup. Keep an in-process deque of the last ~150 titles
+    # this user has seen, inject as a HARD ban list into the prompt. Without
+    # this Claude rotates through ~10 favourite phrasings forever even with
+    # randomized seeds. Persists across requests but not across server
+    # restart — acceptable: blacklist in the prompt itself catches the
+    # worst offenders on cold start.
+    recent_titles_block = ''
+    user_email = current_user_email() or 'default'
+    recent = _RECENT_IDEA_TITLES.setdefault(user_email, collections.deque(maxlen=150))
+    if recent:
+        # Show only the last 60 in the prompt to keep token usage sane.
+        recent_list = list(recent)[-60:]
+        recent_titles_block = (
+            "RECENTLY SHOWN TO THIS USER — HARD BAN (do NOT repeat, do NOT paraphrase):\n"
+            + '\n'.join(f'  ✗ {t}' for t in recent_list)
+            + "\nIf ANY new title is even structurally similar (same opening clause / same "
+              "noun pattern / same template + same archetype) — rewrite it with a different "
+              "template AND different vocabulary.\n\n"
+        )
 
     if genres:
         genre_rule = (
@@ -7059,6 +7120,7 @@ def generate_series_ideas():
         "Generate exactly 5 SHORT DRAMA series concepts for TikTok/Reels.\n\n"
         + genre_rule
         + avoid_rule
+        + recent_titles_block
         + "INSPIRATION SEEDS (one per idea — these are LIGHT prompts, pick what's useful, "
         "ignore what overcomplicates):\n"
         f"{constraints}\n\n"
@@ -7089,7 +7151,18 @@ def generate_series_ideas():
     )
     try:
         data = json.loads(strip_json(claude_ask(prompt, system=_IDEAS_SYSTEM)))
-        return jsonify(data.get('ideas', data))
+        ideas = data.get('ideas', data) if isinstance(data, dict) else data
+        # Record titles into the recent deque so the next batch won't repeat
+        # them. Best-effort: malformed payloads just skip recording.
+        try:
+            if isinstance(ideas, list):
+                for it in ideas:
+                    t = (it or {}).get('title') if isinstance(it, dict) else None
+                    if t and isinstance(t, str):
+                        recent.append(t.strip())
+        except Exception:
+            pass
+        return jsonify(ideas)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
