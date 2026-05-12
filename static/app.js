@@ -6108,32 +6108,37 @@ function _findChunkRange(scriptText, chunkText) {
     // Fall back to the heuristic end-of-chunkText length.
     return [anchorOffset, anchorOffset + chunkText.length];
   }
-  // Expand BACKWARDS: for each chunk-line before anchorChunkIdx, see if the
-  // corresponding script-line above matches verbatim (trimmed). Picks up
-  // short speaker cues like «ELENA», «MARCUS» that sit just before the long
-  // anchor inside the chunk.
+  // Expand BACKWARDS / FORWARDS line-by-line. Blank lines in EITHER stream
+  // (chunk_text packs lines tightly, scriptText has blank rows between
+  // speaker groups) are skipped without breaking the walk. Any non-blank
+  // mismatch stops the expansion.
+  const _trim = (a) => (a || '').trim();
+  // Backwards
   let firstScriptIdx = anchorScriptIdx;
-  for (let ci = anchorChunkIdx - 1, si = anchorScriptIdx - 1; ci >= 0 && si >= 0; ci--, si--) {
-    if ((scriptLines[si] || '').trim() === (chunkLines[ci] || '').trim()) {
-      firstScriptIdx = si;
-    } else if ((chunkLines[ci] || '').trim() === '') {
-      // Blank line in chunk_text — keep walking but don't advance the range.
-      continue;
-    } else {
-      break;
+  {
+    let ci = anchorChunkIdx - 1, si = anchorScriptIdx - 1;
+    while (ci >= 0 && si >= 0) {
+      const ct = _trim(chunkLines[ci]);
+      const st = _trim(scriptLines[si]);
+      if (st === '' && ct !== '') { si--; continue; }   // blank in script
+      if (ct === '' && st !== '') { ci--; continue; }   // blank in chunk
+      if (ct === '' && st === '') { ci--; si--; continue; }
+      if (st === ct) { firstScriptIdx = si; ci--; si--; }
+      else break;
     }
   }
-  // Expand FORWARDS similarly to cover trailing short lines like the final
-  // «What did you show her?» that's < 25 chars and would otherwise be left
-  // outside the range.
+  // Forwards
   let lastScriptIdx = anchorScriptIdx;
-  for (let ci = anchorChunkIdx + 1, si = anchorScriptIdx + 1; ci < chunkLines.length && si < scriptLines.length; ci++, si++) {
-    if ((scriptLines[si] || '').trim() === (chunkLines[ci] || '').trim()) {
-      lastScriptIdx = si;
-    } else if ((chunkLines[ci] || '').trim() === '') {
-      continue;
-    } else {
-      break;
+  {
+    let ci = anchorChunkIdx + 1, si = anchorScriptIdx + 1;
+    while (ci < chunkLines.length && si < scriptLines.length) {
+      const ct = _trim(chunkLines[ci]);
+      const st = _trim(scriptLines[si]);
+      if (st === '' && ct !== '') { si++; continue; }
+      if (ct === '' && st !== '') { ci++; continue; }
+      if (ct === '' && st === '') { ci++; si++; continue; }
+      if (st === ct) { lastScriptIdx = si; ci++; si++; }
+      else break;
     }
   }
   return [lineRanges[firstScriptIdx][0], lineRanges[lastScriptIdx][1]];
