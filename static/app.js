@@ -5884,10 +5884,16 @@ function _parseScriptScenes(scriptText, overrides) {
   //     1-line 4-second segment wastes a whole 15s Seedance chunk.
   //   Pass 2 (merge tiny): post-walk segments. Any segment < MIN_SEGMENT gets
   //     merged into a neighbour if the combined size stays ≤ HARD_MAX.
-  const TARGET = 11.0;          // aim around this (informational)
-  const SOFT_MAX = 13.0;        // normal break threshold (2s buffer below 15s chunk)
-  const MIN_SEGMENT_SEC = 5.0;  // smaller than this = wasted Seedance chunk
-  const HARD_MAX_SEC = 14.5;    // absolute ceiling — Seedance chunk is 15s
+  // Chunk-duration budget. Lowered 2026-05-12 after we saw episodes where a
+  // single 11-13s chunk crammed 6-7 dialogue lines and 7 shot-bits — Seedance
+  // can't actually render that many cuts in one 10-15s render, so it produces
+  // a static two-shot with lazy lipsync and the «heroine teleports between
+  // facing camera vs facing partner» bug. ~8s chunk = ~2-3 lines = one clean
+  // shot-reverse-shot pair, which Seedance can deliver.
+  const TARGET = 8.0;           // aim around this (informational)
+  const SOFT_MAX = 9.5;         // normal break threshold
+  const MIN_SEGMENT_SEC = 4.0;  // smaller than this = wasted Seedance chunk
+  const HARD_MAX_SEC = 11.5;    // absolute ceiling
   // Speaker cue detector — bare ALL-CAPS character-name line (1-4 tokens,
   // optional «(CONT'D)» / «(V.O.)» / «(to X)» suffix). These must NEVER be
   // separated from the dialogue line that follows — otherwise Seedance gets
