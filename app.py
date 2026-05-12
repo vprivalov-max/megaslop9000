@@ -6057,12 +6057,55 @@ DIVERSITY ENFORCEMENT — MANDATORY when generating multiple ideas:
 FORBIDDEN title styles: metaphorical ("Shadows of Yesterday"), vague ("The Choices We Make"), literary ("When Light Finds Darkness"), anything that sounds like an indie film or a book club pick. But "soft-literal" titles ARE encouraged ("After 10 Years, He Was Still Waiting" reads literal enough — keep these alongside the louder templates for variety).
 
 SYNOPSIS RULES:
-- 3 sentences max. Every word is plot, zero atmosphere-setting.
+- 3 sentences MAX. Every word is plot, zero atmosphere-setting.
 - Sentence 1: The injustice/humiliation done to the protagonist OR the shocking inciting situation
 - Sentence 2: The forced entanglement / power imbalance / secret collision
 - Sentence 3: The twist that reframes everything or the impossible choice she faces
 - Tone: punchy, present-tense energy, zero hedging. Sound like a trailer voiceover.
 - synopsis_ru: same energy in Russian — 2-3 предложения, как будто рассказываешь подруге что только что посмотрела
+
+COMPLEXITY HARD CAPS — ZERO TOLERANCE:
+This is the most violated rule. The synopsis must be UNDERSTANDABLE on FIRST READ.
+Audience must instantly grasp who/what/why. If reader needs to re-read to follow — IT'S TOO COMPLEX.
+
+  HARD LIMITS:
+  • MAX 3 named characters in the whole synopsis (protagonist + 1-2 others). Not 5, not 7.
+  • EXACTLY 1 central conflict / story engine. NOT three nested ones.
+  • MAX 1 «twist» = the cliffhanger at the end of sentence 3. NOT a chain of reveals.
+  • NO «and then... and also... and turns out... and meanwhile...» stacking.
+  • NO professions piled on one character («ex-cartel-accountant in witness protection
+    who is also a rival surgeon and a sober mentor»). Pick ONE identity per character.
+  • NO multiple shocking backstories converging in one synopsis (dead sister + custody
+    fight + addiction recovery + hidden mentor + cartel money + medical sabotage = NO).
+  • If you find yourself writing «—» (em-dash) more than twice in a single synopsis, you're
+    stacking too much. Strip back to one clean clause per sentence.
+
+  TEST: read your synopsis to an 8-year-old. Could they tell you back what the show is
+  about in one sentence? If no — rewrite simpler.
+
+  ✗ BAD (real example — 6+ reveals nested):
+  «Natalie is three months sober and scrubbing dishes at a tech retreat when a guest
+  collapses from an overdose — and she is the only person on the island who knows how
+  to administer naloxone. The man turns out to be her late sister's boyfriend, who is
+  filing for permanent custody of Natalie's niece. The island's owner — a man she's been
+  having quiet conversations with — reveals he is a former cartel accountant in witness
+  protection who has been sabotaging the boyfriend's medical career...»
+  ↑ This is a soap opera season finale, not a hook. 5 characters, 6 backstories, 4 conflicts.
+
+  ✓ GOOD (same domain, ONE engine, clear):
+  «Three years sober and working as a maid at a luxury rehab clinic, Maya recognises
+  the new patient — the surgeon whose botched operation killed her sister. He doesn't
+  remember her face. She has 30 days to decide: testify and destroy him, or save him
+  and inherit his guilt.»
+  ↑ 2 characters, 1 conflict (revenge vs forgiveness), 1 twist at the end. Clear in
+  one read.
+
+  ✓ GOOD (different example, family/custody engine):
+  «Single mother Anna takes a job as nanny to her ex-husband's new wife — the woman
+  he left her for. Neither knows Anna is the boy's biological aunt. When the wife asks
+  Anna to «handle» an inconvenient relative, Anna realises she's being set up to
+  disappear — and the only person who'd notice is the husband who threw her out.»
+  ↑ 3 characters, 1 engine (revenge + sister-substitution), 1 twist (the setup).
 
 DIALOGUE-FIRST RULE — HARD BAN ON PAPERWORK & SCREENS:
 Reveals come from spoken confrontations between people on screen, never from documents or screens.
@@ -6521,22 +6564,32 @@ def generate_series_ideas():
         "Generate exactly 5 SHORT DRAMA series concepts for TikTok/Reels.\n\n"
         + genre_rule
         + avoid_rule
-        + "Use these creative constraints (one per idea) — each idea gets its OWN combo:\n"
+        + "INSPIRATION SEEDS (one per idea — these are LIGHT prompts, pick what's useful, "
+        "ignore what overcomplicates):\n"
         f"{constraints}\n\n"
-        "How to use the constraints:\n"
-        "- Each idea must clearly USE its assigned setting, premise structure, and protagonist/antagonist archetype.\n"
-        "- The twist element should be THE turning point or central engine — not a side detail.\n"
-        "- If an archetype clashes with the title-template you'd reach for — pick a DIFFERENT title-template; don't override the archetype.\n\n"
+        "How to use the seeds:\n"
+        "- Treat each row as 6 OPTIONAL ingredients. Pick 2-3 that combine cleanly into ONE simple premise.\n"
+        "- IGNORE seeds that would force complexity. Better a clean «setting + protagonist + 1 twist» than\n"
+        "  a Frankenstein with every seed jammed in.\n"
+        "- The synopsis must read like one clear hook (see SYNOPSIS RULES + COMPLEXITY HARD CAPS in system).\n"
+        "- DO NOT stack the seeds into one nested backstory. Simpler is always better.\n\n"
         "Diversity check before output (mandatory):\n"
         "- No two ideas may share the same setting category (urban-elite vs blue-collar vs institutional vs road/island vs creative-niche).\n"
         "- No two ideas may use the same TITLE TEMPLATE — pick from different rows of the title rules above.\n"
         "- AT LEAST 2 of the 5 must NOT center primarily on a romantic relationship as the engine — pick revenge, mystery, found-family, custody, or comeback as the spine.\n"
-        "- AT LEAST 1 idea must use a non-billionaire/non-CEO/non-mafia antagonist (use the assigned antagonist archetype).\n"
-        "- If you find two of your drafts feel like reflavoured copies — rewrite the second with a different premise structure entirely.\n\n"
+        "- AT LEAST 1 idea must use a non-billionaire/non-CEO/non-mafia antagonist.\n"
+        "- If two ideas feel like reflavoured copies — rewrite one with a different premise structure.\n\n"
+        "SIMPLICITY CHECK before output (mandatory — re-read each synopsis):\n"
+        "- Could you describe the show in ONE sentence to a friend? If no, it's too tangled — strip back.\n"
+        "- Count named characters per synopsis. Strictly ≤ 3. More = simplify.\n"
+        "- Count «turns out / actually / and also» phrases. Strictly ≤ 1 per synopsis.\n"
+        "- If the protagonist has 2+ jobs/roles stacked («ex-cartel-accountant in witness protection who is\n"
+        "  also a rival surgeon») — strip to ONE identity.\n"
+        "- Count em-dashes («—»). ≤ 2 per synopsis. More = stacking.\n\n"
         "Rules:\n"
         "- All titles and English fields must be in English\n"
         "- synopsis_ru must be in Russian — short (2-3 sentences), vivid, makes you want to watch\n"
-        "- No generic titles. No predictable plots. Surprise me.\n\n"
+        "- No generic titles. No predictable plots. Surprise me — but stay SIMPLE.\n\n"
         f"Return JSON matching this schema:\n{_IDEAS_SCHEMA}"
     )
     try:
