@@ -11897,6 +11897,45 @@ def auto_assemble_episode(sid, num):
     ffmpeg_bin = shutil.which('ffmpeg')
     if not ffmpeg_bin:
         return jsonify({'error': 'ffmpeg не установлен. brew install ffmpeg'}), 500
+    ffprobe_bin = shutil.which('ffprobe')   # paired with ffmpeg; both come from the same package
+
+    # ── Per-input probe: audio presence + duration ────────────────────────
+    # Facade clips are rendered without audio (generate_audio=False), regular
+    # Seedance chunks have audio. Mixing them with bare concat-copy or with
+    # an unconditional filter-complex `[i:a]` map produces a broken/silent
+    # file. So: probe each segment, and during filter-complex synthesize a
+    # matching-length silent track for any input that lacks one.
+    def _probe_audio_and_duration(path):
+        if not ffprobe_bin:
+            return True, 5.0     # safest defaults — assume has audio, ~chunk length
+        has_audio = True
+        try:
+            out = subprocess.check_output(
+                [ffprobe_bin, '-v', 'error', '-show_entries', 'stream=codec_type',
+                 '-of', 'csv=p=0', path],
+                text=True, timeout=10,
+            )
+            has_audio = ('audio' in out)
+        except Exception:
+            pass
+        dur = 5.0
+        try:
+            out = subprocess.check_output(
+                [ffprobe_bin, '-v', 'error', '-show_entries', 'format=duration',
+                 '-of', 'csv=p=0', path],
+                text=True, timeout=10,
+            )
+            dur = float((out or '').strip() or 5.0)
+        except Exception:
+            pass
+        return has_audio, dur
+
+    seg_meta = [_probe_audio_and_duration(p) for p in seg_paths]
+    audio_uniform = all(ha for ha, _ in seg_meta)
+    # Concat-copy is only safe when all inputs share codec/dims/fps AND every
+    # segment has an audio track. Facades typically violate both → skip the
+    # fast path entirely once we know audio coverage isn't uniform.
+    can_try_copy = audio_uniform and (facades_inserted == 0)
 
     out_dir = base / 'OUT'
     out_dir.mkdir(exist_ok=True)
@@ -11905,9 +11944,6 @@ def auto_assemble_episode(sid, num):
     out_name = f"{safe_title}_E{num:03d}.mp4"
     out_path = out_dir / out_name
 
-    # Concat-demuxer (no re-encode) — assumes chunks share codec/dims/fps,
-    # which is true since they all came from the same Seedance run with same
-    # duration/resolution params. Falls back to filter-complex on failure.
     list_file = out_dir / f'_concat_{int(time.time())}_{num}.txt'
     list_file.write_text(
         '\n'.join(f"file '{p}'" for p in seg_paths),
@@ -11921,31 +11957,62 @@ def auto_assemble_episode(sid, num):
     with RENDER_SEMAPHORE:
         if time.time() - queue_wait > 0.5:
             print(f'[auto-assemble] {sid}/ep{num} waited {time.time()-queue_wait:.1f}s in queue')
-        try:
-            proc = subprocess.run(cmd_copy, capture_output=True, text=True, timeout=600)
-        except subprocess.TimeoutExpired:
-            try: list_file.unlink(missing_ok=True)
-            except Exception: pass
-            return jsonify({'error': 'ffmpeg timeout (>10 min)'}), 500
+        proc = None
+        if can_try_copy:
+            try:
+                proc = subprocess.run(cmd_copy, capture_output=True, text=True, timeout=600)
+            except subprocess.TimeoutExpired:
+                try: list_file.unlink(missing_ok=True)
+                except Exception: pass
+                return jsonify({'error': 'ffmpeg timeout (>10 min)'}), 500
 
-        # Concat-copy fails when codec params drift between chunks. Retry with
-        # filter-complex (re-encode) before giving up.
-        if proc.returncode != 0:
-            print(f'[auto-assemble] {sid}/ep{num} concat-copy failed, retry filter-complex')
+        # Fallback to filter-complex re-encode when (a) we skipped concat-copy
+        # because audio coverage was non-uniform, or (b) concat-copy failed
+        # due to codec drift. Normalize video (scale to even dims, fps=24)
+        # and synthesize stereo 48k silence for any segment that has no
+        # audio track — otherwise mapping [i:a] of a missing stream produces
+        # a broken/silent output.
+        if (not can_try_copy) or (proc and proc.returncode != 0):
+            if can_try_copy:
+                print(f'[auto-assemble] {sid}/ep{num} concat-copy failed, retry filter-complex')
+            else:
+                print(f'[auto-assemble] {sid}/ep{num} skipping concat-copy: '
+                      f'facades_inserted={facades_inserted} audio_uniform={audio_uniform}')
             inputs = []
             filt = []
+            n = len(seg_paths)
             for i, p in enumerate(seg_paths):
                 inputs += ['-i', p]
-                filt.append(f"[{i}:v]setpts=PTS-STARTPTS,scale=trunc(iw/2)*2:trunc(ih/2)*2,setsar=1[v{i}]")
-                filt.append(f"[{i}:a]asetpts=PTS-STARTPTS[a{i}]")
-            n = len(seg_paths)
+                filt.append(
+                    f"[{i}:v]setpts=PTS-STARTPTS,"
+                    f"scale=trunc(iw/2)*2:trunc(ih/2)*2,setsar=1,fps=24[v{i}]"
+                )
+                has_audio, dur = seg_meta[i]
+                if has_audio:
+                    filt.append(
+                        f"[{i}:a]aresample=async=1:first_pts=0,"
+                        f"aformat=channel_layouts=stereo:sample_rates=48000,"
+                        f"asetpts=PTS-STARTPTS[a{i}]"
+                    )
+                else:
+                    # Synthesize silent stereo of the clip's exact length so
+                    # video/audio timelines stay aligned across the concat.
+                    filt.append(
+                        f"anullsrc=channel_layout=stereo:sample_rate=48000,"
+                        f"atrim=0:{max(0.1, dur):.3f},asetpts=PTS-STARTPTS[a{i}]"
+                    )
             cat = ''.join(f"[v{i}][a{i}]" for i in range(n))
             filt.append(f"{cat}concat=n={n}:v=1:a=1[v][a]")
-            cmd_re = [ffmpeg_bin, '-y', *inputs, '-filter_complex', ';'.join(filt),
-                      '-map', '[v]', '-map', '[a]',
-                      '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20',
-                      '-pix_fmt', 'yuv420p',
-                      '-c:a', 'aac', '-b:a', '128k', str(out_path)]
+            cmd_re = [
+                ffmpeg_bin, '-y', *inputs,
+                '-filter_complex', ';'.join(filt),
+                '-map', '[v]', '-map', '[a]',
+                '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20',
+                '-pix_fmt', 'yuv420p',
+                '-c:a', 'aac', '-b:a', '128k', '-ar', '48000', '-ac', '2',
+                '-movflags', '+faststart',
+                str(out_path),
+            ]
             try:
                 proc = subprocess.run(cmd_re, capture_output=True, text=True, timeout=900)
             except subprocess.TimeoutExpired:
@@ -11956,7 +12023,7 @@ def auto_assemble_episode(sid, num):
                 try: list_file.unlink(missing_ok=True)
                 except Exception: pass
                 return jsonify({
-                    'error': 'ffmpeg failed (both concat-copy and filter-complex)',
+                    'error': 'ffmpeg failed (filter-complex re-encode)',
                     'stderr': (proc.stderr or '')[-2000:],
                 }), 500
 
