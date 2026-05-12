@@ -851,6 +851,11 @@
           <span class="idea-gen-sep">или</span>
           <button class="btn-idea-random" id="btn-gen-ideas" onclick="generateSeriesIdeas()">💡 5 идей на выбор</button>
         </div>
+        <details style="margin:8px 0;background:rgba(132,94,247,0.04);border:1px solid rgba(132,94,247,0.15);border-radius:8px;padding:6px 12px">
+          <summary style="cursor:pointer;font-size:0.82rem;color:var(--muted);user-select:none">🚫 Не предлагать (тропы / роли которые надоели)</summary>
+          <textarea id="series-ideas-avoid" rows="2" placeholder="Через запятую или с новой строки. Примеры: «близнецы, пастор, billionaire CEO, мафия, секта, fake marriage».&#10;Сохраняется в браузере и используется каждый раз когда жмёшь «💡 5 идей»." style="width:100%;margin-top:6px;font-size:0.85rem;background:#1a1a1f;border:1px solid #333;border-radius:6px;color:#eee;padding:6px 8px;resize:vertical"></textarea>
+          <div style="font-size:0.72rem;color:var(--muted);margin-top:4px">Claude распознаёт синонимы и переводы: указал «pastor» — заблокированы priest / preacher / cleric / cult founder. Указал «близнецы» — заблокированы twin / doppelganger / mirror sibling.</div>
+        </details>
         <div id="series-ideas-list" class="series-ideas-list hidden"></div>
         <div id="series-gen-status" class="series-gen-status"></div>
       </div>
@@ -1210,6 +1215,16 @@
                 <option value="long_meaty">длинные, насыщенные</option>
               </select>
             </div>
+            <div class="field-group" style="margin:0">
+              <label style="font-size:0.82rem">👥 Главных персов в сцене</label>
+              <input type="number" id="append-gen-max-chars" min="1" max="6" value="2" style="width:80px">
+              <div style="font-size:0.72rem;color:var(--muted);margin-top:3px">по умолчанию 2 (макс. 4 если ситуация требует)</div>
+            </div>
+          </div>
+          <div style="font-size:0.72rem;color:var(--muted);margin-top:8px;line-height:1.5">
+            💡 Толпа / массовка / гости мероприятия — НЕ считаются. Это лимит на главных героев которые активно
+            ведут сцену. Claude получает указание: в большинстве сцен 2 спикера, изредка 3, максимум 4 для
+            эмоциональной кульминации. Сцены где 4 главных персонажа постоянно мусолят что-то — недопустимы.
           </div>
         </details>
         <div class="field-group">

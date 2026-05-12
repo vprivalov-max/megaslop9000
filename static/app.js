@@ -1262,9 +1262,11 @@ async function appendGenerateScript(btn) {
   // Optional advanced parameters — empty = let Claude decide.
   const durationSecRaw = (document.getElementById('append-gen-duration-sec')?.value || '').trim();
   const linesCountRaw  = (document.getElementById('append-gen-lines-count')?.value || '').trim();
+  const maxCharsRaw    = (document.getElementById('append-gen-max-chars')?.value || '').trim();
   const styleVal = (document.getElementById('append-gen-style')?.value || '').trim();
   const durationSec = durationSecRaw ? Math.max(30, Math.min(240, parseInt(durationSecRaw, 10))) : null;
   const linesCount  = linesCountRaw  ? Math.max(3, Math.min(40, parseInt(linesCountRaw, 10)))   : null;
+  const maxChars    = maxCharsRaw    ? Math.max(1, Math.min(6, parseInt(maxCharsRaw, 10)))      : null;
   const ta = document.getElementById('append-script-text');
   const statusEl = document.getElementById('append-gen-status');
   if (ta && ta.value.trim() && !await appConfirm({
@@ -1283,7 +1285,7 @@ async function appendGenerateScript(btn) {
   try {
     const r = await api.post(
       `/api/series/${S.seriesId}/generate-script-batch`,
-      { count, direction, duration_sec: durationSec, lines_count: linesCount, style: styleVal },
+      { count, direction, duration_sec: durationSec, lines_count: linesCount, style: styleVal, max_main_chars_per_scene: maxChars },
       { timeoutMs: 600_000 },
     );
     if (r.error) throw new Error(r.error);
@@ -1871,6 +1873,18 @@ async function generateSeriesIdeas() {
   const status = document.getElementById('series-gen-status');
   const list = document.getElementById('series-ideas-list');
   const genres = getSelectedGenres();
+  // Avoid-list — user-curated tropes/words to never suggest. Stored in
+  // localStorage between sessions so they don't have to retype every time.
+  const avoidEl = document.getElementById('series-ideas-avoid');
+  if (avoidEl) {
+    // Rehydrate from localStorage on first call if field is empty.
+    if (!avoidEl.value && !avoidEl.dataset.hydrated) {
+      try { avoidEl.value = localStorage.getItem('series_ideas_avoid') || ''; } catch {}
+      avoidEl.dataset.hydrated = '1';
+    }
+    try { localStorage.setItem('series_ideas_avoid', avoidEl.value || ''); } catch {}
+  }
+  const avoid = (avoidEl?.value || '').trim();
   // No genres = full creative freedom across all 6 axes (settings/twists/
   // premises/protag/antag/tones). Backend handles empty genres list fine —
   // see /api/generate-series-ideas: genre_rule is empty when genres=[].
@@ -1880,7 +1894,7 @@ async function generateSeriesIdeas() {
   list.classList.add('hidden');
   list.innerHTML = '';
   try {
-    const ideas = await api.post('/api/generate-series-ideas', { genres });
+    const ideas = await api.post('/api/generate-series-ideas', { genres, avoid });
     list.innerHTML = ideas.map((idea, i) => `
       <div class="idea-card" onclick="pickSeriesIdea(${i})">
         <div class="idea-card-title">${esc(idea.title)}</div>

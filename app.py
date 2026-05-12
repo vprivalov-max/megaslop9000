@@ -3261,6 +3261,12 @@ def generate_script_batch(sid):
     except (TypeError, ValueError):
         lines_count = None
     style_preset = (body.get('style') or '').strip()
+    max_chars_raw = body.get('max_main_chars_per_scene')
+    try:
+        max_main_chars = int(max_chars_raw) if max_chars_raw not in (None, '', 0) else None
+        if max_main_chars is not None: max_main_chars = max(1, min(6, max_main_chars))
+    except (TypeError, ValueError):
+        max_main_chars = None
     # Style presets translated to Claude-friendly directives.
     _STYLE_PRESETS = {
         'short_punchy': 'Реплики КОРОТКИЕ и рваные (1-7 слов). TikTok-ритм: быстрые удары, шок-фразы, paus'
@@ -3370,12 +3376,32 @@ def generate_script_batch(sid):
         f"Каждая серия = ~1 минута экрана ≈ {lines_range_word} реплик/действий. "
     )
     style_block = (f"\nСТИЛЬ РЕПЛИК: {style_clause}\n" if style_clause else '')
+    # Scene-character cap directive. NOT about total cast size — about how
+    # many MAIN characters actively drive any given scene. Crowds/extras
+    # don't count. Default is 2, max 4 only for emotional climaxes.
+    if max_main_chars:
+        if max_main_chars == 1:
+            crowd_clause = 'ОДИН главный персонаж на сцену (моно-сцены). Изредка может быть второй на короткую реплику.'
+        elif max_main_chars == 2:
+            crowd_clause = '2 главных персонажа в большинстве сцен (диалог). Изредка 3 на ключевые моменты. Никаких сцен где 4+ главных героев постоянно обсуждают.'
+        else:
+            crowd_clause = f'В большинстве сцен 2 главных персонажа, изредка 3, МАКСИМУМ {max_main_chars} ТОЛЬКО для эмоциональной кульминации (откровение, конфронтация всей семьи). Не делай сцен где {max_main_chars} главных героев постоянно мусолят одно — это вяло.'
+        crowd_block = (
+            f"\nЛИМИТ ПЕРСОНАЖЕЙ В СЦЕНЕ (главных): {max_main_chars}.\n"
+            f"{crowd_clause}\n"
+            "ВАЖНО — это НЕ запрет на массовку: сцены на свадьбе, вечеринке, "
+            "митинге, в зале суда МОГУТ иметь толпу фоновых персонажей. Лимит "
+            "только на основных героев которые активно ведут сцену (имеют реплики/действия).\n"
+        )
+    else:
+        crowd_block = ''
     system = (
         f"Ты — сценарист короткой драмы для вертикального TikTok/Reels. Пишешь {mode_label} на N серий. "
         f"{length_clause}Формат: "
         "имена ВЕРХНИМ регистром перед репликами, диалог короткий и накалённый, обязательный cliffhanger "
         "в конце КАЖДОЙ серии (открытый вопрос или новая угроза которая толкает к следующей).\n"
-        f"{style_block}\n"
+        f"{style_block}"
+        f"{crowd_block}\n"
         + ("ПРАВИЛА ПИЛОТА И СТАРТОВОЙ ДУГИ:\n"
            "1. Если в roster уже есть персонажи — используй их имена дословно. Если roster пустой — "
            "сам придумай героев, дай каждому отчётливое имя и личность.\n"
@@ -6124,6 +6150,26 @@ _IDEA_SETTINGS = [
     'military intelligence unit', 'private security firm', 'biotech research lab',
     'fertility research lab', 'family court chambers', 'PR crisis firm',
     'tabloid newsroom', 'investigative journalism desk',
+    # Expansion pack — added to break the «one of 60 same settings» repetition
+    'state fair / county rodeo circuit', 'wedding planning empire', 'haute pâtisserie kitchen brigade',
+    'historical reenactment troupe', 'animal sanctuary in financial crisis',
+    'oncology ward inpatient floor', 'hospice palliative care unit', 'organ transplant coordination office',
+    'speedboat racing circuit on the Med', 'NASCAR pit crew on the road',
+    'street-style fight club hidden under a gym', 'underground poker ring at a country club',
+    'travelling renaissance fair', 'casino floor and high-roller suite', 'ski-resort patrol & search-rescue team',
+    'arctic research outpost during polar night', 'maritime salvage operation',
+    'high-stakes auction house with provenance dispute', 'rare-coin trading desk under FBI watch',
+    'private island retreat for tech execs', 'wellness commune off-grid in the desert',
+    'ayahuasca retreat center', 'orchestral pit / opera house backstage',
+    'high-fashion couture atelier in Paris', 'esports betting syndicate front office',
+    'crypto exchange compliance war room', 'pre-IPO board fight at unicorn startup',
+    'family-run funeral home', 'taxidermy studio with celebrity clientele',
+    'antique gun appraisal show', 'beauty pageant prep camp',
+    'high-school reunion organising committee', 'class action plaintiffs\' kitchen-table coalition',
+    'small-town mayor\'s office during scandal', 'gerontological psych ward',
+    'restaurant week judge panel + chefs', 'high-end real estate brokerage in Manhattan',
+    'organic farm CSA with paying members in the city', 'rare-book restoration workshop',
+    'amusement park behind-the-scenes operations',
 ]
 _IDEA_TWISTS = [
     # Identity / deception cluster (de-duped from old 5+ → kept distinct)
@@ -6156,6 +6202,42 @@ _IDEA_TWISTS = [
     # Power dynamics
     'company inheritance shock', 'rejected mate / pack outcast (supernatural)',
     'reverse-Cinderella (rich woman / lower-status man)',
+    # Expansion pack — fresh engines to break twin/billionaire/pastor monoculture
+    'someone is alive that everyone thought died ten years ago',
+    'a forged signature trips a multi-million dollar audit',
+    'a family heirloom turns out to be stolen wartime art',
+    'a video deepfake is used in court as real evidence',
+    'a recovering addict\'s sponsor is the dealer who started them',
+    'two strangers discover they\'re both married to the same person',
+    'a missing kidney donor turns out to be alive and demanding compensation',
+    'the will reads only after a year of cohabitation by named heirs',
+    'a tattoo artist recognises a kidnap victim\'s ink on a stranger',
+    'the AI girlfriend is a real woman behind the chatbot',
+    'wedding ring was switched — wrong person is married',
+    'a journalist\'s source turns out to be their estranged parent',
+    'a 911 call from years ago surfaces and changes the verdict',
+    'a child\'s school project exposes hidden family identity',
+    'the rival bidding for the company was paid by your spouse',
+    'a service animal recognises a former abuser at a charity gala',
+    'a wrong delivery brings evidence of a long-running affair',
+    'an inherited diary names the wrong father',
+    'the witness who saved you was paid by the person who hired the attack',
+    'a viral TikTok cooks down an alibi to ashes',
+    'someone walking with amnesia turns out to be a high-value asset',
+    'a hospital mix-up gave a dying patient the wrong cure 5 years ago',
+    'an emergency surrogate is the protagonist\'s old high school enemy',
+    'a podcast guest accidentally confesses to a cold case live',
+    'a soldier comes home to find their spouse remarried to their commander',
+    'a buried time capsule contradicts everyone\'s memory of that night',
+    'protagonist\'s «dead» parent is alive under witness protection',
+    'a courtroom-translator is hiding native fluency to gather intel',
+    'a charity\'s mission statement is a money-laundering script',
+    'the personal trainer is an undercover detective',
+    'a paternity test was forged in the lab decades ago',
+    'a vintage photograph proves grandfather wasn\'t who family says',
+    'a wildfire forces two families with shared dark history to evacuate together',
+    'a memorial service is interrupted by the «dead» person walking in',
+    'an online support group turns out to be run by the abuser',
 ]
 _IDEA_TONES = [
     ('Dark thriller', 'Suspenseful'),
@@ -6184,6 +6266,16 @@ _IDEA_TONES = [
     ('Chaotic comedy', 'Everyone making bad decisions, fast'),
     ('Pastoral noir', 'Sleepy small town, dark currents'),
     ('Confessional first-person', 'Whispered intimacy, narrator-driven energy'),
+    # Expansion pack
+    ('Slow-burn psychological dread', 'Skin-prickling unease'),
+    ('Vengeance cold-dish', 'Patient ruthlessness'),
+    ('Glamour-meets-rot', 'Champagne and corruption'),
+    ('Workplace ensemble dramedy', 'Sharp banter, real stakes'),
+    ('Generational saga', 'Decades-spanning, family-as-prison'),
+    ('Single-location pressure cooker', 'One room, escalating heat'),
+    ('Investigation procedural with personal cost', 'Case-of-the-week + ongoing trauma'),
+    ('Whodunit at a closed event', 'Knives Out energy, social skewering'),
+    ('Identity rebuild', 'Stripped of everything, building from zero'),
 ]
 _IDEA_PREMISE_STRUCTURES = [
     'Forced cohabitation / locked-in scenario (snowstorm / contract / shared apartment by mistake)',
@@ -6220,6 +6312,31 @@ _IDEA_PREMISE_STRUCTURES = [
     'Long con — protagonist is being scammed but turns it back',
     'Custody battle as the engine — fight over child or inheritance',
     'Caregiver & patient — one is hiding why they really took the job',
+    # Expansion pack
+    'Class-action lawsuit — five strangers find common enemy mid-trial',
+    'Witness-relocation gone wrong — wrong person took the spot',
+    'Ghosting victim becomes obsessed with finding why',
+    'Whistleblower inside a beloved institution',
+    'Body-found hike — group must decide whether to report',
+    'Family reunites for an estate auction, fights over a single item',
+    'Trial period at a luxury job — perks come at hidden cost',
+    'Recovery support sponsor turns out to be victim of sponsee',
+    'Diary discovered after death rewrites family history',
+    'Long-lost adult sibling tracks down their birth family',
+    'Hidden second family discovered after a parent\'s death',
+    'Job interview that\'s actually a multi-day psychological experiment',
+    'Cold case reopened by a podcast, suspects start dying again',
+    'Cross-cultural marriage where each side hides a major secret',
+    'Caretaker for a wealthy elder who turns out to be lucid and dangerous',
+    'Inherited business that hides illegal back-channel revenue',
+    'Beloved teacher accused — kids organise their own investigation',
+    'Online date who ghosted reappears as the boss/landlord/doctor',
+    'Roommate ad on Craigslist — one of them is hunting the other',
+    'Childhood imaginary friend turns out to be a real abducted sibling',
+    'Returning soldier discovers spouse has children that aren\'t theirs',
+    'Identity-theft victim systematically destroys the thief\'s life',
+    'Live-stream gone catastrophically wrong, must hide what happened',
+    'Three lives intersect on a single 911 dispatch over one shift',
 ]
 _IDEA_PROTAG_ARCHETYPES = [
     'Ex-intelligence operative posing as nanny / housekeeper / tutor',
@@ -6252,6 +6369,35 @@ _IDEA_PROTAG_ARCHETYPES = [
     'Music producer hiding pop-star past from new partner',
     'Pastor\'s wife realising the church is a cult',
     'Reality-TV contestant whose scripted villain edit is destroying her real life',
+    # Expansion pack — non-«billionaire/twin/pastor» protagonists
+    'Hospice nurse with a knack for spotting suspicious deaths',
+    'Apartment-building super who quietly knows every tenant\'s secrets',
+    'Mid-career conductor sabotaged by ambitious second violinist',
+    'Genealogist hired to find a missing heir — finds herself',
+    'Forensic linguist who recognises an anonymous letter\'s writer',
+    'Truck driver who picks up the wrong hitchhiker',
+    'Auctioneer whose memory for objects opens an old murder case',
+    'Crisis-line counsellor who recognises a caller\'s voice',
+    'Subway conductor who keeps seeing the same passenger every night',
+    'Tarot reader whose «cold reads» turn unsettlingly accurate',
+    'Veterinarian who notices abuse markers in injured pets',
+    'School bus driver from a small town who saw too much',
+    'Customs officer whose first big bust was set up to fail',
+    'Wedding photographer with a knack for catching guilty glances',
+    'Cleaning crew lead inside a high-profile law firm',
+    'Sound engineer who hears the wrong word on a recorded confession',
+    'Hostage negotiator dealing with a hostage who is family',
+    'Sister of a serial killer trying to live a normal life',
+    'Locksmith who knows every door in a wealthy neighborhood',
+    'Pet shelter manager who recognises a missing-child case dog',
+    'Crisis-PR rep who refuses to take a high-profile client',
+    'High-school chemistry teacher recruited by anti-drug task force',
+    'Retired Olympic gymnast coaching the daughter of her old rival',
+    'Estate-sale curator who finds dangerous evidence in dead grandma\'s drawer',
+    'Mountain rescue volunteer with a personal connection to victim',
+    'Translator at the UN who overhears a side conversation she shouldn\'t',
+    'Funeral director who is friend to the dead and witness to the living',
+    'Single dad in custody fight against ex who runs a media empire',
 ]
 _IDEA_ANTAG_ARCHETYPES = [
     'Charming AI-driven psychotherapist secretly recording sessions',
@@ -6279,6 +6425,35 @@ _IDEA_ANTAG_ARCHETYPES = [
     'Coach / agent / manager controlling the protagonist\'s entire career',
     'Mafia boss father who is also the only protection available',
     'Ex-husband who never legally divorced and now claims her business',
+    # Expansion pack — antagonists OUTSIDE the «twin/pastor/billionaire» triad
+    'Wellness influencer running a financial-fraud pyramid scheme',
+    'Mother-in-law systematically alienating grandchild from one parent',
+    'Star employee who is gaslighting protagonist into thinking she\'s losing it',
+    'Family chef quietly poisoning matriarch over months',
+    'Charity board chair stealing from the foundation',
+    'Childhood babysitter who never left town and never forgot the slight',
+    'Public defender who throws cases at someone else\'s request',
+    'Friendly neighbour who runs a dark-web identity-theft ring',
+    'Hospital ethics committee member with a grudge to settle',
+    'Genius prodigy student whose pranks escalate to crimes',
+    'Pet groomer who hides micro-cameras in clients\' homes',
+    'Boss who reorganises so protagonist reports to her abusive ex',
+    'Insurance investigator who keeps «coincidentally» showing up at deaths',
+    'Veteran detective on the verge of retirement covering for his old partner',
+    'Family friend who has been impersonating an aunt for 30 years',
+    'Local sheriff with quiet alliance to organised crime',
+    'Doula manipulating new mothers into giving up custody',
+    'Wedding officiant who blackmails couples on their honeymoon',
+    'Reality TV producer engineering crises off-camera',
+    'Therapist who breaks confidentiality to a single high-paying party',
+    'Mid-tier executive who organised the protagonist\'s entire downfall',
+    'Investigative journalist who turns out to be the killer\'s ally',
+    'Adoption agency director who placed children in wrong families on purpose',
+    'Estranged sibling weaponising shared trauma to gain control',
+    'Live-in nanny secretly working for child\'s biological father',
+    'Beloved community-theatre director with predatory pattern',
+    'Caregiver agency owner who runs human-trafficking front',
+    'Anonymous letter-writer destabilising small-town for personal reasons',
 ]
 _IDEA_AVOID_REPETITIVE_FRAMES = [
     'avoid the "she\'s secretly the heiress and he doesn\'t know" frame if another idea uses it',
@@ -6292,6 +6467,10 @@ _IDEA_AVOID_REPETITIVE_FRAMES = [
 def generate_series_ideas():
     data_in = request.json or {}
     genres = data_in.get('genres') or []
+    # Free-text avoid-list: user-curated tropes/words that must NOT appear in
+    # any of the 5 ideas (titles, synopses, character roles). Comma-separated
+    # or newline-separated. E.g. «близнецы, пастор, billionaire CEO».
+    avoid_raw = (data_in.get('avoid') or '').strip()
 
     if genres:
         genre_rule = (
@@ -6301,6 +6480,25 @@ def generate_series_ideas():
         )
     else:
         genre_rule = ""
+
+    # Build avoid-rule. Split user's text into tokens, normalise, and pass as
+    # a HARD ban list. Claude is told to reject ideas that contain any of
+    # these words/concepts and regenerate.
+    avoid_rule = ""
+    if avoid_raw:
+        # Accept commas, newlines, semicolons, slashes. Drop empties + dedup.
+        tokens = [t.strip() for t in re.split(r'[,;\n/]+', avoid_raw) if t.strip()]
+        if tokens:
+            ban_list = ', '.join(f'«{t}»' for t in tokens[:40])
+            avoid_rule = (
+                f"HARD BAN LIST (пользователь устал от этих троп — НИ ОДНА из 5 идей НЕ должна содержать эти концепты):\n"
+                f"{ban_list}\n"
+                "Проверяй title, synopsis_ru, и все ключевые роли/архетипы каждой идеи. Если идея содержит "
+                "что-то из бан-списка (даже если только в подтексте архетипа) — выбрось её и сгенери замену.\n"
+                "Распознавай синонимы и переводы: если бан = «pastor», то «cleric / priest / preacher / "
+                "religious leader / cult founder» тоже под запретом. Если бан = «близнецы», то «twin / "
+                "doppelganger / mirror sibling / identical» тоже.\n\n"
+            )
 
     # Six-axis sampling — produces ~ millions of unique combos so back-to-back
     # batches don't repeat. Each idea gets ONE pick from every axis.
@@ -6322,6 +6520,7 @@ def generate_series_ideas():
     prompt = (
         "Generate exactly 5 SHORT DRAMA series concepts for TikTok/Reels.\n\n"
         + genre_rule
+        + avoid_rule
         + "Use these creative constraints (one per idea) — each idea gets its OWN combo:\n"
         f"{constraints}\n\n"
         "How to use the constraints:\n"
