@@ -853,7 +853,11 @@
         </div>
         <details style="margin:8px 0;background:rgba(132,94,247,0.04);border:1px solid rgba(132,94,247,0.15);border-radius:8px;padding:6px 12px">
           <summary style="cursor:pointer;font-size:0.82rem;color:var(--muted);user-select:none">🚫 Не предлагать (тропы / роли которые надоели)</summary>
-          <textarea id="series-ideas-avoid" rows="2" placeholder="Через запятую или с новой строки. Примеры: «близнецы, пастор, billionaire CEO, мафия, секта, fake marriage».&#10;Сохраняется в браузере и используется каждый раз когда жмёшь «💡 5 идей»." style="width:100%;margin-top:6px;font-size:0.85rem;background:#1a1a1f;border:1px solid #333;border-radius:6px;color:#eee;padding:6px 8px;resize:vertical"></textarea>
+          <textarea id="series-ideas-avoid" rows="2"
+            oninput="_seriesIdeasAvoidSave(this)"
+            onfocus="_seriesIdeasAvoidHydrate(this)"
+            placeholder="Через запятую или с новой строки. Примеры: «близнецы, пастор, billionaire CEO, мафия, секта, fake marriage».&#10;Сохраняется в браузере и используется каждый раз когда жмёшь «💡 5 идей»."
+            style="width:100%;margin-top:6px;font-size:0.85rem;background:#1a1a1f;border:1px solid #333;border-radius:6px;color:#eee;padding:6px 8px;resize:vertical"></textarea>
           <div style="font-size:0.72rem;color:var(--muted);margin-top:4px">Claude распознаёт синонимы и переводы: указал «pastor» — заблокированы priest / preacher / cleric / cult founder. Указал «близнецы» — заблокированы twin / doppelganger / mirror sibling.</div>
         </details>
         <div id="series-ideas-list" class="series-ideas-list hidden"></div>

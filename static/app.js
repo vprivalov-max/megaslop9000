@@ -1053,6 +1053,16 @@ function openCreateSeries() {
   document.getElementById('import-series-script-stats').textContent = '0 символов';
   document.getElementById('import-series-preview').innerHTML = '';
   setSeriesCreateMode('generate');
+  // Hydrate the «🚫 Не предлагать» field from localStorage so user sees their
+  // persisted blocked-tropes list immediately on modal open (no need to
+  // expand <details> first, no need to click into the textarea first).
+  // Reset .hydrated flag so the helper re-runs even if it ran in a prior session.
+  const avoidEl = document.getElementById('series-ideas-avoid');
+  if (avoidEl) {
+    delete avoidEl.dataset.hydrated;
+    avoidEl.value = '';
+    _seriesIdeasAvoidHydrate(avoidEl);
+  }
   openModal('modal-create-series');
 }
 
@@ -1868,6 +1878,35 @@ function randomizeGenres() {
   });
 }
 
+// ── «🚫 Не предлагать» avoid-list persistence ────────────────────────────
+// Stored in localStorage under series_ideas_avoid. Hydrated on focus AND on
+// every modal-open. Auto-saved on every keystroke so user never loses input.
+// First-ever load gets a sensible default (the «классические троп» the user
+// is most often sick of) so the field doesn't feel empty on a fresh install.
+const _SERIES_IDEAS_AVOID_DEFAULT = 'близнецы, пастор, повар, спорт, tape, livestream, fashion, gallery';
+
+function _seriesIdeasAvoidHydrate(el) {
+  if (!el) el = document.getElementById('series-ideas-avoid');
+  if (!el || el.dataset.hydrated === '1') return;
+  try {
+    let stored = localStorage.getItem('series_ideas_avoid');
+    // First-ever load (key absent) → seed with the default. After that the
+    // user's edits stick — explicit empty string is respected.
+    if (stored === null) {
+      stored = _SERIES_IDEAS_AVOID_DEFAULT;
+      localStorage.setItem('series_ideas_avoid', stored);
+    }
+    if (!el.value) el.value = stored;
+  } catch {}
+  el.dataset.hydrated = '1';
+}
+
+function _seriesIdeasAvoidSave(el) {
+  if (!el) return;
+  try { localStorage.setItem('series_ideas_avoid', el.value || ''); } catch {}
+  el.dataset.hydrated = '1';
+}
+
 async function generateSeriesIdeas() {
   const btn = document.getElementById('btn-gen-ideas');
   const status = document.getElementById('series-gen-status');
@@ -1877,12 +1916,8 @@ async function generateSeriesIdeas() {
   // localStorage between sessions so they don't have to retype every time.
   const avoidEl = document.getElementById('series-ideas-avoid');
   if (avoidEl) {
-    // Rehydrate from localStorage on first call if field is empty.
-    if (!avoidEl.value && !avoidEl.dataset.hydrated) {
-      try { avoidEl.value = localStorage.getItem('series_ideas_avoid') || ''; } catch {}
-      avoidEl.dataset.hydrated = '1';
-    }
-    try { localStorage.setItem('series_ideas_avoid', avoidEl.value || ''); } catch {}
+    _seriesIdeasAvoidHydrate(avoidEl);   // safety: if user never opened the field
+    _seriesIdeasAvoidSave(avoidEl);      // safety: capture any unsaved keystrokes
   }
   const avoid = (avoidEl?.value || '').trim();
   // No genres = full creative freedom across all 6 axes (settings/twists/
