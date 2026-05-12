@@ -4190,6 +4190,12 @@ function _renderFacadesList(facades, status) {
   const stEl = document.getElementById('facades-status');
   const genBtn = document.getElementById('facades-generate-btn');
   if (!host) return;
+  // Locations that aren't in ANY existing facade — surface them so the user
+  // can spawn a facade per-location without «сгенерировать всё».
+  const allLocs = (S.series?.locations || []);
+  const usedLocIds = new Set();
+  for (const f of facades) for (const id of (f.member_loc_ids || [])) usedLocIds.add(id);
+  const ungroupedLocs = allLocs.filter(l => !usedLocIds.has(l.id));
   // Status banner
   if (status?.running) {
     stEl.style.display = '';
@@ -4210,11 +4216,29 @@ function _renderFacadesList(facades, status) {
   // Build name → loc lookup for hierarchy display
   const locById = {};
   for (const l of (S.series?.locations || [])) locById[l.id] = l;
+  // Build the ungrouped-locations block (always shown if there are any —
+  // gives per-location «Сгенерить фасад» so user doesn't have to do all).
+  const ungroupedHtml = ungroupedLocs.length ? `
+    <div class="facade-ungrouped-block">
+      <div class="facade-ungrouped-title">🏗 Локации без фасада (${ungroupedLocs.length})</div>
+      <div class="facade-ungrouped-grid">
+        ${ungroupedLocs.map(l => {
+          const ref = (l.ref_images || [])[0];
+          const src = ref ? `/assets/${S.seriesId}/${ref}?v=${Date.now()}` : '';
+          return `
+            <div class="facade-ungrouped-card" title="${esc(l.description || '')}">
+              ${src ? `<img src="${esc(src)}" alt="">` : `<div class="facade-ungrouped-stub">${esc((l.name||'?')[0])}</div>`}
+              <div class="facade-ungrouped-name">${esc(l.name)}</div>
+              <button class="btn-ghost btn-sm" onclick="facadesGenerateForLoc('${esc(l.id)}', this)" style="margin-top:6px;font-size:0.72rem;padding:3px 6px">🎬 Сгенерить фасад</button>
+            </div>`;
+        }).join('')}
+      </div>
+    </div>` : '';
   if (!facades.length) {
-    host.innerHTML = '<div style="font-size:0.86rem;color:var(--muted);padding:24px;text-align:center">Ещё нет сгенерированных фасадов. Нажми «🤖 Сгруппировать локации» чтобы Claude разбил локации по зданиям.</div>';
+    host.innerHTML = ungroupedHtml + '<div style="font-size:0.86rem;color:var(--muted);padding:24px;text-align:center">Ещё нет сгенерированных фасадов. Нажми «🤖 Сгруппировать локации» чтобы Claude разбил по зданиям ИЛИ выбери конкретную локацию выше для одного фасада.</div>';
     return;
   }
-  host.innerHTML = facades.map(f => {
+  host.innerHTML = ungroupedHtml + facades.map(f => {
     const imgSrc = f.image_path ? `/assets/${S.seriesId}/${f.image_path}?v=${Date.now()}` : '';
     const vidSrc = f.video_path ? `/assets/${S.seriesId}/${f.video_path}?v=${Date.now()}` : '';
     const status = f.status || 'unknown';
@@ -4303,7 +4327,10 @@ function _renderGroupsPreview(groups) {
               <div style="font-size:0.78rem;color:var(--muted);margin:2px 0">${esc((g.facade_description || '').slice(0, 220))}</div>
               <div style="font-size:0.74rem;color:var(--muted)">↪ ${g.member_names?.map(esc).join(' · ') || '(пусто)'}</div>
             </div>
-            <button class="btn-icon" onclick="facadesPreviewRemove(${i})" title="Не генерить этот фасад">✕</button>
+            <div style="display:flex;flex-direction:column;gap:4px">
+              <button class="btn-ghost btn-sm" onclick="facadesGenerateOne(${i})" title="Сгенерить только этот фасад" style="font-size:0.74rem;padding:3px 8px">🎬 Этот</button>
+              <button class="btn-icon" onclick="facadesPreviewRemove(${i})" title="Не генерить этот фасад">✕</button>
+            </div>
           </div>`).join('')}
       </div>` : ''}
     ${exteriors.length ? `
@@ -4340,6 +4367,47 @@ async function facadesGenerate() {
     await facadesRefresh();
   } catch (e) {
     alert('Запуск не удался: ' + (e?.message || e));
+  }
+}
+
+// Generate exactly one facade from the preview list (one building from the
+// current Claude grouping). Useful when you want to try one before committing
+// to the whole batch.
+async function facadesGenerateOne(idx) {
+  if (!FACADES_STATE.groupsPreview) return;
+  const g = FACADES_STATE.groupsPreview[idx];
+  if (!g || g.type !== 'building') return;
+  try {
+    const r = await api.post(`/api/series/${S.seriesId}/facades/generate`, { groups: [g] });
+    if (r.error) throw new Error(r.error);
+    showToast(`▶ Запущен фасад «${g.building_name}»`, 4000);
+    // Drop the started group from preview so the user can't double-submit
+    FACADES_STATE.groupsPreview.splice(idx, 1);
+    _renderGroupsPreview(FACADES_STATE.groupsPreview);
+    _facadesStartPoll();
+    await facadesRefresh();
+  } catch (e) {
+    alert('Не удалось: ' + (e?.message || e));
+  }
+}
+
+// Per-location quick-gen — picks one location card from the ungrouped strip,
+// asks the backend to derive building_name + facade_description from that
+// location alone, and kicks off generation as a single-member facade.
+async function facadesGenerateForLoc(locId, btn) {
+  if (btn) {
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span>';
+  }
+  try {
+    const r = await api.post(`/api/series/${S.seriesId}/facades/generate-for-location`, { loc_id: locId });
+    if (r.error) throw new Error(r.error);
+    showToast(`▶ Запущен фасад: ${r.building_name || ''}`, 4000);
+    _facadesStartPoll();
+    await facadesRefresh();
+  } catch (e) {
+    alert('Не удалось: ' + (e?.message || e));
+    if (btn) { btn.disabled = false; btn.innerHTML = '🎬 Сгенерить фасад'; }
   }
 }
 

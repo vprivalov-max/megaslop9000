@@ -2,7 +2,6 @@ import json
 import os
 import re
 import uuid
-import collections
 import random
 import secrets
 import shutil
@@ -5345,6 +5344,62 @@ def facades_regenerate(sid, fid):
     return jsonify({'started': True})
 
 
+@app.route('/api/series/<sid>/facades/generate-for-location', methods=['POST'])
+def facades_generate_for_location(sid):
+    """Generate ONE facade for ONE specific location (or attach the location
+    to a new single-member facade group). Lets the user iterate per-loc
+    instead of «сгенерировать все».
+
+    Body: { loc_id: str, building_name?: str, facade_description?: str }
+    If building_name/facade_description are missing, Claude derives them
+    from the location's name + description on-the-fly."""
+    s = load_series(sid)
+    if not s:
+        return jsonify({'error': 'not found'}), 404
+    body = request.json or {}
+    loc_id = (body.get('loc_id') or '').strip()
+    if not loc_id:
+        return jsonify({'error': 'loc_id required'}), 400
+    loc = next((l for l in (s.get('locations') or []) if l.get('id') == loc_id), None)
+    if not loc:
+        return jsonify({'error': 'location not found'}), 404
+    name = (body.get('building_name') or '').strip()
+    desc = (body.get('facade_description') or '').strip()
+    if not name or not desc:
+        # Quick Claude call — turn the location's own info into a building
+        # name + facade description. Cheap, single-shot Haiku-equivalent.
+        try:
+            sys = (
+                "Ты — продюсер визуальной библиотеки сериала. Тебе дают ОДНУ локацию "
+                "(имя + описание интерьера/места действия). Если это интерьер — "
+                "определи название здания-обладателя (вилла, больница, отель, школа) "
+                "и опиши его ФАСАД СНАРУЖИ. Если это уже наружная локация — оставь "
+                "имя как есть, опиши вид издалека. Только JSON.\n"
+                f'Локация: "{loc["name"]}" — {(loc.get("description") or "")[:300]}\n\n'
+                'Верни:\n{\n'
+                '  "building_name": "...",\n'
+                '  "facade_description": "..." (1-2 предложения, английский)\n'
+                '}\n'
+            )
+            raw = claude_ask("Reply with JSON only.", system=sys, max_tokens=600)
+            data = json.loads(strip_json(raw))
+            name = name or (data.get('building_name') or loc['name']).strip()
+            desc = desc or (data.get('facade_description') or '').strip()
+        except Exception as e:
+            return jsonify({'error': f'Derive failed: {e}'}), 500
+    st = _facade_status(sid)
+    if st.get('running'):
+        return jsonify({'error': 'generation already running'}), 409
+    group = {
+        'building_name': name or loc['name'],
+        'type': 'building',
+        'facade_description': desc or f"Exterior of {loc['name']}.",
+        'member_loc_ids': [loc_id],
+    }
+    _spawn_with_keys(_facade_worker, sid, [group])
+    return jsonify({'started': True, 'building_name': group['building_name']})
+
+
 @app.route('/api/series/<sid>/facades/folder', methods=['POST'])
 def facades_open_folder(sid):
     """macOS / Linux / Windows-friendly: opens the facades folder in the OS
@@ -6498,13 +6553,6 @@ def generate_asset_prompt(sid):
 
 # ── AI: Series idea generation ───────────────────────────────────────────────
 
-# Per-user deque of recently generated idea titles, used to de-duplicate
-# across consecutive «show me 5 ideas» calls within a session. In-memory only —
-# acceptable trade-off; on restart the prompt-level blacklist still catches
-# the most exhausted phrasings.
-_RECENT_IDEA_TITLES = {}  # user_email → deque[str]
-
-
 _IDEAS_SYSTEM = """You are a creative producer for TikTok/Reels short drama series — the addictive, over-the-top format from apps like ReelShort and DramaBox.
 
 LANGUAGE RULE — NON-NEGOTIABLE:
@@ -6555,30 +6603,67 @@ Title templates that work — VARIETY IS REQUIRED. Among any 5 generated ideas, 
   • "[Profession/Role] for [Powerful Other]'s [Secret Need]"
   • "[Concrete Object/Action] Was Never Supposed to [Outcome]"
 
-═══════════════════════════════════════════════════════════════════════
-🚫 EXHAUSTED PHRASINGS — DO NOT USE OR PARAPHRASE THESE (HARD BAN)
-The user has seen these specific opening patterns too many times. Pick a
-different template + different vocabulary. Treat as a blacklist:
-  ✗ "I Wasn't Supposed to ..." (any continuation)
-  ✗ "After 10 Years, ..." (or any "After [N] Years" where N is exactly 10)
-  ✗ "Oh No, I Married ..." / "Oh No, I ..."
-  ✗ "After 10 Years in Prison, ..." or near-variants
-  ✗ Titles beginning with "Pregnant by" — used too often, swap for another power-imbalance template
-  ✗ "I Faked My Death to See ..." — exhausted, find a new I-verb hook
-  ✗ "Never Divorce a Secret Billionaire ..."
-  ✗ "My Poor Husband Is a Billionaire"
-  ✗ "Flash Marriage with My Bodyguard ..."
-If your title even RHYMES with one of these — rewrite it with a different
-verb, time-anchor, or whole template.
+EXTENDED TITLE PATTERN LIBRARY — pick FRESH ones, rotate aggressively. These
+are slot patterns only; invent your own brackets. Mix freely:
+
+  Identity-flip templates:
+  • "[Profession] by Day, [Hidden Role] by Night"
+  • "They Hired Me as [Role]. I'm Their [Twist]."
+  • "Everyone Thinks I'm [Public Label]. I'm Actually [Truth]."
+  • "[Name], Daughter/Son of [Position] — and [Hidden Sin]"
+  • "The [Role] [Person of Power] Forgot to Kill"
+
+  Reversal templates:
+  • "[Victim/Loser] Now [Position of Power]"
+  • "[Powerful Person] Begs the [Lowly Role] He Ruined"
+  • "She [Quiet Verb-ed]. Now He [Cannot Look Away]"
+  • "[Person] Wants Me Back. Too Bad I [Action That Closed the Door]"
+  • "[Role] Walks Into [Place]. Owns It by Friday."
+
+  Object-as-trigger templates:
+  • "The [Specific Object] in [Setting]"
+  • "[Object] Was Never Supposed to End Up With [Person]"
+  • "[Drink/Letter/Ring/Photo] at the [Specific Event]"
+  • "What She Found in His [Container/Place]"
+
+  Setting-locked templates:
+  • "[Setting] Doesn't Forgive"
+  • "Welcome to [Specific Place]. You Won't Leave."
+  • "Last Night at the [Setting]"
+  • "Code [Number] at [Workplace]"
+  • "Cell [Number] Knew the Truth"
+
+  Threat-and-promise templates:
+  • "[Number] Lies. [Number] Bodies. One [Survivor/Witness]."
+  • "[Person]: [Curt Threat / Promise Three Words]"
+  • "Marry [Position] or [Stake]"
+  • "Run. Or [Worse Alternative]"
+  • "[Pronoun] Came Back. [Pronoun] Came Back Wrong."
+
+  Question-and-confession templates:
+  • "Why Is My [Role] [Doing Suspicious Action]?"
+  • "Who Sent the [Object] to [Place]?"
+  • "I Don't Know [Quotient]. But I Know [Other Fact]."
+  • "He Called Me [Label]. He'll Regret That."
+
+  Single-word and ultra-short templates:
+  • "[Single Strong Noun]" (e.g. one-word title — a name, an object, a role)
+  • "[Name]: [Two-Word Reframe]"
+  • "[Two Nouns Separated by Slash]" (e.g. "Mother/Stranger")
 
 OPENING WORD DIVERSITY (within one batch of 5 ideas):
-  • No more than ONE title starting with "I" (any pronoun-led first-person).
-  • No more than ONE title starting with "After" or "When" or any time-anchor.
-  • No more than ONE title starting with "My".
-  • No more than ONE title starting with "The".
-  • Force at least 2 titles to start with a fresh template — a verb-noun pun,
-    an exclamation, a question, a single name + colon, or a noun.
-═══════════════════════════════════════════════════════════════════════
+  • Max ONE title starting with "I" / "My" / "The" / "After" / "When" each.
+  • Force at least 2 titles to start with something else entirely: a name, a
+    profession, a number, a question word, an object, an exclamation, a verb,
+    or a setting noun. Avoid clustering on any single opening word.
+
+NOVELTY GUARDRAIL — before output, scan all 5 titles:
+  • If two share the same opening 1-2 words → rewrite one.
+  • If two use the same template family (both time-anchors, both
+    identity-flips, both "I [verb-ed]" patterns) → swap one to a fresh family.
+  • If a title feels like something the user might have seen ten times before
+    (mafia king, billionaire stepbrother, contract marriage to a boss) —
+    rewrite using a different archetype + different template structure.
 
 Power nouns (mix freely, do NOT pile multiple on one title): Billionaire, CEO, Mafia Boss, Alpha, King, Heiress, Surgeon, Detective, Heiress, Pilot, Soldier, Bodyguard, Coach, Tutor, Pastor, Therapist, Judge, Driver, Nanny, Chef, Architect, Influencer, Twin
 Relationship modifiers: my husband, my ex, my boss, my stepbrother, my brother's best friend, my enemy, my therapist, my doctor, my driver, my landlord, my tutor, my coach, my mentor, my mother, my sister, my fiance, my late husband (alive), my fake husband, my contract wife
@@ -7051,25 +7136,6 @@ def generate_series_ideas():
     # any of the 5 ideas (titles, synopses, character roles). Comma-separated
     # or newline-separated. E.g. «близнецы, пастор, billionaire CEO».
     avoid_raw = (data_in.get('avoid') or '').strip()
-    # Recent-titles dedup. Keep an in-process deque of the last ~150 titles
-    # this user has seen, inject as a HARD ban list into the prompt. Without
-    # this Claude rotates through ~10 favourite phrasings forever even with
-    # randomized seeds. Persists across requests but not across server
-    # restart — acceptable: blacklist in the prompt itself catches the
-    # worst offenders on cold start.
-    recent_titles_block = ''
-    user_email = current_user_email() or 'default'
-    recent = _RECENT_IDEA_TITLES.setdefault(user_email, collections.deque(maxlen=150))
-    if recent:
-        # Show only the last 60 in the prompt to keep token usage sane.
-        recent_list = list(recent)[-60:]
-        recent_titles_block = (
-            "RECENTLY SHOWN TO THIS USER — HARD BAN (do NOT repeat, do NOT paraphrase):\n"
-            + '\n'.join(f'  ✗ {t}' for t in recent_list)
-            + "\nIf ANY new title is even structurally similar (same opening clause / same "
-              "noun pattern / same template + same archetype) — rewrite it with a different "
-              "template AND different vocabulary.\n\n"
-        )
 
     if genres:
         genre_rule = (
@@ -7120,7 +7186,6 @@ def generate_series_ideas():
         "Generate exactly 5 SHORT DRAMA series concepts for TikTok/Reels.\n\n"
         + genre_rule
         + avoid_rule
-        + recent_titles_block
         + "INSPIRATION SEEDS (one per idea — these are LIGHT prompts, pick what's useful, "
         "ignore what overcomplicates):\n"
         f"{constraints}\n\n"
@@ -7151,18 +7216,7 @@ def generate_series_ideas():
     )
     try:
         data = json.loads(strip_json(claude_ask(prompt, system=_IDEAS_SYSTEM)))
-        ideas = data.get('ideas', data) if isinstance(data, dict) else data
-        # Record titles into the recent deque so the next batch won't repeat
-        # them. Best-effort: malformed payloads just skip recording.
-        try:
-            if isinstance(ideas, list):
-                for it in ideas:
-                    t = (it or {}).get('title') if isinstance(it, dict) else None
-                    if t and isinstance(t, str):
-                        recent.append(t.strip())
-        except Exception:
-            pass
-        return jsonify(ideas)
+        return jsonify(data.get('ideas', data))
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
