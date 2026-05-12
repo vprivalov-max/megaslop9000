@@ -6054,36 +6054,89 @@ function _scaleActionDuration(text) {
 // Mirrors the server-side logic in app.py compose endpoint.
 function _findChunkRange(scriptText, chunkText) {
   if (!chunkText || !scriptText) return [-1, -1];
+  const chunkLines = chunkText.split('\n');
+  // Pick anchor candidates: long-enough script-content lines whose chunk-line
+  // index we remember so we can expand the range from there.
   const cands = [];
-  for (const ln of chunkText.split('\n')) {
-    const s = ln.trim();
+  const candChunkIdx = [];
+  for (let i = 0; i < chunkLines.length; i++) {
+    const s = chunkLines[i].trim();
     if (s.length < 25) continue;
     if (_matchSceneHeading(s).match) continue;
     cands.push(s);
+    candChunkIdx.push(i);
     if (cands.length >= 6) break;
   }
-  let start = -1;
-  for (const c of cands) {
-    const idx = scriptText.indexOf(c);
+  // Locate anchor in scriptText: prefer unique match, fall back to first.
+  let anchorOffset = -1;
+  let anchorChunkIdx = -1;
+  for (let k = 0; k < cands.length; k++) {
+    const idx = scriptText.indexOf(cands[k]);
     if (idx === -1) continue;
-    if (scriptText.indexOf(c, idx + 1) === -1) { start = idx; break; }
-  }
-  if (start < 0) {
-    for (const c of cands) {
-      const idx = scriptText.indexOf(c);
-      if (idx !== -1) { start = idx; break; }
+    if (scriptText.indexOf(cands[k], idx + 1) === -1) {
+      anchorOffset = idx;
+      anchorChunkIdx = candChunkIdx[k];
+      break;
     }
   }
-  if (start < 0) return [-1, -1];
-  let end = start + chunkText.length;
-  for (let i = chunkText.split('\n').length - 1; i >= 0; i--) {
-    const s = chunkText.split('\n')[i].trim();
-    if (s.length < 25) continue;
-    if (_matchSceneHeading(s).match) continue;
-    const idx = scriptText.indexOf(s, start);
-    if (idx >= 0) { end = idx + s.length; break; }
+  if (anchorOffset < 0) {
+    for (let k = 0; k < cands.length; k++) {
+      const idx = scriptText.indexOf(cands[k]);
+      if (idx !== -1) { anchorOffset = idx; anchorChunkIdx = candChunkIdx[k]; break; }
+    }
   }
-  return [start, end];
+  if (anchorOffset < 0) return [-1, -1];
+  // Build (start, end) offsets for every script line — used to step line-by-
+  // line in either direction while expanding the matched range.
+  const scriptLines = scriptText.split('\n');
+  const lineRanges = [];
+  {
+    let off = 0;
+    for (const ln of scriptLines) {
+      lineRanges.push([off, off + ln.length]);
+      off += ln.length + 1;
+    }
+  }
+  // Find the script-line whose offset matches the anchor.
+  let anchorScriptIdx = -1;
+  for (let i = 0; i < lineRanges.length; i++) {
+    if (lineRanges[i][0] === anchorOffset) { anchorScriptIdx = i; break; }
+    if (lineRanges[i][0] > anchorOffset) break;
+  }
+  if (anchorScriptIdx < 0) {
+    // Anchor not on a line boundary (shouldn't happen for line-anchored finds).
+    // Fall back to the heuristic end-of-chunkText length.
+    return [anchorOffset, anchorOffset + chunkText.length];
+  }
+  // Expand BACKWARDS: for each chunk-line before anchorChunkIdx, see if the
+  // corresponding script-line above matches verbatim (trimmed). Picks up
+  // short speaker cues like «ELENA», «MARCUS» that sit just before the long
+  // anchor inside the chunk.
+  let firstScriptIdx = anchorScriptIdx;
+  for (let ci = anchorChunkIdx - 1, si = anchorScriptIdx - 1; ci >= 0 && si >= 0; ci--, si--) {
+    if ((scriptLines[si] || '').trim() === (chunkLines[ci] || '').trim()) {
+      firstScriptIdx = si;
+    } else if ((chunkLines[ci] || '').trim() === '') {
+      // Blank line in chunk_text — keep walking but don't advance the range.
+      continue;
+    } else {
+      break;
+    }
+  }
+  // Expand FORWARDS similarly to cover trailing short lines like the final
+  // «What did you show her?» that's < 25 chars and would otherwise be left
+  // outside the range.
+  let lastScriptIdx = anchorScriptIdx;
+  for (let ci = anchorChunkIdx + 1, si = anchorScriptIdx + 1; ci < chunkLines.length && si < scriptLines.length; ci++, si++) {
+    if ((scriptLines[si] || '').trim() === (chunkLines[ci] || '').trim()) {
+      lastScriptIdx = si;
+    } else if ((chunkLines[ci] || '').trim() === '') {
+      continue;
+    } else {
+      break;
+    }
+  }
+  return [lineRanges[firstScriptIdx][0], lineRanges[lastScriptIdx][1]];
 }
 
 function _parseScriptScenes(scriptText, overrides) {
