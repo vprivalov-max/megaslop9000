@@ -126,7 +126,10 @@
       <div class="sidebar-section">
         <div class="section-header">
           <h3>Локации</h3>
-          <button class="btn-icon" onclick="openAddLocation()" title="Добавить локацию">+</button>
+          <div style="display:flex;gap:4px">
+            <button class="btn-icon" onclick="openFacadesPanel()" title="🏛 Фасады зданий — сгенерировать общие планы локаций (интерьеры одного здания группируются под один фасад)">🏛</button>
+            <button class="btn-icon" onclick="openAddLocation()" title="Добавить локацию">+</button>
+          </div>
         </div>
         <div id="locations-list" class="characters-list"></div>
       </div>
@@ -1212,6 +1215,31 @@
     <div class="modal-footer">
       <button class="btn-ghost" onclick="closeModal('modal-create-episode')">Отмена</button>
       <button class="btn-primary" onclick="createEpisode()" data-mlg-action="gunshot">Создать</button>
+    </div>
+  </div>
+</div>
+
+<!-- Building facades panel — generate one exterior shot per parent building -->
+<div id="modal-facades" class="modal hidden">
+  <div class="modal-box" style="max-width:900px;max-height:92vh;display:flex;flex-direction:column">
+    <div class="modal-header">
+      <h2>🏛 Фасады зданий</h2>
+      <button class="btn-icon" onclick="closeModal('modal-facades')">✕</button>
+    </div>
+    <div class="modal-body" style="overflow-y:auto;max-height:calc(92vh - 80px)">
+      <div style="font-size:0.86rem;color:var(--muted);margin-bottom:12px">
+        Группирует интерьеры одного здания (например, кабинет и спальня одного поместья) в один фасад снаружи. По 4-секундному видео на здание. Используй как establishing-кадр перед интерьерными сценами.
+      </div>
+      <div id="facades-folder-hint" style="display:none;font-size:0.78rem;color:var(--muted);margin-bottom:10px;background:var(--surface2);padding:6px 10px;border-radius:6px;border:1px solid var(--border);font-family:ui-monospace,monospace"></div>
+      <div style="display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap">
+        <button class="btn-primary btn-sm" onclick="facadesGroup()" id="facades-group-btn">🤖 Сгруппировать локации</button>
+        <button class="btn-primary btn-sm" onclick="facadesGenerate()" id="facades-generate-btn" disabled style="background:linear-gradient(135deg,#10b981,#059669)">🎬 Сгенерировать все фасады</button>
+        <button class="btn-ghost btn-sm" onclick="facadesOpenFolder()" title="Открыть папку assets/facades в Finder">📂 Открыть папку</button>
+        <button class="btn-ghost btn-sm" onclick="facadesRefresh()">🔄 Обновить</button>
+      </div>
+      <div id="facades-status" style="display:none;font-size:0.82rem;padding:8px 12px;background:var(--surface2);border-radius:6px;border:1px solid var(--border);margin-bottom:12px"></div>
+      <div id="facades-groups-preview" style="display:none;margin-bottom:16px"></div>
+      <div id="facades-list"></div>
     </div>
   </div>
 </div>

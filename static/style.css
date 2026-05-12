@@ -811,6 +811,80 @@ body.sidebar-dragging * {
   box-shadow: inset 0 0 0 1px rgba(168,85,247,0.45);
 }
 
+/* Building facades modal: per-building card with its facade video + a row of
+   child interior thumbnails underneath, so the hierarchy «one mansion → many
+   rooms inside» is obvious at a glance. */
+.facade-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px;
+  margin-bottom: 14px;
+}
+.facade-card-main {
+  display: flex; gap: 14px; align-items: stretch;
+}
+.facade-media {
+  flex-shrink: 0; width: 160px; height: 285px;   /* 9:16 */
+  background: var(--surface2);
+  border-radius: 6px;
+  overflow: hidden;
+  display: flex; align-items: center; justify-content: center;
+}
+.facade-media video, .facade-media img {
+  width: 100%; height: 100%; object-fit: cover;
+}
+.facade-stub {
+  font-size: 2.5rem; color: var(--muted);
+}
+.facade-info { flex: 1; min-width: 0; }
+.facade-name {
+  font-weight: 600; font-size: 1.05rem; color: var(--text); margin-bottom: 4px;
+}
+.facade-status { font-size: 0.82rem; margin-bottom: 8px; }
+.facade-desc {
+  font-size: 0.82rem; color: var(--muted);
+  line-height: 1.4; margin-bottom: 10px;
+}
+.facade-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.facade-children {
+  margin-top: 12px; padding-top: 10px;
+  border-top: 1px dashed var(--border);
+}
+.facade-children-label {
+  font-size: 0.76rem; color: var(--muted); margin-bottom: 6px;
+}
+.facade-children-grid {
+  display: flex; gap: 8px; flex-wrap: wrap;
+}
+.facade-child {
+  width: 80px; text-align: center;
+}
+.facade-child img {
+  width: 80px; height: 80px;
+  object-fit: cover; border-radius: 4px;
+  border: 1px solid var(--border);
+}
+.facade-child-stub {
+  width: 80px; height: 80px;
+  background: var(--surface2);
+  border-radius: 4px; border: 1px solid var(--border);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 1.4rem; font-weight: 600; color: var(--muted);
+}
+.facade-child-name {
+  font-size: 0.7rem; color: var(--muted); margin-top: 3px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.facade-preview-row {
+  display: flex; gap: 10px; align-items: flex-start;
+  padding: 8px 10px;
+  background: rgba(132,94,247,0.06);
+  border: 1px solid rgba(132,94,247,0.2);
+  border-radius: 6px;
+  margin-bottom: 6px;
+}
+
 /* Import-from-script: per-entity row in the create-series modal — checkbox
    on top, file-upload + thumbnail chips below. */
 .import-entity-row {

@@ -8,6 +8,7 @@ import shutil
 import datetime
 import time
 import subprocess
+import sys
 import threading
 import requests
 from pathlib import Path
@@ -1745,6 +1746,7 @@ def episodes_dir(sid):  return series_path(sid) / 'episodes'
 def assets_dir(sid):    return series_path(sid) / 'assets'
 def vid_dir(sid):       return series_path(sid) / 'VID'
 def out_dir(sid):       return series_path(sid) / 'OUT'
+def facades_dir(sid):   return series_path(sid) / 'assets' / 'facades'
 
 # Template Premiere Pro project. The user drops a blank .prproj here once
 # (created in Premiere via File → New Project → save as "empty.prproj") and
@@ -5044,6 +5046,325 @@ def regenerate_location(sid, loc_id):
         return jsonify({'ready': True, 'url': f'/assets/{sid}/{rel_path}', 'image_url': image_url})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+
+# ── Building facades ────────────────────────────────────────────────────────
+# Per-series feature: cluster interior locations into their parent building
+# (e.g. «Marcus's office» + «Marcus's bedroom» → «Bellacourt Mansion»), then
+# generate ONE exterior facade image + a short Seedance video per building.
+# Used as «open every new venue with a 4s facade shot» before the dialogue
+# starts inside. Storage: assets/facades/<facade_id>/{facade.jpg, facade.mp4}.
+# series.location_facades[] persists the linkage back to series.locations.
+
+_FACADE_STATUS = {}   # sid → status dict
+
+def _facade_status(sid):
+    return _FACADE_STATUS.setdefault(sid, {
+        'running': False, 'total': 0, 'done': 0, 'errors': [], 'current': None,
+    })
+
+
+@app.route('/api/series/<sid>/facades/group', methods=['POST'])
+def facades_group(sid):
+    """Have Claude cluster the series' locations into parent buildings.
+    Returns preview groupings — frontend lets the user accept / edit before
+    kicking off generation. Pure read; no side effects."""
+    s = load_series(sid)
+    if not s:
+        return jsonify({'error': 'not found'}), 404
+    locs = [l for l in (s.get('locations') or []) if l.get('name')]
+    if not locs:
+        return jsonify({'error': 'У сериала нет локаций для группировки'}), 400
+    locs_block = '\n'.join(
+        f'- id={l["id"]} | "{l["name"]}" — {(l.get("description") or "")[:200]}'
+        for l in locs
+    )
+    sys = (
+        "Ты — продюсер визуальной библиотеки сериала. Тебе дают список локаций. "
+        "Сгруппируй их по ЗДАНИЯМ-ОБЛАДАТЕЛЯМ. Цель: для каждого здания сгенерируем "
+        "ОДИН фасадный плановый кадр снаружи, который будет показывать «вот это место» "
+        "перед интерьерными сценами внутри.\n\n"
+        "ПРАВИЛА:\n"
+        "1. Локации-интерьеры одного и того же здания группируй вместе. Примеры:\n"
+        "   • «Marcus's office» + «Marcus's bedroom» + «Marcus's wine cellar» → одно здание «Bellacourt Mansion»\n"
+        "   • «Hospital reception» + «ICU ward» + «Hospital cafeteria» → одно «City Hospital»\n"
+        "   • «Elena's motel room» + «Motel hallway» → одно «Roadside Motel»\n"
+        "2. Самодостаточные exterior-локации (улица, виноградник, парк, набережная, лес) — каждая "
+        "СВОЯ группа из 1 элемента с type='exterior'. У них уже есть наружный кадр в ref-картинках, "
+        "отдельный facade не нужен.\n"
+        "3. Если для двух локаций по описанию НЕ ясно одно ли это здание — держи их отдельно. "
+        "Лучше лишний фасад, чем неправильное склеивание.\n"
+        "4. Имя здания должно быть КОНКРЕТНЫМ (имя владельца / название учреждения / города), "
+        "не «building» / «structure» / «place». «Bellacourt Mansion», не «Mansion».\n"
+        "5. type='building' для зданий нуждающихся в фасадной генерации, type='exterior' для уже-наружных.\n\n"
+        f"ЛОКАЦИИ СЕРИАЛА:\n{locs_block}\n\n"
+        "Верни JSON и ТОЛЬКО JSON:\n"
+        '{\n'
+        '  "groups": [\n'
+        '    {\n'
+        '      "building_name": "Bellacourt Mansion",\n'
+        '      "type": "building",\n'
+        '      "facade_description": "Three-storey stone mansion covered in vines, ornate front entrance with double oak doors, gravel driveway, daylight",\n'
+        '      "member_loc_ids": ["id1", "id2"]\n'
+        '    }\n'
+        '  ]\n'
+        '}\n'
+    )
+    try:
+        raw = claude_ask("Сгруппируй и верни JSON.", system=sys, max_tokens=4000)
+        data = json.loads(strip_json(raw))
+        groups = data.get('groups') or []
+        known_ids = {l['id'] for l in locs}
+        name_by_id = {l['id']: l['name'] for l in locs}
+        for g in groups:
+            g['member_loc_ids'] = [i for i in (g.get('member_loc_ids') or []) if i in known_ids]
+            g['member_names'] = [name_by_id[i] for i in g['member_loc_ids']]
+        return jsonify({'groups': groups})
+    except Exception as e:
+        return jsonify({'error': f'Group failed: {e}'}), 500
+
+
+def _facade_worker(sid, groups):
+    """Background: for each `building` group, generate facade image then a
+    short Seedance video. Saves to assets/facades/<facade_id>/; updates
+    series.location_facades[] incrementally so the UI sees progress."""
+    st = _facade_status(sid)
+    work_groups = [g for g in groups
+                   if g.get('type') == 'building'
+                   and (g.get('member_loc_ids') or g.get('member_names'))]
+    st.update({
+        'running': True, 'total': len(work_groups), 'done': 0,
+        'errors': [], 'started_at': datetime.datetime.utcnow().isoformat(),
+        'finished_at': None, 'current': None,
+    })
+    try:
+        s0 = load_series(sid)
+        if not s0:
+            st['errors'].append({'error': 'series gone'})
+            return
+        # Ensure the facade list exists
+        s0.setdefault('location_facades', [])
+        save_series(sid, s0)
+        for g in work_groups:
+            name = (g.get('building_name') or '').strip() or 'Unnamed Building'
+            desc = (g.get('facade_description') or '').strip()
+            st['current'] = name
+            fid = 'fac_' + str(uuid.uuid4())[:8]
+            fac_dir = facades_dir(sid) / fid
+            fac_dir.mkdir(parents=True, exist_ok=True)
+            facade = {
+                'id': fid,
+                'building_name': name,
+                'facade_description': desc,
+                'member_loc_ids': list(g.get('member_loc_ids') or []),
+                'image_path': '',
+                'image_avai_url': '',
+                'video_path': '',
+                'video_avai_url': '',
+                'status': 'generating',
+                'created_at': datetime.datetime.utcnow().isoformat(),
+            }
+            # Initial save so UI sees the in-progress card
+            s = load_series(sid)
+            s.setdefault('location_facades', []).append(facade)
+            save_series(sid, s)
+
+            # ── Image generation ──────────────────────────────────────────
+            tone = s.get('tone', '')
+            style_clause = _series_style_clause(s)
+            img_prompt = (
+                f"Exterior facade of {name}. {desc}. No people in frame. "
+                f"{(tone + ' atmosphere. ') if tone else ''}"
+                f"Cinematic wide establishing shot of the building exterior. "
+                f"Vertical 9:16 framing for short-drama. {style_clause}"
+            )
+            img_prompt = re.sub(r'\s+', ' ', img_prompt).strip()
+            img_path = fac_dir / 'facade.jpg'
+            img_url = ''
+            try:
+                img_url = avai_generate(
+                    img_prompt, img_path, aspect_ratio='9:16',
+                    preferred_provider=_series_image_provider(s),
+                )
+                facade['image_avai_url'] = img_url
+                facade['image_path'] = str(img_path.relative_to(series_path(sid)))
+            except Exception as e:
+                facade['status'] = 'failed'
+                facade['error'] = f'image: {str(e)[:200]}'
+                st['errors'].append({'facade_id': fid, 'building': name, 'error': str(e)[:200]})
+                _merge_facade(sid, fid, facade)
+                continue
+            _merge_facade(sid, fid, facade)
+
+            # ── Video generation (4-5 second static establishing) ─────────
+            try:
+                vid_prompt = (
+                    f"Static cinematic establishing wide shot of {name} exterior. {desc}. "
+                    "No people, no characters. Subtle ambient motion only — drifting clouds, "
+                    "swaying foliage, very slow camera push-in. Cinematic, 9:16."
+                )
+                vid_prompt = re.sub(r'\s+', ' ', vid_prompt).strip()
+                avai_key = _get_user_avai_key()
+                job = _avai_seedance_start(
+                    prompt=vid_prompt,
+                    ref_urls=[img_url] if img_url else [],
+                    duration=5,    # Seedance min 5s; covers the 4s establishing
+                    resolution='720p',
+                    moderation_bypass='off',
+                    aspect_ratio='9:16',
+                    generate_audio=False,
+                    avai_key=avai_key,
+                )
+                vid_path_local = fac_dir / 'facade.mp4'
+                vid_url = ''
+                for _ in range(180):   # 12-min ceiling
+                    time.sleep(4)
+                    pst = _avai_seedance_status(job['job_id'], status_url=job['status_url'], avai_key=avai_key)
+                    if pst.get('status') == 'completed':
+                        vid_url = pst.get('video_url', '')
+                        break
+                    if pst.get('status') in ('failed', 'error'):
+                        raise RuntimeError(pst.get('error') or 'seedance failed')
+                if not vid_url:
+                    raise RuntimeError('seedance timeout')
+                r = requests.get(vid_url, timeout=120, stream=True)
+                r.raise_for_status()
+                with open(vid_path_local, 'wb') as fp:
+                    for chk in r.iter_content(1 << 16):
+                        fp.write(chk)
+                facade['video_avai_url'] = vid_url
+                facade['video_path'] = str(vid_path_local.relative_to(series_path(sid)))
+                facade['status'] = 'ready'
+            except Exception as e:
+                facade['status'] = 'image_only'
+                facade['error'] = f'video: {str(e)[:200]}'
+                st['errors'].append({'facade_id': fid, 'building': name, 'error': f'video: {str(e)[:200]}'})
+            _merge_facade(sid, fid, facade)
+            st['done'] += 1
+    finally:
+        st['running'] = False
+        st['finished_at'] = datetime.datetime.utcnow().isoformat()
+        st['current'] = None
+
+
+def _merge_facade(sid, fid, facade):
+    """Re-read series, update the facade entry by id, save. Avoids clobbering
+    concurrent writes from other endpoints."""
+    s = load_series(sid)
+    if not s: return
+    facs = s.setdefault('location_facades', [])
+    found = False
+    for i, f in enumerate(facs):
+        if f.get('id') == fid:
+            facs[i] = {**f, **facade}
+            found = True
+            break
+    if not found:
+        facs.append(facade)
+    save_series(sid, s)
+
+
+@app.route('/api/series/<sid>/facades/generate', methods=['POST'])
+def facades_generate(sid):
+    """Body: { groups: [...] } where groups is the Claude-grouped list (or
+    user-edited variant). Returns immediately, worker writes facades back
+    incrementally; poll /facades for state."""
+    s = load_series(sid)
+    if not s:
+        return jsonify({'error': 'not found'}), 404
+    body = request.json or {}
+    groups = body.get('groups') or []
+    if not groups:
+        return jsonify({'error': 'no groups provided'}), 400
+    st = _facade_status(sid)
+    if st.get('running'):
+        return jsonify({'error': 'generation already running'}), 409
+    _spawn_with_keys(_facade_worker, sid, groups)
+    work_count = len([g for g in groups if g.get('type') == 'building'])
+    return jsonify({'started': True, 'count': work_count})
+
+
+@app.route('/api/series/<sid>/facades', methods=['GET'])
+def facades_list(sid):
+    s = load_series(sid)
+    if not s:
+        return jsonify({'error': 'not found'}), 404
+    return jsonify({
+        'facades': s.get('location_facades') or [],
+        'status': _facade_status(sid),
+        'folder': str(facades_dir(sid).resolve()),
+    })
+
+
+@app.route('/api/series/<sid>/facades/<fid>', methods=['DELETE'])
+def facades_delete(sid, fid):
+    s = load_series(sid)
+    if not s:
+        return jsonify({'error': 'not found'}), 404
+    s['location_facades'] = [f for f in (s.get('location_facades') or []) if f.get('id') != fid]
+    save_series(sid, s)
+    d = facades_dir(sid) / fid
+    if d.exists():
+        try: shutil.rmtree(d)
+        except Exception: pass
+    return jsonify({'ok': True})
+
+
+@app.route('/api/series/<sid>/facades/<fid>/regenerate', methods=['POST'])
+def facades_regenerate(sid, fid):
+    """Re-run image+video for one facade. Optional body overrides {building_name,
+    facade_description, member_loc_ids}."""
+    s = load_series(sid)
+    if not s:
+        return jsonify({'error': 'not found'}), 404
+    fac = next((f for f in (s.get('location_facades') or []) if f.get('id') == fid), None)
+    if not fac:
+        return jsonify({'error': 'facade not found'}), 404
+    body = request.json or {}
+    name = (body.get('building_name') or fac.get('building_name') or '').strip()
+    desc = (body.get('facade_description') or fac.get('facade_description') or '').strip()
+    members = body.get('member_loc_ids') if 'member_loc_ids' in body else fac.get('member_loc_ids')
+    # Wipe the existing entry so worker creates a fresh one with a new fid
+    s['location_facades'] = [f for f in s['location_facades'] if f.get('id') != fid]
+    save_series(sid, s)
+    d = facades_dir(sid) / fid
+    if d.exists():
+        try: shutil.rmtree(d)
+        except Exception: pass
+    st = _facade_status(sid)
+    if st.get('running'):
+        return jsonify({'error': 'generation already running'}), 409
+    group = {
+        'building_name': name,
+        'type': 'building',
+        'facade_description': desc,
+        'member_loc_ids': list(members or []),
+    }
+    _spawn_with_keys(_facade_worker, sid, [group])
+    return jsonify({'started': True})
+
+
+@app.route('/api/series/<sid>/facades/folder', methods=['POST'])
+def facades_open_folder(sid):
+    """macOS / Linux / Windows-friendly: opens the facades folder in the OS
+    file manager when the app runs locally. On the deployed server this is
+    a no-op; the UI uses the returned `folder` path as a copyable hint."""
+    s = load_series(sid)
+    if not s:
+        return jsonify({'error': 'not found'}), 404
+    d = facades_dir(sid)
+    d.mkdir(parents=True, exist_ok=True)
+    folder = str(d.resolve())
+    try:
+        if sys.platform == 'darwin':
+            subprocess.Popen(['open', folder])
+        elif sys.platform == 'win32':
+            subprocess.Popen(['explorer', folder])
+        elif sys.platform.startswith('linux'):
+            subprocess.Popen(['xdg-open', folder])
+    except Exception:
+        pass
+    return jsonify({'folder': folder})
 
 
 @app.route('/api/series/<sid>/locations/<loc_id>/save-frame/<project_id>', methods=['POST'])

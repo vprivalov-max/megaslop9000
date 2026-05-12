@@ -4137,6 +4137,244 @@ async function deleteLocRef(locId, filename) {
   renderLocationsList();
 }
 
+// ── Building facades ──────────────────────────────────────────────────────────
+// Groups interior locations by parent building (e.g. all rooms of a mansion),
+// generates one exterior facade image + 4s Seedance video per building. Used as
+// establishing-shot fodder. Workflow:
+//   1. openFacadesPanel() → loads existing facades from backend, renders the
+//      hierarchy. Buttons: «Сгруппировать», «Сгенерировать все», «Открыть папку».
+//   2. facadesGroup() → POST /facades/group, Claude clusters the loc roster,
+//      preview UI shows each proposed building with its member interiors.
+//   3. User clicks «Сгенерировать все» → POST /facades/generate, worker runs
+//      in background. Polling refreshes the card grid as facades complete.
+const FACADES_STATE = { groupsPreview: null, polling: null };
+
+async function openFacadesPanel() {
+  if (!S.seriesId) { showToast('Открой сериал'); return; }
+  openModal('modal-facades');
+  await facadesRefresh();
+}
+
+async function facadesRefresh() {
+  try {
+    const r = await api.get(`/api/series/${S.seriesId}/facades`);
+    _renderFacadesList(r.facades || [], r.status || {});
+    const hint = document.getElementById('facades-folder-hint');
+    if (hint && r.folder) {
+      hint.textContent = '📂 ' + r.folder;
+      hint.style.display = '';
+    }
+    // Auto-poll while worker is running so progress shows up live.
+    if (r.status?.running) {
+      _facadesStartPoll();
+    } else {
+      _facadesStopPoll();
+    }
+  } catch (e) {
+    showToast('Ошибка загрузки: ' + (e?.message || e));
+  }
+}
+
+function _facadesStartPoll() {
+  if (FACADES_STATE.polling) return;
+  FACADES_STATE.polling = setInterval(() => facadesRefresh(), 6000);
+}
+function _facadesStopPoll() {
+  if (!FACADES_STATE.polling) return;
+  clearInterval(FACADES_STATE.polling);
+  FACADES_STATE.polling = null;
+}
+
+function _renderFacadesList(facades, status) {
+  const host = document.getElementById('facades-list');
+  const stEl = document.getElementById('facades-status');
+  const genBtn = document.getElementById('facades-generate-btn');
+  if (!host) return;
+  // Status banner
+  if (status?.running) {
+    stEl.style.display = '';
+    stEl.innerHTML = `<span class="spinner"></span> Генерирую: ${status.done || 0}/${status.total || 0}${status.current ? ' · ' + esc(status.current) : ''}`;
+  } else if (status?.errors?.length) {
+    stEl.style.display = '';
+    stEl.innerHTML = `⚠ Завершено с ошибками (${status.errors.length}): ${status.errors.slice(0, 2).map(e => esc(e.building || '') + ' — ' + esc(e.error || '')).join('; ')}`;
+  } else {
+    stEl.style.display = 'none';
+  }
+  // Toggle generate button — disabled while running OR while no preview groups
+  // are loaded AND no facades exist yet (need to group first time).
+  if (genBtn) {
+    const hasPreview = !!FACADES_STATE.groupsPreview;
+    genBtn.disabled = !!status?.running || !hasPreview;
+    genBtn.title = status?.running ? 'Генерация уже идёт' : (hasPreview ? '' : 'Сначала нажми «Сгруппировать локации»');
+  }
+  // Build name → loc lookup for hierarchy display
+  const locById = {};
+  for (const l of (S.series?.locations || [])) locById[l.id] = l;
+  if (!facades.length) {
+    host.innerHTML = '<div style="font-size:0.86rem;color:var(--muted);padding:24px;text-align:center">Ещё нет сгенерированных фасадов. Нажми «🤖 Сгруппировать локации» чтобы Claude разбил локации по зданиям.</div>';
+    return;
+  }
+  host.innerHTML = facades.map(f => {
+    const imgSrc = f.image_path ? `/assets/${S.seriesId}/${f.image_path}?v=${Date.now()}` : '';
+    const vidSrc = f.video_path ? `/assets/${S.seriesId}/${f.video_path}?v=${Date.now()}` : '';
+    const status = f.status || 'unknown';
+    const statusColor = status === 'ready' ? 'var(--success)'
+                      : status === 'image_only' ? 'var(--warning)'
+                      : status === 'failed' ? 'var(--danger)'
+                      : 'var(--muted)';
+    const statusLabel = status === 'ready' ? '✓ Готов'
+                      : status === 'image_only' ? '⚠ Только картинка (видео упало)'
+                      : status === 'failed' ? '✗ ' + (f.error || 'Ошибка')
+                      : status === 'generating' ? '⏳ Генерирую…'
+                      : status;
+    const members = (f.member_loc_ids || []).map(id => locById[id]).filter(Boolean);
+    const memberCards = members.map(m => {
+      const mImg = (m.ref_images || [])[0];
+      const mSrc = mImg ? `/assets/${S.seriesId}/${mImg}?v=${Date.now()}` : '';
+      return `
+        <div class="facade-child" title="${esc(m.name)}">
+          ${mSrc ? `<img src="${esc(mSrc)}" alt="">` : `<div class="facade-child-stub">${esc((m.name||'?')[0])}</div>`}
+          <div class="facade-child-name">${esc(m.name)}</div>
+        </div>`;
+    }).join('') || '<div style="font-size:0.74rem;color:var(--muted);font-style:italic">(нет привязанных интерьеров)</div>';
+    return `
+      <div class="facade-card">
+        <div class="facade-card-main">
+          <div class="facade-media">
+            ${vidSrc
+              ? `<video src="${esc(vidSrc)}" muted loop autoplay playsinline></video>`
+              : imgSrc ? `<img src="${esc(imgSrc)}" alt="">`
+                       : `<div class="facade-stub">${status === 'generating' ? '<span class="spinner"></span>' : '🏛'}</div>`}
+          </div>
+          <div class="facade-info">
+            <div class="facade-name">${esc(f.building_name || 'Untitled')}</div>
+            <div class="facade-status" style="color:${statusColor}">${esc(statusLabel)}</div>
+            <div class="facade-desc">${esc((f.facade_description || '').slice(0, 200))}</div>
+            <div class="facade-actions">
+              <button class="btn-ghost btn-sm" onclick="facadesRegenerate('${esc(f.id)}')">🔄 Перегенерить</button>
+              <button class="btn-ghost btn-sm" onclick="facadesDelete('${esc(f.id)}')" style="color:var(--danger)">✕ Удалить</button>
+            </div>
+          </div>
+        </div>
+        <div class="facade-children">
+          <div class="facade-children-label">Интерьеры внутри:</div>
+          <div class="facade-children-grid">${memberCards}</div>
+        </div>
+      </div>`;
+  }).join('');
+}
+
+async function facadesGroup() {
+  const btn = document.getElementById('facades-group-btn');
+  const orig = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span> Анализирую…';
+  try {
+    const r = await api.post(`/api/series/${S.seriesId}/facades/group`, {});
+    if (r.error) throw new Error(r.error);
+    FACADES_STATE.groupsPreview = r.groups || [];
+    _renderGroupsPreview(FACADES_STATE.groupsPreview);
+    // Refresh button state
+    await facadesRefresh();
+  } catch (e) {
+    alert('Группировка не удалась: ' + (e?.message || e));
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = orig;
+  }
+}
+
+function _renderGroupsPreview(groups) {
+  const host = document.getElementById('facades-groups-preview');
+  if (!host) return;
+  if (!groups?.length) { host.style.display = 'none'; return; }
+  host.style.display = '';
+  const buildings = groups.filter(g => g.type === 'building');
+  const exteriors = groups.filter(g => g.type !== 'building');
+  host.innerHTML = `
+    <div style="font-weight:600;color:var(--text);margin-bottom:8px">Предложенная группировка (нажми «Сгенерировать» чтобы запустить):</div>
+    ${buildings.length ? `
+      <div style="margin-bottom:10px">
+        <div style="font-size:0.82rem;color:var(--muted);margin-bottom:6px">🏛 Зданий для генерации фасадов: ${buildings.length}</div>
+        ${buildings.map((g, i) => `
+          <div class="facade-preview-row">
+            <div style="flex:1">
+              <div style="font-weight:600">${esc(g.building_name)}</div>
+              <div style="font-size:0.78rem;color:var(--muted);margin:2px 0">${esc((g.facade_description || '').slice(0, 220))}</div>
+              <div style="font-size:0.74rem;color:var(--muted)">↪ ${g.member_names?.map(esc).join(' · ') || '(пусто)'}</div>
+            </div>
+            <button class="btn-icon" onclick="facadesPreviewRemove(${i})" title="Не генерить этот фасад">✕</button>
+          </div>`).join('')}
+      </div>` : ''}
+    ${exteriors.length ? `
+      <div>
+        <div style="font-size:0.78rem;color:var(--muted)">🌳 Уже наружные (пропустим): ${exteriors.map(g => esc(g.building_name)).join(', ')}</div>
+      </div>` : ''}
+  `;
+}
+
+function facadesPreviewRemove(idx) {
+  if (!FACADES_STATE.groupsPreview) return;
+  FACADES_STATE.groupsPreview.splice(idx, 1);
+  _renderGroupsPreview(FACADES_STATE.groupsPreview);
+}
+
+async function facadesGenerate() {
+  if (!FACADES_STATE.groupsPreview?.length) {
+    alert('Сначала нажми «🤖 Сгруппировать локации»');
+    return;
+  }
+  const buildings = FACADES_STATE.groupsPreview.filter(g => g.type === 'building');
+  if (!buildings.length) {
+    alert('Нет зданий для генерации (все локации уже exterior).');
+    return;
+  }
+  if (!confirm(`Сгенерировать ${buildings.length} фасад(ов)? Это займёт ~2-3 минуты на каждое здание (картинка + 4-сек видео).`)) return;
+  try {
+    const r = await api.post(`/api/series/${S.seriesId}/facades/generate`, { groups: FACADES_STATE.groupsPreview });
+    if (r.error) throw new Error(r.error);
+    showToast(`▶ Запущено: ${r.count} зданий, обновление каждые 6с`, 4000);
+    FACADES_STATE.groupsPreview = null;
+    document.getElementById('facades-groups-preview').style.display = 'none';
+    _facadesStartPoll();
+    await facadesRefresh();
+  } catch (e) {
+    alert('Запуск не удался: ' + (e?.message || e));
+  }
+}
+
+async function facadesRegenerate(fid) {
+  if (!confirm('Перегенерить фасад? Старая картинка и видео будут удалены.')) return;
+  try {
+    const r = await api.post(`/api/series/${S.seriesId}/facades/${fid}/regenerate`, {});
+    if (r.error) throw new Error(r.error);
+    showToast('▶ Перегенерация запущена');
+    _facadesStartPoll();
+    await facadesRefresh();
+  } catch (e) {
+    alert('Не удалось: ' + (e?.message || e));
+  }
+}
+
+async function facadesDelete(fid) {
+  if (!confirm('Удалить фасад? Файлы тоже удалятся.')) return;
+  try {
+    await api.del(`/api/series/${S.seriesId}/facades/${fid}`);
+    await facadesRefresh();
+  } catch (e) {
+    alert('Не удалось: ' + (e?.message || e));
+  }
+}
+
+async function facadesOpenFolder() {
+  try {
+    const r = await api.post(`/api/series/${S.seriesId}/facades/folder`, {});
+    showToast('📂 ' + (r.folder || 'Папка открыта'), 4000);
+  } catch (e) {
+    showToast('Не удалось открыть: ' + (e?.message || e));
+  }
+}
+
 // ── Items (story-relevant props: handbag, gun, locket, ...) ───────────────────
 let currentItemId = null;
 
