@@ -2515,13 +2515,17 @@ def toggle_pin(sid):
 # lines BETWEEN the boundary markers, swallowing actual episode body into the
 # next match. Restricting to spaces/tabs keeps each match anchored to a single
 # line.
+# `[*_]{0,3}` tolerates markdown bold/italic wrappers like `**СЕРИЯ 1 — "TITLE"**`
+# or `__Episode 5__`. Without this, a script copy-pasted from chat (where the
+# author wrapped headings in `**`) silently parsed as a single mega-episode.
+# User-reported bug: Natia uploaded 5-episode RU script, preview said 1.
 _EPISODE_BOUNDARY_PATTERNS = [
-    # Triple-equals fenced: === ЭПИЗОД 5 === / === EPISODE 5 ===
-    r'(?im)^[ \t]*={2,}[ \t]*(?:эпизод|серия|episode|ep\.?)[ \t]*(\d+)[^\n]*$',
+    # Triple-equals fenced: === ЭПИЗОД 5 === / === EPISODE 5 === (±**bold**)
+    r'(?im)^[ \t]*[*_]{0,3}[ \t]*={2,}[ \t]*(?:эпизод|серия|episode|ep\.?)[ \t]*(\d+)[^\n]*$',
     # Markdown headers: ## ЭПИЗОД 5 / # Episode 5
     r'(?im)^#{1,6}[ \t]*(?:эпизод|серия|episode|ep\.?)[ \t]*(\d+)[^\n]*$',
-    # Plain bare line: ЭПИЗОД 5 / Episode 5 / Серия 5
-    r'(?im)^[ \t]*(?:эпизод|серия|episode|ep\.?)[ \t]+(\d+)[ \t]*[:\-—]?[ \t]*[^\n]*$',
+    # Plain bare line: ЭПИЗОД 5 / Episode 5 / Серия 5 / **СЕРИЯ 5 — "TITLE"**
+    r'(?im)^[ \t]*[*_]{0,3}[ \t]*(?:эпизод|серия|episode|ep\.?)[ \t]+(\d+)[ \t]*[:\-—]?[ \t]*[^\n]*$',
     # Numbered with period only: 5. (when on its own line)
     r'(?m)^[ \t]*(\d+)\.[ \t]*$',
 ]
@@ -2569,12 +2573,15 @@ def _split_script_into_episodes(text):
             end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
             body = text[start:end].strip()
             # Title = the matched line (without the marker prefix and any
-            # trailing decorators), trimmed.
+            # trailing decorators), trimmed. Strip markdown bold/italic
+            # wrappers (** __ *) — for `**СЕРИЯ 1 — "YOUR CEILING"**` the
+            # title should come out as `"YOUR CEILING"`, not `**"YOUR CEILING"**`.
             line = m.group(0).strip()
-            title = re.sub(r'^[#=\s]+', '', line)                                                # leading # / =
-            title = re.sub(r'[#=\s]+$', '', title)                                               # trailing # / =
+            title = re.sub(r'^[#=*_\s]+', '', line)                                              # leading # = * _
+            title = re.sub(r'[#=*_\s]+$', '', title)                                             # trailing # = * _
             title = re.sub(r'^(эпизод|серия|episode|ep\.?)\s*\d+\s*[:\-—]?\s*', '', title, flags=re.IGNORECASE)
-            episodes.append({'number': num, 'title': title.strip(), 'body': body})
+            title = title.strip(' \t*_#"\'')                                                     # final polish for stray quotes/decorators
+            episodes.append({'number': num, 'title': title, 'body': body})
         if episodes:
             # Renumber sequentially if numbers are dup or non-monotonic.
             seen = set()
