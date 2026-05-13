@@ -2594,6 +2594,106 @@ def _split_script_into_episodes(text):
     return [{'number': 1, 'title': '', 'body': text.strip()}]
 
 
+# Pattern for "CHARACTER: spoken text" — captures the speaker (uppercase
+# letters Latin/Cyrillic, 2+ chars) and the spoken body. Allows an optional
+# parenthetical action note between the name and the colon, e.g.
+#   VICTORIA *(nervous laugh)*: Wait... no.
+#   МАРКУС (тихо): That was before I knew.
+# The negative lookbehind via `[A-ZА-ЯЁ]` requires the FIRST char to be
+# uppercase so we don't false-match "Time:" or "Location:" labels.
+_DIALOGUE_LINE_RE = re.compile(
+    r'^[ \t]*([A-ZА-ЯЁ][A-ZА-ЯЁ0-9 \-\.]{1,30})\s*(?:\*?\([^)\n]+\)\*?)?\s*:\s*(.+?)\s*$',
+    re.MULTILINE,
+)
+# Action-only line wrapped in `*(...)*` or `[...]` — we explicitly DON'T
+# include these in dialogue detection (action lines may legitimately stay
+# in Russian per _SCRIPT_SYSTEM convention).
+_ACTION_LINE_RE = re.compile(
+    r'^\s*(?:\*\([^)]+\)\*|\[[^\]]+\])\s*$', re.MULTILINE,
+)
+_CYRILLIC_RE = re.compile(r'[Ѐ-ӿ]')
+_CJK_RE      = re.compile(r'[一-鿿]')          # Chinese / shared Han
+_HIRAGANA_RE = re.compile(r'[぀-ゟ]')
+_KATAKANA_RE = re.compile(r'[゠-ヿ]')
+_HANGUL_RE   = re.compile(r'[가-힯]')
+_LATIN_RE    = re.compile(r'[A-Za-z]')
+
+def _detect_dialogue_language(text: str) -> dict:
+    """Walk every "CHARACTER: spoken text" line, measure how much of the
+    spoken body is non-Latin script. Returns a dict the preview endpoint
+    can pass straight to the UI:
+
+        {dialogue_lines, non_english_lines, ratio,
+         sample_lines: [str], detected_lang: 'ru'|'zh'|'ja'|'ko'|'other'|'en'}
+
+    Action lines wrapped in `*(...)*` or `[...]` are ignored — they may
+    legitimately stay in Russian per the _SCRIPT_SYSTEM convention.
+    The caller decides whether to warn (suggested threshold: ratio > 0.15).
+    """
+    if not text or not text.strip():
+        return {'dialogue_lines': 0, 'non_english_lines': 0, 'ratio': 0.0,
+                'sample_lines': [], 'detected_lang': 'en'}
+
+    total = 0
+    non_en = 0
+    lang_counts = {'ru': 0, 'zh': 0, 'ja': 0, 'ko': 0, 'other': 0}
+    samples = []
+
+    for m in _DIALOGUE_LINE_RE.finditer(text):
+        speaker = m.group(1).strip()
+        spoken  = m.group(2).strip()
+        # Filter false positives — labels like "TIME:", "LOCATION:" that
+        # match the uppercase pattern but aren't real dialogue. Real
+        # character names usually contain no whitespace OR are 1-2 words
+        # max; if it's a single common label word, skip.
+        if speaker.upper() in ('TIME', 'LOCATION', 'DAY', 'NIGHT', 'NOTE',
+                               'BRIEF', 'SUMMARY', 'SCENE', 'EPISODE',
+                               'CAST', 'CHARACTER', 'CHARACTERS', 'PLACE',
+                               'ВРЕМЯ', 'МЕСТО', 'СЦЕНА', 'ЭПИЗОД', 'СЕРИЯ',
+                               'ЛОКАЦИЯ', 'ПЕРСОНАЖИ', 'ПЕРСОНАЖ'):
+            continue
+        if not spoken or len(spoken) < 3:
+            continue
+        total += 1
+        latin_n    = len(_LATIN_RE.findall(spoken))
+        cyr_n      = len(_CYRILLIC_RE.findall(spoken))
+        cjk_n      = len(_CJK_RE.findall(spoken))
+        hira_n     = len(_HIRAGANA_RE.findall(spoken))
+        kata_n     = len(_KATAKANA_RE.findall(spoken))
+        hangul_n   = len(_HANGUL_RE.findall(spoken))
+        non_latin  = cyr_n + cjk_n + hira_n + kata_n + hangul_n
+        alpha_total = latin_n + non_latin
+        if alpha_total == 0:
+            continue  # all punctuation/digits — undecidable, skip
+        non_latin_ratio = non_latin / alpha_total
+        if non_latin_ratio > 0.4:
+            non_en += 1
+            # Classify which script dominated this line.
+            buckets = (('ru', cyr_n), ('zh', cjk_n),
+                       ('ja', hira_n + kata_n), ('ko', hangul_n))
+            top = max(buckets, key=lambda b: b[1])
+            lang_counts[top[0] if top[1] > 0 else 'other'] += 1
+            if len(samples) < 3:
+                # Trim long lines for UI display.
+                sample = f'{speaker}: {spoken}'
+                samples.append(sample[:140] + ('…' if len(sample) > 140 else ''))
+
+    ratio = (non_en / total) if total else 0.0
+    detected = 'en'
+    if non_en > 0:
+        # Pick the dominant non-EN script across all flagged lines.
+        top = max(lang_counts.items(), key=lambda kv: kv[1])
+        detected = top[0] if top[1] > 0 else 'other'
+
+    return {
+        'dialogue_lines': total,
+        'non_english_lines': non_en,
+        'ratio': round(ratio, 3),
+        'sample_lines': samples,
+        'detected_lang': detected,
+    }
+
+
 # Per-series import status; UI polls /import-status. Lives in-memory only;
 # survives across requests in the same gunicorn worker (we run with workers=1
 # anyway). On restart the user just sees no in-flight job and can retry.
@@ -3166,18 +3266,124 @@ def import_from_script_apply_fixes():
 def import_from_script_preview():
     """Returns the proposed episode breakdown for a pasted script WITHOUT
     creating anything. UI shows it as a confirmable preview. Cheap (regex-
-    only, no LLM)."""
+    only, no LLM).
+
+    Also runs `_detect_dialogue_language()` — if more than 15% of dialogue
+    lines are non-English, returns a `dialogue_lang_warning` payload so
+    the UI can offer to adapt the script to English before commit."""
     data = request.json or {}
     script = (data.get('script') or '').strip()
     if not script:
         return jsonify({'error': 'script required'}), 400
     eps = _split_script_into_episodes(script)
-    return jsonify({
+    lang_info = _detect_dialogue_language(script)
+    payload = {
         'episodes': [
             {'number': e['number'], 'title': e['title'], 'preview': e['body'][:240], 'length': len(e['body'])}
             for e in eps
         ],
         'total_chars': len(script),
+    }
+    # 15% threshold — below that the few stray non-EN words are probably
+    # quoted phrases or names, not the dominant dialogue language.
+    if lang_info['ratio'] > 0.15 and lang_info['non_english_lines'] > 0:
+        payload['dialogue_lang_warning'] = lang_info
+    return jsonify(payload)
+
+
+_TRANSLATE_DIALOGUES_SYSTEM = """You are a screenplay localization editor. \
+Your only job: rewrite the dialogue lines in the user's script so the spoken \
+text is natural conversational ENGLISH, while preserving everything else \
+EXACTLY as it appears in the input.
+
+WHAT TO TRANSLATE:
+- Spoken dialogue body — the text AFTER `CHARACTER:` (or `CHARACTER (action):`).
+  Make it natural spoken English. Preserve emotional tone and meaning. Keep
+  the same approximate length (±20% words). Use contractions ("I'm", "don't")
+  for realistic speech.
+
+WHAT TO LEAVE UNTOUCHED, BYTE-FOR-BYTE:
+- Episode/scene headers (e.g. `**СЕРИЯ 1 — "TITLE"**`, `=== ЭПИЗОД 5 ===`,
+  `## EPISODE 1`, scene slug lines like `ИНТА. РЕСТОРАН — НОЧЬ`).
+- Character name cues — leave the speaker label in original casing
+  (e.g. `VICTORIA:`, `МАРКУС:` — DON'T transliterate Cyrillic names).
+- Action lines / stage directions wrapped in `[...]`, `(...)`, or `*(...)*`.
+  These may stay in their original language (per project convention).
+- Blank lines, separators (`---`, `===`), markdown formatting (`**`, `*`).
+- English dialogue lines that are ALREADY in English — output them unchanged.
+
+OUTPUT FORMAT:
+- Return ONLY the rewritten script. No preamble, no explanation, no code fence.
+- Preserve line order exactly. Preserve line breaks. Same number of lines as input.
+
+EXAMPLE:
+Input:
+  **СЕРИЯ 1 — "ПОТОЛОК"**
+  *(awkward silence in the store)*
+  VICTORIA *(nervous laugh)*: Подожди... нет, это шутка. Ты серьёзно?
+  MARCUS: Это было до того, как я узнал.
+
+Output:
+  **СЕРИЯ 1 — "ПОТОЛОК"**
+  *(awkward silence in the store)*
+  VICTORIA *(nervous laugh)*: Wait... no, this has to be a joke. Are you serious?
+  MARCUS: That was before I knew.
+"""
+
+@app.route('/api/series/import-from-script/translate-dialogues', methods=['POST'])
+def import_from_script_translate_dialogues():
+    """Single Claude pass that rewrites only the spoken-text portion of each
+    dialogue line to natural English, leaving headers / action lines / scene
+    slugs / character cues untouched. UI calls this when the user clicks
+    «Адаптировать на английский» in the preview modal.
+
+    Body: {script: str}
+    Returns: {translated_script: str, lines_changed_estimate: int,
+              before_ratio: float, after_ratio: float}
+    """
+    data = request.json or {}
+    script = (data.get('script') or '').strip()
+    if not script:
+        return jsonify({'error': 'script required'}), 400
+    if len(script) > 200000:
+        # Sanity guard — gigantic paste would blow up Claude's context. We
+        # could split-and-stitch but that's an iteration-2 feature; for now
+        # tell the user to split manually.
+        return jsonify({'error': 'script too long (>200k chars). Split into smaller batches and translate each.'}), 400
+
+    before = _detect_dialogue_language(script)
+    try:
+        translated = claude_ask(
+            script,
+            system=_TRANSLATE_DIALOGUES_SYSTEM,
+            model='sonnet',  # need translation quality, not haiku speed
+            max_tokens=24000,
+            timeout=600,
+        ).strip()
+    except Exception as e:
+        _log_event('WARN', 'translate_dialogues_failed', err=str(e)[:300],
+                   script_chars=len(script))
+        return jsonify({'error': f'Не удалось адаптировать сценарий: {e}'}), 500
+
+    # Strip accidental code-fence wrappers if the model still added them.
+    if translated.startswith('```'):
+        translated = re.sub(r'^```[a-zA-Z]*\n?', '', translated)
+        translated = re.sub(r'\n?```\s*$', '', translated)
+        translated = translated.strip()
+
+    after = _detect_dialogue_language(translated)
+    _log_event('INFO', 'translate_dialogues_ok',
+               before_ratio=before['ratio'], after_ratio=after['ratio'],
+               before_lang=before.get('detected_lang'),
+               script_chars=len(script), translated_chars=len(translated))
+
+    return jsonify({
+        'translated_script': translated,
+        'before_ratio': before['ratio'],
+        'after_ratio':  after['ratio'],
+        'before_lang':  before.get('detected_lang', 'en'),
+        'lines_total':  before['dialogue_lines'],
+        'lines_changed_estimate': before['non_english_lines'] - after['non_english_lines'],
     })
 
 
@@ -3211,6 +3417,7 @@ def import_from_script():
         do_extract_chars  = _flag('extract_characters', do_extract)
         do_extract_locs   = _flag('extract_locations',  do_extract)
         do_extract_items  = _flag('extract_items',      do_extract)
+        dialogue_lang_hint = (form.get('dialogue_language_hint') or '').strip().lower()
         char_files = request.files.getlist('character_files') or request.files.getlist('character_files[]')
         loc_files  = request.files.getlist('location_files')  or request.files.getlist('location_files[]')
     else:
@@ -3222,6 +3429,7 @@ def import_from_script():
         do_extract_chars = bool(data.get('extract_characters', do_extract))
         do_extract_locs  = bool(data.get('extract_locations',  do_extract))
         do_extract_items = bool(data.get('extract_items',      do_extract))
+        dialogue_lang_hint = (data.get('dialogue_language_hint') or '').strip().lower()
         char_files, loc_files = [], []
 
     if not title:
@@ -3259,6 +3467,12 @@ def import_from_script():
             'image_size': '1K',
         },
     }
+    # User imported a non-English script and explicitly chose «оставить как
+    # есть» in the preview warning — remember it on the series so the UI can
+    # show a persistent badge `🌐 Диалоги: русский` and the user isn't
+    # surprised later. Empty / 'en' = no badge.
+    if dialogue_lang_hint and dialogue_lang_hint not in ('en', 'english'):
+        series_data['dialogue_language_hint'] = dialogue_lang_hint
     save_series(sid, series_data)
     scaffold_series_folders(sid, title)
 
@@ -3693,6 +3907,10 @@ def append_from_script(sid):
     if not script:
         return jsonify({'error': 'script required'}), 400
     do_extract = bool(data.get('extract_entities', True))
+    dialogue_lang_hint = (data.get('dialogue_language_hint') or '').strip().lower()
+    if dialogue_lang_hint and dialogue_lang_hint not in ('en', 'english'):
+        s['dialogue_language_hint'] = dialogue_lang_hint
+        save_series(sid, s)
 
     eps = _split_script_into_episodes(script)
     if not eps:

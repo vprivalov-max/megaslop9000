@@ -1134,10 +1134,92 @@ function importUpdateStats() {
   if (stats) stats.textContent = `${txt.length.toLocaleString('ru-RU')} символов`;
 }
 
+// Module-level state for "user clicked «оставить как есть» on the language
+// warning" — keyed by the textarea id (so import vs append flows don't bleed
+// into each other). The commit function reads this to decide whether to
+// send a `dialogue_language_hint` to the backend.
+const _LANG_WARN_KEPT = {};  // {'import-series-script': 'ru', ...}
+
+const _LANG_LABELS = {
+  ru: 'русский', zh: 'китайский', ja: 'японский',
+  ko: 'корейский', other: 'не-английский',
+};
+
+function _renderLangWarning(payload, textareaId) {
+  // Returns HTML for the yellow warning plate, or '' if no warning. Skips
+  // rendering if the user has already dismissed it for this textarea in
+  // this session.
+  if (!payload || _LANG_WARN_KEPT[textareaId]) return '';
+  const pct = Math.round((payload.ratio || 0) * 100);
+  const lang = _LANG_LABELS[payload.detected_lang] || payload.detected_lang || 'не-английский';
+  const samples = (payload.sample_lines || []).map(s => `<div style="font-family:monospace;font-size:0.78rem;color:var(--muted);margin-left:8px">${esc(s)}</div>`).join('');
+  return `
+    <div class="lang-warn-plate" style="margin-bottom:10px;padding:10px 12px;background:rgba(251,191,36,0.10);border:1px solid rgba(251,191,36,0.45);border-radius:6px;font-size:0.85rem;line-height:1.45">
+      <div style="color:#fbbf24;font-weight:600;margin-bottom:4px">⚠ Диалоги не на английском (~${pct}% строк, похоже на ${esc(lang)})</div>
+      <div style="color:var(--text);margin:6px 0">
+        ${samples}
+      </div>
+      <div style="color:var(--muted);margin:6px 0 10px;font-size:0.8rem">
+        По умолчанию тулза работает с английскими диалогами. Если оставить как
+        есть — персонажи будут говорить на оригинальном языке в видео-генерации.
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <button class="btn-accent btn-sm" onclick="langWarnAdapt('${textareaId}', this)">🔄 Адаптировать на английский (Claude, ~30с)</button>
+        <button class="btn-ghost btn-sm" onclick="langWarnKeep('${textareaId}', '${esc(payload.detected_lang)}')">⏭ Оставить как есть</button>
+      </div>
+    </div>`;
+}
+
+// User clicked "Адаптировать" — calls translate endpoint, swaps textarea
+// content with translated version, re-runs the appropriate preview which
+// will now show 0% non-EN dialogue and no warning.
+async function langWarnAdapt(textareaId, btn) {
+  const ta = document.getElementById(textareaId);
+  if (!ta) return;
+  const script = (ta.value || '').trim();
+  if (!script) return;
+  const originalLabel = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span> Адаптирую...';
+  try {
+    const r = await api.post('/api/series/import-from-script/translate-dialogues',
+      { script }, { timeoutMs: 600000 });
+    if (r.error) throw new Error(r.error);
+    ta.value = r.translated_script || script;
+    // Refresh char-count badge if present.
+    if (typeof importUpdateStats === 'function') importUpdateStats();
+    if (typeof appendUpdateStats === 'function') appendUpdateStats();
+    // Re-run the matching preview — warning should disappear because
+    // backend now sees ratio ≈ 0.
+    if (textareaId === 'import-series-script' && typeof importPreviewSplit === 'function') {
+      importPreviewSplit();
+    } else if (textareaId === 'append-script-text' && typeof appendPreviewSplit === 'function') {
+      appendPreviewSplit();
+    }
+    showToast(`✓ Сценарий адаптирован на английский (заменено реплик: ~${r.lines_changed_estimate || 0})`, 4000);
+  } catch (e) {
+    btn.disabled = false;
+    btn.innerHTML = originalLabel;
+    showToast('✗ Не удалось адаптировать: ' + (e?.message || e), 5000);
+  }
+}
+
+// User clicked "Оставить как есть" — remember the language hint locally so
+// the commit function can persist it on series.json, then hide the plate.
+function langWarnKeep(textareaId, lang) {
+  _LANG_WARN_KEPT[textareaId] = lang;
+  const plate = document.querySelector(`.lang-warn-plate`);
+  if (plate) plate.remove();
+  showToast(`⚠ Сериал будет с диалогами на оригинальном языке (${_LANG_LABELS[lang] || lang})`, 4000);
+}
+
 async function importPreviewSplit() {
   const script = (document.getElementById('import-series-script')?.value || '').trim();
   const previewEl = document.getElementById('import-series-preview');
   if (!script) { previewEl.innerHTML = '<div style="color:var(--warning);font-size:0.85rem">Сценарий пустой</div>'; return; }
+  // Reset kept-decision when user re-pastes / re-previews so the warning
+  // can show again if it's still relevant.
+  delete _LANG_WARN_KEPT['import-series-script'];
   previewEl.innerHTML = '<div style="font-size:0.85rem;color:var(--muted)"><span class="spinner"></span> Анализирую разбивку...</div>';
   try {
     const r = await api.post('/api/series/import-from-script/preview', { script });
@@ -1147,7 +1229,9 @@ async function importPreviewSplit() {
       previewEl.innerHTML = '<div style="color:var(--warning);font-size:0.85rem">Не удалось разбить — будет создан 1 эпизод со всем текстом</div>';
       return;
     }
+    const warnHtml = _renderLangWarning(r.dialogue_lang_warning, 'import-series-script');
     previewEl.innerHTML = `
+      ${warnHtml}
       <div style="font-size:0.85rem;color:var(--success);margin-bottom:6px">
         ✓ Найдено эпизодов: <strong>${eps.length}</strong>
       </div>
@@ -1248,6 +1332,7 @@ async function importCreateSeries() {
   btn.innerHTML = '<span class="spinner"></span> Создаю сериал...';
   try {
     const hasFiles = IMPORT_PICKED.chars.length + IMPORT_PICKED.locs.length > 0;
+    const langHint = _LANG_WARN_KEPT['import-series-script'] || '';
     let r;
     if (hasFiles) {
       // Multipart path — pre-upload files alongside the script.
@@ -1257,6 +1342,7 @@ async function importCreateSeries() {
       fd.append('extract_characters', extractChars ? '1' : '0');
       fd.append('extract_locations',  extractLocs  ? '1' : '0');
       fd.append('extract_items',      extractItems ? '1' : '0');
+      if (langHint) fd.append('dialogue_language_hint', langHint);
       // Rename file to the user-edited name (preserving extension) so the
       // backend stem→name converter picks up edits made in the chip UI.
       const _renamed = (entry) => {
@@ -1268,12 +1354,14 @@ async function importCreateSeries() {
       for (const e of IMPORT_PICKED.locs)  fd.append('location_files',  _renamed(e));
       r = await api.postForm('/api/series/import-from-script', fd, { timeoutMs: 180000 });
     } else {
-      r = await api.post('/api/series/import-from-script', {
+      const body = {
         title, script,
         extract_characters: extractChars,
         extract_locations:  extractLocs,
         extract_items:      extractItems,
-      });
+      };
+      if (langHint) body.dialogue_language_hint = langHint;
+      r = await api.post('/api/series/import-from-script', body);
     }
     if (r.error) throw new Error(r.error);
     closeModal('modal-create-series');
@@ -1459,6 +1547,7 @@ async function appendPreviewSplit() {
   const script = (document.getElementById('append-script-text')?.value || '').trim();
   const previewEl = document.getElementById('append-script-preview');
   if (!script) { previewEl.innerHTML = '<div style="color:var(--warning);font-size:0.85rem">Сценарий пустой</div>'; return; }
+  delete _LANG_WARN_KEPT['append-script-text'];
   previewEl.innerHTML = '<div style="font-size:0.85rem;color:var(--muted)"><span class="spinner"></span> Анализирую разбивку...</div>';
   try {
     const r = await api.post('/api/series/import-from-script/preview', { script });
@@ -1469,7 +1558,9 @@ async function appendPreviewSplit() {
       previewEl.innerHTML = '<div style="color:var(--warning);font-size:0.85rem">Не удалось разбить — будет добавлена 1 серия со всем текстом</div>';
       return;
     }
+    const warnHtml = _renderLangWarning(r.dialogue_lang_warning, 'append-script-text');
     previewEl.innerHTML = `
+      ${warnHtml}
       <div style="font-size:0.85rem;color:var(--success);margin-bottom:6px">
         ✓ Найдено эпизодов: <strong>${eps.length}</strong> · станут сериями <strong>№${startNum}–${startNum + eps.length - 1}</strong>
       </div>
@@ -1636,9 +1727,10 @@ async function appendScriptGo() {
   btn.disabled = true;
   btn.innerHTML = '<span class="spinner"></span> Добавляю...';
   try {
-    const r = await api.post(`/api/series/${S.seriesId}/append-from-script`, {
-      script, extract_entities: extract,
-    });
+    const langHint = _LANG_WARN_KEPT['append-script-text'] || '';
+    const body = { script, extract_entities: extract };
+    if (langHint) body.dialogue_language_hint = langHint;
+    const r = await api.post(`/api/series/${S.seriesId}/append-from-script`, body);
     if (r.error) throw new Error(r.error);
     closeModal('modal-append-script');
     const range = (r.first_episode === r.last_episode)
@@ -3003,7 +3095,10 @@ function renderSeriesView() {
 
   // Bible
   const autogenOn = !!s.auto_generate_assets;
+  const dlHint = s.dialogue_language_hint;
+  const dlLabel = dlHint ? (_LANG_LABELS[dlHint] || dlHint) : '';
   document.getElementById('bible-content').innerHTML = `
+    ${dlHint ? `<div style="margin-bottom:8px;padding:6px 10px;background:rgba(251,191,36,0.10);border:1px solid rgba(251,191,36,0.35);border-radius:6px;font-size:0.82rem;color:#fbbf24" title="При импорте сценария тулза обнаружила диалоги не на английском и юзер выбрал «оставить как есть». Видео-генерация будет на оригинальном языке.">🌐 Диалоги: <strong>${esc(dlLabel)}</strong> — не EN</div>` : ''}
     ${s.genre ? `<div><strong>Жанр:</strong> ${esc(s.genre)}</div>` : ''}
     ${s.tone ? `<div><strong>Тон:</strong> ${esc(s.tone)}</div>` : ''}
     ${s.target_audience ? `<div><strong>Аудитория:</strong> ${esc(s.target_audience)}</div>` : ''}
