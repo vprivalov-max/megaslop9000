@@ -5427,21 +5427,29 @@ def _facade_status(sid):
     })
 
 
-@app.route('/api/series/<sid>/facades/group', methods=['POST'])
-def facades_group(sid):
-    """Have Claude cluster the series' locations into parent buildings.
-    Returns preview groupings — frontend lets the user accept / edit before
-    kicking off generation. Pure read; no side effects."""
-    s = load_series(sid)
-    if not s:
-        return jsonify({'error': 'not found'}), 404
-    locs = [l for l in (s.get('locations') or []) if l.get('name')]
-    if not locs:
-        return jsonify({'error': 'У сериала нет локаций для группировки'}), 400
+def _claude_group_locations(locs, existing_building_names=None):
+    """Cluster the given locations into building groups via Claude. Reused
+    by the manual `/facades/group` endpoint and by the post-accept auto
+    sweep. `existing_building_names` (optional) is passed as context so
+    Claude prefers reusing an existing facade's name when a new location
+    belongs to a building already in the library — keeps grouping stable
+    across multiple script-accept cycles.
+
+    Returns: list of dicts with keys
+      building_name, type ('building'|'exterior'), facade_description,
+      member_loc_ids, member_names.
+    """
     locs_block = '\n'.join(
         f'- id={l["id"]} | "{l["name"]}" — {(l.get("description") or "")[:200]}'
         for l in locs
     )
+    existing_block = ''
+    if existing_building_names:
+        existing_block = (
+            "\nУЖЕ СУЩЕСТВУЮЩИЕ ЗДАНИЯ В ЭТОМ СЕРИАЛЕ (если новая локация "
+            "принадлежит одному из них — используй его имя ДОСЛОВНО):\n"
+            + '\n'.join(f'  • {n}' for n in existing_building_names) + '\n'
+        )
     sys = (
         "Ты — продюсер визуальной библиотеки сериала. Тебе дают список локаций. "
         "Сгруппируй их по ЗДАНИЯМ-ОБЛАДАТЕЛЯМ. Цель: для каждого здания сгенерируем "
@@ -5459,8 +5467,9 @@ def facades_group(sid):
         "Лучше лишний фасад, чем неправильное склеивание.\n"
         "4. Имя здания должно быть КОНКРЕТНЫМ (имя владельца / название учреждения / города), "
         "не «building» / «structure» / «place». «Bellacourt Mansion», не «Mansion».\n"
-        "5. type='building' для зданий нуждающихся в фасадной генерации, type='exterior' для уже-наружных.\n\n"
-        f"ЛОКАЦИИ СЕРИАЛА:\n{locs_block}\n\n"
+        "5. type='building' для зданий нуждающихся в фасадной генерации, type='exterior' для уже-наружных.\n"
+        f"{existing_block}"
+        f"\nЛОКАЦИИ СЕРИАЛА:\n{locs_block}\n\n"
         "Верни JSON и ТОЛЬКО JSON:\n"
         '{\n'
         '  "groups": [\n'
@@ -5473,15 +5482,30 @@ def facades_group(sid):
         '  ]\n'
         '}\n'
     )
+    raw = claude_ask("Сгруппируй и верни JSON.", system=sys, max_tokens=4000)
+    data = json.loads(strip_json(raw))
+    groups = data.get('groups') or []
+    known_ids = {l['id'] for l in locs}
+    name_by_id = {l['id']: l['name'] for l in locs}
+    for g in groups:
+        g['member_loc_ids'] = [i for i in (g.get('member_loc_ids') or []) if i in known_ids]
+        g['member_names']   = [name_by_id[i] for i in g['member_loc_ids']]
+    return groups
+
+
+@app.route('/api/series/<sid>/facades/group', methods=['POST'])
+def facades_group(sid):
+    """Have Claude cluster the series' locations into parent buildings.
+    Returns preview groupings — frontend lets the user accept / edit before
+    kicking off generation. Pure read; no side effects."""
+    s = load_series(sid)
+    if not s:
+        return jsonify({'error': 'not found'}), 404
+    locs = [l for l in (s.get('locations') or []) if l.get('name')]
+    if not locs:
+        return jsonify({'error': 'У сериала нет локаций для группировки'}), 400
     try:
-        raw = claude_ask("Сгруппируй и верни JSON.", system=sys, max_tokens=4000)
-        data = json.loads(strip_json(raw))
-        groups = data.get('groups') or []
-        known_ids = {l['id'] for l in locs}
-        name_by_id = {l['id']: l['name'] for l in locs}
-        for g in groups:
-            g['member_loc_ids'] = [i for i in (g.get('member_loc_ids') or []) if i in known_ids]
-            g['member_names'] = [name_by_id[i] for i in g['member_loc_ids']]
+        groups = _claude_group_locations(locs)
         return jsonify({'groups': groups})
     except Exception as e:
         return jsonify({'error': f'Group failed: {e}'}), 500
@@ -5645,6 +5669,107 @@ def facades_generate(sid):
     _spawn_with_keys(_facade_worker, sid, groups)
     work_count = len([g for g in groups if g.get('type') == 'building'])
     return jsonify({'started': True, 'count': work_count})
+
+
+def auto_facades_for_new_locations(sid):
+    """Idempotent post-sweep hook: find locations that have a generated
+    interior but aren't yet a member of any existing facade group, ask
+    Claude to cluster them (using existing building names as anchors so
+    similar locs reuse an existing facade), then either MERGE into the
+    existing facade by name or spawn `_facade_worker` for genuinely new
+    buildings.
+
+    Called from the tail of `auto_generate_missing_assets` so facade gen
+    fires automatically after interiors finish. Safe to call repeatedly —
+    on a second invocation with no new locations it's a no-op.
+
+    Honors:
+      • `series.auto_facades = False`  → skip (explicit user opt-out)
+      • `location._skip_autogen = True` → loc never participates
+      • `_facade_status(sid).running`   → don't double-run
+    """
+    s = load_series(sid)
+    if not s:
+        return
+    if s.get('auto_facades') is False:
+        return  # explicit opt-out at series level
+    if s.get('auto_generate_assets') is False:
+        return  # broader opt-out — user disabled autogen entirely
+    st = _facade_status(sid)
+    if st.get('running'):
+        print(f'[auto-facades {sid}] worker already running — skipping', flush=True)
+        return
+
+    existing_facades = s.get('location_facades') or []
+    existing_member_ids = {
+        mid for f in existing_facades for mid in (f.get('member_loc_ids') or [])
+    }
+    existing_name_to_facade = {
+        (f.get('building_name') or '').strip().lower(): f
+        for f in existing_facades if f.get('building_name')
+    }
+    all_locs = s.get('locations') or []
+    new_locs = [
+        l for l in all_locs
+        if l.get('id') and l['id'] not in existing_member_ids
+        and not l.get('_skip_autogen')
+        and (l.get('ref_images') or [])   # interior already rendered
+    ]
+    if not new_locs:
+        return  # nothing to do — fully idempotent
+
+    print(f'[auto-facades {sid}] {len(new_locs)} new location(s) need facade — grouping…', flush=True)
+    try:
+        existing_names = sorted({f.get('building_name', '').strip() for f in existing_facades if f.get('building_name')})
+        groups = _claude_group_locations(new_locs, existing_building_names=existing_names)
+    except Exception as e:
+        print(f'[auto-facades {sid}] grouping failed: {e}', flush=True)
+        _log_event('WARN', 'auto_facades_group_failed', sid=sid, err=str(e)[:200])
+        return
+
+    # Split: groups whose building_name matches an existing facade → merge.
+    # Groups with a new building_name → queue for _facade_worker.
+    work_groups = []
+    s_disk = load_series(sid)
+    if not s_disk:
+        return
+    s_disk.setdefault('location_facades', [])
+    merges = 0
+    for g in groups:
+        if g.get('type') != 'building':
+            continue  # exteriors don't need facade gen
+        bname = (g.get('building_name') or '').strip()
+        if not bname:
+            continue
+        new_mids = [m for m in (g.get('member_loc_ids') or []) if m not in existing_member_ids]
+        if not new_mids:
+            continue
+        existing = existing_name_to_facade.get(bname.lower())
+        if existing:
+            # Merge: extend the existing facade's member list. No re-render.
+            for f in s_disk.get('location_facades', []):
+                if f.get('id') == existing.get('id'):
+                    f.setdefault('member_loc_ids', [])
+                    for mid in new_mids:
+                        if mid not in f['member_loc_ids']:
+                            f['member_loc_ids'].append(mid)
+                    merges += 1
+                    break
+        else:
+            work_groups.append({
+                'building_name': bname,
+                'type': 'building',
+                'facade_description': (g.get('facade_description') or '').strip(),
+                'member_loc_ids': new_mids,
+            })
+    if merges:
+        save_series(sid, s_disk)
+        print(f'[auto-facades {sid}] merged into {merges} existing facade(s)', flush=True)
+
+    if work_groups:
+        print(f'[auto-facades {sid}] kicking off facade gen for {len(work_groups)} new building(s): '
+              + ', '.join(g["building_name"] for g in work_groups), flush=True)
+        _spawn_with_keys(_facade_worker, sid, work_groups)
 
 
 @app.route('/api/series/<sid>/facades', methods=['GET'])
@@ -6793,6 +6918,16 @@ def auto_generate_missing_assets(sid):
                     # _spawn_with_keys), so _capture_user_keys() reads the propagated
                     # keys and forwards them to the recursive sweep.
                     _spawn_with_keys(auto_generate_missing_assets, sid)
+                else:
+                    # Interiors are settled — kick off facade auto-grouping for any
+                    # locations that came out of this sweep without an existing
+                    # facade. Idempotent: re-running on an unchanged series is a
+                    # no-op. Runs in its own background thread so this sweep can
+                    # release its lock immediately.
+                    try:
+                        _spawn_with_keys(auto_facades_for_new_locations, sid)
+                    except Exception as e:
+                        print(f'[autogen {sid}] facade auto-trigger failed to spawn: {e}')
         except Exception as e:
             print(f'[autogen {sid}] re-check failed: {e}')
 
