@@ -15261,14 +15261,13 @@ async function cropSave() {
 // (hashchange listener already registered next to navigate())
 
 // ── Help video modal ──────────────────────────────────────────────────────────
-// Replace HELP_VIDEO_ID below with your YouTube video ID (the part after ?v=)
-const HELP_VIDEO_YT_ID = 'HELP_VIDEO_ID';
+const HELP_VIDEO_DRIVE_ID = '1RvrO3jaJDNXvgXOusUZxSvg1McoqpUwe';
 
 function openHelpVideo() {
   const modal = document.getElementById('help-video-modal');
   const iframe = document.getElementById('help-video-iframe');
   if (!modal || !iframe) return;
-  iframe.src = `https://www.youtube.com/embed/${HELP_VIDEO_YT_ID}?autoplay=1&rel=0&modestbranding=1`;
+  iframe.src = `https://drive.google.com/file/d/${HELP_VIDEO_DRIVE_ID}/preview`;
   modal.classList.remove('hidden');
 }
 
