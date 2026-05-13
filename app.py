@@ -4185,6 +4185,29 @@ def _series_style_clause(s):
     return f"Visual style: {v}"
 
 
+# Keywords that indicate clothing is already described in appearance/description.
+_CLOTHING_WORDS = (
+    'wearing', 'dressed', 'outfit', 'shirt', 'blouse', 'dress', 'skirt',
+    'pants', 'trousers', 'jeans', 'jacket', 'coat', 'suit', 'uniform',
+    'sweater', 'hoodie', 'vest', 'shorts', 'gown', 'robe', 'cloak',
+    'clothes', 'clothing', 'attire', 'wardrobe', 'fabric', 'garment',
+    # Russian equivalents
+    'одет', 'носит', 'костюм', 'платье', 'рубашка', 'блузка', 'юбка',
+    'брюки', 'джинсы', 'куртка', 'пальто', 'свитер', 'худи', 'шорты',
+    'халат', 'мантия', 'одежда', 'форма',
+)
+
+def _clothing_clause(appearance: str, description: str = '') -> str:
+    """Return 'Fully clothed in everyday casual attire. ' if neither
+    appearance nor description mentions any clothing. Prevents models
+    from defaulting to lingerie/swimwear on female full-body portraits."""
+    combined = (appearance + ' ' + description).lower()
+    if any(w in combined for w in _CLOTHING_WORDS):
+        return ''
+    return 'Fully clothed in everyday casual attire. '
+
+
+
 # ── Characters ───────────────────────────────────────────────────────────────
 
 @app.route('/api/series/<sid>/characters', methods=['POST'])
@@ -4652,9 +4675,12 @@ def generate_character_image(sid, char_id):
 
     gender = 'woman' if char.get('gender') == 'female' else 'man'
     style_clause = _series_style_clause(s)
+    _appearance = char.get('appearance', '')
+    _desc = char.get('description', '')
     prompt = (
         f"Full body portrait of {char['name']}, a {gender}. "
-        f"{char.get('appearance', '')}. {char.get('description', '')}. "
+        f"{_appearance}. {_desc}. "
+        f"{_clothing_clause(_appearance, _desc)}"
         f"Standing facing camera, slight 3/4 angle. Neutral relaxed pose. "
         f"Arms hanging loosely at sides, hands open and empty — no objects held, no props, not in pockets. "
         f"Uniform solid gray background, #808080, no gradients, no props, no furniture. No shadows or reflections on background. "
@@ -4782,9 +4808,11 @@ def regenerate_character(sid, char_id):
     gender = 'woman' if char.get('gender') == 'female' else 'man'
     constraints_clause = f" IMPORTANT — strictly follow these constraints: {wishes}." if wishes else ""
     style_clause = _series_style_clause(s)
+    _desc = char.get('description', '')
     prompt = (
         f"Full body portrait of {char['name']}, a {gender}. "
-        f"{appearance_for_prompt}. {char.get('description', '')}.{constraints_clause} "
+        f"{appearance_for_prompt}. {_desc}.{constraints_clause} "
+        f"{_clothing_clause(appearance_for_prompt, _desc)}"
         f"Standing facing camera, slight 3/4 angle. Neutral relaxed pose. "
         f"Arms hanging loosely at sides, hands open and empty — no objects held, no props, not in pockets. "
         f"Uniform solid gray background, #808080, no gradients, no props, no furniture. No shadows or reflections on background. "
@@ -6064,10 +6092,12 @@ def _gen_char_base_inline(s, sid, char):
     is_stylised = bool(style_clause and 'strict' in style_clause.lower())
     realism_suffix = '' if is_stylised else ' Photorealistic, cinematic quality, high detail on face and clothing.'
     style_prefix = (style_clause + ' ') if style_clause else ''
+    clothing_fallback = '' if is_animal else _clothing_clause(appearance, description)
     prompt = (
         f"{style_prefix}"
         f"Full body portrait of {char['name']}{kind_label}. "
         f"{appearance}. {description}.{constraints_clause} "
+        f"{clothing_fallback}"
         f"Standing facing camera, slight 3/4 angle. Neutral relaxed pose. "
         f"Arms hanging loosely at sides, hands open and empty — no objects held, no props, not in pockets. "
         f"Uniform solid gray background, #808080, no gradients, no props, no furniture. No shadows or reflections on background. "
