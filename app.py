@@ -1468,6 +1468,40 @@ def _build_episode_tag_mapping(script_text, active_chars, active_locs):
     return out
 
 
+# Generic clothing nouns. If the appearance ends with one of these
+# (preceded by optional adjectives), the trailing phrase is "vague" — it
+# tells the model only that there are clothes, not which ones. Seedance
+# treats this as a creative freedom and picks a different concrete look
+# per chunk (sweater on chunk 1, coat on chunk 2, etc.) — causing the
+# clothing-drift bug Eduard reported with Lena. Concrete garment names
+# (blazer / dress / suit / coat / jeans / shirt / ...) are NOT in this
+# list — they're left intact because they actually constrain the look.
+_VAGUE_CLOTHING_TAIL_RE = re.compile(
+    r'[,;]?\s*(?:and\s+|wearing\s+|dressed\s+in\s+|in\s+|with\s+)?'
+    r'(?:[a-zA-Zа-яА-ЯёЁ\-]+\s+){0,5}'
+    r'(?:clothing|clothes|attire|outfit|wear|garments?|wardrobe'
+    r'|одежда|одежде|одежду|наряд|наряде|гардероб)\b'
+    r'\.?\s*$',
+    flags=re.IGNORECASE,
+)
+
+def _strip_vague_clothing_tail(appearance: str) -> str:
+    """Remove a trailing vague-clothing phrase (e.g. "and open casual
+    clothing.", "in everyday attire", "wearing casual outfit") from an
+    appearance string. Specific garment names are preserved because they
+    don't end in the generic nouns matched by `_VAGUE_CLOTHING_TAIL_RE`.
+
+    Returns the original string unchanged if stripping would gut more
+    than 70% of the text (paranoid guard against a degenerate match
+    swallowing the whole sentence)."""
+    if not appearance:
+        return appearance
+    candidate = _VAGUE_CLOTHING_TAIL_RE.sub('', appearance).rstrip(' ,;.').strip()
+    if len(candidate) >= max(15, int(len(appearance) * 0.3)):
+        return candidate
+    return appearance
+
+
 def _canonical_char_description(s, char_id, outfit_label):
     """Canonical description used BOTH for image generation AND for Seedance
     BINDING — same text in both places guarantees visual+textual alignment.
@@ -1486,6 +1520,12 @@ def _canonical_char_description(s, char_id, outfit_label):
     if not char:
         return ''
     appearance = (char.get('appearance') or '').strip()
+    # Vague clothing tails ("and open casual clothing.", "in everyday attire")
+    # cause Seedance to render a different concrete outfit per chunk because
+    # the model treats them as creative freedom rather than a constraint.
+    # The specific outfit_desc set below carries the authoritative wardrobe
+    # info; appearance only needs to describe the PERSON (face/build/hair).
+    appearance = _strip_vague_clothing_tail(appearance)
     outfit_desc = ''
     outfits = char.get('outfits') or []
     is_base_request = (not outfit_label) or outfit_label.lower() in ('base', '')
@@ -3876,13 +3916,21 @@ def generate_script_batch(sid):
             if lines[0].startswith('```'): lines = lines[1:]
             if lines and lines[-1].startswith('```'): lines = lines[:-1]
             text = '\n'.join(lines).strip()
-        return jsonify({
+        payload = {
             'script': text,
             'first_episode': first_new_num,
             'last_episode':  last_new_num,
             'count': count,
             'from_scratch': from_scratch,
-        })
+        }
+        # Generated text SHOULD be English dialogue per _BATCH_SCRIPT_SYSTEM,
+        # but Claude occasionally drifts to Russian when the bible / direction
+        # is in Russian. Detect and warn so the UI can offer adaptation
+        # before the user appends these episodes to the series.
+        lang_info = _detect_dialogue_language(text)
+        if lang_info['ratio'] > 0.15 and lang_info['non_english_lines'] > 0:
+            payload['dialogue_lang_warning'] = lang_info
+        return jsonify(payload)
     except Exception as e:
         _log_event('WARN', 'generate_script_batch_fail', err=str(e)[:200])
         return jsonify({'error': str(e)}), 500

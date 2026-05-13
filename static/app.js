@@ -1512,6 +1512,13 @@ async function appendGenerateScript(btn) {
     // Auto-switch to paste mode so user sees the textarea + preview/logic buttons.
     setAppendMode('paste');
     showToast(`✓ Сгенерировано ${r.count} серий — проверяй и добавляй`, 6000);
+    // Auto-fire preview so the user immediately sees the episode list AND
+    // any non-English-dialogue warning (Claude occasionally drifts to RU
+    // when the bible/direction are in Russian). The preview re-runs lang
+    // detection — it's regex-cheap (~10ms) so the extra call is fine.
+    if (typeof appendPreviewSplit === 'function') {
+      setTimeout(() => appendPreviewSplit(), 50);
+    }
   } catch (e) {
     if (statusEl) statusEl.innerHTML = `<span style="color:#f87171">✗ Ошибка: ${esc(e?.message || e)}</span>`;
     showToast('Ошибка генерации: ' + (e?.message || e), 6000);
