@@ -13219,6 +13219,14 @@ async function sdRetry(idx, btn) {
         duration: c.duration || 15,
         resolution: c.resolution || '720p',
         moderation_bypass: c.moderation_bypass || 'collage_grid',
+        // Carry the source chunk's canonical script_order. Without this the
+        // retry creates a no-position orphan, and the backend's auto-assemble
+        // dedup keeps the OLD chunk for that script_order slot AND appends
+        // the retry to the tail of the timeline — producing a final video
+        // that shows BOTH versions back-to-back. User-reported on series
+        // «My Roommate From Craigslist Is Hunting Me» ep 1: clothing «скачет»
+        // every shot because v1 and v2 were both in the assembled cut.
+        script_order: (typeof c.script_order === 'number') ? c.script_order : null,
         refs: (c.refs || []).map(r => ({
           kind: r.kind, id: r.id, outfit: r.outfit || null, url: r.url || null,
           source: r.source, prev_idx: r.prev_idx, name: r.name,

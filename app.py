@@ -12414,8 +12414,32 @@ def auto_assemble_episode(sid, num):
                     by_order[so] = c
         else:
             no_order.append(c)
+    # Legacy-retry rescue: chunks created via the old sdRetry flow (before
+    # script_order propagation) land here with so=None but their chunk_text
+    # matches an existing by_order chunk verbatim. Treat them as retries of
+    # that script slot so the dedup picks the NEWER take and we don't double-
+    # play the segment. Without this rescue, the auto-assemble would stitch
+    # [orig1, orig2, orig3, retry1, retry2] producing the user-reported
+    # "clothing changes every shot" mess in «My Roommate From Craigslist…».
+    chunk_text_to_so = {
+        (by_order[k].get('chunk_text') or '').strip(): k
+        for k in by_order
+        if (by_order[k].get('chunk_text') or '').strip()
+    }
+    truly_orphan = []
+    for c in no_order:
+        ct = (c.get('chunk_text') or '').strip()
+        so = chunk_text_to_so.get(ct) if ct else None
+        if so is not None:
+            prev = by_order[so]
+            cur_key = (c.get('idx') or 0, c.get('created_at') or 0)
+            prev_key = (prev.get('idx') or 0, prev.get('created_at') or 0)
+            if cur_key > prev_key:
+                by_order[so] = c
+        else:
+            truly_orphan.append(c)
     chunks = [by_order[k] for k in sorted(by_order.keys())] + sorted(
-        no_order, key=lambda c: c.get('idx') or 0
+        truly_orphan, key=lambda c: c.get('idx') or 0
     )
 
     if require_all and isinstance(expected_segments, int) and expected_segments > 0:
