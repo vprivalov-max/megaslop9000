@@ -447,10 +447,6 @@
         <div class="field-group seedance-only" id="seedance-panel">
           <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:6px">
             <label style="margin:0">🎬 Seedance — генерация видео</label>
-            <button class="btn-accent btn-sm" id="sd-assemble-btn" onclick="sdAssembleEpisode(this)"
-                    title="Склеить все готовые чанки этой серии в один mp4 в порядке script_order. Кладётся в папку OUT/. Появляется когда есть хотя бы 1 готовый чанк."
-                    style="display:none">🎬 Собрать серию</button>
-            <a id="sd-assembled-link" href="#" download style="display:none;font-size:0.82rem;color:#4ade80;text-decoration:underline" title="Скачать ранее собранный финал">⬇ Скачать финал</a>
             <span id="sd-poll-status" style="font-size:0.78rem;color:var(--muted);margin-left:auto"></span>
           </div>
 
@@ -541,6 +537,10 @@
               <button id="sd-sort-chrono" onclick="sdSetSort('chrono')" title="По сценарию: #1, #2, #3 … (ретраи сразу после оригинала)">📜 Хронология</button>
               <button id="sd-sort-newest" onclick="sdSetSort('newest')" title="Самые свежие сверху — удобно во время активной генерации">🆕 Свежие</button>
             </div>
+            <button class="btn-accent btn-sm" id="sd-assemble-btn" onclick="sdAssembleEpisode(this)"
+                    title="Склеить все готовые чанки этой серии в один mp4 в порядке script_order. Кладётся в папку OUT/. Появляется когда есть хотя бы 1 готовый чанк."
+                    style="display:none">🎬 Собрать серию</button>
+            <a id="sd-assembled-link" href="#" download style="display:none;font-size:0.82rem;color:#4ade80;text-decoration:underline" title="Скачать ранее собранный финал">⬇ Скачать финал</a>
             <span class="muted" id="sd-list-count" style="font-size:0.78rem;margin-left:auto"></span>
           </div>
 
