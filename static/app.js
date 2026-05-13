@@ -4749,12 +4749,13 @@ async function copyCanonicalDescription() {
   }
 }
 
-function renderCharAssetsGrid(char) {
+function renderCharAssetsGrid(char, bustCache) {
   const grid = document.getElementById('char-assets-grid');
   const refs = char.ref_images || [];
+  const cacheSuffix = bustCache ? `?t=${Date.now()}` : '';
   grid.innerHTML = refs.map(r => {
     const fname = r.split('/').pop();
-    const url = `${assetUrl(r)}`;
+    const url = `${assetUrl(r)}${cacheSuffix}`;
     return `
       <div class="photo-thumb-wrap" onclick="openCharLightbox('${char.id}','${url}')">
         <img src="${url}" alt="">
@@ -5124,7 +5125,7 @@ async function regenerateCharacterFromLightbox() {
     // Refresh state
     S.series = await api.get(`/api/series/${S.seriesId}`);
     const c = S.series.characters.find(x => x.id === currentCharId);
-    renderCharAssetsGrid(c);
+    renderCharAssetsGrid(c, true);
     renderOutfitsList(c);
     renderCharactersList();
 
@@ -5317,7 +5318,7 @@ async function regenerateCharacter() {
     status.textContent = msg;
     S.series = await api.get(`/api/series/${S.seriesId}`);
     const c = S.series.characters.find(x => x.id === currentCharId);
-    renderCharAssetsGrid(c);
+    renderCharAssetsGrid(c, true);
     renderOutfitsList(c);
     renderCharactersList();
     btn.disabled = false;
