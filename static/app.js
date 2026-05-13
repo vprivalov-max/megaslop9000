@@ -4277,6 +4277,7 @@ function _renderFacadesList(facades, status) {
             <div class="facade-actions">
               <button class="btn-ghost btn-sm" onclick="facadesRegenerate('${esc(f.id)}')">🔄 Перегенерить</button>
               <button class="btn-ghost btn-sm" onclick="facadesDelete('${esc(f.id)}')" style="color:var(--danger)">✕ Удалить</button>
+              ${vidSrc ? `<a class="btn-ghost btn-sm" href="${esc(vidSrc)}" download>⬇ Скачать видео</a>` : ''}
             </div>
           </div>
         </div>
@@ -5049,9 +5050,16 @@ function openCharLightbox(charId, url) {
           <input type="checkbox" id="lb-regen-outfits" checked>
           <span>Также перегенерировать все костюмы</span>
         </label>
+        <label class="cb" title="Claude перепишет поле appearance с нуля — помогает если текущее описание содержит эмоции/действия вместо внешности">
+          <input type="checkbox" id="lb-rewrite-appearance">
+          <span>Переписать описание персонажа заново</span>
+        </label>
         <div id="lb-regen-status" class="lb-status"></div>
         <button id="lb-regen-btn" class="btn-regen" onclick="regenerateCharacterFromLightbox()">
           ↻ Перегенерировать
+        </button>
+        <button class="btn-ghost" style="color:var(--danger);margin-top:8px;width:100%" onclick="deleteCharacterFromLightbox()">
+          🗑 Удалить персонажа
         </button>
       </div>
     </div>`;
@@ -5073,21 +5081,30 @@ document.addEventListener('keydown', (e) => {
   }
 });
 
+async function deleteCharacterFromLightbox() {
+  if (!currentCharId) return;
+  if (!confirm('Удалить персонажа полностью? Это действие необратимо.')) return;
+  closeLightbox();
+  await deleteCharacter(currentCharId);
+}
+
 async function regenerateCharacterFromLightbox() {
   if (!currentCharId) return;
   const wishes = (document.getElementById('lb-regen-wishes').value || '').trim();
   const regenOutfits = document.getElementById('lb-regen-outfits').checked;
+  const rewriteAppearance = document.getElementById('lb-rewrite-appearance')?.checked || false;
   const status = document.getElementById('lb-regen-status');
   const btn = document.getElementById('lb-regen-btn');
   btn.disabled = true;
   btn.innerHTML = '<span class="spinner"></span> Генерируем...';
   status.className = 'lb-status';
-  status.textContent = 'Перегенерируем основной образ' + (regenOutfits ? ' + костюмы' : '') + ' (~15-30 сек на каждый)...';
+  status.textContent = (rewriteAppearance ? 'Переписываем описание + ' : '') +
+    'Перегенерируем основной образ' + (regenOutfits ? ' + костюмы' : '') + ' (~15-30 сек на каждый)...';
 
   try {
     const res = await api.post(
       `/api/series/${S.seriesId}/characters/${currentCharId}/regenerate`,
-      { wishes, regenerate_outfits: regenOutfits }
+      { wishes, regenerate_outfits: regenOutfits, rewrite_appearance: rewriteAppearance }
     );
     if (res.error) {
       status.className = 'lb-status err';
@@ -12539,7 +12556,11 @@ async function sdAssembleEpisode(btn) {
       { require_all: false, expected_segments: segmentCount },
       { timeoutMs: 900_000 }
     );
-    if (r.error) throw new Error(r.error);
+    if (r.error) {
+      const detail = r.stderr ? '\n' + r.stderr.slice(-600) : '';
+      console.error('[assemble] ffmpeg stderr:', r.stderr);
+      throw new Error(r.error + detail);
+    }
     // Refresh episode so we get the new assembled_path.
     try {
       S.episode = await api.get(`/api/series/${S.seriesId}/episodes/${S.episode.number}`);

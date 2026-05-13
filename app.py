@@ -4554,8 +4554,9 @@ def generate_outfit_image(sid, char_id, outfit_id):
             f'Same {gender} as the reference image. Now wearing: {outfit["label"]}. '
             f'{outfit.get("description", "")}. '
             f'Same face, same hair, same body — only the clothing changes. '
-            f'Full body, front-facing, slight 3/4 angle. Neutral relaxed pose, arms at sides. '
-            f'Uniform solid gray background, #808080. No shadows on background. '
+            f'Full body, front-facing, slight 3/4 angle. Neutral relaxed pose. '
+            f'Arms hanging loosely at sides, hands open and empty — no objects held, no props, not in pockets. '
+            f'Uniform solid gray background, #808080, no gradients, no props, no furniture. No shadows on background. '
             f'Studio lighting, soft and even. Photorealistic, cinematic quality.'
         )
     else:
@@ -4564,8 +4565,9 @@ def generate_outfit_image(sid, char_id, outfit_id):
             f'Full body portrait of {char["name"]}, a {gender}. '
             f'{char.get("appearance", "")}. '
             f'Wearing: {outfit["label"]}. {outfit.get("description", "")}. '
-            f'Standing facing camera, slight 3/4 angle. Neutral pose, arms at sides. '
-            f'Uniform solid gray background, #808080. No shadows on background. '
+            f'Standing facing camera, slight 3/4 angle. Neutral relaxed pose. '
+            'Arms hanging loosely at sides, hands open and empty — no objects held, no props, not in pockets. '
+            f'Uniform solid gray background, #808080, no gradients, no props, no furniture. No shadows on background. '
             f'Studio lighting, soft and even. Photorealistic, cinematic quality.'
         )
     prompt = re.sub(r'\s+', ' ', prompt).strip()
@@ -4653,8 +4655,9 @@ def generate_character_image(sid, char_id):
     prompt = (
         f"Full body portrait of {char['name']}, a {gender}. "
         f"{char.get('appearance', '')}. {char.get('description', '')}. "
-        f"Standing facing camera, slight 3/4 angle. Neutral relaxed pose, arms at sides. "
-        f"Uniform solid gray background, #808080. No shadows or reflections on background. "
+        f"Standing facing camera, slight 3/4 angle. Neutral relaxed pose. "
+        f"Arms hanging loosely at sides, hands open and empty — no objects held, no props, not in pockets. "
+        f"Uniform solid gray background, #808080, no gradients, no props, no furniture. No shadows or reflections on background. "
         f"Studio lighting, soft and even, no harsh shadows on face or body. "
         f"{style_clause}"
     )
@@ -4693,6 +4696,9 @@ def regenerate_character(sid, char_id):
     body = request.get_json(silent=True) or {}
     wishes = (body.get('wishes') or '').strip()
     regen_outfits = bool(body.get('regenerate_outfits', True))
+    # When true: rewrite appearance via Claude before generating (breaks
+    # out of the «same prompt → same result» loop when appearance is stale).
+    rewrite_appearance = bool(body.get('rewrite_appearance', False))
 
     # Persist constraints onto the character so future inline generations
     # also respect them. Empty wishes => clear them.
@@ -4715,7 +4721,39 @@ def regenerate_character(sid, char_id):
     # 3. Use the cleaned appearance in the generation prompt.
     appearance_raw = (char.get('appearance') or '').strip()
     appearance_for_prompt = appearance_raw
-    if wishes and appearance_raw:
+
+    # ── Rewrite appearance from scratch via Claude (breaks same-prompt loop) ──
+    # Triggered when user clicks "Перегенерить с новым описанием" or when the
+    # appearance text is clearly scene-specific (emotional states, actions, etc.)
+    # and the user wants a completely fresh canonical visual description.
+    if rewrite_appearance:
+        desc_source = char.get('description') or ''
+        try:
+            rewritten = claude_ask_fast(
+                f"CHARACTER NAME: {char.get('name', '')}\n"
+                f"CHARACTER DESCRIPTION (story role, personality): {desc_source}\n"
+                f"CURRENT APPEARANCE TEXT: {appearance_raw}\n"
+                + (f"USER CONSTRAINTS: {wishes}\n" if wishes else '')
+                + "\nTask: write a fresh canonical APPEARANCE field for image generation. "
+                "Rules: (a) physical traits ONLY — age, build, hair color/length/style, "
+                "eye color, face shape, distinguishing features, typical clothing; "
+                "(b) NO scene context, NO emotions, NO actions, NO props; "
+                "(c) concrete and specific — 'shoulder-length auburn hair' not 'beautiful hair'; "
+                "(d) 1-3 short sentences, comma-separated descriptors, NO 'she is' opener.\n"
+                "Output: the appearance text only, no quotes, no preamble.",
+                system="You write character appearance descriptions for image generation. Plain text only.",
+            ).strip().strip('"\'`')
+            if rewritten and len(rewritten) > 10:
+                appearance_for_prompt = rewritten
+                char['appearance'] = rewritten
+                _log_event('INFO', 'appearance_rewritten',
+                           char_id=char_id, name=char.get('name', ''),
+                           before=appearance_raw[:200], after=rewritten[:200])
+        except Exception as e:
+            _log_event('WARN', 'appearance_rewrite_failed', char_id=char_id, err=str(e)[:200])
+
+    elif wishes and appearance_raw:
+        # ── Cleanup: remove scene-context from appearance that conflicts with wishes ──
         try:
             cleaned = claude_ask_fast(
                 f"CHARACTER APPEARANCE FIELD: {appearance_raw}\n"
@@ -4729,20 +4767,15 @@ def regenerate_character(sid, char_id):
                 "Keep the language of the original appearance text.",
                 system="You are a surgical text editor. Output the rewritten sentence(s) and nothing else.",
             ).strip()
-            # Sanity: must be shorter or comparable, no JSON / no quotes
             cleaned = cleaned.strip('"\'`')
             if cleaned and len(cleaned) < len(appearance_raw) * 2 and len(cleaned) > 5:
                 appearance_for_prompt = cleaned
-                # Persist the cleaned appearance so subsequent regens (outfit
-                # variants, future bumps) use the fixed version.
                 char['appearance'] = cleaned
                 _log_event('INFO', 'appearance_cleaned',
                            char_id=char_id, name=char.get('name', ''),
                            before=appearance_raw[:200], after=cleaned[:200],
                            wishes=wishes[:200])
         except Exception as e:
-            # Don't block regeneration on the cleanup failing — just use the
-            # original appearance text.
             _log_event('WARN', 'appearance_cleanup_failed',
                        char_id=char_id, err=str(e)[:200])
 
@@ -4752,12 +4785,18 @@ def regenerate_character(sid, char_id):
     prompt = (
         f"Full body portrait of {char['name']}, a {gender}. "
         f"{appearance_for_prompt}. {char.get('description', '')}.{constraints_clause} "
-        f"Standing facing camera, slight 3/4 angle. Neutral relaxed pose, arms at sides. "
-        f"Uniform solid gray background, #808080. No shadows or reflections on background. "
+        f"Standing facing camera, slight 3/4 angle. Neutral relaxed pose. "
+        f"Arms hanging loosely at sides, hands open and empty — no objects held, no props, not in pockets. "
+        f"Uniform solid gray background, #808080, no gradients, no props, no furniture. No shadows or reflections on background. "
         f"Studio lighting, soft and even, no harsh shadows on face or body. "
         f"{style_clause}"
     )
     prompt = re.sub(r'\s+', ' ', prompt).strip()
+    # Append a short random token so each regeneration is a unique API request —
+    # provider-level caching (Banana/Seedream deduplicate identical prompt strings)
+    # was causing the same image to come back on every regen.
+    variation_token = uuid.uuid4().hex[:8]
+    prompt = f"{prompt} [v{variation_token}]"
 
     char_slug = slugify(char['name'])
     char_dir = assets_dir(sid) / 'characters' / char_slug
@@ -4810,8 +4849,9 @@ def regenerate_character(sid, char_id):
                     f'Now wearing: {outfit["label"]}. {outfit.get("description", "")}. '
                     f'Same face, same hair, same body — only the clothing changes.'
                     f'{out_constraints}'
-                    f'Full body, front-facing, slight 3/4 angle. Neutral relaxed pose, arms at sides. '
-                    f'Uniform solid gray background, #808080. No shadows on background. '
+                    f'Full body, front-facing, slight 3/4 angle. Neutral relaxed pose. '
+                    f'Arms hanging loosely at sides, hands open and empty — no objects held, no props, not in pockets. '
+                    f'Uniform solid gray background, #808080, no gradients, no props, no furniture. No shadows on background. '
                     f'Studio lighting, soft and even. Photorealistic, cinematic quality.'
                 )
                 ref_prompt = re.sub(r'\s+', ' ', ref_prompt).strip()
@@ -6028,8 +6068,9 @@ def _gen_char_base_inline(s, sid, char):
         f"{style_prefix}"
         f"Full body portrait of {char['name']}{kind_label}. "
         f"{appearance}. {description}.{constraints_clause} "
-        f"Standing facing camera, slight 3/4 angle. Neutral relaxed pose, arms at sides. "
-        f"Uniform solid gray background, #808080. No shadows or reflections on background. "
+        f"Standing facing camera, slight 3/4 angle. Neutral relaxed pose. "
+        f"Arms hanging loosely at sides, hands open and empty — no objects held, no props, not in pockets. "
+        f"Uniform solid gray background, #808080, no gradients, no props, no furniture. No shadows or reflections on background. "
         f"Studio lighting, soft and even, no harsh shadows on face or body."
         f"{realism_suffix}"
     )
@@ -6079,8 +6120,9 @@ def _gen_outfit_inline(s, sid, char, outfit):
         + f'Now wearing: {outfit["label"]}. {outfit.get("description", "")}. '
         + ('Same face, same body — only the clothing changes. ' if reference_url else '')
         + constraints_clause
-        + 'Full body, front-facing, slight 3/4 angle. Neutral relaxed pose, arms at sides. '
-          'Uniform solid gray background, #808080. No shadows on background. '
+        + 'Full body, front-facing, slight 3/4 angle. Neutral relaxed pose. '
+          'Arms hanging loosely at sides, hands open and empty — no objects held, no props, not in pockets. '
+          'Uniform solid gray background, #808080, no gradients, no props, no furniture. No shadows on background. '
           'Studio lighting, soft and even.'
         + realism_suffix
     )
@@ -8058,6 +8100,30 @@ What this sounds like in practice:
 
 Every scene should feel like it belongs on a telenovela that has been turned up to maximum volume.
 
+━━━ PHYSICAL ACTION IN CONFLICT SCENES — MANDATORY ━━━
+Short drama lives on physical escalation — dialogue alone is static. Every conflict scene MUST contain at least one physical action beat written as an action line.
+
+Required minimum: 1 physical beat per conflict scene (more is better).
+
+Approved physical beats — rotate, match the emotional register:
+  • [СЛЫШИТСЯ ХЛЁСТКИЙ ЗВУК — Vivian даёт Marcus пощёчину. Он не двигается.]
+  • [Elena отшвыривает его руку и делает шаг назад.]
+  • [Marcus хватает её за запястье прежде чем она уходит.]
+  • [Claire швыряет стакан об стену рядом с ней — стекло разлетается.]
+  • [Elena резко выбивает папку у него из рук — бумаги летят по полу.]
+  • [Marcus встаёт из-за стола, медленно заходит к ней за спину.]
+  • [Elena упирает руку ему в грудь, не давая пройти.]
+  • [Vivian хватает её за подбородок, заставляя смотреть в глаза.]
+  • [Marcus разворачивает её к себе за плечо.]
+  • [Elena отступает к стене — его рука бьёт по стене рядом с её головой.]
+
+Physical beat rules:
+  ✓ Write the action in [square brackets] — it IS a filmable action line
+  ✓ The beat should come at a peak moment of confrontation, not randomly
+  ✓ Escalate across the series: slap in ep 3 < grab in ep 7 < full physical struggle in ep 15
+  ✗ FORBIDDEN: "conversation about violence" instead of actual violence ("He threatened to hurt her" as dialogue — show it physically instead)
+  ✗ FORBIDDEN: fight scenes that take >2 action lines — this is a 60-second episode, not an action film
+
 ━━━ DIALOGUE-FIRST RULE — HARD BAN ON PAPERWORK ━━━
 This is short drama for vertical video. EVERYTHING must be revealed through SPOKEN DIALOGUE between living people on screen.
 
@@ -8084,6 +8150,15 @@ FORMAT RULES:
 - Scene headings: INT./EXT. LOCATION — DAY/NIGHT (max 3 words)
 - Action lines: [square brackets], max 1 line, max 5 per episode, filmable in 2 seconds
 - Parentheticals: max 1 per speaking block, only when tone is completely non-obvious
+- NO INTERRUPTIONS — HARD BAN: NEVER cut a character's line mid-sentence with a dash (—). Every line must be a complete sentence. FORBIDDEN patterns:
+    ✗  ELENA: You should have told me—
+    ✗  MARCUS: (перебивает) I don't want to hear—
+    ✗  VIVIAN: You have no right to be—
+  WHY: the video generator renders interrupted lines as two people speaking simultaneously — it looks broken on screen.
+  INSTEAD: let each character finish their thought. Interruption = a new action line + the other character's complete line.
+    ✓  ELENA: You should have told me the truth.
+       [Marcus резко встаёт, не давая ей договорить.]
+       MARCUS: I owe you nothing.
 
 After the script add:
 ━━━━━━━━━━━━━━━━━━━━━━━
@@ -8188,6 +8263,8 @@ HOOK / DIALOGUE / CLIFFHANGER STYLE — same as single-episode mode
 - Emotional dial: 8–10/10, never below 7
 - End each sub-episode on REACTION, not action — cut before resolution
 - Cliffhanger types (rotate, never repeat back-to-back): ARRIVAL, REVELATION, ULTIMATUM, FALL, ALLIANCE, SILENT POWER, RECORDING SURFACES, WRONG PERSON, SECRET ALREADY KNOWN
+- PHYSICAL ACTION IN CONFLICT SCENES — MANDATORY: every conflict scene must contain at least 1 physical action beat in [brackets]. Slap, grab, push, object thrown, arm blocked — rotate and escalate across the chunk. Pure dialogue confrontations without a physical beat are static and flat.
+- NO INTERRUPTIONS — HARD BAN: NEVER cut a line mid-sentence with a dash (—). Every spoken line is a complete sentence. FORBIDDEN: "ELENA: You should have—" or "(перебивает)". The video generator renders cut lines as two people talking at once — it looks broken. Instead: complete the line, then use an action beat to show the interruption physically.
 
 ═══════════════════════════════════════
 DIALOGUE-FIRST RULE — HARD BAN ON PAPERWORK
@@ -8219,6 +8296,7 @@ FORMAT RULES
 - Action lines: [square brackets], max 1 line each, max 5 per sub-episode (≤25 in whole chunk), filmable in 2 seconds
 - Parentheticals: max 1 per speaking block, only when tone non-obvious
 - NO scene-bridging narration. Cut hard between scenes.
+- NO INTERRUPTIONS: every spoken line is a complete sentence — no mid-sentence dashes (—). Show interruption via action line, not a cut line.
 
 ═══════════════════════════════════════
 AFTER THE LAST CUT MARKER, output this CHUNK NOTES block (Russian):
@@ -10648,13 +10726,21 @@ def delete_character_asset(sid, char_id, filename):
     s = load_series(sid)
     if not s:
         return jsonify({'error': 'not found'}), 404
-    full = series_path(sid) / 'assets' / 'characters' / char_id / filename
-    if full.exists():
-        full.unlink()
-    rel = f'assets/characters/{char_id}/{filename}'
-    for char in s['characters']:
-        if char['id'] == char_id:
-            char['ref_images'] = [r for r in char.get('ref_images', []) if r != rel]
+    char = next((c for c in s['characters'] if c['id'] == char_id), None)
+    if not char:
+        return jsonify({'error': 'character not found'}), 404
+    # Files live under assets/characters/<slug>/, NOT assets/characters/<char_id>/.
+    # Find the matching ref_image by basename, delete the actual file at its stored path.
+    refs = char.get('ref_images') or []
+    matched_rel = next((r for r in refs if Path(r).name == filename), None)
+    if matched_rel:
+        full = series_path(sid) / matched_rel
+        if full.exists():
+            full.unlink(missing_ok=True)
+        char['ref_images'] = [r for r in refs if r != matched_rel]
+        # Clear avai_base_url if this was the base portrait
+        if asset_name(char.get('name', ''), 'BASE') in filename:
+            char.pop('avai_base_url', None)
     save_series(sid, s)
     return jsonify({'ok': True})
 
@@ -11968,24 +12054,55 @@ def auto_assemble_episode(sid, num):
 
         # Fallback to filter-complex re-encode when (a) we skipped concat-copy
         # because audio coverage was non-uniform, or (b) concat-copy failed
-        # due to codec drift. Normalize video (scale to even dims, fps=24)
-        # and synthesize stereo 48k silence for any segment that has no
-        # audio track — otherwise mapping [i:a] of a missing stream produces
-        # a broken/silent output.
+        # due to codec drift. Normalize ALL inputs to the same resolution so
+        # concat doesn't fail on dimension mismatches (facades are often a
+        # different size than Seedance chunks). We probe the first "real" chunk
+        # (non-facade, i.e. the last seg_paths entry that comes from a chunk
+        # record) to get the canonical W×H, then scale everything to that.
         if (not can_try_copy) or (proc and proc.returncode != 0):
             if can_try_copy:
                 print(f'[auto-assemble] {sid}/ep{num} concat-copy failed, retry filter-complex')
             else:
                 print(f'[auto-assemble] {sid}/ep{num} skipping concat-copy: '
                       f'facades_inserted={facades_inserted} audio_uniform={audio_uniform}')
+
+            # Probe target resolution from the first non-facade segment.
+            target_w, target_h = 576, 1024  # sensible default for 9:16
+            if ffprobe_bin:
+                chunk_paths = [str(base / c['video_path']) for c in chunks
+                               if (base / c['video_path']).exists()]
+                for cp in chunk_paths[:3]:   # try first few, stop at first success
+                    try:
+                        dim_out = subprocess.check_output(
+                            [ffprobe_bin, '-v', 'error',
+                             '-show_entries', 'stream=width,height',
+                             '-of', 'csv=p=0:s=x', cp],
+                            text=True, timeout=10,
+                        ).strip()
+                        if dim_out:
+                            tw, th = (int(x) for x in dim_out.split('x'))
+                            if tw > 0 and th > 0:
+                                # Round to even dimensions (libx264 requirement)
+                                target_w = tw if tw % 2 == 0 else tw - 1
+                                target_h = th if th % 2 == 0 else th - 1
+                                break
+                    except Exception:
+                        pass
+            print(f'[auto-assemble] {sid}/ep{num} target resolution: {target_w}x{target_h}')
+
             inputs = []
             filt = []
             n = len(seg_paths)
             for i, p in enumerate(seg_paths):
                 inputs += ['-i', p]
+                # Scale to target resolution with padding to avoid AR distortion.
+                # force_original_aspect_ratio=decrease → fit within box,
+                # pad → letterbox/pillarbox to fill exact target dims.
                 filt.append(
                     f"[{i}:v]setpts=PTS-STARTPTS,"
-                    f"scale=trunc(iw/2)*2:trunc(ih/2)*2,setsar=1,fps=24[v{i}]"
+                    f"scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,"
+                    f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2,"
+                    f"setsar=1,fps=24[v{i}]"
                 )
                 has_audio, dur = seg_meta[i]
                 if has_audio:
@@ -12020,11 +12137,13 @@ def auto_assemble_episode(sid, num):
                 except Exception: pass
                 return jsonify({'error': 'ffmpeg timeout (filter-complex >15 min)'}), 500
             if proc.returncode != 0:
+                stderr_tail = (proc.stderr or '')[-3000:]
+                print(f'[auto-assemble] {sid}/ep{num} ffmpeg FAILED:\n{stderr_tail}', flush=True)
                 try: list_file.unlink(missing_ok=True)
                 except Exception: pass
                 return jsonify({
                     'error': 'ffmpeg failed (filter-complex re-encode)',
-                    'stderr': (proc.stderr or '')[-2000:],
+                    'stderr': stderr_tail,
                 }), 500
 
     try: list_file.unlink(missing_ok=True)
@@ -13892,7 +14011,7 @@ def seedance_compose(sid, num):
     # CANONICAL char description for BINDING — uses the SAME text that was fed
     # to the image generator (appearance + outfit description). Visual ref and
     # textual description are guaranteed aligned.
-    name_to_clothing = {}
+    name_to_clothing = {}   # keyed by full name AND first name for prompt lookup
     for r in ref_meta:
         if r.get('kind') != 'char':
             continue
@@ -13901,7 +14020,13 @@ def seedance_compose(sid, num):
             continue
         ch = next((c for c in (s.get('characters') or []) if c['id'] == r.get('id')), None)
         if ch:
-            name_to_clothing[ch['name']] = desc
+            full_name = ch['name']
+            name_to_clothing[full_name] = desc
+            # Composers write first-name-only in BINDING (e.g. "Marcus" not "Marcus Bellacourt").
+            # Index by first name too so the regex lookup matches.
+            first_name = full_name.split()[0]
+            if first_name != full_name and first_name not in name_to_clothing:
+                name_to_clothing[first_name] = desc
             r['clothing'] = desc          # surface in response so UI can show it
     # Inject descriptions into the BINDING line. Pattern: '@Image1=Maya' →
     # '@Image1=Maya (navy scrubs, hair in bun)'. Only the first occurrence per
@@ -13924,15 +14049,27 @@ def seedance_compose(sid, num):
             r'@Image(\d+)\s*[=—\-]\s*([A-Za-zА-яЁё][A-Za-zА-яЁё\d _\-]{0,30})',
             _inject_clothing, prompt_text
         )
-        # Fallback: composer didn't write a BINDING line at all → prepend one
+        # Fallback: no @ImageN binding lines found at all → prepend explicit note
+        missing = [nm for nm in name_to_clothing if nm not in already_injected
+                   and nm.split()[0] not in already_injected]
+        # Deduplicate: keep only full names (skip first-name aliases already covered)
+        missing_full = [nm for nm in missing if nm in {ch2['name'] for ch2 in (s.get('characters') or [])}]
         if not already_injected:
-            binding_parts = []
-            for nm, desc in name_to_clothing.items():
-                binding_parts.append(f'{nm} ({desc})')
+            # Composer wrote no BINDING line at all — prepend one
+            binding_parts = [f'{nm} ({name_to_clothing[nm]})' for nm in missing_full]
             prompt_text = (
-                f'Note: одежда из refs — ' + ', '.join(binding_parts) + '. '
+                'Note: одежда из refs — ' + ', '.join(binding_parts) + '. '
                 'Используй эти описания если упоминаешь одежду; больше ничего о ней не пиши.\n\n'
                 + prompt_text
+            )
+        elif missing_full:
+            # Some chars were injected but others were missed (shouldn't happen now,
+            # but as a safety net append the missed ones after the binding line).
+            extra = ', '.join(f'{nm} ({name_to_clothing[nm]})' for nm in missing_full)
+            prompt_text = re.sub(
+                r'(В refs:[^\n]+)',
+                lambda m2: m2.group(0) + f' Также в сцене: {extra}.',
+                prompt_text, count=1
             )
         data['prompt'] = prompt_text
 
