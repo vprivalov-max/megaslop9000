@@ -7616,14 +7616,20 @@ async function startAutoMode() {
   // Both auto-mode flavors force establishing shots ON (2s location intro
    // on every new scene), regardless of the manual checkbox.
   const allSegs  = _autoCollectSegments({ forceEstablishing: true });
+  // Annotate scriptOrder BEFORE the skip-filter — the script slot a segment
+  // owns is its position in the FULL list, not its position among the still-
+  // selected ones. If we reindex after filtering, a user who skips seg 0..2
+  // and keeps seg 3 ends up generating a chunk with script_order=0; that
+  // collides with the original chunk #1 (also script_order=0), the auto-
+  // assemble dedup picks the newer take and drops the real #1 from the
+  // final cut. Bug repro: «My Roommate From Craigslist Is Hunting Me» ep 1
+  // — uncheck AUTO on 1/2/3, keep 4, auto-mode spawned a phantom «#1 v2».
+  allSegs.forEach((s, i) => { s.scriptOrder = i; });
   // Per-segment auto-mode skip filter. Uses the unique-per-episode
   // autoSkipKey (`s{sceneIdx}g{segIdx}`), NOT the first-line text — see
   // toggleSegmentAutoInclude for why.
   const skippedCount = allSegs.filter(s => _isSegmentAutoSkipped(s.autoSkipKey)).length;
   AUTO.segments = allSegs.filter(s => !_isSegmentAutoSkipped(s.autoSkipKey));
-  // Annotate each segment with its script-order index so /seedance/start can
-  // record the canonical position regardless of network arrival order.
-  AUTO.segments.forEach((s, i) => { s.scriptOrder = i; });
   AUTO.total    = AUTO.segments.length;
   AUTO.cursor   = 0;             // back-compat with status UI
   AUTO.completedCount = 0;       // atomic counter across chains
@@ -7939,13 +7945,18 @@ async function startAutoMode() {
             // from line durations). prebuilt.plan.durationSec is just Claude echoing
             // input — and stale batches built before durationSec was passed all say 15.
             const segDur = seg.durationSec || (prebuilt.plan && prebuilt.plan.durationSec) || duration;
+            // Use seg.scriptOrder (assigned BEFORE the skip-filter) instead of
+            // the local index `i` — `i` is position in the filtered AUTO.segments
+            // list and collides with existing chunks when the user skipped some
+            // earlier segments. See the `allSegs.forEach((s, i) => { s.scriptOrder = i; })`
+            // comment above for the repro.
             startRes = await api.post(
               `/api/series/${epSid}/episodes/${epNumber}/seedance/start`,
               {
                 prompt: prebuilt.prompt,
                 chunk_text: seg.text,
                 duration: segDur, resolution, moderation_bypass,
-                script_order: i,
+                script_order: seg.scriptOrder,
                 refs: (prebuilt.refs || []).map(r => ({
                   kind: r.kind, id: r.id, outfit: r.outfit || null, url: r.url || null,
                   source: r.source, prev_idx: r.prev_idx, name: r.name,
@@ -7953,8 +7964,10 @@ async function startAutoMode() {
               }
             );
           } else {
-            // Fallback per-chunk compose if batch missed this anchor
-            const cs = await _autoComposeStart(seg, i);
+            // Fallback per-chunk compose if batch missed this anchor.
+            // Pass seg.scriptOrder (full-list position) — _autoComposeStart
+            // forwards it to /seedance/start as the canonical slot.
+            const cs = await _autoComposeStart(seg, seg.scriptOrder);
             startRes = cs.startRes;
           }
           AUTO.completedCount++;
