@@ -4852,7 +4852,7 @@ def generate_outfit_image(sid, char_id, outfit_id):
             f'Same face, same hair, same body — only the clothing changes. '
             f'Full body, front-facing, slight 3/4 angle. Neutral relaxed pose. '
             f'Arms hanging loosely at sides, hands open and empty — no objects held, no props, not in pockets. '
-            f'Uniform solid gray background, #808080, no gradients, no props, no furniture. No shadows on background. '
+            f'STRICT BACKGROUND: ONLY a flat featureless gray (#808080) studio cyclorama behind the character. ABSOLUTELY NO windows, doors, walls, room interiors, furniture, plants, objects, decor, outdoor scenes, or any environmental elements whatsoever. Character must be isolated against the gray field — no setting, no architecture, no context. No shadows or reflections on the background. '
             f'Studio lighting, soft and even. Photorealistic, cinematic quality.'
         )
     else:
@@ -4863,7 +4863,7 @@ def generate_outfit_image(sid, char_id, outfit_id):
             f'Wearing: {outfit["label"]}. {outfit.get("description", "")}. '
             f'Standing facing camera, slight 3/4 angle. Neutral relaxed pose. '
             'Arms hanging loosely at sides, hands open and empty — no objects held, no props, not in pockets. '
-            f'Uniform solid gray background, #808080, no gradients, no props, no furniture. No shadows on background. '
+            f'STRICT BACKGROUND: ONLY a flat featureless gray (#808080) studio cyclorama behind the character. ABSOLUTELY NO windows, doors, walls, room interiors, furniture, plants, objects, decor, outdoor scenes, or any environmental elements whatsoever. Character must be isolated against the gray field — no setting, no architecture, no context. No shadows or reflections on the background. '
             f'Studio lighting, soft and even. Photorealistic, cinematic quality.'
         )
     prompt = re.sub(r'\s+', ' ', prompt).strip()
@@ -4956,7 +4956,7 @@ def generate_character_image(sid, char_id):
         f"{_clothing_clause(_appearance, _desc)}"
         f"Standing facing camera, slight 3/4 angle. Neutral relaxed pose. "
         f"Arms hanging loosely at sides, hands open and empty — no objects held, no props, not in pockets. "
-        f"Uniform solid gray background, #808080, no gradients, no props, no furniture. No shadows or reflections on background. "
+        f"STRICT BACKGROUND: ONLY a flat featureless gray (#808080) studio cyclorama behind the character. ABSOLUTELY NO windows, doors, walls, room interiors, furniture, plants, objects, decor, outdoor scenes, or any environmental elements whatsoever. Character must be isolated against the gray field — no setting, no architecture, no context. No shadows or reflections on the background. "
         f"Studio lighting, soft and even, no harsh shadows on face or body. "
         f"{style_clause}"
     )
@@ -5088,7 +5088,7 @@ def regenerate_character(sid, char_id):
         f"{_clothing_clause(appearance_for_prompt, _desc)}"
         f"Standing facing camera, slight 3/4 angle. Neutral relaxed pose. "
         f"Arms hanging loosely at sides, hands open and empty — no objects held, no props, not in pockets. "
-        f"Uniform solid gray background, #808080, no gradients, no props, no furniture. No shadows or reflections on background. "
+        f"STRICT BACKGROUND: ONLY a flat featureless gray (#808080) studio cyclorama behind the character. ABSOLUTELY NO windows, doors, walls, room interiors, furniture, plants, objects, decor, outdoor scenes, or any environmental elements whatsoever. Character must be isolated against the gray field — no setting, no architecture, no context. No shadows or reflections on the background. "
         f"Studio lighting, soft and even, no harsh shadows on face or body. "
         f"{style_clause}"
     )
@@ -5152,7 +5152,7 @@ def regenerate_character(sid, char_id):
                     f'{out_constraints}'
                     f'Full body, front-facing, slight 3/4 angle. Neutral relaxed pose. '
                     f'Arms hanging loosely at sides, hands open and empty — no objects held, no props, not in pockets. '
-                    f'Uniform solid gray background, #808080, no gradients, no props, no furniture. No shadows on background. '
+                    f'STRICT BACKGROUND: ONLY a flat featureless gray (#808080) studio cyclorama behind the character. ABSOLUTELY NO windows, doors, walls, room interiors, furniture, plants, objects, decor, outdoor scenes, or any environmental elements whatsoever. Character must be isolated against the gray field — no setting, no architecture, no context. No shadows or reflections on the background. '
                     f'Studio lighting, soft and even. Photorealistic, cinematic quality.'
                 )
                 ref_prompt = re.sub(r'\s+', ' ', ref_prompt).strip()
@@ -6373,17 +6373,39 @@ def _gen_char_base_inline(s, sid, char):
         f"{clothing_fallback}"
         f"Standing facing camera, slight 3/4 angle. Neutral relaxed pose. "
         f"Arms hanging loosely at sides, hands open and empty — no objects held, no props, not in pockets. "
-        f"Uniform solid gray background, #808080, no gradients, no props, no furniture. No shadows or reflections on background. "
+        f"STRICT BACKGROUND: ONLY a flat featureless gray (#808080) studio cyclorama behind the character. ABSOLUTELY NO windows, doors, walls, room interiors, furniture, plants, objects, decor, outdoor scenes, or any environmental elements whatsoever. Character must be isolated against the gray field — no setting, no architecture, no context. No shadows or reflections on the background. "
         f"Studio lighting, soft and even, no harsh shadows on face or body."
         f"{realism_suffix}"
     )
     prompt = re.sub(r'\s+', ' ', prompt).strip()
     char_slug = slugify(char['name'])
     out_path = assets_dir(sid) / 'characters' / char_slug / f'{asset_name(char["name"], "BASE")}.jpg'
-    image_url = avai_generate(prompt, out_path, preferred_provider=_series_image_provider(s))
+    # Race-safe path: write to a unique temp file FIRST, never the canonical
+    # path directly. The autogen orchestrator (_run_task) atomically moves
+    # the temp into place ONLY if no concurrent user-driven regenerate has
+    # populated `char['ref_images']` in the meantime.
+    # Without this, the following sequence corrupts user state:
+    #   T0  autogen worker reads stale snapshot (ref_images empty)
+    #   T0+5  autogen avai_generate writes canonical CATHERINE_BASE.jpg
+    #   T0+10 user clicks Regenerate, regen avai_generate ALSO writes
+    #         canonical CATHERINE_BASE.jpg (user's version)
+    #   T0+15 autogen avai_generate (slow API for a different concurrent
+    #         worker) finishes and overwrites CATHERINE_BASE.jpg with the
+    #         stale autogen image — silently undoing the user's regen on
+    #         disk. User-reported on series «Six Weeks After the Gala».
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = out_path.with_name(f'.autogen-{uuid.uuid4().hex[:8]}-{out_path.name}')
+    image_url = avai_generate(prompt, tmp_path, preferred_provider=_series_image_provider(s))
     rel_path = str(out_path.relative_to(series_path(sid)))
-    char.setdefault('ref_images', []).insert(0, rel_path)
-    char['avai_base_url'] = image_url
+    # Stash the staging info on the char so _run_task can commit it under lock.
+    # `_autogen_pending` is intentionally NOT persisted to disk — orchestrator
+    # consumes it before any save_series.
+    char['_autogen_pending'] = {
+        'tmp_path': str(tmp_path),
+        'canonical_path': str(out_path),
+        'rel_path': rel_path,
+        'image_url': image_url,
+    }
 
 def _gen_outfit_inline(s, sid, char, outfit):
     """Generate outfit photo via i2i from char base. Mutates outfit."""
@@ -6425,7 +6447,7 @@ def _gen_outfit_inline(s, sid, char, outfit):
         + constraints_clause
         + 'Full body, front-facing, slight 3/4 angle. Neutral relaxed pose. '
           'Arms hanging loosely at sides, hands open and empty — no objects held, no props, not in pockets. '
-          'Uniform solid gray background, #808080, no gradients, no props, no furniture. No shadows on background. '
+          'STRICT BACKGROUND: ONLY a flat featureless gray (#808080) studio cyclorama behind the character. ABSOLUTELY NO windows, doors, walls, room interiors, furniture, plants, objects, decor, outdoor scenes, or any environmental elements whatsoever. Character must be isolated against the gray field — no setting, no architecture, no context. No shadows or reflections on the background. '
           'Studio lighting, soft and even.'
         + realism_suffix
     )
@@ -6610,17 +6632,40 @@ def auto_generate_missing_assets(sid):
                         return
                     ip_entry = {'kind': 'char', 'parent_id': parent_id, 'child_id': None, 'name': char.get('name', '')}
                     _ip_add(ip_entry)
-                    _gen_char_base_inline(s_local, sid, char)  # SLOW: avai API call
-                    new_refs = char.get('ref_images') or []
-                    new_url  = char.get('avai_base_url') or ''
+                    _gen_char_base_inline(s_local, sid, char)  # SLOW: avai API call → writes to temp path
+                    pending = char.get('_autogen_pending') or {}
+                    tmp_p   = Path(pending.get('tmp_path', ''))
+                    canon_p = Path(pending.get('canonical_path', ''))
+                    new_url = pending.get('image_url', '')
+                    new_rel = pending.get('rel_path', '')
+                    if not tmp_p or not tmp_p.exists():
+                        return  # generation failed before producing a file
                     with save_lock:
                         s_disk = load_series(sid)
-                        if not s_disk: return
+                        if not s_disk:
+                            tmp_p.unlink(missing_ok=True)
+                            return
                         c_disk = next((c for c in s_disk.get('characters', []) if c['id'] == parent_id), None)
                         if c_disk and not c_disk.get('ref_images'):
-                            c_disk['ref_images'] = new_refs
+                            # Commit: rename temp → canonical, persist series.json
+                            try:
+                                canon_p.parent.mkdir(parents=True, exist_ok=True)
+                                tmp_p.replace(canon_p)  # atomic on same filesystem
+                            except Exception as e:
+                                _log_event('WARN', 'autogen_char_commit_failed',
+                                           char_id=parent_id, err=str(e)[:200])
+                                tmp_p.unlink(missing_ok=True)
+                                return
+                            c_disk['ref_images'] = [new_rel]
                             c_disk['avai_base_url'] = new_url
                             save_series(sid, s_disk)
+                        else:
+                            # User regen / manual upload already populated this
+                            # char between our stale snapshot and this commit.
+                            # Discard our work — keep the user's version intact.
+                            tmp_p.unlink(missing_ok=True)
+                            _log_event('INFO', 'autogen_char_skipped_by_user_regen',
+                                       char_id=parent_id, name=char.get('name', ''))
                 elif kind == 'outfit':
                     char = next((c for c in s_local.get('characters', []) if c['id'] == parent_id), None)
                     if not char: return
