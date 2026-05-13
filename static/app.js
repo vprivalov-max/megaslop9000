@@ -3542,6 +3542,7 @@ function _updateRangeGenSelectionCount() {
 }
 
 function renderEpisodesList() {
+  try { _initSeriesMusicCheckbox(); } catch {}
   const el = document.getElementById('episodes-list');
   const empty = document.getElementById('episodes-empty');
   if (!S.episodes.length) {
@@ -7747,6 +7748,9 @@ async function startAutoMode() {
         duration: seg.durationSec || sharedOpts.duration, resolution: sharedOpts.resolution,
         moderation_bypass: sharedOpts.moderation_bypass,
         script_order: (scriptOrder != null ? scriptOrder : (typeof seg.scriptOrder === 'number' ? seg.scriptOrder : null)),
+        sceneIdx: seg.sceneIdx,
+        segIdx: seg.segIdx,
+        durationSec: seg.durationSec || sharedOpts.duration,
         refs: (composeRes.refs || []).map(r => ({
           kind: r.kind, id: r.id, outfit: r.outfit || null, url: r.url || null,
           source: r.source, prev_idx: r.prev_idx, name: r.name,
@@ -7957,6 +7961,9 @@ async function startAutoMode() {
                 chunk_text: seg.text,
                 duration: segDur, resolution, moderation_bypass,
                 script_order: seg.scriptOrder,
+                sceneIdx: seg.sceneIdx,
+                segIdx: seg.segIdx,
+                durationSec: segDur,
                 refs: (prebuilt.refs || []).map(r => ({
                   kind: r.kind, id: r.id, outfit: r.outfit || null, url: r.url || null,
                   source: r.source, prev_idx: r.prev_idx, name: r.name,
@@ -8537,6 +8544,25 @@ async function startRangeGen() {
           else if (r?.error) assembleNote = ` · ⚠ авто-сборка: ${r.error}`;
         } catch (e) {
           assembleNote = ` · ⚠ авто-сборка упала: ${e.message || e}`;
+        }
+
+        // Fire-and-forget music generation if series has it enabled.
+        // Backend spawns daemon threads per scene; we just kick it off and
+        // let the UI poll status via _sdRefreshMusic when user opens the
+        // episode. Failing here must not block range-gen progression.
+        const musicEnabled = (S.series?.id === RANGE.seriesId)
+          ? (S.series?.settings?.enable_music !== false)
+          : true;
+        if (musicEnabled) {
+          try {
+            await api.post(
+              `/api/series/${RANGE.seriesId}/episodes/${epNum}/music/generate`,
+              {}
+            );
+            assembleNote += ' · 🎵 музыка запущена';
+          } catch (e) {
+            assembleNote += ` · 🎵 ⚠ ${e.message || e}`;
+          }
         }
       }
     } catch (e) {
@@ -12648,11 +12674,16 @@ function _sdUpdateAssembleUI(chunks) {
   const assembledRel = S.episode?.assembled_path;
   if (assembledRel && S.seriesId) {
     link.style.display = '';
+    // href is set for accessibility but actual download triggered via onclick
+    // (downloadAssembledWithMusic) so we can also pull MUS_*.wav alongside.
     link.href = `/assets/${S.seriesId}/${assembledRel}?v=${S.episode.assembled_at || ''}`;
-    link.title = `Скачать ${assembledRel.split('/').pop()}`;
+    link.title = `Скачать ${assembledRel.split('/').pop()} (+ музыка)`;
   } else {
     link.style.display = 'none';
   }
+  // Refresh music UI on every chunk update — cheap (uses cached poll data).
+  try { _sdUpdateMusicUI(chunks, MUSIC.last[_musicKey()] || null); } catch {}
+  try { _sdRefreshMusic(); } catch {}
 }
 
 async function sdAssembleEpisode(btn) {
@@ -12702,6 +12733,233 @@ async function sdAssembleEpisode(btn) {
     btn.disabled = false;
     btn.innerHTML = orig;
   }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// 🎵 MUSIC — ElevenLabs per-scene music UI
+// ════════════════════════════════════════════════════════════════════════════
+// State cache for music poll. Keyed by `${sid}/${num}` → latest poll response.
+const MUSIC = { last: {}, pollTimers: {} };
+
+function _musicKey() {
+  return `${S.seriesId}/${S.episode?.number}`;
+}
+
+async function seriesToggleMusic(input) {
+  if (!S.series || !S.seriesId) return;
+  const enabled = !!input.checked;
+  S.series.settings = S.series.settings || {};
+  S.series.settings.enable_music = enabled;
+  try {
+    S.series = await api.put(`/api/series/${S.seriesId}`, { settings: S.series.settings });
+    showToast(enabled
+      ? '🎵 Авто-музыка включена — новые эпизоды получат трек после сборки'
+      : '🔇 Авто-музыка отключена — старые треки не трогаем', 4000);
+  } catch (e) {
+    input.checked = !enabled;
+    showToast('Не удалось сохранить настройку: ' + (e.message || e), 4000);
+  }
+}
+
+function _initSeriesMusicCheckbox() {
+  const el = document.getElementById('series-enable-music');
+  if (!el || !S.series) return;
+  const cur = S.series?.settings?.enable_music;
+  // Default ON if not explicitly set to false.
+  el.checked = cur !== false;
+}
+
+function _sdUpdateMusicUI(chunks, music) {
+  const btn = document.getElementById('sd-music-btn');
+  const regen = document.getElementById('sd-music-regen-btn');
+  const dl = document.getElementById('sd-music-dl-link');
+  const counter = document.getElementById('sd-music-counter');
+  if (!btn) return;
+
+  const available = (music && music.available_scenes) || [];
+  const scenes = (music && music.music_scenes) || [];
+  const totalScenes = available.length;
+  const byIdx = new Map(scenes.map(s => [s.sceneIdx, s]));
+  const completed = available.filter(a => byIdx.get(a.sceneIdx)?.status === 'completed').length;
+  const generating = available.filter(a => byIdx.get(a.sceneIdx)?.status === 'generating' || byIdx.get(a.sceneIdx)?.status === 'pending').length;
+  const failed = available.filter(a => byIdx.get(a.sceneIdx)?.status === 'failed').length;
+
+  // Show the «Сгенерировать музыку» button whenever the episode has at least
+  // one completed chunk — even if the chunks lack sceneIdx (legacy data).
+  // Clicking will hit the backend which returns a helpful error toast.
+  const completedChunks = (chunks || []).filter(c => c.status === 'completed' && c.video_path).length;
+
+  if (totalScenes === 0) {
+    if (completedChunks > 0) {
+      btn.style.display = '';
+      btn.disabled = false;
+      btn.innerHTML = '🎵 Сгенерировать музыку';
+      btn.title = 'Сгенерировать инструментальную музыку под каждую сцену. Если кнопка ругается — старые чанки без sceneIdx, нужно их перегенерить.';
+    } else {
+      btn.style.display = 'none';
+    }
+    regen.style.display = 'none';
+    dl.style.display = 'none';
+    counter.style.display = 'none';
+    return;
+  }
+
+  // Show «🎵 Сгенерировать музыку» if at least one scene is missing or failed.
+  btn.style.display = (completed < totalScenes) ? '' : 'none';
+  if (generating > 0) {
+    btn.disabled = true;
+    btn.innerHTML = `<span class="spinner"></span> Музыка ${completed}/${totalScenes}`;
+  } else {
+    btn.disabled = false;
+    btn.innerHTML = '🎵 Сгенерировать музыку' + (failed > 0 ? ` · ⚠ ${failed} failed` : '');
+  }
+
+  regen.style.display = (completed > 0) ? '' : 'none';
+  dl.style.display = (completed > 0) ? '' : 'none';
+  if (dl.style.display) {
+    dl.href = `/api/series/${S.seriesId}/episodes/${S.episode.number}/music/download`;
+  }
+  counter.style.display = '';
+  counter.textContent = `🎵 ${completed}/${totalScenes}` + (generating > 0 ? ` · ${generating} gen` : '') + (failed > 0 ? ` · ${failed} fail` : '');
+}
+
+async function _sdRefreshMusic() {
+  if (!S.seriesId || !S.episode) return;
+  try {
+    const res = await api.get(
+      `/api/series/${S.seriesId}/episodes/${S.episode.number}/music/poll`
+    );
+    MUSIC.last[_musicKey()] = res;
+    _sdUpdateMusicUI(SD._lastChunks || [], res);
+    return res;
+  } catch (e) { return null; }
+}
+
+function _sdEnsureMusicPoll() {
+  const key = _musicKey();
+  if (MUSIC.pollTimers[key]) return;
+  MUSIC.pollTimers[key] = setInterval(async () => {
+    if (`${S.seriesId}/${S.episode?.number}` !== key) {
+      clearInterval(MUSIC.pollTimers[key]);
+      delete MUSIC.pollTimers[key];
+      return;
+    }
+    const res = await _sdRefreshMusic();
+    // Stop polling once nothing is in flight.
+    const inFlight = (res?.music_scenes || []).some(s => s.status === 'generating' || s.status === 'pending');
+    if (!inFlight) {
+      clearInterval(MUSIC.pollTimers[key]);
+      delete MUSIC.pollTimers[key];
+    }
+  }, 8000);
+}
+
+async function sdGenerateMusic(btn) {
+  if (!S.seriesId || !S.episode) { showToast('Открой серию'); return; }
+  const orig = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span> Запуск...';
+  try {
+    const r = await api.post(
+      `/api/series/${S.seriesId}/episodes/${S.episode.number}/music/generate`,
+      {}
+    );
+    if (r.error) throw new Error(r.error);
+    showToast(`▶ Музыка стартовала на ${r.scenes?.length || 0} сценах`, 3500);
+    _sdEnsureMusicPoll();
+    setTimeout(_sdRefreshMusic, 1000);
+  } catch (e) {
+    showToast('Ошибка запуска музыки: ' + (e.message || e), 5000);
+    btn.disabled = false;
+    btn.innerHTML = orig;
+  }
+}
+
+async function sdRegenMusicDialog() {
+  if (!S.seriesId || !S.episode) return;
+  const cur = MUSIC.last[_musicKey()] || await _sdRefreshMusic();
+  const scenes = (cur?.available_scenes || []);
+  if (!scenes.length) { showToast('Нет сцен для перегенерации', 3500); return; }
+
+  const sceneOptions = scenes.map(s => {
+    const m = (cur.music_scenes || []).find(x => x.sceneIdx === s.sceneIdx);
+    const tag = m?.status === 'completed' ? '✓' : (m?.status === 'failed' ? '✗' : '·');
+    return `<option value="${s.sceneIdx}">${tag} Сцена ${s.sceneIdx + 1} (~${Math.round(s.total_sec)}с, ${s.chunks} чанк${s.chunks === 1 ? '' : 'ов'})</option>`;
+  }).join('');
+
+  const wrap = document.createElement('div');
+  wrap.className = 'modal-overlay';
+  wrap.innerHTML = `
+    <div class="modal-card" style="max-width:520px">
+      <h3 style="margin-top:0">🎵 Перегенерировать музыку</h3>
+      <p style="color:var(--muted);font-size:0.88rem;margin-top:0">Промпт переписывается под пожелание, генерится новый трек. Старый файл перезаписывается.</p>
+      <label style="display:block;margin-bottom:6px;font-size:0.86rem">Сцена:</label>
+      <select id="mr-scene" style="width:100%;padding:6px 8px;background:#1a1a1f;border:1px solid #333;border-radius:4px;color:#eee;margin-bottom:10px">
+        ${sceneOptions}
+      </select>
+      <label style="display:block;margin-bottom:6px;font-size:0.86rem">Пожелание (на любом языке):</label>
+      <textarea id="mr-hint" rows="3" placeholder="повеселей, подинамичнее, понапряжённее…" style="width:100%;padding:6px 8px;background:#1a1a1f;border:1px solid #333;border-radius:4px;color:#eee;resize:vertical;min-height:60px"></textarea>
+      <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px">
+        <button class="btn-ghost btn-sm" onclick="this.closest('.modal-overlay').remove()">Отмена</button>
+        <button class="btn-accent btn-sm" id="mr-go">▶ Перегенерировать</button>
+      </div>
+    </div>`;
+  document.body.appendChild(wrap);
+  wrap.querySelector('#mr-go').onclick = async () => {
+    const sceneIdx = parseInt(wrap.querySelector('#mr-scene').value, 10);
+    const hint = wrap.querySelector('#mr-hint').value.trim();
+    wrap.remove();
+    try {
+      const r = await api.post(
+        `/api/series/${S.seriesId}/episodes/${S.episode.number}/music/regenerate`,
+        { sceneIdx, user_hint: hint }
+      );
+      if (r.error) throw new Error(r.error);
+      showToast(`▶ Сцена ${sceneIdx + 1} перегенерируется` + (hint ? ` · «${hint}»` : ''), 4000);
+      _sdEnsureMusicPoll();
+      setTimeout(_sdRefreshMusic, 1000);
+    } catch (e) {
+      showToast('Ошибка: ' + (e.message || e), 5000);
+    }
+  };
+}
+
+function _triggerHiddenDownload(url) {
+  const a = document.createElement('a');
+  a.href = url;
+  // Force «save» semantics regardless of the server's Content-Disposition.
+  // Without this attribute the browser sniffs video/mp4 from /assets/<...>.mp4
+  // and opens an inline player in a new tab instead of downloading — user
+  // reported «Скачать финал» suddenly previewing instead of saving after
+  // the music-bundle handler replaced the original `<a download>` attribute.
+  // Empty value = browser picks filename from URL last segment / CD header.
+  a.download = '';
+  a.style.display = 'none';
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => a.remove(), 800);
+}
+
+function downloadAssembledWithMusic(evt) {
+  if (evt) evt.preventDefault();
+  const link = document.getElementById('sd-assembled-link');
+  if (!link || !S.episode?.assembled_path) return;
+  const mp4Url = `/assets/${S.seriesId}/${S.episode.assembled_path}?v=${S.episode.assembled_at || ''}`;
+  _triggerHiddenDownload(mp4Url);
+  // Bundle music WAV if at least one scene completed.
+  const music = MUSIC.last[_musicKey()];
+  const hasMusic = (music?.music_scenes || []).some(s => s.status === 'completed');
+  if (hasMusic) {
+    setTimeout(() => _triggerHiddenDownload(
+      `/api/series/${S.seriesId}/episodes/${S.episode.number}/music/download`
+    ), 600);
+  }
+}
+
+function downloadMusicOnly(evt) {
+  if (evt) evt.preventDefault();
+  if (!S.seriesId || !S.episode) return;
+  _triggerHiddenDownload(`/api/series/${S.seriesId}/episodes/${S.episode.number}/music/download`);
 }
 
 async function sdRefreshList() {
