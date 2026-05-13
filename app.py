@@ -13524,7 +13524,57 @@ def seedance_compose(sid, num):
 
     cur_start, cur_end = _range_in_script(chunk_text)
     cur_pos = cur_start  # keep old name for downstream code
-    all_chunks = _seedance_chunks(ep)
+    raw_chunks = _seedance_chunks(ep)
+    # Dedupe by script_order BEFORE neighbour selection. When the user retries
+    # a chunk, both v1 and v2 sit in seedance_chunks with the same script_order
+    # — the older v1 still carries `cutframes_avai_urls` / `lastframe_avai_url`
+    # cached on its record. If we let v1 win the neighbour race (which happens
+    # when its `end_pos` in script is even 1 char longer than v2's), the next
+    # chunk's compose attaches v1's stale frames as continuity refs and the
+    # new generation inherits the old costumes / characters / mise-en-scène.
+    # User-reported on «My Roommate From Craigslist Is Hunting Me»: pre-cut
+    # frames showed an old (since-replaced) character's wardrobe.
+    # Defense layer 2 — also drop chunks whose mp4 file is gone from disk;
+    # they can't supply real continuity frames and are lingering orphans.
+    by_so = {}
+    no_so = []
+    for c in raw_chunks:
+        vp = c.get('video_path')
+        if vp and not (series_path(sid) / vp).exists():
+            continue  # orphan: video deleted but record lingered
+        so = c.get('script_order')
+        if isinstance(so, int):
+            prev = by_so.get(so)
+            if prev is None:
+                by_so[so] = c
+            else:
+                cur_key  = (c.get('idx') or 0, c.get('created_at') or 0)
+                prev_key = (prev.get('idx') or 0, prev.get('created_at') or 0)
+                if cur_key > prev_key:
+                    by_so[so] = c
+        else:
+            no_so.append(c)
+    # Legacy retries created before script_order was propagated land in no_so
+    # but their chunk_text matches a by_so entry verbatim — same script slot,
+    # different retry. Pick the newest.
+    chunk_text_to_so = {
+        (by_so[k].get('chunk_text') or '').strip(): k
+        for k in by_so
+        if (by_so[k].get('chunk_text') or '').strip()
+    }
+    truly_orphan = []
+    for c in no_so:
+        ct = (c.get('chunk_text') or '').strip()
+        so = chunk_text_to_so.get(ct) if ct else None
+        if so is not None:
+            prev = by_so[so]
+            cur_key  = (c.get('idx') or 0, c.get('created_at') or 0)
+            prev_key = (prev.get('idx') or 0, prev.get('created_at') or 0)
+            if cur_key > prev_key:
+                by_so[so] = c
+        else:
+            truly_orphan.append(c)
+    all_chunks = list(by_so.values()) + truly_orphan
     located = []
     for c in all_chunks:
         sp, ep_ = _range_in_script(c.get('chunk_text') or '')
@@ -13587,7 +13637,29 @@ def seedance_compose(sid, num):
                 if not txt: return -1
                 anchor = next((ln.strip() for ln in txt.splitlines() if len(ln.strip()) > 25), txt[:80].strip())
                 return prev_ep_script.find(anchor)
-            prev_ep_chunks = _seedance_chunks(prev_ep_obj_x)
+            # Same dedup as in-episode neighbour selection: drop orphaned
+            # records whose mp4 is gone, then keep only the newest take per
+            # script_order so a stale v1 doesn't supply continuity frames.
+            raw_prev = _seedance_chunks(prev_ep_obj_x)
+            by_so_p = {}
+            no_so_p = []
+            for c in raw_prev:
+                vp = c.get('video_path')
+                if vp and not (series_path(sid) / vp).exists():
+                    continue
+                so = c.get('script_order')
+                if isinstance(so, int):
+                    prev = by_so_p.get(so)
+                    if prev is None:
+                        by_so_p[so] = c
+                    else:
+                        cur_key  = (c.get('idx') or 0, c.get('created_at') or 0)
+                        prev_key = (prev.get('idx') or 0, prev.get('created_at') or 0)
+                        if cur_key > prev_key:
+                            by_so_p[so] = c
+                else:
+                    no_so_p.append(c)
+            prev_ep_chunks = list(by_so_p.values()) + no_so_p
             located_prev = []
             for c in prev_ep_chunks:
                 p = _pos_in_prev(c.get('chunk_text') or '')
