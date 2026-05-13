@@ -5224,6 +5224,15 @@ async function regenerateCharacterFromLightbox() {
     if (failed.length) msg += ` · ошибок: ${failed.length} (${failed.join(', ')})`;
     status.textContent = msg;
 
+    // Bump the global asset version BEFORE re-rendering so every URL
+    // built by `assetUrl()` (sidebar miniatures, outfit grid, episode
+    // thumbnails) carries the new `?v=` token. Without this, the canonical
+    // filename stays the same across regenerations and the browser's HTTP
+    // cache serves the OLD image to every view except the lightbox (which
+    // builds its own ad-hoc cache-buster below). User saw new variant in
+    // lightbox, then sidebar miniature kept showing the old one and on
+    // re-open the cached old image came back.
+    bumpAssetVersion();
     // Refresh state
     S.series = await api.get(`/api/series/${S.seriesId}`);
     const c = S.series.characters.find(x => x.id === currentCharId);
@@ -5418,6 +5427,7 @@ async function regenerateCharacter() {
     if (regenOutfits) msg += ` · костюмов перегенерировано: ${totalOutfits}`;
     if (failedOutfits.length) msg += ` · ошибок: ${failedOutfits.length} (${failedOutfits.join(', ')})`;
     status.textContent = msg;
+    bumpAssetVersion();   // invalidate cached photos across all views
     S.series = await api.get(`/api/series/${S.seriesId}`);
     const c = S.series.characters.find(x => x.id === currentCharId);
     renderCharAssetsGrid(c, true);

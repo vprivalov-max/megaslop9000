@@ -4975,6 +4975,7 @@ def generate_character_image(sid, char_id):
         refs.insert(0, rel_path)
         # Store remote URL for i2i outfit variants later
         char['avai_base_url'] = image_url
+        char['updated_at'] = int(time.time())   # cache-bust signal for frontend URLs
         save_series(sid, s)
         return jsonify({'ready': True, 'url': f'/assets/{sid}/{rel_path}', 'image_url': image_url})
     except Exception as e:
@@ -5124,6 +5125,13 @@ def regenerate_character(sid, char_id):
     refs[:] = [r for r in refs if Path(r).stem != out_path.stem]
     refs.insert(0, rel_path)
     char['avai_base_url'] = image_url
+    # Bump updated_at so frontend URL cache-busters change → browser fetches
+    # the new file instead of serving the prior generation from HTTP cache.
+    # User-reported: regenerated portrait visible in lightbox but sidebar
+    # miniature kept showing the old one because the URL stayed identical
+    # (canonical filename never changes). All views compose `?v=<updated_at>`
+    # so a fresh bump invalidates every cached copy in one shot.
+    char['updated_at'] = int(time.time())
 
     # If any outfit was flagged is_base, point it at the new base photo too.
     for o in (char.get('outfits') or []):
@@ -6658,6 +6666,7 @@ def auto_generate_missing_assets(sid):
                                 return
                             c_disk['ref_images'] = [new_rel]
                             c_disk['avai_base_url'] = new_url
+                            c_disk['updated_at'] = int(time.time())
                             save_series(sid, s_disk)
                         else:
                             # User regen / manual upload already populated this
@@ -11058,6 +11067,7 @@ def upload_character_asset(sid, char_id):
     file.save(final)
     char['ref_images'] = [rel_path]
     char['avai_base_url'] = ''  # invalidate — old AVAI URL pointed at the old (deleted) gen
+    char['updated_at'] = int(time.time())   # cache-bust signal for frontend URLs
     save_series(sid, s)
     # Log so we can trace user-reported "uploaded photo vanished" cases.
     try:
@@ -11089,6 +11099,7 @@ def delete_character_asset(sid, char_id, filename):
         # Clear avai_base_url if this was the base portrait
         if asset_name(char.get('name', ''), 'BASE') in filename:
             char.pop('avai_base_url', None)
+        char['updated_at'] = int(time.time())   # cache-bust signal for frontend URLs
     save_series(sid, s)
     return jsonify({'ok': True})
 
