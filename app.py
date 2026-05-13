@@ -15500,7 +15500,7 @@ def seedance_compose(sid, num):
         if fallback_block:
             data['prompt'] = (data.get('prompt') or '').rstrip() + fallback_block
             _log_event('INFO', 'pose_lock_fallback', sid=sid, ep_num=num,
-                       level=pose_lock_fallback,
+                       fallback_level=pose_lock_fallback,
                        prev_idx=prev_neighbour.get('idx'))
 
     # ── FRAMING FORCED-INJECTION (Track A1) ─────────────────────────────────
