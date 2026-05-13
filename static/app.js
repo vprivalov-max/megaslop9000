@@ -12865,11 +12865,23 @@ async function sdGenerateMusic(btn) {
       {}
     );
     if (r.error) throw new Error(r.error);
-    showToast(`▶ Музыка стартовала на ${r.scenes?.length || 0} сценах`, 3500);
+    showToast(`▶ Музыка стартовала на ${r.scenes?.length || 0} сценах — ~30-90с на сцену`, 5000);
+
+    // Optimistic UI: pre-fill cache so the counter switches to «🎵 0/N · gen»
+    // immediately instead of waiting for the first poll round-trip.
+    const key = _musicKey();
+    if (!MUSIC.last[key]) MUSIC.last[key] = { music_scenes: [], available_scenes: [] };
+    const cache = MUSIC.last[key];
+    (r.scenes || []).forEach(s => {
+      cache.music_scenes = (cache.music_scenes || []).filter(x => x.sceneIdx !== s.sceneIdx);
+      cache.music_scenes.push({ sceneIdx: s.sceneIdx, status: 'pending' });
+    });
+    _sdUpdateMusicUI(SD._lastChunks || [], cache);
+
     _sdEnsureMusicPoll();
-    setTimeout(_sdRefreshMusic, 1000);
+    _sdRefreshMusic();
   } catch (e) {
-    showToast('Ошибка запуска музыки: ' + (e.message || e), 5000);
+    showToast('Ошибка запуска музыки: ' + (e.message || e), 6000);
     btn.disabled = false;
     btn.innerHTML = orig;
   }
@@ -12881,47 +12893,70 @@ async function sdRegenMusicDialog() {
   const scenes = (cur?.available_scenes || []);
   if (!scenes.length) { showToast('Нет сцен для перегенерации', 3500); return; }
 
+  document.getElementById('music-regen-modal')?.remove();
+  const root = document.createElement('div');
+  root.id = 'music-regen-modal';
+  root.className = 'app-confirm-modal';
   const sceneOptions = scenes.map(s => {
     const m = (cur.music_scenes || []).find(x => x.sceneIdx === s.sceneIdx);
     const tag = m?.status === 'completed' ? '✓' : (m?.status === 'failed' ? '✗' : '·');
     return `<option value="${s.sceneIdx}">${tag} Сцена ${s.sceneIdx + 1} (~${Math.round(s.total_sec)}с, ${s.chunks} чанк${s.chunks === 1 ? '' : 'ов'})</option>`;
   }).join('');
-
-  const wrap = document.createElement('div');
-  wrap.className = 'modal-overlay';
-  wrap.innerHTML = `
-    <div class="modal-card" style="max-width:520px">
-      <h3 style="margin-top:0">🎵 Перегенерировать музыку</h3>
-      <p style="color:var(--muted);font-size:0.88rem;margin-top:0">Промпт переписывается под пожелание, генерится новый трек. Старый файл перезаписывается.</p>
-      <label style="display:block;margin-bottom:6px;font-size:0.86rem">Сцена:</label>
-      <select id="mr-scene" style="width:100%;padding:6px 8px;background:#1a1a1f;border:1px solid #333;border-radius:4px;color:#eee;margin-bottom:10px">
-        ${sceneOptions}
-      </select>
-      <label style="display:block;margin-bottom:6px;font-size:0.86rem">Пожелание (на любом языке):</label>
-      <textarea id="mr-hint" rows="3" placeholder="повеселей, подинамичнее, понапряжённее…" style="width:100%;padding:6px 8px;background:#1a1a1f;border:1px solid #333;border-radius:4px;color:#eee;resize:vertical;min-height:60px"></textarea>
-      <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px">
-        <button class="btn-ghost btn-sm" onclick="this.closest('.modal-overlay').remove()">Отмена</button>
-        <button class="btn-accent btn-sm" id="mr-go">▶ Перегенерировать</button>
+  // Reuse the project's confirm-modal styling — same backdrop, same box.
+  root.innerHTML = `
+    <div class="app-confirm-backdrop"></div>
+    <div class="app-confirm-box" role="dialog" aria-modal="true" style="max-width:520px">
+      <div class="app-confirm-title">🎵 Перегенерировать музыку</div>
+      <div class="app-confirm-body" style="text-align:left">
+        <p style="color:var(--muted);font-size:0.88rem;margin:0 0 12px">Промпт переписывается под пожелание, генерится новый трек. Старый файл перезаписывается.</p>
+        <label style="display:block;margin-bottom:6px;font-size:0.86rem">Сцена:</label>
+        <select id="mr-scene" style="width:100%;padding:6px 8px;background:#1a1a1f;border:1px solid #333;border-radius:4px;color:#eee;margin-bottom:10px">
+          ${sceneOptions}
+        </select>
+        <label style="display:block;margin-bottom:6px;font-size:0.86rem">Пожелание (на любом языке):</label>
+        <textarea id="mr-hint" rows="3" placeholder="повеселей, подинамичнее, понапряжённее…" style="width:100%;padding:6px 8px;background:#1a1a1f;border:1px solid #333;border-radius:4px;color:#eee;resize:vertical;min-height:60px;font-family:inherit"></textarea>
+      </div>
+      <div class="app-confirm-actions">
+        <button class="btn-ghost" data-act="cancel">Отмена</button>
+        <button class="btn-accent" data-act="ok" autofocus>▶ Перегенерировать</button>
       </div>
     </div>`;
-  document.body.appendChild(wrap);
-  wrap.querySelector('#mr-go').onclick = async () => {
-    const sceneIdx = parseInt(wrap.querySelector('#mr-scene').value, 10);
-    const hint = wrap.querySelector('#mr-hint').value.trim();
-    wrap.remove();
+  document.body.appendChild(root);
+  const close = () => { try { root.remove(); } catch {} };
+  root.querySelector('[data-act="cancel"]').addEventListener('click', close);
+  root.querySelector('.app-confirm-backdrop').addEventListener('click', close);
+  root.querySelector('[data-act="ok"]').addEventListener('click', async () => {
+    const sceneIdx = parseInt(root.querySelector('#mr-scene').value, 10);
+    const hint = root.querySelector('#mr-hint').value.trim();
+    close();
+
+    // Optimistic UI: mark the scene as 'pending' in our cache so the toolbar
+    // counter and «🎵 Сгенерировать музыку» button flip to spinner BEFORE the
+    // first poll round-trip lands.
+    const key = _musicKey();
+    if (!MUSIC.last[key]) MUSIC.last[key] = { music_scenes: [], available_scenes: [] };
+    const cache = MUSIC.last[key];
+    cache.music_scenes = (cache.music_scenes || []).filter(s => s.sceneIdx !== sceneIdx);
+    cache.music_scenes.push({ sceneIdx, status: 'pending', user_hint: hint });
+    _sdUpdateMusicUI(SD._lastChunks || [], cache);
+
+    showToast(`▶ Сцена ${sceneIdx + 1} перегенерируется` + (hint ? ` · «${hint}»` : ''), 5000);
     try {
       const r = await api.post(
         `/api/series/${S.seriesId}/episodes/${S.episode.number}/music/regenerate`,
         { sceneIdx, user_hint: hint }
       );
       if (r.error) throw new Error(r.error);
-      showToast(`▶ Сцена ${sceneIdx + 1} перегенерируется` + (hint ? ` · «${hint}»` : ''), 4000);
       _sdEnsureMusicPoll();
-      setTimeout(_sdRefreshMusic, 1000);
+      // First poll right away so spinner reflects real backend state ASAP.
+      _sdRefreshMusic();
     } catch (e) {
-      showToast('Ошибка: ' + (e.message || e), 5000);
+      showToast('Ошибка: ' + (e.message || e), 6000);
+      // Revert optimistic state on error.
+      cache.music_scenes = (cache.music_scenes || []).filter(s => s.sceneIdx !== sceneIdx);
+      _sdUpdateMusicUI(SD._lastChunks || [], cache);
     }
-  };
+  });
 }
 
 function _triggerHiddenDownload(url) {
@@ -15224,3 +15259,26 @@ async function cropSave() {
 // ── Init: restore view from URL hash ─────────────────────────────────────────
 (function bootRoute() { _navFromHash(); })();
 // (hashchange listener already registered next to navigate())
+
+// ── Help video modal ──────────────────────────────────────────────────────────
+// Replace HELP_VIDEO_ID below with your YouTube video ID (the part after ?v=)
+const HELP_VIDEO_YT_ID = 'HELP_VIDEO_ID';
+
+function openHelpVideo() {
+  const modal = document.getElementById('help-video-modal');
+  const iframe = document.getElementById('help-video-iframe');
+  if (!modal || !iframe) return;
+  iframe.src = `https://www.youtube.com/embed/${HELP_VIDEO_YT_ID}?autoplay=1&rel=0&modestbranding=1`;
+  modal.classList.remove('hidden');
+}
+
+function closeHelpVideo() {
+  const modal = document.getElementById('help-video-modal');
+  const iframe = document.getElementById('help-video-iframe');
+  if (iframe) iframe.src = '';   // stop playback
+  if (modal) modal.classList.add('hidden');
+}
+
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') closeHelpVideo();
+});

@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>MegaSlop 9000</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='%230a0e14'/><text x='50' y='79' font-size='78' font-family='Impact,Arial Black,sans-serif' font-weight='900' text-anchor='middle' fill='%23a855f7'>M</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&display=swap" rel="stylesheet">
@@ -38,7 +39,10 @@
 <!-- ══════════════════════════════════════════════════════ -->
 <div id="view-projects" class="view">
   <div class="page-header">
-    <h1>Мои сериалы</h1>
+    <div style="display:flex;align-items:center;gap:10px">
+      <h1 style="margin:0">Мои сериалы</h1>
+      <button class="help-btn" onclick="openHelpVideo()" title="Как пользоваться MegaSlop 9000?">?</button>
+    </div>
     <div class="page-header-actions">
       <button class="dropzone-btn" id="dz-archive" onclick="openArchiveModal()" title="Архив (перетащи сериал сюда, чтобы скрыть)">
         <span class="dz-icon">📦</span>
@@ -72,6 +76,22 @@
   <div id="projects-grid" class="projects-grid"></div>
   <div id="projects-empty" class="empty-state hidden">
     <p>Ещё нет ни одного проекта.<br>Создай первый сериал!</p>
+  </div>
+</div>
+
+<!-- Help video modal -->
+<div id="help-video-modal" class="help-video-overlay hidden" onclick="if(event.target===this)closeHelpVideo()">
+  <div class="help-video-box">
+    <button class="help-video-close" onclick="closeHelpVideo()">✕</button>
+    <h2 class="help-video-title">Как пользоваться MegaSlop 9000?</h2>
+    <div class="help-video-wrap">
+      <iframe id="help-video-iframe" width="100%" height="100%"
+        src=""
+        title="Как пользоваться MegaSlop 9000"
+        frameborder="0"
+        allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+        allowfullscreen></iframe>
+    </div>
   </div>
 </div>
 
@@ -200,6 +220,10 @@
           <label style="display:flex;align-items:center;gap:6px;cursor:pointer" title="Когда серия закончит генерацию — автоматически склеить все её чанки в финальный mp4 в папке OUT/">
             <input type="checkbox" id="range-gen-auto-assemble" checked style="width:14px;height:14px">
             <span>авто-сборка финала</span>
+          </label>
+          <label style="display:flex;align-items:center;gap:6px;cursor:pointer" title="Автоматически генерить инструментальную музыку под каждую сцену после сборки финала. Снять — новые эпизоды без музыки. Не влияет на уже сгенерированные.">
+            <input type="checkbox" id="series-enable-music" checked style="width:14px;height:14px" onchange="seriesToggleMusic(this)">
+            <span>🎵 авто-музыка</span>
           </label>
           <button class="btn-accent btn-sm" id="range-gen-start-btn" onclick="startRangeGen()">▶ Сгенерировать выделенные</button>
           <button class="btn-danger btn-sm" id="range-gen-stop-btn" onclick="stopRangeGen()" style="display:none">⏸ Остановить</button>
@@ -540,7 +564,15 @@
             <button class="btn-accent btn-sm" id="sd-assemble-btn" onclick="sdAssembleEpisode(this)"
                     title="Склеить все готовые чанки этой серии в один mp4 в порядке script_order. Кладётся в папку OUT/. Появляется когда есть хотя бы 1 готовый чанк."
                     style="display:none">🎬 Собрать серию</button>
-            <a id="sd-assembled-link" href="#" download style="display:none;font-size:0.82rem;color:#4ade80;text-decoration:underline" title="Скачать ранее собранный финал">⬇ Скачать финал</a>
+            <a id="sd-assembled-link" href="#" onclick="downloadAssembledWithMusic(event)" style="display:none;font-size:0.82rem;color:#4ade80;text-decoration:underline" title="Скачать собранный финал + музыку отдельным WAV-файлом">⬇ Скачать финал</a>
+            <button class="btn-accent btn-sm" id="sd-music-btn" onclick="sdGenerateMusic(this)"
+                    title="Сгенерировать инструментальную музыку под каждую сцену серии (ElevenLabs Music). Длительность трека — сумма чанков сцены минус 10%."
+                    style="display:none">🎵 Сгенерировать музыку</button>
+            <button class="btn-ghost btn-sm" id="sd-music-regen-btn" onclick="sdRegenMusicDialog()"
+                    title="Перегенерировать музыку одной сцены с пожеланием («повеселей», «понапряжённее»…)"
+                    style="display:none">↻ Перегенерить музыку</button>
+            <a id="sd-music-dl-link" href="#" onclick="downloadMusicOnly(event)" style="display:none;font-size:0.82rem;color:#a78bfa;text-decoration:underline" title="Скачать музыку отдельным WAV-файлом MUS_<сериал>_<эпизод>.wav">⬇ Скачать музыку</a>
+            <span id="sd-music-counter" style="display:none;font-size:0.78rem;color:#a78bfa"></span>
             <span class="muted" id="sd-list-count" style="font-size:0.78rem;margin-left:auto"></span>
           </div>
 
