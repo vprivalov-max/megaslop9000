@@ -15022,8 +15022,21 @@ def seedance_compose(sid, num):
         '  "prompt": "ru/en motion prompt, ~60-110 слов, по структуре выше, с эмоциями перед каждой репликой и финальным @Image<N> локации",\n'
         '  "refs": [{"kind":"char","id":"...","outfit":"label_or_null"}, ..., {"kind":"item","id":"..."}, ..., {"kind":"loc","id":"..."}],\n'
         '  "scene_continuity": true|false,\n'
-        '  "reasoning": "одно предложение — почему именно эти референсы и continuity"\n'
+        '  "framing": "close_up_single" | "medium_single" | "ots" | "two_shot" | "profile_two" | "tracking_shot" | "action_wide" | "wide",\n'
+        '  "framing_anchor": "<имя персонажа foreground для OTS — чьим плечом загораживаем>; null для остальных framing\'ов",\n'
+        '  "reasoning": "одно предложение — почему именно эти референсы, continuity и framing"\n'
         "}\n\n"
+        "FRAMING — обязательное поле, выбирай ОДИН вариант:\n"
+        "  • close_up_single / medium_single — в refs ОДИН персонаж + локация (плюс items). Используй когда в кадре правда один герой.\n"
+        "  • ots — статичный диалог лицом к лицу, камера за плечом anchor'а; в refs оба + локация; framing_anchor = имя того кого видим со спины.\n"
+        "  • two_shot — оба в кадре статика (рядом, лицом к камере или под лёгким углом).\n"
+        "  • profile_two — оба профилями к камере в тесном пространстве (в машине, за столом, плечом-к-плечу).\n"
+        "  • tracking_shot — walking-and-talking, оба бок-о-бок, камера движется параллельно.\n"
+        "  • action_wide — физический контакт / драка / групповое действие, оба видны полностью.\n"
+        "  • wide — establishing shot или групповая сцена с 3+ персонажами.\n"
+        "  ПРИНЦИП: если в refs[] >=2 character'а — framing должен быть ИЗ {ots, two_shot, profile_two, tracking_shot, action_wide, wide}. "
+        "Никогда не выбирай close_up_single/medium_single при двух персах в refs — это противоречие и приведёт ко «второй размыто сзади». "
+        "Если по контексту нужен close-up — выкидывай второго из refs[] (он молчит и не действует в этом chunk'е).\n\n"
         "ПРОВЕРКА перед выводом:\n"
         "- BINDING-строка (@Image1=<имя>, @Image2=<имя>, ...) идёт ПЕРВОЙ в prompt? Если нет — допиши.\n"
         "- В SUBJECT/ACTION/SCENE используются ИМЕНА (без @ImageN)? Если нашёл @ImageN в этих блоках — замени на имя.\n"
@@ -15410,6 +15423,123 @@ def seedance_compose(sid, num):
             data['prompt'] = (data.get('prompt') or '').rstrip() + state_extra
             state_analysis_attached = True
 
+    # ── FRAMING FORCED-INJECTION (Track A1) ─────────────────────────────────
+    # If composer returned a structured framing value AND there are 2+ char
+    # refs, append a deterministic per-framing composition block. This is the
+    # main defence against the «второй размыто сзади» artifact — instead of
+    # hoping Claude's prose contains the right spatial cue, the server writes
+    # the exact phrasing Seedance responds to.
+    #
+    # Back-compat: if `framing` is missing/unknown, OR there's <2 chars in
+    # refs, we don't inject anything → existing single-shot flows are unchanged.
+    framing = (data.get('framing') or '').strip().lower()
+    framing_anchor = (data.get('framing_anchor') or '').strip()
+    char_ref_count = sum(1 for r in (data.get('refs') or []) if r.get('kind') == 'char')
+    _FRAMING_BLOCKS = {
+        'ots': (
+            "КОМПОЗИЦИЯ КАДРА (FORCED OTS): Камера расположена за плечом {anchor}. "
+            "В нижней четверти кадра — затылок и плечо {anchor} как foreground-силуэт в лёгком расфокусе. "
+            "По центру кадра в фокусе — лицо собеседника на среднем крупном плане, смотрит мимо камеры в сторону {anchor}. "
+            "{anchor} ЕСТЬ в кадре как foreground, НЕ как фон. НИ ОДИН из персонажей НЕ размыт силуэтом сзади лицом в камеру."
+        ),
+        'two_shot': (
+            "КОМПОЗИЦИЯ КАДРА (FORCED TWO-SHOT): Оба персонажа в кадре на среднем плане, "
+            "плечом к плечу или под лёгким углом друг к другу, лица на одной линии резкости. "
+            "Равная резкость обоих. Ни один не размыт в фоне."
+        ),
+        'profile_two': (
+            "КОМПОЗИЦИЯ КАДРА (FORCED PROFILE-TWO): Оба персонажа профилями к камере "
+            "в тесном пространстве (кабина машины / за столом / у стойки). "
+            "Оба видны как полноценные фигуры, равная резкость. Ни один не в расфокусе."
+        ),
+        'tracking_shot': (
+            "КОМПОЗИЦИЯ КАДРА (FORCED TRACKING): Камера движется параллельно героям, "
+            "оба идут бок-о-бок в стрид-кадре, равная резкость обоих. "
+            "НЕ ставь одного спереди резкого + второго позади размытого — оба на одной линии."
+        ),
+        'action_wide': (
+            "КОМПОЗИЦИЯ КАДРА (FORCED ACTION-WIDE): Все участники действия полностью в кадре "
+            "(головы и ноги видны), физическое взаимодействие чётко прочитывается. "
+            "Никаких размытых силуэтов на фоне — все фигуры с понятной позой."
+        ),
+    }
+    if framing in _FRAMING_BLOCKS and char_ref_count >= 2:
+        block = _FRAMING_BLOCKS[framing]
+        if framing == 'ots' and framing_anchor:
+            block = block.format(anchor=framing_anchor)
+        elif framing == 'ots':
+            # OTS without anchor — composer mistake. Fall back to two_shot
+            # phrasing rather than injecting empty {anchor}.
+            block = _FRAMING_BLOCKS['two_shot']
+            framing = 'two_shot'
+        data['prompt'] = (data.get('prompt') or '').rstrip() + "\n\n" + block
+
+    # ── ANTI-BACKGROUND SCRUB (Track A3) ────────────────────────────────────
+    # Safety net: even with A1/A4 rules, Claude occasionally slips a phrase
+    # like «Anna stands in the background, blurred». Such a phrase, even one
+    # sentence, primes Seedance to place the character exactly that way.
+    # Pattern-strip the known bad formulations; log every hit for analysis.
+    scrub_hits = []
+    ref_char_names = []
+    for r in (data.get('refs') or []):
+        if r.get('kind') == 'char':
+            ch = next((c for c in (s.get('characters') or []) if c.get('id') == r.get('id')), None)
+            if ch and ch.get('name'):
+                ref_char_names.append(re.escape(ch['name']))
+    if ref_char_names and (data.get('prompt') or ''):
+        name_re = re.compile(r'\b(?:' + '|'.join(ref_char_names) + r')\b')
+        # Detect sentences that COMBINE a background-marker AND a blur-marker
+        # AND contain a character name from refs. Sentence-level granularity
+        # is safer than fragment regex — we keep nearby clean sentences intact.
+        bg_markers = re.compile(
+            r'(?:in (?:the )?(?:deep )?background\b'
+            r'|far behind\b'
+            r'|silhouette\b'
+            r'|silhouetted\b'
+            r'|на заднем плане\b'
+            r'|вдалеке\b'
+            r'|в глубине кадра\b'
+            r'|сзади в кадре\b'
+            r'|силуэт\w*\b)',
+            re.IGNORECASE,
+        )
+        blur_markers = re.compile(
+            r'(?:\bblurred\b'
+            r'|\bout of focus\b'
+            r'|\bsoft focus\b'
+            r'|\bdefocus\w*\b'
+            r'|\bобрезает\b'
+            r'|\bразмыт\w*\b'
+            r'|\bрасфокус\w*\b'
+            r'|\bнерезк\w*\b)',
+            re.IGNORECASE,
+        )
+        # Split prompt into sentences-ish (`.`, `!`, `?`, `;`, line breaks)
+        sentences = re.split(r'(?<=[\.\!\?;])\s+|\n+', data.get('prompt') or '')
+        kept = []
+        for s_text in sentences:
+            has_bg = bool(bg_markers.search(s_text))
+            has_blur = bool(blur_markers.search(s_text))
+            has_char = bool(name_re.search(s_text))
+            # Special case allow-list: forced OTS block contains "blurred earpiece"
+            # which is desired phrasing. Skip if sentence has "back-of-head" or
+            # "over <name>'s shoulder" or "earpiece" — those are valid OTS cues.
+            is_valid_ots = bool(re.search(
+                r'\b(?:back-of-head|earpiece|over [A-ZА-ЯЁ][^\s]*\'?s? shoulder|за плечом|плечо\s+\S+\s+как foreground)',
+                s_text, re.IGNORECASE,
+            ))
+            if has_bg and has_blur and has_char and not is_valid_ots:
+                scrub_hits.append(s_text.strip())
+                continue   # drop this sentence
+            kept.append(s_text)
+        if scrub_hits:
+            new_prompt = ' '.join(kept)
+            new_prompt = re.sub(r'\s+([\.,;\!\?])', r'\1', new_prompt)
+            new_prompt = re.sub(r'\s{2,}', ' ', new_prompt).strip()
+            data['prompt'] = new_prompt
+            _log_event('INFO', 'anti_background_scrub', sid=sid, ep_num=num,
+                       hits=scrub_hits[:5], hit_count=len(scrub_hits))
+
     debug_prev = None
     if prev_neighbour:
         debug_prev = {
@@ -15429,6 +15559,9 @@ def seedance_compose(sid, num):
         'auto_close_up_detected': bool(auto_close_up_block),
         'scene_continuity': data.get('scene_continuity'),
         'reasoning': data.get('reasoning', ''),
+        'framing': framing or None,
+        'framing_anchor': framing_anchor or None,
+        'anti_background_scrub_hits': scrub_hits,
         'lastframe_attached': lastframe_attached,
         'cutframes_attached': cutframes_attached,
         'state_analysis_attached': state_analysis_attached,
