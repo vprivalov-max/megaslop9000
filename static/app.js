@@ -12833,9 +12833,21 @@ function _sdChronoKey(chunk, labelInfo) {
   ];
 }
 
+// Cache-bust the chunk's video URL with the chunk's created_at timestamp
+// (or current time as fallback). After a delete+regen, the new chunk reuses
+// the same idx (so the same filename `seedance_ep001_chunk000.mp4`), and
+// without a cache-buster the browser keeps serving the OLD video from its
+// HTTP cache — including footage of characters that have since been
+// removed from the series. User-reported on «My Roommate From Craigslist…».
+function _chunkVideoUrl(c) {
+  if (!c || !c.video_path) return '';
+  const bust = c.created_at || c.completed_at || Math.floor(Date.now() / 1000);
+  return `${assetUrl(c.video_path)}?v=${bust}`;
+}
+
 function _sdCardHTML(c, labelInfo) {
   const stCls = `sd-status-${c.status || 'pending'}`;
-  const videoUrl = c.video_path ? `${assetUrl(c.video_path)}` : '';
+  const videoUrl = _chunkVideoUrl(c);
   const cost = c.cost != null ? `$${Number(c.cost).toFixed(2)}` : '';
   let placeholderText;
   if (c.status === 'failed') placeholderText = '✗ failed';
@@ -12963,7 +12975,7 @@ function sdOpenChunkModal(idx) {
   document.addEventListener('keydown', _sdModalKeyHandler);
   const labels = _sdComputeLabels(list);
   const lbl = labels.get(c.idx) || { label: `#?${c.idx}`, take: '' };
-  const videoUrl = c.video_path ? assetUrl(c.video_path) : '';
+  const videoUrl = _chunkVideoUrl(c);
   const stCls = `sd-status-${c.status || 'pending'}`;
   const cost = c.cost != null ? `$${Number(c.cost).toFixed(2)}` : '';
   const canRetry = !!(c.prompt && (c.refs || []).length && c.status !== 'submitting');
@@ -13835,7 +13847,7 @@ function mtRenderTimeline() {
   }
   empty?.classList.add('hidden');
   el.innerHTML = MT.clips.map((c, i) => {
-    const url = c.video_path ? `${assetUrl(c.video_path)}` : '';
+    const url = _chunkVideoUrl(c);
     const dur = Math.max(0.1, (c.out || 0) - (c.in || 0));
     const w = Math.max(70, dur * MT.pxPerSec);
     const trimMark = (c.in > 0.05 || (c.orig_duration && Math.abs(c.out - c.orig_duration) > 0.05))
@@ -14138,7 +14150,7 @@ function mtLoadClipIntoPlayer(idx, localOffset = 0) {
   if (idx < 0 || idx >= MT.clips.length) return;
   const c = MT.clips[idx];
   if (!c.video_path) return;
-  const url = `${assetUrl(c.video_path)}`;
+  const url = _chunkVideoUrl(c);
   const targetTime = (c.in || 0) + localOffset;
   if (MT.curIdx !== idx) {
     MT.curIdx = idx;
@@ -14546,7 +14558,7 @@ async function mtRefreshLibrary() {
       return;
     }
     lib.innerHTML = items.map(c => {
-      const url = `${assetUrl(c.video_path)}`;
+      const url = _chunkVideoUrl(c);
       return `
         <div class="mt-lib-item" draggable="true"
              ondragstart="mtLibDragStart(event,${c.ep},${c.idx})"
