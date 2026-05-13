@@ -14094,15 +14094,36 @@ def seedance_compose(sid, num):
     next_neighbour = None
     prev_neighbour_ep = num         # which episode prev_neighbour belongs to
     prev_neighbour_obj = ep         # the loaded episode dict (for save_episode)
+    # B3: helper — last scene-heading byte offset at or before given pos.
+    # Used to weight same-scene candidates above cross-scene ones in
+    # `_prev_score` so parallel auto-mode / retry timing can't put a chunk
+    # from the previous scene ahead of the just-pending same-scene one.
+    def _last_scene_heading_before(pos):
+        if pos <= 0:
+            return -1
+        last = -1
+        cursor = 0
+        for ln in full_script_for_pos.split('\n'):
+            if cursor > pos:
+                break
+            if is_scene_heading(ln):
+                last = cursor
+            cursor += len(ln) + 1
+        return last
+    cur_scene_anchor = _last_scene_heading_before(cur_start) if cur_start >= 0 else -1
+
     if cur_start >= 0:
         # PREV = chunk whose END is closest to (but ≤) the current chunk's START.
-        # On ties (regenerations of the same fragment): prefer completed,
+        # PRIMARY tiebreak: same-scene (no scene heading between cur and candidate).
+        # On scoring ties (regenerations of the same fragment): prefer completed,
         # then prefer the most recently created.
         def _prev_score(c, end_pos):
+            same_scene = (_last_scene_heading_before(end_pos) == cur_scene_anchor)
             return (
-                end_pos,                                    # 1) max end position
-                1 if c.get('status') == 'completed' else 0, # 2) completed wins
-                int(c.get('created_at') or 0),              # 3) newer wins
+                1 if same_scene else 0,                     # 1) same scene wins HARD
+                end_pos,                                    # 2) max end position
+                1 if c.get('status') == 'completed' else 0, # 3) completed wins
+                int(c.get('created_at') or 0),              # 4) newer wins
             )
         best_prev = None  # (score_tuple, chunk)
         for sp, ep_pos, c in located:
@@ -15423,6 +15444,65 @@ def seedance_compose(sid, num):
             data['prompt'] = (data.get('prompt') or '').rstrip() + state_extra
             state_analysis_attached = True
 
+    # ── POSE LOCK FALLBACK CHAIN (Track B2) ─────────────────────────────────
+    # If Vision didn't run (no continuity frames attached) OR Vision returned
+    # empty (network blip / content-filter), we still need SOMETHING anchoring
+    # the next chunk's poses to the previous chunk. Fall back to:
+    #   (2) prev_neighbour.ending_state (coarse one-liner written by Haiku
+    #       after the prev chunk completed)
+    #   (3) regex-extract pose verbs from prev_neighbour.chunk_text
+    # If even those produce nothing — leave as before (no block); model
+    # falls back to base portraits. The compose response includes
+    # `pose_lock_fallback` so logs/UI can see what level fired.
+    pose_lock_fallback = 'vision' if state_analysis_attached else None
+    if not state_analysis_attached and prev_neighbour:
+        fallback_block = ''
+        ending_state = (prev_neighbour.get('ending_state') or '').strip()
+        if ending_state:
+            fallback_block = (
+                "\n\nПОЗИЦИИ ИЗ ПРОШЛОГО ЧАНКА (упрощённое продолжение — Vision-анализ continuity-кадров не "
+                "доступен; используем ending_state):\n"
+                f"  {ending_state}\n\n"
+                "Это финальная мизансцена предыдущего чанка. Сохрани эти позы и расстановку в начале текущего "
+                "чанка, пока в CHUNK'е нет ЯВНОГО ГЛАГОЛА смены позы (садится, встаёт, выходит). "
+                "Первая строка ACTION должна явно продолжать эту расстановку."
+            )
+            pose_lock_fallback = 'ending_state'
+        else:
+            prev_text = (prev_neighbour.get('chunk_text') or '')
+            if prev_text:
+                # Regex-извлечение поз: имя_персонажа + pose-verb в одной фразе.
+                # Имена ловим жадно (CamelCase / ALL CAPS / просто заглавная), затем
+                # ищем pose-verb в пределах ~30 символов.
+                pose_re = re.compile(
+                    r'\b([A-ZА-ЯЁ][A-Za-zА-Яа-яЁё\-]{1,30})\b[^.,;\n]{0,30}\b'
+                    r'(?:сидит|сидят|стоит|стоят|лежит|лежат|на коленях|опирается|опираются|'
+                    r'наклоняется|наклоняются|обнимает|обнимают|держит за|приседает|приседают|'
+                    r'sits|stands|kneels|leans|holds|hugs|kneeling|sitting|standing|leaning)\b',
+                    re.IGNORECASE,
+                )
+                hits = pose_re.findall(prev_text)
+                if hits:
+                    uniq = []
+                    for h in hits:
+                        if h not in uniq:
+                            uniq.append(h)
+                        if len(uniq) >= 3:
+                            break
+                    fallback_block = (
+                        f"\n\nПОЗИЦИИ ИЗ ПРОШЛОГО ЧАНКА (regex-extract — нет ни Vision-анализа, "
+                        f"ни ending_state):\n"
+                        f"  В прошлом чанке упоминались позы у: {', '.join(uniq)}\n\n"
+                        f"Если эти персонажи присутствуют в текущем CHUNK'е — сохрани их позу/действие "
+                        f"из предыдущего чанка, пока нет ЯВНОГО ГЛАГОЛА смены."
+                    )
+                    pose_lock_fallback = 'chunk_text_regex'
+        if fallback_block:
+            data['prompt'] = (data.get('prompt') or '').rstrip() + fallback_block
+            _log_event('INFO', 'pose_lock_fallback', sid=sid, ep_num=num,
+                       level=pose_lock_fallback,
+                       prev_idx=prev_neighbour.get('idx'))
+
     # ── FRAMING FORCED-INJECTION (Track A1) ─────────────────────────────────
     # If composer returned a structured framing value AND there are 2+ char
     # refs, append a deterministic per-framing composition block. This is the
@@ -15473,6 +15553,18 @@ def seedance_compose(sid, num):
             block = _FRAMING_BLOCKS['two_shot']
             framing = 'two_shot'
         data['prompt'] = (data.get('prompt') or '').rstrip() + "\n\n" + block
+
+    # ── B4: POSTURE/STATE LOCK ECHO at the very end of prompt ────────────────
+    # When pose-lock is active (Vision OR fallback), append a compact one-line
+    # caps reminder as the LAST thing in the prompt. Banana/Seedance hold tail-
+    # of-prompt instructions stronger than mid-prompt — the upfront block sets
+    # context, this echo reinforces «don't change pose» right before generation.
+    if pose_lock_fallback in ('vision', 'ending_state', 'chunk_text_regex'):
+        data['prompt'] = (data.get('prompt') or '').rstrip() + (
+            "\n\nКРИТИЧНО: НЕ меняй позы персонажей из POSTURE LOCK выше пока в этом chunk'е "
+            "нет ЯВНОГО ГЛАГОЛА смены позы (садится, встаёт, выходит, ложится). "
+            "Continuity > свобода интерпретации."
+        )
 
     # ── ANTI-BACKGROUND SCRUB (Track A3) ────────────────────────────────────
     # Safety net: even with A1/A4 rules, Claude occasionally slips a phrase
@@ -15542,12 +15634,52 @@ def seedance_compose(sid, num):
 
     debug_prev = None
     if prev_neighbour:
+        prev_end_pos = next(
+            (ep_pos for sp, ep_pos, c in located if c is prev_neighbour),
+            -1,
+        )
+        prev_scene_anchor = _last_scene_heading_before(prev_end_pos) if prev_end_pos >= 0 else -1
         debug_prev = {
             'idx': prev_neighbour.get('idx'),
             'episode': prev_neighbour_ep,
             'has_video': bool(prev_neighbour.get('video_path')),
             'pos_found': cur_pos >= 0,
+            'same_scene': (cur_scene_anchor == prev_scene_anchor) if cur_scene_anchor >= 0 else None,
+            'status': prev_neighbour.get('status'),
         }
+
+    # ── B5: COMPOSE SANITY WARNINGS ─────────────────────────────────────────
+    # Defence-in-depth: surface internal inconsistencies as `compose_warnings`
+    # to the UI, so when the user reports «chunk is bad» we can immediately
+    # see which guard failed.
+    compose_warnings = []
+    # 1) prev_neighbour exists + scene_continuity claims true, but no pose lock
+    #    of any kind landed in the prompt → next chunk WILL drift in pose.
+    if (prev_neighbour and data.get('scene_continuity') is not False
+            and not pose_lock_fallback):
+        compose_warnings.append({
+            'kind': 'no_pose_lock_with_prev',
+            'detail': 'prev_neighbour exists and continuity is on, but neither Vision-analysis '
+                      'nor ending_state nor chunk_text regex produced a pose-lock block. '
+                      'Pose drift likely.',
+        })
+    # 2) prev_neighbour from a different scene than current chunk.
+    if debug_prev and debug_prev.get('same_scene') is False:
+        compose_warnings.append({
+            'kind': 'prev_cross_scene',
+            'detail': f"prev_neighbour idx={debug_prev.get('idx')} is from a different scene "
+                      f"than the current chunk — pose continuity will not transfer.",
+        })
+    # 3) framing missing but composer returned 2+ char refs.
+    if char_ref_count >= 2 and not framing:
+        compose_warnings.append({
+            'kind': 'multi_char_no_framing',
+            'detail': f"{char_ref_count} character refs but composer did not return a `framing` "
+                      "field. Server-side OTS/two-shot injection skipped.",
+        })
+    if compose_warnings:
+        _log_event('INFO', 'compose_warnings', sid=sid, ep_num=num,
+                   warnings=compose_warnings)
     return jsonify({
         'prompt': data.get('prompt', ''),
         'refs': ref_meta,
@@ -15565,6 +15697,8 @@ def seedance_compose(sid, num):
         'lastframe_attached': lastframe_attached,
         'cutframes_attached': cutframes_attached,
         'state_analysis_attached': state_analysis_attached,
+        'pose_lock_fallback': pose_lock_fallback,
+        'compose_warnings': compose_warnings,
         'prev_neighbour': debug_prev,
         'cur_pos_found': cur_pos >= 0,
     })
@@ -15612,6 +15746,10 @@ def seedance_start(sid, num):
     scene_idx_val = _as_int_or_none(body.get('sceneIdx'))
     seg_idx_val   = _as_int_or_none(body.get('segIdx'))
     duration_sec_val = _as_int_or_none(body.get('durationSec')) or duration
+    # B1: composer-reported «scene_continuity was reset» reason. Persisted on
+    # the chunk so the UI can show a yellow «⚠ континьюити сброшен» badge
+    # explaining why a pose/position discontinuity occurred relative to prev chunk.
+    continuity_reset_reason = (body.get('continuity_reset_reason') or '').strip()[:500]
 
     # Per-episode lock — serializes the read-load-mutate-save cycle so parallel
     # /start calls don't race and erase each other's chunks (Flask threaded=True
@@ -15643,6 +15781,7 @@ def seedance_start(sid, num):
             'sceneIdx': scene_idx_val,
             'segIdx': seg_idx_val,
             'durationSec': duration_sec_val,
+            'continuity_reset_reason': continuity_reset_reason or None,
         }
         chunks.append(chunk)
         save_episode(sid, num, ep)

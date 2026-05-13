@@ -12480,10 +12480,31 @@ async function sdCompose() {
       return { ...r, name, photoUrl };
     });
     sdRenderRefs();
-    let msg = res.scene_continuity ? '✓ продолжение прошлой сцены' : '✓ скомпоновано';
+    // B1: if composer explicitly reset scene_continuity AND prev_neighbour
+    // exists — capture the reason so /seedance/start can persist it on the
+    // chunk for the yellow «⚠ континьюити сброшен» badge.
+    if (res.scene_continuity === false && res.prev_neighbour) {
+      SD._continuityResetReason = (res.reasoning || '').trim() ||
+        'composer explicitly reset scene continuity';
+    } else {
+      delete SD._continuityResetReason;
+    }
+    let msg = res.scene_continuity ? '✓ продолжение прошлой сцены'
+      : (res.prev_neighbour ? '⚠ континьюити сброшен composer\'ом' : '✓ скомпоновано');
     if (res.lastframe_attached) msg += ' · 🎞 last frame прицеплен';
     if (res.cutframes_attached) msg += ` · ✂ ${res.cutframes_attached} кадр(ов) перед склейками`;
     if (res.state_analysis_attached) msg += ' · 🧠 состояние персов проанализировано';
+    if (res.framing) msg += ` · 🎥 ${res.framing}`;
+    if ((res.anti_background_scrub_hits || []).length) {
+      msg += ` · 🧹 background-scrub: ${res.anti_background_scrub_hits.length}`;
+    }
+    if (res.pose_lock_fallback && res.pose_lock_fallback !== 'vision') {
+      msg += ` · 🦴 pose-lock: ${res.pose_lock_fallback}`;
+    }
+    if ((res.compose_warnings || []).length) {
+      const kinds = res.compose_warnings.map(w => w.kind).join(', ');
+      msg += ` · ⚠ ${kinds}`;
+    }
     if (!res.cur_pos_found) {
       msg += ' · ⚠ позицию в сценарии не нашёл (continuity без соседа)';
     } else if (res.prev_neighbour) {
@@ -12640,12 +12661,18 @@ async function sdGenerate() {
     // visible as @Image3), but Seedance is positional — we must renumber on
     // submit. Also strips BINDING entries for tags whose ref was deleted.
     const submitPrompt = _sdRemapPromptForSubmit(prompt, SD.refs);
+    const startBody = {
+      prompt: submitPrompt, chunk_text: chunk, duration, resolution, moderation_bypass,
+      refs: SD.refs.map(r => ({ kind: r.kind, id: r.id, outfit: r.outfit || null, url: r.url || null })),
+    };
+    // B1: carry the «continuity reset by composer» reason from the last
+    // sdCompose response so it lands on the chunk record for the UI badge.
+    if (SD._continuityResetReason) {
+      startBody.continuity_reset_reason = SD._continuityResetReason;
+    }
     const res = await api.post(
       `/api/series/${S.seriesId}/episodes/${S.episode.number}/seedance/start`,
-      {
-        prompt: submitPrompt, chunk_text: chunk, duration, resolution, moderation_bypass,
-        refs: SD.refs.map(r => ({ kind: r.kind, id: r.id, outfit: r.outfit || null, url: r.url || null }))
-      }
+      startBody
     );
     showToast(`▶ Чанк #${res.chunk?.idx ?? '?'} в очереди — можно листать дальше, генерация 1-15 мин`);
     // Не очищаем prompt/chunk_text/refs — часто хочется доработать тот же промпт
@@ -13199,6 +13226,7 @@ function _sdCardHTML(c, labelInfo) {
         ${cost ? `<span>· ${cost}</span>` : ''}
       </div>
       ${c.error && c.status !== 'completed' ? `<div class="sd-card-err" title="${esc(c.error)}">${esc(c.error)}</div>` : ''}
+      ${c.continuity_reset_reason ? `<div class="sd-card-warn" title="${esc(c.continuity_reset_reason)}" style="background:rgba(251,191,36,0.12);border:1px solid rgba(251,191,36,0.4);border-radius:4px;padding:3px 6px;margin-top:3px;color:#fbbf24;font-size:0.74rem">⚠ континьюити сброшен</div>` : ''}
     </div>
     <div class="sd-gen-actions">
       ${videoUrl ? `<a class="btn-ghost btn-sm" href="${videoUrl}" download onclick="event.stopPropagation()">⬇ Скачать</a>` : '<span></span>'}
@@ -13206,6 +13234,7 @@ function _sdCardHTML(c, labelInfo) {
       ${canRetry ? `<button class="btn-ghost btn-sm" onclick="event.stopPropagation();sdRetry(${c.idx}, this)" title="Retry: тот же промпт+refs, новый чанк">🔁 Retry</button>` : '<span></span>'}
       <button class="btn-ghost btn-sm" onclick="event.stopPropagation();sdReuse(${c.idx})" title="Подставить параметры в форму выше">↻ Reuse</button>
       ${c.status === 'failed' ? `<button class="btn-ghost btn-sm full-row" onclick="event.stopPropagation();sdHealAndReuse(${c.idx}, this)" title="Переписать промпт чтобы прошёл модерацию + Reuse">🩹 Лечить промпт</button>` : ''}
+      ${(c.status === 'failed' && (c.heal_count || 0) >= 1) ? `<button class="btn-ghost btn-sm full-row" style="color:var(--accent)" onclick="event.stopPropagation();sdRewriteChunk(${c.idx}, this)" title="Лечение не помогло — переписать сцену с нуля с учётом всей серии">✍️ Переписать сцену</button>` : ''}
       <button class="btn-ghost btn-sm full-row" onclick="event.stopPropagation();sdDelete(${c.idx})">🗑 Удалить</button>
     </div>
   `;
@@ -13260,7 +13289,7 @@ function _sdCardSig(c, labelInfo) {
     c.idx, c.status, c.video_path || '',
     c.progress ?? '', c.error || '',
     c.prompt || '', c.duration, c.resolution, c.moderation_bypass,
-    c.cost ?? '', lblKey,
+    c.cost ?? '', c.heal_count ?? 0, lblKey,
   ].join('|');
 }
 
@@ -13329,6 +13358,7 @@ function sdOpenChunkModal(idx) {
         ${canRetry ? `<button class="btn-ghost btn-sm" onclick="sdRetry(${c.idx}, this)">🔁 Retry</button>` : ''}
         <button class="btn-ghost btn-sm" onclick="sdReuse(${c.idx});_sdCloseChunkModal()">↻ Reuse</button>
         ${c.status === 'failed' ? `<button class="btn-ghost btn-sm" onclick="sdHealAndReuse(${c.idx}, this)">🩹 Лечить</button>` : ''}
+        ${(c.status === 'failed' && (c.heal_count || 0) >= 1) ? `<button class="btn-ghost btn-sm" style="color:var(--accent)" onclick="sdRewriteChunk(${c.idx}, this)" title="Переписать сцену с нуля с учётом всей серии">✍️ Переписать сцену</button>` : ''}
         <button class="btn-ghost btn-sm" onclick="if(confirm('Удалить эту генерацию?')){sdDelete(${c.idx});_sdCloseChunkModal()}" style="color:var(--danger)">🗑 Удалить</button>
       </div>
       <div style="font-size:0.78rem;color:var(--muted);margin-top:4px">Промпт, отправленный в Seedance:</div>
@@ -13780,6 +13810,38 @@ async function sdHealAndReuse(idx, btn) {
     showToast('✗ heal: ' + (e.message || e), 6000);
   } finally {
     if (btn) { btn.disabled = false; btn.innerHTML = oldHtml || '🩹 Лечить'; }
+  }
+}
+
+async function sdRewriteChunk(idx, btn) {
+  const oldHtml = btn ? btn.innerHTML : '';
+  if (btn) { btn.disabled = true; btn.innerHTML = '⏳ переписываю...'; }
+  try {
+    const res = await api.post(
+      `/api/series/${S.seriesId}/episodes/${S.episode.number}/seedance/${idx}/rewrite-chunk`,
+      {}
+    );
+    // Apply rewritten chunk_text into composer
+    if (res.chunk_text) document.getElementById('sd-chunk-text').value = res.chunk_text;
+    // Show what changed
+    const changes = res.changes || [];
+    const lines = changes.length
+      ? changes.map(s => `  • ${s}`).join('\n')
+      : '  (модель не выделила конкретных правок — проверь сам)';
+    const reason = res.reasoning ? `\n\nОбоснование: ${res.reasoning}` : '';
+    alert(
+      `✍️ Сцена переписана. Что изменено:\n\n${lines}${reason}\n\n` +
+      'Текст обновлён в composer. Нажми ▶ Сгенерировать — автоматически построит новый видео-промпт.'
+    );
+    showToast('✍️ Сцена переписана', 4000);
+    // Reuse copies refs/params; then restore the rewritten chunk_text
+    await sdReuse(idx);
+    if (res.chunk_text) document.getElementById('sd-chunk-text').value = res.chunk_text;
+    document.getElementById('seedance-panel')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } catch (e) {
+    showToast('✗ rewrite: ' + (e.message || e), 6000);
+  } finally {
+    if (btn) { btn.disabled = false; btn.innerHTML = oldHtml || '✍️ Переписать'; }
   }
 }
 
