@@ -4482,6 +4482,68 @@ def _clothing_clause(appearance: str, description: str = '') -> str:
     return 'Fully clothed in everyday casual attire. '
 
 
+# Document-prop keywords. When an item's name OR description matches one of
+# these, Banana defaults to «antique parchment with wax seal» because most
+# training data tagged «document/contract/inheritance/registry» is historical.
+# We catch this and inject a modern-document directive instead.
+_DOCUMENT_KEYWORDS = (
+    # English roots
+    'document', 'contract', 'paper', 'letter', 'note', 'folder', 'file',
+    'dossier', 'registry', 'register', 'certificate', 'form', 'report',
+    'draft', 'statement', 'agreement', 'deed', 'will', 'testament', 'license',
+    'permit', 'passport', 'manuscript', 'ledger', 'log', 'record', 'envelope',
+    'invoice', 'receipt', 'bill', 'lease', 'résumé', 'resume', 'cv',
+    'application', 'memo', 'dispatch', 'photograph', 'photo', 'photos',
+    'newspaper', 'magazine', 'flyer', 'pamphlet', 'brochure', 'card', 'pass',
+    # Russian roots
+    'документ', 'докум', 'контракт', 'договор', 'бумаг', 'письм', 'записк',
+    'папка', 'досье', 'регистр', 'реестр', 'сертификат', 'свидетельств',
+    'форма', 'отчёт', 'отчет', 'заявлен', 'черновик', 'акт', 'заявка',
+    'лицензия', 'паспорт', 'манускрипт', 'рукопис', 'грамот', 'дело',
+    'протокол', 'конверт', 'счёт', 'счет', 'квитанция', 'дневник',
+    'фотограф', 'фото', 'снимок', 'газета', 'журнал', 'листовк', 'буклет',
+    'карточка', 'пропуск', 'удостоверение', 'визитка',
+)
+
+
+def _modern_document_directive(item) -> str:
+    """If the item looks like a document/paper prop, return a directive that
+    forces a modern crisp office-aesthetic look. Banana/Gemini Image Pro
+    defaults to «yellowed antique parchment with wax seal + cursive» for
+    anything that smells like «document», «contract», «registry», «грамота».
+    This pulls it back to «something you'd see on a desk today».
+
+    Skip when:
+      • The item already has user-set `image_constraints` — user has spoken,
+        don't contradict their explicit wish.
+      • Name/description hit none of the document keywords.
+    """
+    if (item.get('image_constraints') or '').strip():
+        return ''
+    haystack = (
+        (item.get('name') or '') + ' ' + (item.get('description') or '')
+    ).lower()
+    if not any(kw in haystack for kw in _DOCUMENT_KEYWORDS):
+        return ''
+    return (
+        " MODERN DOCUMENT STYLE — STRICTLY ENFORCE: crisp clean modern paper "
+        "(A4 / US letter size if applicable), contemporary printed or laser-"
+        "printed text in standard digital typography (Times / Arial / Helvetica), "
+        "white or very pale cream paper, sharp clean edges, today's office "
+        "aesthetic — looks like it was printed yesterday. "
+        "ABSOLUTELY NO: yellowing, no aging, no fading, no tea-stained paper, "
+        "no parchment, no scrolls, no medieval / 19th-century styling, "
+        "no leather-bound antique books, no calligraphic cursive handwriting, "
+        "no illuminated manuscript decorations, no wax seals (red / brown / any), "
+        "no ribbon binding, no string-tied stacks, no rough deckle edges, "
+        "no quill / inkwell / fountain-pen drama. "
+        "If signatures appear — modern blue or black ballpoint / fountain-pen ink "
+        "on the signature line, NOT elaborate cursive flourishes. "
+        "If multiple pages — neatly stacked or stapled like in an office, "
+        "not bundled with string. "
+    )
+
+
 
 # ── Characters ───────────────────────────────────────────────────────────────
 
@@ -5989,8 +6051,9 @@ def generate_item_image(sid, item_id):
     style_clause = _series_style_clause(s)
     constraints = (item.get('image_constraints') or '').strip()
     constraints_clause = f" IMPORTANT — strictly follow these constraints: {constraints}." if constraints else ""
+    modern_doc_clause = _modern_document_directive(item)
     prompt = (
-        f"{item['name']}. {item.get('description', '')}.{constraints_clause} "
+        f"{item['name']}. {item.get('description', '')}.{constraints_clause}{modern_doc_clause} "
         f"Product-style still-life photo of the object alone. No people, no hands, no characters. "
         f"Centered composition, neutral seamless background (#dadada), soft even studio lighting, "
         f"subtle shadow on ground, sharp focus on object texture and details. "
@@ -6030,8 +6093,9 @@ def regenerate_item(sid, item_id):
     item['image_constraints'] = wishes
     style_clause = _series_style_clause(s)
     constraints_clause = f" IMPORTANT — strictly follow these constraints: {wishes}." if wishes else ""
+    modern_doc_clause = _modern_document_directive(item)
     prompt = (
-        f"{item['name']}. {item.get('description', '')}.{constraints_clause} "
+        f"{item['name']}. {item.get('description', '')}.{constraints_clause}{modern_doc_clause} "
         f"Product-style still-life photo of the object alone. No people, no hands, no characters. "
         f"Centered composition, neutral seamless background (#dadada), soft even studio lighting, "
         f"subtle shadow on ground, sharp focus on object texture and details. "
@@ -6630,9 +6694,10 @@ def _gen_item_inline(s, sid, item):
     style_prefix = (style_clause + ' ') if style_clause else ''
     constraints = (item.get('image_constraints') or '').strip()
     constraints_clause = f" IMPORTANT — strictly follow these constraints: {constraints}." if constraints else ""
+    modern_doc_clause = _modern_document_directive(item)
     prompt = (
         f"{style_prefix}"
-        f"{item['name']}. {item.get('description', '')}.{constraints_clause} "
+        f"{item['name']}. {item.get('description', '')}.{constraints_clause}{modern_doc_clause} "
         f"Product-style still-life of the object alone. No people, no hands, no characters. "
         f"Centered composition, neutral seamless background (#dadada), soft even studio lighting, "
         f"subtle shadow on ground, sharp focus on object texture and details. "
