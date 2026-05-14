@@ -6951,6 +6951,33 @@ function _isVoiceOverLine(text) {
   return /^[A-ZА-ЯЁ][A-Za-zА-Яа-яЁё_0-9 .\-']{0,40}\s*\((?:v\.?o\.?|voiceover|voice[\s\-]over|o\.?s\.?|off[\s\-]screen|narration|закадр\w*|голос за кадром|внутренний голос|мысленно|про себя)\)\s*[:：]/i
     .test(t);
 }
+
+// Single source of truth for chunk duration estimation from raw chunk text.
+// Replicates the VO-aware logic used in _autoCollectSegments + parallel range-
+// gen so retries / reuses / heal flows compute consistent durations instead of
+// inheriting the (potentially inflated) duration of the chunk being replaced.
+// Returns an integer in [5, 15] seconds.
+function _estimateChunkDurationSec(chunkText, opts) {
+  opts = opts || {};
+  const text = (chunkText || '').trim();
+  if (!text) return Math.max(5, Math.min(15, opts.fallback || 5));
+  // Split into raw lines, skip empties and scene heading / fade markers
+  // (_lineDuration returns 0 for those).
+  const rawLines = text.split('\n').map(l => l.trim()).filter(Boolean);
+  let voSec = 0, dialogSec = 0, actionSec = 0;
+  let hasVo = false;
+  for (const l of rawLines) {
+    const dur = (typeof _lineDuration === 'function') ? _lineDuration(l) : 0;
+    if (!dur) continue;
+    if (_isVoiceOverLine(l))      { voSec += dur; hasVo = true; }
+    else if (_isDialogueLine(l))  { dialogSec += dur; }
+    else                          { actionSec += dur; }
+  }
+  const contentSec = Math.max(voSec, actionSec) + dialogSec;
+  const buffer = (hasVo && dialogSec === 0) ? 0.6 : 1.5;
+  const target = Math.ceil(contentSec + buffer);
+  return Math.max(5, Math.min(15, target || 5));
+}
 async function _persistLineOverrides(overrides) {
   if (!S.episode) return;
   S.episode.line_overrides = overrides;
@@ -7445,24 +7472,10 @@ function _autoCollectSegments(opts = {}) {
       // VO overlaps action visuals (you HEAR narration WHILE seeing the camera
       // move) — so we don't ADD action+VO durations, we take the max. Regular
       // sequential dialogue still adds on top (lipsync = must play in order).
-      // Without this, a 4s VO line + 5s action description produced a 9-11s
-      // chunk where only 4s had spoken content; user-reported on «Diner Opens
-      // at Midnight…» ep 1 — chunks had 5-9s of silence/idle visual before VO
-      // would even start, and the clip felt empty.
-      let voSec = 0, dialogSec = 0, actionSec = 0;
-      let hasVo = false;
-      for (const l of lines) {
-        const dur = l.duration || 0;
-        if (_isVoiceOverLine(l.text)) { voSec += dur; hasVo = true; }
-        else if (_isDialogueLine(l.text)) { dialogSec += dur; }
-        else { actionSec += dur; }
-      }
-      const contentSec = Math.max(voSec, actionSec) + dialogSec;
-      // VO-only chunks (no regular dialogue) need less buffer — TTS narration
-      // is more predictable than free speech with pauses.
-      const buffer = (hasVo && dialogSec === 0) ? 0.6 : 1.5;
-      const targetSec = Math.ceil(contentSec + buffer) + (wantsEstablishing ? 2 : 0);
-      const durationSec = Math.max(5, Math.min(15, targetSec));
+      // Same logic powers `_estimateChunkDurationSec` for retries/reuses.
+      const segmentText = lines.map(l => l.text).join('\n');
+      const base = _estimateChunkDurationSec(segmentText);
+      const durationSec = Math.max(5, Math.min(15, base + (wantsEstablishing ? 2 : 0)));
       out.push({
         sceneIdx: sIdx, segIdx: g, text, anchor,
         // Stable identity used by the AUTO-skip filter. Must match the key
@@ -8306,20 +8319,10 @@ async function _runEpisodeAutoStandalone(sid, num, opts = {}) {
         const hasCloseUp = lines.some(l => _isLineCloseUp(l.text));
         const anchor = _lineAnchor(lines[0].text);
         const isFirstOfScene = (g === 0);
-        // Mirror the VO-aware calc from _autoCollectSegments — voiceover and
-        // action visuals overlap (max, not sum); sequential dialogue stacks.
-        let voSec = 0, dialogSec = 0, actionSec = 0;
-        let hasVo = false;
-        for (const l of lines) {
-          const dur = l.duration || 0;
-          if (_isVoiceOverLine(l.text)) { voSec += dur; hasVo = true; }
-          else if (_isDialogueLine(l.text)) { dialogSec += dur; }
-          else { actionSec += dur; }
-        }
-        const contentSec = Math.max(voSec, actionSec) + dialogSec;
-        const buffer = (hasVo && dialogSec === 0) ? 0.6 : 1.5;
-        const targetSec = Math.ceil(contentSec + buffer) + (isFirstOfScene ? 2 : 0);
-        const durationSec = Math.max(5, Math.min(15, targetSec));
+        // Same VO-aware shared helper used by sequential auto-mode and retry.
+        const segmentText = lines.map(l => l.text).join('\n');
+        const base = _estimateChunkDurationSec(segmentText);
+        const durationSec = Math.max(5, Math.min(15, base + (isFirstOfScene ? 2 : 0)));
         allSegs.push({
           sceneIdx: sIdx, segIdx: g, text, anchor,
           has_close_up: hasCloseUp, durationSec,
@@ -13067,6 +13070,67 @@ function _sdUpdateMusicUI(chunks, music) {
   }
   counter.style.display = '';
   counter.textContent = `🎵 ${completed}/${totalScenes}` + (generating > 0 ? ` · ${generating} gen` : '') + (failed > 0 ? ` · ${failed} fail` : '');
+
+  _sdRenderMusicPlayers(available, byIdx);
+}
+
+// Inline <audio> per completed scene. Renders into #sd-music-players.
+// Preserves the currently-playing element's state across re-renders (poll
+// tick would otherwise reset playback every 8s).
+function _sdRenderMusicPlayers(available, byIdx) {
+  const host = document.getElementById('sd-music-players');
+  if (!host) return;
+  const completedScenes = available.filter(a => byIdx.get(a.sceneIdx)?.status === 'completed');
+  if (!completedScenes.length) {
+    host.style.display = 'none';
+    host.innerHTML = '';
+    return;
+  }
+
+  // Snapshot current playback so we don't interrupt the user on each poll.
+  const prev = {};
+  host.querySelectorAll('audio[data-scene]').forEach(a => {
+    prev[a.dataset.scene] = { t: a.currentTime, paused: a.paused, src: a.src };
+  });
+
+  host.style.display = '';
+  const rows = completedScenes.map(a => {
+    const rec = byIdx.get(a.sceneIdx);
+    const path = rec?.audio_path;
+    if (!path) return '';
+    // ?v=ts cache-buster so a regen reloads the new file in the player.
+    const url = `/assets/${S.seriesId}/${path}?v=${rec.generated_at || ''}`;
+    const hint = rec.user_hint ? ` · «${rec.user_hint}»` : '';
+    const dur = rec.duration_ms ? `${Math.round(rec.duration_ms/1000)}с` : `~${Math.round(a.total_sec)}с`;
+    return `
+      <div style="display:flex;align-items:center;gap:10px;padding:4px 0">
+        <span style="min-width:88px;font-size:0.82rem;color:#a78bfa;font-weight:600">Сцена ${a.sceneIdx + 1}</span>
+        <audio controls preload="metadata" data-scene="${a.sceneIdx}" src="${url}" style="flex:1;height:32px"></audio>
+        <span style="font-size:0.74rem;color:var(--muted);min-width:96px;text-align:right" title="${esc(hint || '')}">${dur}${hint ? ' 💬' : ''}</span>
+        <a href="${url}" download style="font-size:0.78rem;color:#a78bfa;text-decoration:underline" title="Скачать только эту сцену">⬇</a>
+      </div>`;
+  }).join('');
+
+  host.innerHTML = `
+    <div style="font-size:0.78rem;color:#a78bfa;margin-bottom:6px;font-weight:600">
+      🎵 Прослушать музыку (${completedScenes.length} ${completedScenes.length === 1 ? 'сцена' : 'сцен'})
+    </div>
+    ${rows}
+  `;
+
+  // Restore prior playback state — match by data-scene since src may have
+  // a new ?v= cache-buster after a regen.
+  host.querySelectorAll('audio[data-scene]').forEach(a => {
+    const p = prev[a.dataset.scene];
+    if (!p) return;
+    const stripV = (u) => (u || '').split('?')[0];
+    if (stripV(p.src) === stripV(a.src)) {
+      a.addEventListener('loadedmetadata', () => {
+        try { a.currentTime = p.t || 0; } catch {}
+        if (!p.paused) { try { a.play(); } catch {} }
+      }, { once: true });
+    }
+  });
 }
 
 async function _sdRefreshMusic() {
@@ -13771,7 +13835,15 @@ async function sdRetry(idx, btn) {
       {
         prompt: c.prompt,
         chunk_text: c.chunk_text || '',
-        duration: c.duration || 15,
+        // Recompute duration from chunk_text via the VO-aware estimator. The
+        // stored `c.duration` may have been set BEFORE the voiceover-overlap
+        // fix shipped, so a retry would inherit the inflated value (9s for a
+        // 4s VO line) — user-reported on «Diner Opens at Midnight…» ep 1
+        // even after the formula fix. Fallback to c.duration only if chunk_text
+        // is empty (legacy chunk without stored script text).
+        duration: c.chunk_text
+          ? _estimateChunkDurationSec(c.chunk_text, { fallback: c.duration || 15 })
+          : (c.duration || 15),
         resolution: c.resolution || '720p',
         moderation_bypass: c.moderation_bypass || 'collage_grid',
         // Carry the source chunk's canonical script_order. Without this the
@@ -14070,7 +14142,13 @@ async function sdReuse(idx) {
   if (!c) return;
   document.getElementById('sd-chunk-text').value = c.chunk_text || '';
   document.getElementById('sd-prompt').value = c.prompt || '';
-  document.getElementById('sd-duration').value = c.duration || 15;
+  // Recompute duration via the VO-aware estimator instead of inheriting the
+  // stored value — legacy chunks generated before the VO-overlap fix had
+  // inflated durations (VO + action summed). Form field stays editable, user
+  // can override if needed.
+  document.getElementById('sd-duration').value = c.chunk_text
+    ? _estimateChunkDurationSec(c.chunk_text, { fallback: c.duration || 15 })
+    : (c.duration || 15);
   document.getElementById('sd-resolution').value = c.resolution || '720p';
   document.getElementById('sd-mod-bypass').value = c.moderation_bypass || 'collage_grid';
   // Rebuild refs from stored descriptors. Must cover every kind that compose/
