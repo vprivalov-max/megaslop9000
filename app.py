@@ -5662,10 +5662,19 @@ def _facade_worker(sid, groups):
                 vid_prompt = (
                     f"Static cinematic establishing wide shot of {name} exterior. {desc}. "
                     "No people, no characters. Subtle ambient motion only — drifting clouds, "
-                    "swaying foliage, very slow camera push-in. Cinematic, 9:16."
+                    "swaying foliage, very slow camera push-in. "
+                    "Ambient location sounds only — wind, distant traffic, birds, rustling foliage, "
+                    "rain or city hum depending on setting. No speech, no music, no dialogue. "
+                    "Cinematic, 9:16."
                 )
                 vid_prompt = re.sub(r'\s+', ' ', vid_prompt).strip()
                 avai_key = _get_user_avai_key()
+                # Generate ambient audio for the establishing shot — gives the
+                # facade clip atmosphere (wind / city / rain depending on
+                # location) instead of dead silence before the next chunk
+                # begins. Assembly already handles mixed-audio sources
+                # (auto-asssemble probes per-input audio presence) so this is
+                # back-compat with older facades rendered silent.
                 job = _avai_seedance_start(
                     prompt=vid_prompt,
                     ref_urls=[img_url] if img_url else [],
@@ -5673,7 +5682,7 @@ def _facade_worker(sid, groups):
                     resolution='720p',
                     moderation_bypass='off',
                     aspect_ratio='9:16',
-                    generate_audio=False,
+                    generate_audio=True,
                     avai_key=avai_key,
                 )
                 vid_path_local = fac_dir / 'facade.mp4'
