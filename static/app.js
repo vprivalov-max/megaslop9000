@@ -1516,6 +1516,7 @@ async function appendGenerateScript(btn) {
   const durationSec = durationSecRaw ? Math.max(30, Math.min(240, parseInt(durationSecRaw, 10))) : null;
   const linesCount  = linesCountRaw  ? Math.max(3, Math.min(40, parseInt(linesCountRaw, 10)))   : null;
   const maxChars    = maxCharsRaw    ? Math.max(1, Math.min(6, parseInt(maxCharsRaw, 10)))      : null;
+  const noInterruptions = document.getElementById('append-gen-no-interruptions')?.checked !== false;
   const ta = document.getElementById('append-script-text');
   const statusEl = document.getElementById('append-gen-status');
   if (ta && ta.value.trim() && !await appConfirm({
@@ -1534,7 +1535,7 @@ async function appendGenerateScript(btn) {
   try {
     const r = await api.post(
       `/api/series/${S.seriesId}/generate-script-batch`,
-      { count, direction, duration_sec: durationSec, lines_count: linesCount, style: styleVal, max_main_chars_per_scene: maxChars },
+      { count, direction, duration_sec: durationSec, lines_count: linesCount, style: styleVal, max_main_chars_per_scene: maxChars, no_interruptions: noInterruptions },
       { timeoutMs: 600_000 },
     );
     if (r.error) throw new Error(r.error);
@@ -1760,6 +1761,140 @@ function appendLogicUndo() {
   appendUpdateStats();
   showToast('↶ Откачено к версии до правок', 3000);
   const out = document.getElementById('append-script-logic');
+  if (out) out.innerHTML = '';
+}
+
+// ── Logic-check for the "New Series → Import" modal ────────────────────────
+// Mirror of appendLogicCheck / appendLogicApply / appendLogicUndo but wired
+// to import-series-script + import-series-logic instead of append-* elements.
+
+let _importLogicIssues = [];
+
+async function importLogicCheck(btn) {
+  const script = (document.getElementById('import-series-script')?.value || '').trim();
+  const out = document.getElementById('import-series-logic');
+  if (!script) { if (out) out.innerHTML = '<div style="color:var(--warning);font-size:0.85rem">Сценарий пустой</div>'; return; }
+  const oldHtml = btn ? btn.innerHTML : '';
+  if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Читаю…'; }
+  if (out) out.innerHTML = '<div style="font-size:0.85rem;color:var(--muted)"><span class="spinner"></span> Claude читает все серии и ищет противоречия… ~15-40 сек</div>';
+  _importLogicIssues = [];
+  try {
+    const r = await api.post('/api/series/import-from-script/logic-check', { script }, { timeoutMs: 120000 });
+    if (r.error) throw new Error(r.error);
+    const issues = r.issues || [];
+    _importLogicIssues = issues;
+    if (!issues.length) {
+      if (out) out.innerHTML = `<div style="padding:10px;background:rgba(74,222,128,0.12);border:1px solid rgba(74,222,128,0.35);border-radius:6px;color:#4ade80;font-size:0.85rem">✅ Логика чистая — проанализировано серий: <strong>${r.episodes_analyzed}</strong>. Противоречий не найдено.</div>`;
+      return;
+    }
+    const sevColor = { critical: '#f87171', high: '#fbbf24', medium: '#a78bfa', low: '#9ca3af' };
+    const sevLabel = { critical: 'CRIT', high: 'HIGH', medium: 'MED', low: 'LOW' };
+    const typeLabel = {
+      contradiction:    '⚡ Противоречие',
+      plot_hole:        '🕳 Плот-хол',
+      forgotten_thread: '🧵 Забытая линия',
+      continuity:       '🔗 Continuity',
+      timeline:         '⏱ Таймлайн',
+    };
+    if (out) out.innerHTML = `
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:6px;font-size:0.85rem">
+        <span style="color:var(--muted)">🧠 Найдено проблем:</span>
+        <strong style="color:#fbbf24">${issues.length}</strong>
+        <span style="color:var(--muted)">(серий: ${r.episodes_analyzed})</span>
+        <button class="btn-ghost btn-sm" onclick="importLogicSelectAll(true)" style="margin-left:auto">✓ Все</button>
+        <button class="btn-ghost btn-sm" onclick="importLogicSelectAll(false)">✕ Снять</button>
+        <button class="btn-accent btn-sm" onclick="importLogicApply(this)" title="Claude перепишет сценарий минимально, только исправив выделенные проблемы">🩹 Полечить выбранные</button>
+      </div>
+      <div style="max-height:300px;overflow-y:auto;border:1px solid var(--border);border-radius:6px;background:var(--surface2)">
+        ${issues.map((it, i) => {
+          const presetChecked = (it.severity === 'critical' || it.severity === 'high') ? 'checked' : '';
+          return `
+          <label style="display:flex;gap:10px;padding:10px 12px;border-bottom:1px solid var(--border);font-size:0.82rem;cursor:pointer">
+            <input type="checkbox" class="import-logic-cb" data-idx="${i}" ${presetChecked} style="margin-top:3px;width:16px;height:16px;flex:0 0 16px;accent-color:#10b981">
+            <div style="flex:1;min-width:0">
+              <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;flex-wrap:wrap">
+                <span style="background:${sevColor[it.severity] || '#9ca3af'};color:#000;padding:2px 6px;border-radius:4px;font-weight:700;font-size:0.7rem">${sevLabel[it.severity] || it.severity || '?'}</span>
+                <span style="color:var(--muted)">${esc(typeLabel[it.type] || it.type || '')}</span>
+                <span style="color:var(--accent);font-weight:600;margin-left:auto">Эп. ${(it.episodes || []).join(', ')}</span>
+              </div>
+              <div style="color:var(--text);font-weight:600;margin-bottom:3px">${esc(it.summary || '')}</div>
+              ${it.evidence ? `<div style="color:var(--muted);font-style:italic;font-size:0.78rem;margin-bottom:3px">«${esc(it.evidence)}»</div>` : ''}
+              ${it.fix ? `<div style="color:#4ade80;font-size:0.78rem">→ ${esc(it.fix)}</div>` : ''}
+            </div>
+          </label>`;
+        }).join('')}
+      </div>
+      <div style="margin-top:6px;font-size:0.78rem;color:var(--muted)">
+        💡 Поставь галочки на тех проблемах что хочешь починить → «🩹 Полечить выбранные». Critical/High по умолчанию уже отмечены.
+      </div>`;
+  } catch (e) {
+    if (out) out.innerHTML = `<div style="color:var(--danger);font-size:0.85rem">Ошибка: ${esc(e?.message || e)}</div>`;
+  } finally {
+    if (btn) { btn.disabled = false; btn.innerHTML = oldHtml || '🧠 Проверить логику'; }
+  }
+}
+
+function importLogicSelectAll(val) {
+  document.querySelectorAll('.import-logic-cb').forEach(cb => { cb.checked = val; });
+}
+
+async function importLogicApply(btn) {
+  const ta = document.getElementById('import-series-script');
+  const script = (ta?.value || '').trim();
+  if (!script) { showToast('Сценарий пустой', 3000); return; }
+  const selected = [...document.querySelectorAll('.import-logic-cb:checked')]
+    .map(cb => _importLogicIssues[parseInt(cb.dataset.idx, 10)])
+    .filter(Boolean);
+  if (!selected.length) { showToast('Не выделено ни одной проблемы для лечения', 3000); return; }
+  if (!await appConfirm({
+    title: '🩹 Полечить выделенные проблемы?',
+    message: `Будет переписано: ${selected.length} проблем(ы).\n\nClaude сделает минимальные правки — оставит всё остальное как есть.`,
+    okText: '🩹 Полечить', cancelText: 'Отмена', okStyle: 'accent',
+  })) return;
+  const orig = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span> Claude переписывает…';
+  try {
+    const r = await api.post('/api/series/import-from-script/apply-fixes',
+      { script, issues: selected }, { timeoutMs: 180000 });
+    if (r.error) throw new Error(r.error);
+    if (!r.script) throw new Error('пустой ответ');
+    ta.dataset.preFixSnapshot = script;
+    ta.value = r.script;
+    // Update char counter
+    const stats = document.getElementById('import-series-script-stats');
+    if (stats) stats.textContent = r.script.length.toLocaleString('ru') + ' символов';
+    const changes = r.changes || [];
+    const changesHtml = changes.length
+      ? changes.map(c => `<li><strong>#${c.issue_index || '?'}:</strong> ${esc(c.summary || '')}</li>`).join('')
+      : '<li>(no per-issue summary returned)</li>';
+    const out = document.getElementById('import-series-logic');
+    if (out) out.innerHTML = `
+      <div style="padding:10px 12px;background:rgba(16,185,129,0.10);border:1px solid rgba(16,185,129,0.35);border-radius:6px;font-size:0.82rem">
+        <div style="color:#10b981;font-weight:700;margin-bottom:6px">✓ Применено ${r.applied_count} правок. Что изменилось:</div>
+        <ul style="margin:6px 0 6px 18px;color:var(--text)">${changesHtml}</ul>
+        <div style="display:flex;gap:8px;margin-top:8px">
+          <button class="btn-ghost btn-sm" onclick="importLogicUndo()" title="Вернуть текст до правок">↶ Отменить</button>
+          <button class="btn-accent btn-sm" onclick="importLogicCheck(this)">🧠 Проверить ещё раз</button>
+        </div>
+      </div>`;
+    showToast(`✓ Применено ${r.applied_count} правок`, 5000);
+  } catch (e) {
+    showToast('Ошибка лечения: ' + (e?.message || e), 6000);
+  } finally {
+    btn.disabled = false; btn.innerHTML = orig;
+  }
+}
+
+function importLogicUndo() {
+  const ta = document.getElementById('import-series-script');
+  if (!ta || !ta.dataset.preFixSnapshot) { showToast('Нет снапшота для отката', 3000); return; }
+  ta.value = ta.dataset.preFixSnapshot;
+  delete ta.dataset.preFixSnapshot;
+  const stats = document.getElementById('import-series-script-stats');
+  if (stats) stats.textContent = ta.value.length.toLocaleString('ru') + ' символов';
+  showToast('↶ Откачено к версии до правок', 3000);
+  const out = document.getElementById('import-series-logic');
   if (out) out.innerHTML = '';
 }
 
@@ -6799,6 +6934,23 @@ function _isDialogueLine(text) {
   if (!/^[A-Za-zА-Яа-яЁё_][A-Za-zА-Яа-яЁё_0-9 ()\-']{0,40}\s*[:：]\s/.test(t)) return false;
   return /^[A-ZА-ЯЁ]/.test(t);  // first letter must be uppercase
 }
+// Voice-over / off-screen / internal-monologue marker detector. These
+// lines play as audio narration overlaid ON TOP of the visual action —
+// the listener can hear them while seeing whatever the camera is doing.
+// For chunk-duration calc this means we don't ADD action duration on
+// top of VO duration; the two overlap, max() not sum.
+//
+// Self-contained on purpose — _isDialogueLine rejects periods in the
+// speaker cue («SOPHIE (V.O.)» has dots) so we'd miss exactly the most
+// common VO formatting. We just look for «<name>(<vo-marker>):» shape.
+function _isVoiceOverLine(text) {
+  if (!text) return false;
+  const t = text.trim();
+  // Must start with an uppercase-letter name, have a parenthetical with
+  // a VO marker, and end the cue with a colon.
+  return /^[A-ZА-ЯЁ][A-Za-zА-Яа-яЁё_0-9 .\-']{0,40}\s*\((?:v\.?o\.?|voiceover|voice[\s\-]over|o\.?s\.?|off[\s\-]screen|narration|закадр\w*|голос за кадром|внутренний голос|мысленно|про себя)\)\s*[:：]/i
+    .test(t);
+}
 async function _persistLineOverrides(overrides) {
   if (!S.episode) return;
   S.episode.line_overrides = overrides;
@@ -7290,8 +7442,26 @@ function _autoCollectSegments(opts = {}) {
       // durationSec (clamped to 15) so the dialogue still fits.
       const isFirstOfScene = (g === 0);
       const wantsEstablishing = establishing && isFirstOfScene;
-      const contentSec = lines.reduce((s, l) => s + (l.duration || 0), 0);
-      const targetSec = Math.ceil(contentSec + 1.5) + (wantsEstablishing ? 2 : 0);
+      // VO overlaps action visuals (you HEAR narration WHILE seeing the camera
+      // move) — so we don't ADD action+VO durations, we take the max. Regular
+      // sequential dialogue still adds on top (lipsync = must play in order).
+      // Without this, a 4s VO line + 5s action description produced a 9-11s
+      // chunk where only 4s had spoken content; user-reported on «Diner Opens
+      // at Midnight…» ep 1 — chunks had 5-9s of silence/idle visual before VO
+      // would even start, and the clip felt empty.
+      let voSec = 0, dialogSec = 0, actionSec = 0;
+      let hasVo = false;
+      for (const l of lines) {
+        const dur = l.duration || 0;
+        if (_isVoiceOverLine(l.text)) { voSec += dur; hasVo = true; }
+        else if (_isDialogueLine(l.text)) { dialogSec += dur; }
+        else { actionSec += dur; }
+      }
+      const contentSec = Math.max(voSec, actionSec) + dialogSec;
+      // VO-only chunks (no regular dialogue) need less buffer — TTS narration
+      // is more predictable than free speech with pauses.
+      const buffer = (hasVo && dialogSec === 0) ? 0.6 : 1.5;
+      const targetSec = Math.ceil(contentSec + buffer) + (wantsEstablishing ? 2 : 0);
       const durationSec = Math.max(5, Math.min(15, targetSec));
       out.push({
         sceneIdx: sIdx, segIdx: g, text, anchor,
@@ -8136,8 +8306,19 @@ async function _runEpisodeAutoStandalone(sid, num, opts = {}) {
         const hasCloseUp = lines.some(l => _isLineCloseUp(l.text));
         const anchor = _lineAnchor(lines[0].text);
         const isFirstOfScene = (g === 0);
-        const contentSec = lines.reduce((s, l) => s + (l.duration || 0), 0);
-        const targetSec = Math.ceil(contentSec + 1.5) + (isFirstOfScene ? 2 : 0);
+        // Mirror the VO-aware calc from _autoCollectSegments — voiceover and
+        // action visuals overlap (max, not sum); sequential dialogue stacks.
+        let voSec = 0, dialogSec = 0, actionSec = 0;
+        let hasVo = false;
+        for (const l of lines) {
+          const dur = l.duration || 0;
+          if (_isVoiceOverLine(l.text)) { voSec += dur; hasVo = true; }
+          else if (_isDialogueLine(l.text)) { dialogSec += dur; }
+          else { actionSec += dur; }
+        }
+        const contentSec = Math.max(voSec, actionSec) + dialogSec;
+        const buffer = (hasVo && dialogSec === 0) ? 0.6 : 1.5;
+        const targetSec = Math.ceil(contentSec + buffer) + (isFirstOfScene ? 2 : 0);
         const durationSec = Math.max(5, Math.min(15, targetSec));
         allSegs.push({
           sceneIdx: sIdx, segIdx: g, text, anchor,
