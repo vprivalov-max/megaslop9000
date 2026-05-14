@@ -14419,6 +14419,13 @@ def seedance_compose(sid, num):
         "возможный кадр и его не должно быть НИКОГДА. Если в кадре 2 персонажа — оба обязаны "
         "быть полноценными фигурами с понятной позой и равной резкостью; если второй не нужен в "
         "кадре — выкидывай его из refs и пиши medium close-up / close-up одного.\n"
+        "     ❌ КАТЕГОРИЧЕСКИ НЕЛЬЗЯ: «изобретать» постороннего человека для OTS-плеча / "
+        "статиста на фоне / случайного силуэта в кадре. Все фигуры в кадре ОБЯЗАНЫ быть из refs[]. "
+        "Если для OTS-кадра нужно чьё-то плечо/затылок на переднем плане — это плечо ОДНОГО ИЗ "
+        "уже заявленных персонажей (того кого ты укажешь в `framing_anchor`), НЕ нового. "
+        "В тексте промпта формулируй ИМЕНЕМ существующего перса: 'over Maya (@Image2)'s shoulder, "
+        "back-of-head bottom-left — that's the SAME Maya from @Image2, same hair and outfit'. "
+        "БЕЗ имени = модель сама изобретает кому это плечо принадлежит, и часто рисует левую девушку.\n"
         "     ❌ Запрещённые формулировки (даже если они «передают атмосферу»): "
         "'<name> stands in the background, blurred', '<name> visible far behind <other>, soft focus', "
         "'<name> out of focus while <other> sharp' (когда оба заявлены в refs), 'silhouette of <name> "
@@ -15595,13 +15602,42 @@ def seedance_compose(sid, num):
     # refs, we don't inject anything → existing single-shot flows are unchanged.
     framing = (data.get('framing') or '').strip().lower()
     framing_anchor = (data.get('framing_anchor') or '').strip()
-    char_ref_count = sum(1 for r in (data.get('refs') or []) if r.get('kind') == 'char')
+    char_refs_ordered = [r for r in (data.get('refs') or []) if r.get('kind') == 'char']
+    char_ref_count = len(char_refs_ordered)
+    # Resolve character ref names + their @ImageN slot (1-based, matches the
+    # order in `refs[]`). Used to tie OTS shoulder to a SPECIFIC existing
+    # character — without this Seedance invents a third figure for the
+    # foreground shoulder («over X's shoulder» → model generates someone
+    # whose shoulder THIS is, even when X is one of the existing refs).
+    char_names_by_slot = {}   # 1-based slot index → canonical name
+    for i, r in enumerate(char_refs_ordered):
+        ch = next((c for c in (s.get('characters') or []) if c.get('id') == r.get('id')), None)
+        if ch and ch.get('name'):
+            char_names_by_slot[i + 1] = ch['name']
+    cast_list = ', '.join(f'@Image{idx}={nm}' for idx, nm in char_names_by_slot.items())
+    cast_restriction = (
+        f" В кадре ТОЛЬКО эти персонажи: {cast_list}. "
+        "НЕ добавляй НИКАКИХ других людей — ни массовки, ни статистов, ни «случайной фигуры», "
+        "ни безымянных силуэтов на фоне или переднем плане. Если рамка кадра требует чьё-то плечо/затылок/руку "
+        "на переднем плане — это плечо/затылок/рука ОДНОГО ИЗ УЖЕ ЗАЯВЛЕННЫХ персонажей выше, НЕ нового."
+    ) if char_names_by_slot else ''
+    # Find @ImageN slot for the OTS anchor (matched by canonical name, case-insensitive).
+    anchor_slot = None
+    if framing_anchor:
+        for idx, nm in char_names_by_slot.items():
+            if nm.strip().lower() == framing_anchor.strip().lower():
+                anchor_slot = idx
+                break
     _FRAMING_BLOCKS = {
         'ots': (
-            "КОМПОЗИЦИЯ КАДРА (FORCED OTS): Камера расположена за плечом {anchor}. "
-            "В нижней четверти кадра — затылок и плечо {anchor} как foreground-силуэт в лёгком расфокусе. "
-            "По центру кадра в фокусе — лицо собеседника на среднем крупном плане, смотрит мимо камеры в сторону {anchor}. "
-            "{anchor} ЕСТЬ в кадре как foreground, НЕ как фон. НИ ОДИН из персонажей НЕ размыт силуэтом сзади лицом в камеру."
+            "КОМПОЗИЦИЯ КАДРА (FORCED OTS): Камера расположена за правым плечом {anchor} "
+            "(@Image{anchor_slot} в refs выше). Плечо и затылок в нижнем-левом углу кадра "
+            "— это ТОТ ЖЕ САМЫЙ персонаж @Image{anchor_slot}: те же волосы, та же одежда, "
+            "тот же силуэт что на его reference-фотографии. "
+            "НЕ создавай нового персонажа для этого плеча. По центру кадра в фокусе — лицо "
+            "другого спикера на среднем крупном плане, смотрит мимо камеры в сторону @Image{anchor_slot}. "
+            "@Image{anchor_slot} ЕСТЬ в кадре как foreground-силуэт, НЕ как фон. "
+            "НИ ОДИН из персонажей НЕ размыт силуэтом сзади лицом в камеру."
         ),
         'two_shot': (
             "КОМПОЗИЦИЯ КАДРА (FORCED TWO-SHOT): Оба персонажа в кадре на среднем плане, "
@@ -15626,14 +15662,24 @@ def seedance_compose(sid, num):
     }
     if framing in _FRAMING_BLOCKS and char_ref_count >= 2:
         block = _FRAMING_BLOCKS[framing]
-        if framing == 'ots' and framing_anchor:
-            block = block.format(anchor=framing_anchor)
-        elif framing == 'ots':
-            # OTS without anchor — composer mistake. Fall back to two_shot
-            # phrasing rather than injecting empty {anchor}.
-            block = _FRAMING_BLOCKS['two_shot']
-            framing = 'two_shot'
-        data['prompt'] = (data.get('prompt') or '').rstrip() + "\n\n" + block
+        if framing == 'ots':
+            if anchor_slot:
+                # We resolved anchor → @ImageN slot. Tie the OTS shoulder
+                # specifically to that ref so Seedance can't invent a third
+                # person to be the shoulder-foreground. User-reported bug:
+                # «Pregnant by the Man Who Hates Me» ep 1 — 2 characters in
+                # refs, but the first two frames were OTS of a phantom «girl
+                # in black» the model invented for the shoulder slot.
+                block = block.format(anchor=framing_anchor, anchor_slot=anchor_slot)
+            else:
+                # OTS anchor name didn't match any char ref (composer mistake
+                # or stale name). Fall back to two_shot phrasing — safer than
+                # an unanchored OTS that will invite invented bystanders.
+                block = _FRAMING_BLOCKS['two_shot']
+                framing = 'two_shot'
+        # Append cast restriction to ALL multi-char framings so no framing
+        # can implicitly justify a phantom third person.
+        data['prompt'] = (data.get('prompt') or '').rstrip() + "\n\n" + block + cast_restriction
 
     # ── B4: POSTURE/STATE LOCK ECHO at the very end of prompt ────────────────
     # When pose-lock is active (Vision OR fallback), append a compact one-line
