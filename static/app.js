@@ -1391,6 +1391,40 @@ document.addEventListener('DOMContentLoaded', () => {
 // Twin of the import-from-script flow above, but adds episodes to the CURRENT
 // series instead of creating a new one. Numbering continues from the highest
 // existing episode (so a 38-episode series + 12 new ones → episodes 39-50).
+// Generate-mode form fields whose values should persist between sessions.
+// Skipped on purpose: `append-gen-direction` (idea text — different every
+// time) and `append-script-text` (the script content itself).
+const _APPEND_PERSIST_FIELDS = [
+  'append-gen-count',
+  'append-gen-duration-sec',
+  'append-gen-lines-count',
+  'append-gen-style',
+  'append-gen-max-chars',
+];
+function _appendPersistKey(id) { return `appendGenPrefs:${id}`; }
+function _appendRestorePrefs() {
+  for (const id of _APPEND_PERSIST_FIELDS) {
+    try {
+      const v = localStorage.getItem(_appendPersistKey(id));
+      if (v == null) continue;
+      const el = document.getElementById(id);
+      if (el) el.value = v;
+    } catch {}
+  }
+}
+function _appendWireAutosave() {
+  for (const id of _APPEND_PERSIST_FIELDS) {
+    const el = document.getElementById(id);
+    if (!el || el.dataset.appendAutosaveWired) continue;
+    el.dataset.appendAutosaveWired = '1';
+    const save = () => {
+      try { localStorage.setItem(_appendPersistKey(id), el.value || ''); } catch {}
+    };
+    el.addEventListener('change', save);
+    el.addEventListener('input', save);
+  }
+}
+
 function openAppendScript() {
   if (!S.seriesId) { showToast('Открой сериал'); return; }
   const ta = document.getElementById('append-script-text');
@@ -1405,6 +1439,10 @@ function openAppendScript() {
   setAppendMode('paste');
   appendUpdateStats();
   openModal('modal-append-script');
+  // Restore last-used generate-mode form values + attach autosave listeners
+  // so the next change/input writes back to localStorage immediately.
+  _appendRestorePrefs();
+  _appendWireAutosave();
 }
 
 // Switch between «📋 Вставить готовый» and «✨ Сгенерировать новые» modes.
