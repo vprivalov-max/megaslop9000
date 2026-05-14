@@ -3673,6 +3673,7 @@ def generate_script_batch(sid):
     except (TypeError, ValueError):
         lines_count = None
     style_preset = (body.get('style') or '').strip()
+    no_interruptions = bool(body.get('no_interruptions', True))  # default: interruptions forbidden
     max_chars_raw = body.get('max_main_chars_per_scene')
     try:
         max_main_chars = int(max_chars_raw) if max_chars_raw not in (None, '', 0) else None
@@ -3845,7 +3846,16 @@ def generate_script_batch(sid):
         "   – Сколько VO-блоков? (≤ 2, и сюжет НЕ должен ими двигаться)\n"
         "   – Двигается ли сюжет через бумагу? (должно быть НЕТ)\n"
         "   Если хоть один тест провален — перепиши серию до вывода.\n"
-        "===\n"
+        + (
+        "7. ПЕРЕБИВАНИЯ — ЖЁСТКИЙ ЗАПРЕТ: НИКОГДА не обрывай реплику персонажа на полуслове тире (—). "
+        "Каждая произнесённая реплика — законченное предложение. ЗАПРЕЩЕНО: «ELENA: You should have—» или «(перебивает)». "
+        "Видеогенератор рендерит обрезанные реплики как двух одновременно говорящих — это выглядит сломанным. "
+        "Хочешь показать перебивание — заверши реплику + action line показывает физическое вмешательство + следующий персонаж говорит полную реплику.\n"
+        if no_interruptions else
+        "7. ПЕРЕБИВАНИЯ — РАЗРЕШЕНЫ: персонажи могут перебивать друг друга (обрыв фразы тире, «(перебивает)»). "
+        "Это создаёт живой темп, но не злоупотребляй — не более 2-3 перебиваний на серию, только в эмоциональных пиках.\n"
+        )
+        + "===\n"
     )
     system = (
         f"Ты — сценарист короткой драмы для вертикального TikTok/Reels. Пишешь {mode_label} на N серий. "
@@ -14386,6 +14396,12 @@ def seedance_compose(sid, num):
         "(обычно английский). Технические термины камеры тоже переводи: 'tracking shot' → 'трекинг-шот' или "
         "'движение камеры за героем', 'medium close-up' → 'средний крупный план', 'OTS' → 'через плечо', "
         "'slow dolly in' → 'медленный наезд'. Если поймал себя на английской фразе вне кавычек — перепиши.\n\n"
+        "ГОЛОС И АКЦЕНТ — ОБЯЗАТЕЛЬНО: озвучка ВСЕХ реплик строго на стандартном американском английском "
+        "(General American). Никаких British / Australian / European / Indian / exotic акцентов. "
+        "Если в реплике есть нестандартное слово (slang / regional) — оно произносится с американским произношением, "
+        "не с акцентом носителя. Это касается И обычной речи персонажей, И voiceover-нарратора. "
+        "Композитор: вставь упоминание в blocке STYLE/ATMOSPHERE («Voice: standard American English accent throughout») — "
+        "сервер дополнительно укрепит это финальной строкой промпта.\n\n"
         "СТРУКТУРА промпта (~60–110 слов всего, первые 20–30 слов решают):\n"
         "  0) BINDING — ПЕРВАЯ строка промпта. Биндим имена к ref-слотам ровно ОДИН раз:\n"
         "     'В refs: @Image1=Ethan, @Image2=Maya, @Image3=Lobby (локация).' "
@@ -15745,6 +15761,19 @@ def seedance_compose(sid, num):
     if compose_warnings:
         _log_event('INFO', 'compose_warnings', sid=sid, ep_num=num,
                    warnings=compose_warnings)
+
+    # ── VOICE / ACCENT FINAL ENFORCEMENT ────────────────────────────────────
+    # Last line of the prompt — Banana/Seedance reads tail-of-prompt as
+    # high-priority directive. Even if the composer forgot the STYLE-block
+    # accent hint, this short caps line locks American-English narration
+    # for every spoken line (regular dialogue + voiceover).
+    data['prompt'] = (data.get('prompt') or '').rstrip() + (
+        "\n\nVOICE: every spoken line — regular dialogue AND voiceover — is "
+        "performed in clear standard American English (General American accent). "
+        "No British / European / Australian / Indian / regional or exotic accents. "
+        "Natural conversational American delivery throughout."
+    )
+
     return jsonify({
         'prompt': data.get('prompt', ''),
         'refs': ref_meta,
