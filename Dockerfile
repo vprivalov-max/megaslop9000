@@ -18,6 +18,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app.py gunicorn.conf.py ./
 COPY static ./static
 COPY templates ./templates
+COPY services ./services
 
 # Runtime data goes here. Mount a host volume in docker-compose.
 ENV DATA_ROOT=/data

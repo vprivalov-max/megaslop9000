@@ -1069,6 +1069,7 @@ function openCreateSeries() {
     const el = document.getElementById(id); if (el) el.checked = true;
   }
   try { _importResetPickedFiles(); } catch (_) {}
+  try { _hydrateImportStylePicker(); } catch (_) {}
   setSeriesCreateMode('generate');
   // Hydrate the «🚫 Не предлагать» field from localStorage so user sees their
   // persisted blocked-tropes list immediately on modal open (no need to
@@ -1333,6 +1334,14 @@ async function importCreateSeries() {
   try {
     const hasFiles = IMPORT_PICKED.chars.length + IMPORT_PICKED.locs.length > 0;
     const langHint = _LANG_WARN_KEPT['import-series-script'] || '';
+    // Style choice — read BEFORE submit so generation uses it from the start
+    // instead of defaulting to 'cinematic' then prompting the user 900ms
+    // after the worker already kicked off (and locked some chars to the
+    // wrong look). User-reported real bug: «The Fox CEO's Trap» — picked
+    // PIXAR in the post-create prompt, but worker had already started
+    // generating realistic portraits before that prompt opened.
+    const styleType = (document.getElementById('import-style-type')?.value || 'cinematic').trim();
+    const styleCustomDesc = (document.getElementById('import-style-custom-desc')?.value || '').trim();
     let r;
     if (hasFiles) {
       // Multipart path — pre-upload files alongside the script.
@@ -1343,6 +1352,8 @@ async function importCreateSeries() {
       fd.append('extract_locations',  extractLocs  ? '1' : '0');
       fd.append('extract_items',      extractItems ? '1' : '0');
       if (langHint) fd.append('dialogue_language_hint', langHint);
+      fd.append('style_type', styleType);
+      if (styleCustomDesc) fd.append('style_custom_description', styleCustomDesc);
       // Rename file to the user-edited name (preserving extension) so the
       // backend stem→name converter picks up edits made in the chip UI.
       const _renamed = (entry) => {
@@ -1359,6 +1370,8 @@ async function importCreateSeries() {
         extract_characters: extractChars,
         extract_locations:  extractLocs,
         extract_items:      extractItems,
+        style_type: styleType,
+        style_custom_description: styleCustomDesc,
       };
       if (langHint) body.dialogue_language_hint = langHint;
       r = await api.post('/api/series/import-from-script', body);
@@ -1372,7 +1385,9 @@ async function importCreateSeries() {
     _importResetPickedFiles();
     navigate('series', { seriesId: r.sid });
     if (r.extraction_started) setTimeout(() => pollImportStatus(r.sid), 600);
-    setTimeout(() => maybePromptForStyle(true), 900);
+    // No longer auto-prompting for style here — user picks it in the import
+    // modal BEFORE submit so the worker uses the right style from the very
+    // first character/location generation.
   } catch (e) {
     alert('Ошибка импорта: ' + (e?.message || e));
   } finally {
@@ -3560,7 +3575,8 @@ function renderCharactersList() {
   }
   el.innerHTML = s.characters.map(c => {
     const hasRefs = c.ref_images && c.ref_images.length > 0;
-    const imgUrl = hasRefs ? `/assets/${s.id}/${c.ref_images[0]}` : null;
+    const v = c.image_version ? `?v=${c.image_version}` : '';
+    const imgUrl = hasRefs ? `/assets/${s.id}/${c.ref_images[0]}${v}` : null;
     return `
       <div class="char-item" data-autogen-kind="char" data-autogen-id="${c.id}" onclick="openCharAssets('${c.id}')"
            ondragover="_dropAssetOver(event)" ondragleave="_dropAssetLeave(event)"
@@ -3592,7 +3608,8 @@ function renderLocationsList() {
   }
   el.innerHTML = locs.map(l => {
     const hasRefs = l.ref_images && l.ref_images.length > 0;
-    const imgUrl = hasRefs ? `/assets/${s.id}/${l.ref_images[0]}` : null;
+    const v = l.image_version ? `?v=${l.image_version}` : '';
+    const imgUrl = hasRefs ? `/assets/${s.id}/${l.ref_images[0]}${v}` : null;
     return `
       <div class="char-item" data-autogen-kind="loc" data-autogen-id="${l.id}" onclick="openLocAssets('${l.id}')"
            ondragover="_dropAssetOver(event)" ondragleave="_dropAssetLeave(event)"
@@ -4300,10 +4317,12 @@ async function regenerateLocation() {
       { wishes }
     );
     if (!r.ready) throw new Error(r.error || 'unknown');
+    bumpAssetVersion();   // refresh ALL assetUrl()-rendered images
     S.series = await api.get(`/api/series/${S.seriesId}`);
     const l = (S.series.locations || []).find(x => x.id === currentLocId);
     if (l) renderLocAssetsGrid(l);
     if (typeof renderLocationsList === 'function') renderLocationsList();
+    if (typeof renderEpLocations === 'function') renderEpLocations();  // episode-view sidebar
     showToast('✓ Локация перегенерирована');
   } catch (e) {
     showToast('✗ ' + (e.message || e), 5000);
@@ -4315,9 +4334,10 @@ async function regenerateLocation() {
 function renderLocAssetsGrid(loc) {
   const grid = document.getElementById('loc-assets-grid');
   const refs = loc.ref_images || [];
+  const v = loc.image_version ? `?v=${loc.image_version}` : '';
   grid.innerHTML = refs.map(r => {
     const fname = r.split('/').pop();
-    const url = `${assetUrl(r)}`;
+    const url = `${assetUrl(r)}${v}`;
     return `
       <div class="photo-thumb-wrap" onclick="openLocLightbox('${loc.id}','${url}')">
         <img src="${url}" alt="">
@@ -4378,12 +4398,14 @@ async function regenerateLocationFromLightbox() {
       { wishes }
     );
     if (!res.ready) throw new Error(res.error || 'unknown');
+    bumpAssetVersion();   // refresh ALL assetUrl()-rendered images
     status.className = 'lb-status ok';
     status.textContent = '✓ Локация обновлена';
     S.series = await api.get(`/api/series/${S.seriesId}`);
     const l = (S.series.locations || []).find(x => x.id === currentLocId);
     if (l) renderLocAssetsGrid(l);
     renderLocationsList();
+    if (typeof renderEpLocations === 'function') renderEpLocations();  // episode-view sidebar
     setTimeout(() => closeLightbox(), 800);
   } catch (e) {
     status.className = 'lb-status err';
@@ -4734,7 +4756,8 @@ function renderItemsList() {
   }
   el.innerHTML = items.map(it => {
     const hasRefs = it.ref_images && it.ref_images.length > 0;
-    const imgUrl = hasRefs ? `/assets/${s.id}/${it.ref_images[0]}` : null;
+    const v = it.image_version ? `?v=${it.image_version}` : '';
+    const imgUrl = hasRefs ? `/assets/${s.id}/${it.ref_images[0]}${v}` : null;
     return `
       <div class="char-item" data-autogen-kind="item" data-autogen-id="${it.id}" onclick="openItemAssets('${it.id}')"
            ondragover="_dropAssetOver(event)" ondragleave="_dropAssetLeave(event)"
@@ -4884,10 +4907,12 @@ async function regenerateItem() {
       { wishes }
     );
     if (!r.ready) throw new Error(r.error || 'unknown');
+    bumpAssetVersion();   // refresh ALL assetUrl()-rendered images
     S.series = await api.get(`/api/series/${S.seriesId}`);
     const it = (S.series.items || []).find(x => x.id === currentItemId);
     if (it) renderItemAssetsGrid(it);
     renderItemsList();
+    if (typeof renderEpItems === 'function') renderEpItems();  // episode-view sidebar
     showToast('✓ Предмет перегенерирован');
   } catch (e) {
     showToast('✗ ' + (e.message || e), 5000);
@@ -4947,12 +4972,14 @@ async function regenerateItemFromLightbox() {
       { wishes }
     );
     if (!res.ready) throw new Error(res.error || 'unknown');
+    bumpAssetVersion();   // refresh ALL assetUrl()-rendered images
     status.className = 'lb-status ok';
     status.textContent = '✓ Предмет обновлён';
     S.series = await api.get(`/api/series/${S.seriesId}`);
     const it = (S.series.items || []).find(x => x.id === currentItemId);
     if (it) renderItemAssetsGrid(it);
     renderItemsList();
+    if (typeof renderEpItems === 'function') renderEpItems();  // episode-view sidebar
     setTimeout(() => closeLightbox(), 800);
   } catch (e) {
     status.className = 'lb-status err';
@@ -5413,6 +5440,7 @@ async function regenerateCharacterFromLightbox() {
     renderCharAssetsGrid(c, true);
     renderOutfitsList(c);
     renderCharactersList();
+    if (typeof renderEpCharacters === 'function') renderEpCharacters();  // episode-view sidebar
 
     // Swap lightbox image to the freshly generated base (cache-bust)
     const freshUrl = res.base_url + '?t=' + Date.now();
@@ -5607,6 +5635,7 @@ async function regenerateCharacter() {
     renderCharAssetsGrid(c, true);
     renderOutfitsList(c);
     renderCharactersList();
+    if (typeof renderEpCharacters === 'function') renderEpCharacters();  // episode-view sidebar
     btn.disabled = false;
     btn.innerHTML = '↻ Перегенерировать ещё раз';
     setTimeout(() => {
@@ -5623,6 +5652,44 @@ async function regenerateCharacter() {
 // ── Style editor ──────────────────────────────────────────────────────────────
 // Cached preset list (loaded once per session).
 let _stylePresetsCache = null;
+
+// Inline-style chips for the create-from-script modal. Renders the preset
+// list as clickable pills (cinematic / pixar / anime / noir / photorealistic /
+// custom). Selection writes into the hidden #import-style-type input that the
+// submit handler reads. «Custom» reveals the description textarea below.
+async function _hydrateImportStylePicker() {
+  const container = document.getElementById('import-style-chips');
+  if (!container) return;
+  const customTa = document.getElementById('import-style-custom-desc');
+  const hiddenInput = document.getElementById('import-style-type');
+  if (!hiddenInput) return;
+  const presets = await _loadStylePresets();
+  // Always include 'custom' at the end of the list.
+  const list = [...presets, { id: 'custom', name: 'Свой стиль', desc: '' }];
+  hiddenInput.value = 'cinematic';  // default
+  if (customTa) customTa.style.display = 'none';
+  container.innerHTML = list.map(p => {
+    const sel = (p.id === 'cinematic') ? ' selected' : '';
+    return `<button type="button" class="import-style-chip${sel}" data-style="${p.id}"
+      onclick="_pickImportStyle('${p.id}')"
+      style="padding:5px 11px;font-size:0.82rem;border-radius:14px;border:1px solid var(--border);
+             background:${p.id === 'cinematic' ? 'var(--accent)' : '#1a1a1f'};
+             color:${p.id === 'cinematic' ? '#fff' : 'var(--text)'};
+             cursor:pointer">${esc(p.name || p.id)}</button>`;
+  }).join('');
+}
+
+function _pickImportStyle(id) {
+  const hiddenInput = document.getElementById('import-style-type');
+  const customTa = document.getElementById('import-style-custom-desc');
+  if (hiddenInput) hiddenInput.value = id;
+  document.querySelectorAll('.import-style-chip').forEach(btn => {
+    const sel = (btn.dataset.style === id);
+    btn.style.background = sel ? 'var(--accent)' : '#1a1a1f';
+    btn.style.color = sel ? '#fff' : 'var(--text)';
+  });
+  if (customTa) customTa.style.display = (id === 'custom') ? '' : 'none';
+}
 
 async function _loadStylePresets() {
   if (_stylePresetsCache) return _stylePresetsCache;
@@ -6287,17 +6354,62 @@ const _SCRIPT_SKIP_PATTERNS = [
 //     are NOT counted as spoken words — they're stage directions, not speech.
 //   • Scene headings, transitions, separators: 0s.
 const ACTION_BEAT_SEC = 1.5;
-const SPEECH_WPS = 3.8;  // ~228 wpm — short-drama TikTok delivery (faster than conversational)
+const SPEECH_WPS = 2.65;  // ~159 wpm — calibrated to external pro chronometer on actual script dialogue
+
+// Helpers shared between _lineDuration and the segment-builder loop.
+// All quote/dash chars short-drama AI scripts use in practice.
+const _QUOTE_OPEN_RE  = /^[\s]*["'«»“”„‟‘’‚‛‹›「『]/;
+const _QUOTE_CLOSE_RE = /["'«»“”„‟‘’‚‛‹›」』]\s*[.!?…]?\s*$/;
+const _DASH_DIALOGUE_RE = /^[—–]\s+\S/;
+
+// Strip wrapping markdown (`**bold**`, `*italic*`, `__bold__`, `_italic_`)
+// from the line. AI-generated screenplays often emit `**Clara:**` for cues,
+// `**"Hello"**` for emphasized dialogue, or italic-wrapped parentheticals
+// like `*(she winks)*` / `**MAYA** *(irritated):*`. Without stripping,
+// downstream regexes that anchor on a letter all fail and the line falls
+// into generic prose (wrong duration).
+function _stripMarkdownWrappers(s) {
+  if (!s) return s;
+  // Strip a leading **…** that covers the start of the line.
+  s = s.replace(/^\*\*([^*]+)\*\*/, '$1');
+  s = s.replace(/^__([^_]+)__/, '$1');
+  // Strip italic-wrapped parentheticals ANYWHERE in the line:
+  //   *(text)*  → (text)
+  //   *(text):* → (text):    (italic wraps paren AND its colon — common
+  //                            in `**MAYA** *(irritated):* Oh really?`)
+  s = s.replace(/\*(\([^)]+\):?)\*/g, '$1');
+  s = s.replace(/_(\([^)]+\):?)_/g, '$1');
+  // Strip a leading *…* (single asterisk italic) if it wraps a name+colon
+  // or a name only — narrow pattern to avoid stripping mid-sentence emphasis.
+  s = s.replace(/^\*([A-Za-zА-Яа-яЁё][^*]{0,60})\*/, '$1');
+  s = s.replace(/^_([A-Za-zА-Яа-яЁё][^_]{0,60})_/, '$1');
+  return s.trim();
+}
+
+// Count dialogue words after stripping non-spoken decorations.
+function _countDialogueWords(text) {
+  if (!text) return 0;
+  const stripped = text
+    .replace(/^[\s]*["'«»“”„‟‘’‚‛‹›「『]+/, '')        // leading quotes
+    .replace(/["'«»“”„‟‘’‚‛‹›」』]+\s*[.!?…]?\s*$/, '')// trailing quotes
+    .replace(/\([^)]*\)/g, ' ')                       // (parens — tone notes)
+    .replace(/\[[^\]]*\]/g, ' ')                      // [brackets — stage]
+    .replace(/\*[^*]*\*/g, ' ')                       // *italics — emphasis*
+    .trim();
+  return stripped ? stripped.split(/\s+/).filter(Boolean).length : 0;
+}
 
 function _lineDuration(line) {
   let t = (line || '').trim();
   if (!t) return 0;
   // Strip leading line-numbering prefix: "1. ", "2) ", "12: ", "3 - " — common
-  // when scripts come back with enumerated dialogue/action. Without this strip
-  // the dialogue regex below fails (first char is a digit, not a letter) and
-  // the line falls into prose-action with fixed 1.5s — drastically underestimating
-  // long dialogues.
+  // when scripts come back with enumerated dialogue/action.
   t = t.replace(/^\d+[.\):\-—–]\s+/, '');
+  // Strip wrapping markdown (`**Clara:**`, `*Sofia*`) so downstream regexes
+  // anchored on a letter still match.
+  t = _stripMarkdownWrappers(t);
+  if (!t) return 0;
+
   if (_matchSceneHeading(t).match) return 0;
   if (/^[-—=]{3,}\s*$/.test(t)) return 0;
   if (/^\[REVERSAL\]\s*$/i.test(t)) return 0;
@@ -6308,7 +6420,7 @@ function _lineDuration(line) {
 
   // Action line: bracketed prose `[Волк входит и...]`. Scale by length —
   // real action takes time proportional to what's described; a one-liner
-  // ≈1.5s, a long sentence ≈4-6s. Cap so a paragraph doesn't blow a chunk.
+  // ≈1.5s, a long sentence ≈4-6s.
   if (/^\[/.test(t) && /\]\s*$/.test(t)) {
     const inner = t.replace(/[\[\]]/g, '').trim();
     if (!inner) return 0;
@@ -6319,39 +6431,99 @@ function _lineDuration(line) {
   // Accepts BOTH all-caps (AVA:, MAYA:) and Title-case (Adrian:, Clara:) — modern
   // short-drama scripts use Title-case for character cues, classic screenplay
   // format uses all-caps. Discriminator is the colon — prose lines don't have one.
-  const m = t.match(/^([A-Za-zА-Яа-яЁё_][A-Za-zА-Яа-яЁё_0-9 ()\-']{0,40})\s*[:：]\s*(.*)$/);
-  // Reject only if the first letter is lowercase (e.g. random colon-prose like
-  // "the question: who killed her?"). Either ALL-CAPS or Title-case both pass.
+  const m = t.match(/^([A-Za-zА-Яа-яЁё_][A-Za-zА-Яа-яЁё_0-9 ()\-'.#]{0,40})\s*[:：]\s*(.*)$/);
   if (m && /^[A-ZА-ЯЁ]/.test(m[1])) {
-    let rest = m[2] || '';
-    rest = rest.replace(/\([^)]*\)/g, ' ');   // (parenthetical tone notes) — not spoken
-    rest = rest.replace(/\[[^\]]*\]/g, ' ');  // [stage actions inside dialogue] — not spoken
-    rest = rest.replace(/\*[^*]*\*/g, ' ');   // *italic emphasis / inline action* — also not spoken
-    rest = rest.trim();
-    if (!rest) return 0.5;
-    const words = rest.split(/\s+/).filter(Boolean).length;
-    return 0.4 + words / SPEECH_WPS;          // tiny pre-pause + speech rate
+    const rest = m[2] || '';
+    const words = _countDialogueWords(rest);
+    if (!words) return 0.5;
+    return 0.4 + words / SPEECH_WPS;
   }
 
-  // Standalone parenthetical: short emotional beat "(angry)" → 0.4s,
-  // long action wrapped in parens "(Каэлен падает...)" → scale by length.
+  // European/Russian literary dialogue: «— Привет!» / "— How are you?"
+  // Em-dash or en-dash followed by space and dialogue text. Each dash line
+  // is a separate beat (speaker alternates by convention).
+  if (_DASH_DIALOGUE_RE.test(t)) {
+    const inner = t.replace(/^[—–]\s+/, '');
+    const words = _countDialogueWords(inner);
+    if (words > 0) return 0.4 + words / SPEECH_WPS;
+  }
+
+  // Novel-style fully-quoted dialogue line: «"Hello there."» / «"Привет."»
+  // No explicit cue — the whole line is just the quoted utterance. Count as
+  // dialogue.
+  if (_QUOTE_OPEN_RE.test(t) && _QUOTE_CLOSE_RE.test(t)) {
+    const words = _countDialogueWords(t);
+    if (words > 0) return 0.4 + words / SPEECH_WPS;
+  }
+
+  // Novel-style dialogue + attribution: «"I love you," she said.» Line starts
+  // with a quote, has a closing quote, then space + more text (attribution).
+  // The comma usually sits INSIDE the closing quote («"I love you,"»), so we
+  // can't anchor on a comma after — instead we just require the close-quote
+  // be followed by space + any non-space char (the attribution continues).
+  // We extract just the quoted utterance; the attribution is amortized by
+  // the per-line 0.4s pre-pause.
+  const quoteAttrMatch = t.match(/^[\s]*["'«»“”„‟‘’‚‛‹›「『](.+?)["'«»“”„‟‘’‚‛‹›」』]\s+\S/);
+  if (quoteAttrMatch) {
+    const words = _countDialogueWords(quoteAttrMatch[1]);
+    if (words > 0) return 0.4 + words / SPEECH_WPS;
+  }
+
+  // Standalone parenthetical: prefer event detection over length-based scaling
+  // so descriptive parens read as 0s and action parens get 1.5s, consistent
+  // with how unwrapped prose lines are billed.
+  //   (angry)                       → 0.4s  (short tone-note, no event)
+  //   (she winks)                   → 1.5s  (motion verb)
+  //   (Adrian laughs in surprise)   → 1.5s  (motion verb, short paren)
+  //   (a hot summer afternoon...)   → 0s    (no event, pure description)
   const parenMatch = t.match(/^\((.+)\)\.?$/);
   if (parenMatch) {
     const inner = parenMatch[1].trim();
-    if (inner.length <= 25) return 0.4;
-    return _scaleActionDuration(inner);
+    const evDur = _scaleProseDuration(inner);
+    if (evDur > 0) return evDur;
+    return inner.length <= 25 ? 0.4 : 0;
   }
 
-  // Plain prose action (no brackets) — scale by length.
-  return _scaleActionDuration(t);
+  // Directorial markers — «Pause.» / «Beat.» / «Silence.» / «Тишина.»
+  // These are screenplay timing notes, not narrative events. Give a small
+  // beat (the cut/cross-fade between actions) but don't bill as an event.
+  if (/^(pause|beat|silence|тишина|пауза)[.!]?\s*$/i.test(t)) return 0.5;
+
+  // Orphan screenplay speaker cue — standalone name with no dialogue on the
+  // same line ("VIVIENNE", "ETHAN (V.O.)"). 0s; payload line carries time.
+  if (_isOrphanSpeakerCue(t)) return 0;
+
+  // Plain prose narration — describes a visual state. 0s unless it contains
+  // an event/motion verb (handled in _scaleProseDuration).
+  return _scaleProseDuration(t);
 }
 
-// Action duration heuristic: ~35 chars per visible second of footage,
-// floor at ACTION_BEAT_SEC=1.5s, cap at 6s so a long paragraph doesn't
-// take over an entire 15s segment by itself.
+// Bracketed stage-direction duration: explicit physical actions [Wolf enters].
+// These are timed sequences, so scale with complexity; max 6s.
 function _scaleActionDuration(text) {
   const chars = (text || '').length;
   return Math.max(ACTION_BEAT_SEC, Math.min(6, 1 + chars / 35));
+}
+
+// Unbracketed prose lines fall into two categories:
+//   • Scene/character DESCRIPTION — "A car stands on the road.",
+//     "Vivienne is lying halfway under it.", "Cash lies on the pavement."
+//     These describe a visual state. The camera captures it in one frame
+//     regardless of description length → 0 screen-time.
+//   • EVENT lines — "A raccoon walks by.", "The raccoon freezes."
+//     Something actually HAPPENS on screen → ACTION_BEAT_SEC (1.5s).
+//
+// Distinction: does the line contain a motion / change-of-state verb?
+// If yes → event → 1.5s. If no → pure description → 0s.
+// Motion / change-of-state / event verbs. Presence in a prose line means
+// something HAPPENS on screen (vs static scene description). Roots only —
+// the trailing `\w*` matches all conjugations (walks, walked, walking).
+// Cyrillic roots are appended without `\b` (JS `\b` doesn't bracket Cyrillic).
+const _PROSE_EVENT_RE = /\b(walk|run|enter|exit|approach|come|go|leave|depart|arrive|return|rush|dart|dash|sprint|flee|escape|jump|leap|hop|spring|bounc|fall|fell|stumbl|trip|slip|slid|roll|crawl|kneel|crouch|squat|grab|snatch|seiz|reach|extend|stretch|pull|push|shov|throw|toss|hurl|fling|catch|hit|punch|kick|slap|smack|whack|strike|swing|spin|twist|whirl|turn|rotat|pivot|freez|halt|stop|paus|brak|mov|cross|step|drop|lift|raise|lower|hoist|climb|mount|descend|slam|burst|smash|crash|crack|shatter|break|tear|rip|snap|bend|fold|crumple|lung|stagger|wobble|sway|sway|collaps|topple|tumbl|nod|shak|tremb|shiver|quiv|wav|gestur|point|wink|blink|stare|gaz|glanc|peek|peer|squint|ogle|watch|observ|spot|notic|appear|emerg|surfac|materializ|manifest|disappear|vanish|fade|dissolv|reveal|expos|hid|conceal|wince|grimac|flinch|jerk|recoil|shudder|smil|grin|smirk|frown|scowl|glare|sneer|beam|chuckl|giggl|snicker|laugh|cry|cri|sob|weep|wail|moan|groan|grunt|gasp|sigh|pant|wheez|huff|puff|breath|exhal|inhal|cough|sneeze|hiccup|sniff|hiss|growl|roar|bark|yelp|yowl|whimper|whin|whisper|murmur|mumbl|mutter|stammer|stutter|exclaim|shout|scream|yell|holler|bellow|call|hum|whistl|sing|chant|recit|spill|leak|drip|trickl|spray|spurt|gush|flow|stream|pour|splash|squirt|soak|drench|coat|cover|wrap|wind|fasten|tie|untie|button|zip|unzip|knock|tap|rap|drum|bang|thump|kiss|hug|embrac|peck|nuzzl|grip|clutch|squeez|crush|hold|carr|drag|tow|haul|press|lean|recline|rest|lay|laid|sit|stand|ris|set|plac|put|drop|tak|grasp|deliver|give|hand|pass|offer|extend|accept|receive|gather|collect|stack|pil|spread|scatter|sprinkl|dust|sweep|brush|wip|polish|scrub|clean|wash|rins|drink|sip|gulp|swallow|chew|bit|nibbl|gnaw|lick|tast|eat|swallow|read|writ|typ|click|sign|stamp|mark|draw|paint|sketch|ride|driv|board|park|wear|don|remov|strip|undress|dress|clip|scrap|scratch|polish|shav|shed|stride|march|pac|wander|amble|stroll|saunter|trudg|trot|gallop|charg|stomp|tiptoe|sneak|creep|slither|wriggl|float|hover|fly|soar|swoop|div|plung|sink|drown|swim|paddl|wad|surf|sail|cruis|drift|reflect|los|win|find|chas|persu|defend|attack|block|dodg|guard|shield|protect|aim|fir|shoot|spotlight|shine|light|ignit|dim|stares?|glanc|admir|inspect|examin|study|scan|surv|focus)\w*\b|\blooks?\s+(at|up|down|over|around|toward|away|back|forward|inside|outside|within)\b|(?:^|[^А-Яа-яЁё])(идт|идёт|идут|шёл|шла|шли|шед|приш|приход|подойд|подойт|подош|подход|подход|уход|ушёл|ушла|ушли|войт|вош|вход|выйт|выш|вых|сел|сел|сядь|сядет|сидел|вста|встал|встаёт|встан|повор|поверн|поверт|посмотр|смотр|смотрел|смотрит|поглянул|глядит|глянул|взял|берёт|брал|бер|откр|закр|подн|опуст|пов|потян|тян|толкн|толка|удар|ударил|двинул|сказа|говор|шепну|шепч|крикн|крич|восклик|улыб|обня|поцелова|обнимат|кивн|кивает|махн|маша|махал|упал|пад|подым|раскр|закры|вышел|вышла|пришёл|пришла|ушёл|ушла|идя|бежа|бежал|бежит|бегут|схвати|схватил|хватает|схватив|поднял|подним|опустил|подош|подошёл|подходит|ткнул|тыкает|тычет|стало|стал|стала|сделал|делает|сделав|загляну|глядя|залез|залазит|пишет|написал|читает|прочёл|прочит|плач|плакал|плачет|смеет|смеёт|смея|засмеял|улыбнул|улыбается|ухмыл)/i;
+
+function _scaleProseDuration(text) {
+  if (!text || !text.trim()) return 0;
+  return _PROSE_EVENT_RE.test(text) ? ACTION_BEAT_SEC : 0;
 }
 
 // Find a chunk's [start, end] byte-offset in the script via long-line anchors.
@@ -6450,12 +6622,24 @@ function _findChunkRange(scriptText, chunkText) {
 
 function _parseScriptScenes(scriptText, overrides) {
   const rawLines = (scriptText || '').split('\n');
-  const overrideMap = new Map();
+  // Two override maps:
+  //   pairMap: keyed by `s${sceneIdx}a${autoSeg}` — canonical post-2026-05-15
+  //            entries. Matches exactly one segment break, immune to
+  //            duplicate-anchor scripts (dialogue-heavy back-and-forth).
+  //   anchorMap: legacy entries without sceneIdx/autoSeg — keyed by anchor.
+  //            Still respected so old projects don't lose their tweaks.
+  const overridePairMap = new Map();   // 's0a3' → 'merge'|'break'
+  const overrideAnchorMap = new Map(); // 'Ethan:' → 'merge'|'break'  (legacy)
   for (const o of (overrides || [])) {
-    if (o && o.anchor && (o.action === 'break' || o.action === 'merge')) {
-      overrideMap.set(o.anchor, o.action);
+    if (!o || !(o.action === 'break' || o.action === 'merge')) continue;
+    if (typeof o.sceneIdx === 'number' && typeof o.autoSeg === 'number') {
+      overridePairMap.set(`s${o.sceneIdx}a${o.autoSeg}`, o.action);
+    } else if (o.anchor) {
+      overrideAnchorMap.set(o.anchor, o.action);
     }
   }
+  // Combined view for the «do we have any overrides at all?» short-circuit.
+  const overrideMap = overrideAnchorMap;
   const scenes = [];
   let inCast = false;
   let inNotes = false;
@@ -6472,6 +6656,10 @@ function _parseScriptScenes(scriptText, overrides) {
     /^[-–—]\s/.test(s) ||                               // — line
     /^(?:int\.|ext\.|инт\.|экст\.|нат\.|сцена)\s/i.test(s)  // scene heading
   );
+  // Tracks the screenplay-format orphan-cue → payload handoff across lines.
+  // True after we've just seen a bare speaker cue ("SOFIA", "DANTE (V.O.)")
+  // and are waiting for the dialogue text line that belongs to it.
+  let expectingDialogue = false;
   for (const rawLine of rawLines) {
     const lineStart = runningOffset;
     const lineEnd = runningOffset + rawLine.length;
@@ -6506,12 +6694,19 @@ function _parseScriptScenes(scriptText, overrides) {
     if (/^#+\s/.test(t)) continue;
     // Bold meta-labels — story-trailer / scene-trailer annotations the writer attaches:
     //   **КРАТКОЕ СОДЕРЖАНИЕ:** …, **SUMMARY:** …
+    //   **LOCATION:** Manhattan, **IN THE FRAME:** MAYA, ADRIAN
     //   - **Cliffhanger:** "..."
     //   - **Emotional peak:** Vivian's admission of forcing Clara…
     //   - **Setup for Episode 5:** Legal confrontation begins…
-    // Pattern: optional bullet (-, *, •) + **Label:** where Label can include letters, digits, spaces.
-    // We do NOT include `.` or `—` in Label so scene headings like **INT. CAFE — DAY** stay safe.
-    if (/^(?:[-*•]\s+)?\*\*[A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё0-9\s]*:\s*\*\*/.test(t)) continue;
+    //
+    // CRITICAL: must NOT catch dialogue cues like `**ADRIAN:** Damn it.`
+    // The old open pattern `^\*\*[letters]+:\*\*` swallowed every screenplay
+    // cue and dropped its dialogue line silently. Now we whitelist the actual
+    // meta keywords (with optional 1-5 trailing words to cover `Setup for
+    // Episode 5`). Bullet-prefixed lines stay broadly matched — by convention
+    // ANY `- **Label:**` is meta, never dialogue.
+    if (/^[-*•]\s+\*\*[A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё0-9\s]*:\s*\*\*/.test(t)) continue;
+    if (/^\*\*\s*(?:cliffhanger|setup|summary|brief|logline|premise|tl;?dr|synopsis|hook(?:\s+type)?|reversal(?:\s+type)?|escalation(?:\s+rung)?|spoken\s+word\s+count|estimated\s+runtime|emotional(?:\s+peak)?|theme|notes?|location|setting|locale|in\s+the\s+frame|scene\s+brief|кратко(?:е\s+содержание)?|синопсис|содержание|суммари|клиффхэнгер|разворот|хук|локация|в\s+кадре)(?:\s+[\w\d]+){0,5}\s*[:：]\s*\*\*/i.test(t)) continue;
     // Horizontal separators
     if (/^[-—=]{3,}\s*$/.test(t)) continue;
 
@@ -6520,6 +6715,7 @@ function _parseScriptScenes(scriptText, overrides) {
     if (headMatch.match) {
       cur = { id: scenes.length, heading: t, lines: [], totalSec: 0, inferred: headMatch.inferred };
       scenes.push(cur);
+      expectingDialogue = false;  // reset cross-scene state
       continue;
     }
 
@@ -6535,7 +6731,49 @@ function _parseScriptScenes(scriptText, overrides) {
       scenes.push(cur);
     }
 
-    const dur = _lineDuration(rawLine);
+    // Screenplay multi-line dialogue. Two flavors of "cue waiting for payload":
+    //   (a) Orphan cue, no colon:        SOFIA / DANTE (V.O.) / **Clara**
+    //                                    Three nights...
+    //   (b) Name-colon, empty tail:      Clara: / Mrs. Vale: / **Sofia:**
+    //                                    "The moon..."
+    // `_lineDuration` is stateless and cannot tell that the bare line below
+    // a cue is its dialogue payload — it falls through to plain prose and
+    // gets billed at 0-1.5s instead of word-count rate. Track the cue→payload
+    // handoff here so dialogue is computed correctly. Markdown wrappers
+    // (`**Clara:**`, `*Sofia*`) are stripped before matching.
+    const _t = _stripMarkdownWrappers(t);
+    const _isCueAwaitingPayload = (text) => {
+      if (_isOrphanSpeakerCue(text)) return true;
+      // "Clara:" / "Mrs. Vale:" / "DANTE (V.O.):" with empty after the colon
+      const cm = text.match(/^([A-Za-zА-Яа-яЁё_][A-Za-zА-Яа-яЁё_0-9 ()\-'.#]{0,40})\s*[:：]\s*(.*)$/);
+      if (!cm || !/^[A-ZА-ЯЁ]/.test(cm[1])) return false;
+      const tail = (cm[2] || '').replace(/\([^)]*\)/g, ' ').replace(/\[[^\]]*\]/g, ' ').replace(/\*[^*]*\*/g, ' ').trim();
+      return tail === '';
+    };
+    let dur;
+    if (expectingDialogue) {
+      if (_isCueAwaitingPayload(_t)) {
+        // Another cue in a row — keep waiting for payload.
+        dur = 0;
+      } else if (/^\([^)]+\)\.?$/.test(_t)) {
+        // Parenthetical tone note between cue and payload ("(barely breathing)") —
+        // not spoken, kept as 0s; payload still pending on next line.
+        dur = 0;
+      } else {
+        // This line IS the dialogue payload. Compute by speech rate.
+        const words = _countDialogueWords(_t);
+        dur = words > 0 ? 0.4 + words / SPEECH_WPS : 0.5;
+        expectingDialogue = false;
+      }
+    } else {
+      if (_isCueAwaitingPayload(_t)) {
+        // Cue on its own line — 0s, expect dialogue payload next.
+        dur = 0;
+        expectingDialogue = true;
+      } else {
+        dur = _lineDuration(rawLine);
+      }
+    }
     cur.lines.push({
       text: rawLine, duration: dur, segIdx: 0,
       offset: lineStart, offsetEnd: lineEnd,
@@ -6556,14 +6794,32 @@ function _parseScriptScenes(scriptText, overrides) {
   const SOFT_MAX = 13.0;        // normal break threshold (2s buffer below 15s chunk)
   const MIN_SEGMENT_SEC = 5.0;  // smaller than this = wasted Seedance chunk
   const HARD_MAX_SEC = 14.5;    // absolute ceiling — Seedance chunk is 15s
-  // Speaker cue detector — bare ALL-CAPS character-name line (1-4 tokens,
-  // optional «(CONT'D)» / «(V.O.)» / «(to X)» suffix). These must NEVER be
-  // separated from the dialogue line that follows — otherwise Seedance gets
-  // the dialogue without a speaker attached and lipsync goes to a random
-  // character.
+  // Speaker cue detector — a line that's ONLY a character-name cue, no
+  // dialogue text. Two formats supported:
+  //   (a) Classic screenplay ALL-CAPS:  ETHAN  / ETHAN (CONT'D) / ETHAN (V.O.)
+  //   (b) Modern Title-case + colon:    Ethan:  / Ava (V.O.):
+  // Optional parenthetical qualifier «(CONT'D)» / «(V.O.)» / «(to X)».
+  // These must NEVER be separated from the dialogue line that follows —
+  // otherwise the chunk starts with an orphan dialogue line whose speaker
+  // landed in the previous chunk, and ends with a dangling cue whose
+  // dialogue landed in the next chunk. User-reported real bug: chunk
+  // contained «Yes. / Ethan: / You said you stole my access codes. / Ava:».
   const _isSpeakerCue = (text) => {
     const t = (text || '').trim();
     if (!t || t.length > 40) return false;
+    // Format (b): «Name:» or «Name (V.O.):» — only a name + optional
+    // qualifier, ending in a colon, NO dialogue text after the colon.
+    const colonMatch = t.match(/^([A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё0-9 \-']{0,28})(\s*\([^)]{0,20}\))?\s*[:：]\s*$/);
+    if (colonMatch) {
+      const name = colonMatch[1].trim();
+      // Reject heading/meta tokens. (JS \b doesn't work for Cyrillic, so
+      // we use explicit alternation with optional non-letter suffix.)
+      const META_TOKENS = /^(INT|EXT|FADE|CUT|MATCH|DISSOLVE|TIME|END|FIN|SCENE|FLASHBACK|Локация|Сцена|Time|Day|Night|Morning|Evening)(?:[^A-Za-zА-Яа-яЁё]|$)/i;
+      if (/^[A-ZА-ЯЁ]/.test(name) && !META_TOKENS.test(name)) {
+        return true;
+      }
+    }
+    // Format (a): bare ALL-CAPS cue without colon.
     const base = t.replace(/\s*\([^)]+\)\s*$/, '').trim();   // strip (CONT'D) etc
     if (!base || base.length > 30) return false;
     if (/[a-zа-яё]/.test(base)) return false;                // no lowercase
@@ -6636,14 +6892,33 @@ function _parseScriptScenes(scriptText, overrides) {
   // auto-segmentation so user's choices win. Skipped lines (meta, headings)
   // never reach lines[] so they can't carry overrides — fine, those aren't
   // displayed segments anyway.
-  if (overrideMap.size) {
+  if (overridePairMap.size || overrideAnchorMap.size) {
+    let sIdx = 0;
     for (const sc of scenes) {
       // Snapshot auto-segmentation (transitions = points where auto wanted a break)
       for (const l of sc.lines) l._autoSeg = l.segIdx;
+      // For each line, pick action: prefer (sceneIdx, autoSeg) match.
+      // Anchor-only fallback (legacy data) is applied at most ONCE per
+      // anchor per scene — without this guard, a script where many
+      // segments start with the same speaker cue ("Ethan:") would
+      // re-trigger the merge on every same-anchor segment break and
+      // collapse the rest of the scene into one chunk.
+      const usedLegacyAnchors = new Set();
       let curSeg = 0;
       for (let i = 0; i < sc.lines.length; i++) {
         const l = sc.lines[i];
-        const action = overrideMap.get(_lineAnchor(l.text));
+        const pairKey = `s${sIdx}a${l._autoSeg}`;
+        let action = overridePairMap.get(pairKey) || null;
+        if (!action) {
+          const anc = _lineAnchor(l.text);
+          if (!usedLegacyAnchors.has(anc)) {
+            const legacyAction = overrideAnchorMap.get(anc);
+            if (legacyAction) {
+              action = legacyAction;
+              usedLegacyAnchors.add(anc);
+            }
+          }
+        }
         if (i === 0) {
           l.segIdx = 0;
           l._override = action || null;
@@ -6661,6 +6936,7 @@ function _parseScriptScenes(scriptText, overrides) {
         l._override = action || null;
       }
       sc.segCount = sc.lines.length ? (sc.lines[sc.lines.length - 1].segIdx + 1) : 0;
+      sIdx += 1;
     }
   }
   return scenes;
@@ -6767,9 +7043,15 @@ function _renderScenesHTML(scenes, coverage = []) {
       if (!startsNewSeg && editMode && lIdx > 0) {
         const anchor = _lineAnchor(l.text);
         const isOvr = l._override === 'break';
-        const safeAnchor = anchor.replace(/'/g, "\\'");
+        // Escape BOTH single quotes (JS string delim inside onclick) AND
+        // double quotes (HTML attribute delim) AND backslashes/ampersand.
+        // Real production bug: dialogue line starting with «"The child …»
+        // broke the onclick attribute at the first " — click silently
+        // did nothing. _attrSafe handles all four meta-chars in order.
+        const safeAnchor = _attrSafe(anchor);
+        const autoSegArg = (typeof l._autoSeg === 'number') ? l._autoSeg : l.segIdx;
         html += `<div class="ep-split-handle ${isOvr ? 'ovr' : ''}"
-          onclick="toggleSegmentBreak('${safeAnchor}')"
+          onclick="toggleSegmentBreak('${safeAnchor}', ${sIdx}, ${autoSegArg})"
           title="${isOvr ? 'Убрать ручной разрыв здесь' : 'Разделить сегмент перед этой строкой'}"
         >${isOvr ? '✓ разрыв здесь — клик чтобы убрать' : '✂ разделить здесь'}</div>`;
       }
@@ -6785,8 +7067,11 @@ function _renderScenesHTML(scenes, coverage = []) {
           : `<span class="ep-seg-dur" title="Расчётная длительность сегмента">${segTotal.toFixed(1)}с</span>`;
         // First-line anchor of this segment for the MERGE button (per-line, OK
         // if it shifts when the user edits text — merge is a local operation).
+        // See _attrSafe note above: must escape both " (HTML attr delim) and
+        // ' (JS string delim) so a dialogue line starting with «"» doesn't
+        // truncate the onclick handler.
         const firstAnchor = _lineAnchor(l.text);
-        const safeFirstAnchor = firstAnchor.replace(/'/g, "\\'");
+        const safeFirstAnchor = _attrSafe(firstAnchor);
         // Per-segment AUTO-SKIP anchor MUST be unique across the episode.
         // Bug 2026-05-12: using firstAnchor here collapsed all segments whose
         // first line started with the same text (e.g. several segments
@@ -6798,8 +7083,9 @@ function _renderScenesHTML(scenes, coverage = []) {
         const autoSkipKey = `s${sIdx}g${l.segIdx}`;
         const isMergedHere = l._override === 'merge';
         const isAutoSkipped = _isSegmentAutoSkipped(autoSkipKey);
+        const mergeAutoSeg = (typeof l._autoSeg === 'number') ? l._autoSeg : l.segIdx;
         const editBtns = editMode && lIdx > 0
-          ? `<button class="ep-seg-mini" onclick="toggleSegmentMerge('${safeFirstAnchor}')"
+          ? `<button class="ep-seg-mini" onclick="toggleSegmentMerge('${safeFirstAnchor}', ${sIdx}, ${mergeAutoSeg})"
               title="${isMergedHere ? 'Восстановить разделение' : 'Объединить с предыдущим сегментом'}"
             >${isMergedHere ? '↩ разъединить' : '🔗 ↑ объединить'}</button>`
           : '';
@@ -6878,6 +7164,20 @@ function toggleSceneView() {
 
 const SCENE_VIEW_STATE = { showCoverage: true, editMode: false };
 
+// Make a string safe for embedding as a JS-string argument inside an HTML
+// onclick="..." attribute. Order matters:
+//   1) ampersand FIRST so we don't double-encode the entities we add next
+//   2) double-quote → &quot; so the surrounding attribute (which uses ") doesn't terminate early
+//   3) single-quote → \' so the inner JS string (delim ') doesn't terminate early
+//   4) backslash → escape so existing \ in the string doesn't become a JS escape sequence
+function _attrSafe(s) {
+  return String(s || '')
+    .replace(/&/g, '&amp;')
+    .replace(/\\/g, '\\\\')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, "\\'");
+}
+
 // Manual segment overrides per-episode. Loaded from S.episode.segment_overrides
 // at scene-view open time, mutated by user click, persisted via PUT.
 // Each override: {anchor: "first ~60 chars of trimmed line", action: "break"|"merge"}
@@ -6952,6 +7252,35 @@ function _isVoiceOverLine(text) {
     .test(t);
 }
 
+// Detect orphan speaker cues — standalone screenplay-format speaker names
+// that precede their dialogue on the NEXT line. Examples:
+//   FRANK
+//   I'll be in the office doing books.
+//
+//   Sofia (V.O.)
+//   Three nights since I left.
+// Without this detection the cue line is mis-billed as a short action beat
+// (floored to 1.5s) AND the dialogue below is mis-billed as prose-action
+// (chars/35 rate) instead of speech (words/wps) — inflating chunk duration.
+function _isOrphanSpeakerCue(line) {
+  if (!line) return false;
+  const t = line.trim();
+  if (!t) return false;
+  if (t.length > 40) return false;
+  // Reject scene headings / transitions (those start with INT./EXT./FADE/CUT)
+  if (_matchSceneHeading(t).match) return false;
+  if (/^[\s—-]*(FADE|CUT|DISSOLVE|SMASH|MATCH)\s+(IN|OUT|TO|BACK)\b/i.test(t)) return false;
+  // No sentence punctuation (period, exclamation, question) — those indicate
+  // a real action/dialogue line, not a cue. Colons disqualify too (that's
+  // inline "NAME: text" handled by _lineDuration directly).
+  if (/[.!?:]/.test(t.replace(/\([^)]*\)/g, ''))) return false;
+  // Cue body shape: starts with uppercase, optional parenthetical
+  // (V.O. / O.S. / CONT'D / age tag / etc.), allowed chars: letters,
+  // spaces, hyphens, apostrophes. Either ALL-CAPS classic screenplay
+  // form OR Title-case modern form.
+  return /^[A-ZА-ЯЁ][A-Za-zА-Яа-яЁё0-9 \-']{0,38}(?:\s*\([^)]{0,30}\))?\s*$/.test(t);
+}
+
 // Single source of truth for chunk duration estimation from raw chunk text.
 // Replicates the VO-aware logic used in _autoCollectSegments + parallel range-
 // gen so retries / reuses / heal flows compute consistent durations instead of
@@ -6964,9 +7293,51 @@ function _estimateChunkDurationSec(chunkText, opts) {
   // Split into raw lines, skip empties and scene heading / fade markers
   // (_lineDuration returns 0 for those).
   const rawLines = text.split('\n').map(l => l.trim()).filter(Boolean);
+  // Pre-pass: merge multi-line screenplay-format dialogue. Two cue flavors:
+  //   (a) Orphan cue (no colon):       FRANK / DANTE (V.O.)
+  //   (b) Name-colon, empty tail:      Clara: / Mrs. Vale: / **Sofia:**
+  // Both merge with the next non-empty line (skipping a single parenthetical
+  // tone note) so `_lineDuration` bills the payload as dialogue (words/wps)
+  // instead of mis-classifying it as prose action.
+  const _isCueLineForMerge = (s) => {
+    const stripped = _stripMarkdownWrappers(s);
+    if (_isOrphanSpeakerCue(stripped)) return true;
+    const m = stripped.match(/^([A-Za-zА-Яа-яЁё_][A-Za-zА-Яа-яЁё_0-9 ()\-'.#]{0,40})\s*[:：]\s*(.*)$/);
+    if (!m || !/^[A-ZА-ЯЁ]/.test(m[1])) return false;
+    const tail = (m[2] || '').replace(/\([^)]*\)/g, ' ').replace(/\[[^\]]*\]/g, ' ').replace(/\*[^*]*\*/g, ' ').trim();
+    return tail === '';
+  };
+  const mergedLines = [];
+  for (let i = 0; i < rawLines.length; i++) {
+    const cur = rawLines[i];
+    if (_isCueLineForMerge(cur)) {
+      // Optional parenthetical beat between cue and dialogue
+      let parenBeat = '';
+      let j = i + 1;
+      if (j < rawLines.length && /^\([^)]+\)\.?$/.test(rawLines[j])) {
+        parenBeat = ' ' + rawLines[j];
+        j++;
+      }
+      // Next non-empty line is the dialogue payload — unless it's ANOTHER
+      // speaker cue or a scene heading (then current cue is a stray, fall
+      // through to normal action billing).
+      if (j < rawLines.length
+          && !_isCueLineForMerge(rawLines[j])
+          && !_matchSceneHeading(rawLines[j]).match) {
+        const curStripped = _stripMarkdownWrappers(cur);
+        // If cue already ends with a colon (Clara: / Mrs. Vale:), don't add
+        // another — just append the payload. Otherwise insert ':'.
+        const sep = /[:：]\s*$/.test(curStripped) ? '' : ':';
+        mergedLines.push(curStripped + sep + parenBeat + ' ' + rawLines[j]);
+        i = j;  // consume both (or three with paren) lines
+        continue;
+      }
+    }
+    mergedLines.push(cur);
+  }
   let voSec = 0, dialogSec = 0, actionSec = 0;
   let hasVo = false;
-  for (const l of rawLines) {
+  for (const l of mergedLines) {
     const dur = (typeof _lineDuration === 'function') ? _lineDuration(l) : 0;
     if (!dur) continue;
     if (_isVoiceOverLine(l))      { voSec += dur; hasVo = true; }
@@ -7110,31 +7481,55 @@ function sendSceneSegmentToSeedance(sceneIdx, segIdx) {
 }
 
 // Toggle "split" override on a specific line anchor within a scene.
-async function toggleSegmentBreak(anchor) {
+// Override key: (sceneIdx, autoSeg) uniquely identifies a segment-break
+// across script re-parses. Anchor (first 60 chars) is kept as a sanity
+// hint so an edited script can self-heal — if anchor diverges from the
+// recorded one, the override silently drops on next render.
+// Bug 2026-05-15: previously matched ONLY by anchor; in dialogue-heavy
+// scripts where many segments start with the same speaker cue ("Ethan:",
+// "Sofia:"), one merge click suppressed segment breaks on EVERY same-
+// anchor line → the rest of the episode collapsed into one chunk.
+function _findOverrideIdx(overrides, sceneIdx, autoSeg, anchor) {
+  // Prefer exact (sceneIdx, autoSeg) match — that's the canonical key.
+  let i = overrides.findIndex(o =>
+    o && o.sceneIdx === sceneIdx && o.autoSeg === autoSeg
+  );
+  if (i >= 0) return i;
+  // Legacy overrides recorded by anchor only — match if anchor agrees AND
+  // the entry has no scene/autoSeg fields. This back-compat path only
+  // fires for pre-2026-05-15 saved overrides.
+  i = overrides.findIndex(o =>
+    o && o.anchor === anchor
+    && (o.sceneIdx === undefined && o.autoSeg === undefined)
+  );
+  return i;
+}
+
+async function toggleSegmentBreak(anchor, sceneIdx, autoSeg) {
   if (!anchor) return;
   const overrides = _segmentOverrides().slice();
-  const idx = overrides.findIndex(o => o.anchor === anchor);
+  const idx = _findOverrideIdx(overrides, sceneIdx, autoSeg, anchor);
   if (idx < 0) {
-    overrides.push({ anchor, action: 'break' });
+    overrides.push({ anchor, sceneIdx, autoSeg, action: 'break' });
   } else if (overrides[idx].action === 'break') {
     overrides.splice(idx, 1);                      // toggle off
   } else {
-    overrides[idx] = { anchor, action: 'break' };  // override merge → break
+    overrides[idx] = { anchor, sceneIdx, autoSeg, action: 'break' };
   }
   await _persistSegmentOverrides(overrides);
   _renderSceneViewBody();
 }
 
-async function toggleSegmentMerge(anchor) {
+async function toggleSegmentMerge(anchor, sceneIdx, autoSeg) {
   if (!anchor) return;
   const overrides = _segmentOverrides().slice();
-  const idx = overrides.findIndex(o => o.anchor === anchor);
+  const idx = _findOverrideIdx(overrides, sceneIdx, autoSeg, anchor);
   if (idx < 0) {
-    overrides.push({ anchor, action: 'merge' });
+    overrides.push({ anchor, sceneIdx, autoSeg, action: 'merge' });
   } else if (overrides[idx].action === 'merge') {
     overrides.splice(idx, 1);                      // toggle off
   } else {
-    overrides[idx] = { anchor, action: 'merge' };  // override break → merge
+    overrides[idx] = { anchor, sceneIdx, autoSeg, action: 'merge' };
   }
   await _persistSegmentOverrides(overrides);
   _renderSceneViewBody();
@@ -7245,8 +7640,7 @@ async function rebuildBatchPrompts() {
   // Need segments from the parsed scene-view
   const ta = document.getElementById('ep-script');
   if (!ta) return;
-  // batch-compose feeds Turbo auto-mode → establishing shots forced ON.
-  const segs = (typeof _autoCollectSegments === 'function') ? _autoCollectSegments({ forceEstablishing: true }) : [];
+  const segs = (typeof _autoCollectSegments === 'function') ? _autoCollectSegments() : [];
   if (!segs.length) {
     showToast('⚠ Нет сегментов — открой "🎬 Сцены" чтобы сценарий разбился', 4000);
     return;
@@ -7296,7 +7690,6 @@ async function rebuildBatchPrompts() {
         segments: segs.map(s => ({
           anchor: s.anchor, sceneIdx: s.sceneIdx, segIdx: s.segIdx,
           text: s.text, has_close_up: !!s.has_close_up, durationSec: s.durationSec,
-          establishing_shot: !!s.establishing_shot,
         })),
         base_outfits_only: baseOnly,
         style: useStyle ? styleVal : '',
@@ -7448,13 +7841,10 @@ function _autoCollectSegments(opts = {}) {
   const ta = document.getElementById('ep-script');
   if (!ta) return [];
   const scenes = _parseScriptScenes(ta.value || '', _segmentOverrides());
-  // Establishing shot is FORCED ON when called from auto-mode (both Sequential
-  // and Turbo) — sets a 2s wide-shot of the location at the start of every
-  // new scene, regardless of the manual checkbox in the Seedance panel.
-  // For other callers (manual segment preview), respect the checkbox.
-  const establishing = opts.forceEstablishing
-    ? true
-    : !!document.getElementById('sd-establishing-shot')?.checked;
+  // NOTE: the legacy «🏛️ заставка локации (2с)» feature was removed once
+  // per-location facades started auto-generating as standalone clips
+  // shown during assembly. The in-chunk 2-second wide-shot pre-roll used
+  // to eat dialogue budget for nothing.
   const out = [];
   scenes.forEach((sc, sIdx) => {
     for (let g = 0; g < sc.segCount; g++) {
@@ -7464,18 +7854,12 @@ function _autoCollectSegments(opts = {}) {
       const text = head + lines.map(l => l.text).join('\n');
       const hasCloseUp = lines.some(l => _isLineCloseUp(l.text));
       const anchor = _lineAnchor(lines[0].text);
-      // Establishing shot: first seg of each new scene gets a 2s wide-shot
-      // facade pre-roll merged into its action timeline. Toggle adds +2s to
-      // durationSec (clamped to 15) so the dialogue still fits.
-      const isFirstOfScene = (g === 0);
-      const wantsEstablishing = establishing && isFirstOfScene;
       // VO overlaps action visuals (you HEAR narration WHILE seeing the camera
       // move) — so we don't ADD action+VO durations, we take the max. Regular
       // sequential dialogue still adds on top (lipsync = must play in order).
       // Same logic powers `_estimateChunkDurationSec` for retries/reuses.
       const segmentText = lines.map(l => l.text).join('\n');
-      const base = _estimateChunkDurationSec(segmentText);
-      const durationSec = Math.max(5, Math.min(15, base + (wantsEstablishing ? 2 : 0)));
+      const durationSec = _estimateChunkDurationSec(segmentText);
       out.push({
         sceneIdx: sIdx, segIdx: g, text, anchor,
         // Stable identity used by the AUTO-skip filter. Must match the key
@@ -7484,7 +7868,6 @@ function _autoCollectSegments(opts = {}) {
         // one skip flag.
         autoSkipKey: `s${sIdx}g${g}`,
         has_close_up: hasCloseUp, durationSec,
-        establishing_shot: !!wantsEstablishing,
       });
     }
   });
@@ -7835,9 +8218,7 @@ async function startAutoMode() {
     }
   }
   AUTO.errorMode = (localStorage.getItem('auto_error_mode') || 'heal');
-  // Both auto-mode flavors force establishing shots ON (2s location intro
-   // on every new scene), regardless of the manual checkbox.
-  const allSegs  = _autoCollectSegments({ forceEstablishing: true });
+  const allSegs  = _autoCollectSegments();
   // Annotate scriptOrder BEFORE the skip-filter — the script slot a segment
   // owns is its position in the FULL list, not its position among the still-
   // selected ones. If we reindex after filtering, a user who skips seg 0..2
@@ -7936,12 +8317,13 @@ async function startAutoMode() {
   const duration = parseInt(document.getElementById('sd-duration').value) || 15;
   const resolution = document.getElementById('sd-resolution').value;
   const moderation_bypass = document.getElementById('sd-mod-bypass').value;
+  const model_tier = document.getElementById('sd-model-tier')?.value || 'reference-fast';
   const POLL_INTERVAL_MS = 8000;
   const PARALLEL_DELAY_MS = 2000;
   const MAX_HEAL_RETRIES = 1;
   const MAX_PARALLEL_SCENES = 3;
   const sharedOpts = { useLastframe, useCutframes, useStyle, styleVal, baseOnly, closeUpOnly,
-                       duration, resolution, moderation_bypass, POLL_INTERVAL_MS, MAX_HEAL_RETRIES };
+                       duration, resolution, moderation_bypass, model_tier, POLL_INTERVAL_MS, MAX_HEAL_RETRIES };
 
   // Compose + start one segment, returns startRes or throws.
   async function _autoComposeStart(seg, scriptOrder) {
@@ -7968,6 +8350,7 @@ async function startAutoMode() {
         chunk_text: seg.text,
         duration: seg.durationSec || sharedOpts.duration, resolution: sharedOpts.resolution,
         moderation_bypass: sharedOpts.moderation_bypass,
+        model: sharedOpts.model_tier,
         script_order: (scriptOrder != null ? scriptOrder : (typeof seg.scriptOrder === 'number' ? seg.scriptOrder : null)),
         sceneIdx: seg.sceneIdx,
         segIdx: seg.segIdx,
@@ -8040,6 +8423,7 @@ async function startAutoMode() {
               chunk_text: healRes.chunk_text || segText,
               duration: segDuration || sharedOpts.duration, resolution: sharedOpts.resolution,
               moderation_bypass: sharedOpts.moderation_bypass,
+              model: sharedOpts.model_tier,
               refs: (composeRes.refs || []).map(r => ({
                 kind: r.kind, id: r.id, outfit: r.outfit || null, url: r.url || null,
                 source: r.source, prev_idx: r.prev_idx, name: r.name,
@@ -8132,7 +8516,6 @@ async function startAutoMode() {
             segments: AUTO.segments.map(s => ({
               anchor: s.anchor, sceneIdx: s.sceneIdx, segIdx: s.segIdx,
               text: s.text, has_close_up: !!s.has_close_up, durationSec: s.durationSec,
-              establishing_shot: !!s.establishing_shot,
             })),
             base_outfits_only: baseOnly,
             style: useStyle ? styleVal : '',
@@ -8245,6 +8628,25 @@ async function startAutoMode() {
         ? ' (отправлены в очередь — следи за карточками)'
         : '';
       showToast(`✓ Auto-mode завершён · ${AUTO.completedCount}/${AUTO.total} сегмент${AUTO.completedCount === 1 ? '' : AUTO.completedCount < 5 ? 'а' : 'ов'}${tail}`, 6000);
+
+      // Fire-and-forget music generation after a successful single-episode
+      // auto-mode run. Same gate as range-gen — series.settings.enable_music.
+      // We don't block on it (music takes ~30-90s per scene, separate UI poll
+      // handles status). Skipped if cancelled or partial.
+      const epForMusic = epNum;
+      const musicEnabled = S.series?.settings?.enable_music !== false;
+      if (musicEnabled && epForMusic != null && AUTO.completedCount === AUTO.total && AUTO.total > 0) {
+        api.post(`/api/series/${S.seriesId}/episodes/${epForMusic}/music/generate`, {})
+          .then(r => {
+            if (r?.ok) {
+              showToast(`🎵 Музыка запущена — ${r.scenes?.length || 0} сцен`, 4000);
+              try { _sdEnsureMusicPoll(); _sdRefreshMusic(); } catch {}
+            } else if (r?.error) {
+              showToast(`🎵 ⚠ ${r.error}`, 5000);
+            }
+          })
+          .catch(e => showToast(`🎵 ⚠ ${e.message || e}`, 5000));
+      }
     } else {
       showToast(`⏸ Auto-mode остановлен · обработано ${AUTO.completedCount}/${AUTO.total}`, 5000);
     }
@@ -8318,15 +8720,12 @@ async function _runEpisodeAutoStandalone(sid, num, opts = {}) {
         const text = head + lines.map(l => l.text).join('\n');
         const hasCloseUp = lines.some(l => _isLineCloseUp(l.text));
         const anchor = _lineAnchor(lines[0].text);
-        const isFirstOfScene = (g === 0);
         // Same VO-aware shared helper used by sequential auto-mode and retry.
         const segmentText = lines.map(l => l.text).join('\n');
-        const base = _estimateChunkDurationSec(segmentText);
-        const durationSec = Math.max(5, Math.min(15, base + (isFirstOfScene ? 2 : 0)));
+        const durationSec = _estimateChunkDurationSec(segmentText);
         allSegs.push({
           sceneIdx: sIdx, segIdx: g, text, anchor,
           has_close_up: hasCloseUp, durationSec,
-          establishing_shot: isFirstOfScene,
           scriptOrder: allSegs.length,
         });
       }
@@ -8362,6 +8761,7 @@ async function _runEpisodeAutoStandalone(sid, num, opts = {}) {
       duration: opts.duration || 15,
       resolution: opts.resolution || '720p',
       moderation_bypass: opts.moderation_bypass || 'collage_grid',
+      model_tier: opts.model_tier || 'reference-fast',
     };
 
     async function pollUntilDone(chunkIdx, composeRes, segText, segDuration) {
@@ -8418,6 +8818,7 @@ async function _runEpisodeAutoStandalone(sid, num, opts = {}) {
                 duration: segDuration || shared.duration,
                 resolution: shared.resolution,
                 moderation_bypass: shared.moderation_bypass,
+                model: shared.model_tier,
                 refs: (composeRes.refs || []).map(r => ({
                   kind: r.kind, id: r.id, outfit: r.outfit || null, url: r.url || null,
                   source: r.source, prev_idx: r.prev_idx, name: r.name,
@@ -8475,6 +8876,7 @@ async function _runEpisodeAutoStandalone(sid, num, opts = {}) {
             duration: seg.durationSec || shared.duration,
             resolution: shared.resolution,
             moderation_bypass: shared.moderation_bypass,
+            model: shared.model_tier,
             script_order: seg.scriptOrder,
             refs: (composeRes.refs || []).map(r => ({
               kind: r.kind, id: r.id, outfit: r.outfit || null, url: r.url || null,
@@ -8737,7 +9139,8 @@ async function startRangeGen() {
           useLastframe: true, useCutframes: true,
           useStyle: false, styleVal: '',
           baseOnly: false, closeUpOnly: false,
-          duration: 15, resolution: '720p', moderation_bypass: 'collage_grid',
+          duration: 15, resolution: '480p', moderation_bypass: 'collage_grid',
+          model_tier: document.getElementById('sd-model-tier')?.value || 'reference-fast',
           errorMode: 'heal',
           maxParallelScenes: 2,
         });
@@ -8767,21 +9170,23 @@ async function startRangeGen() {
         } catch (e) {
           assembleNote = ` · ⚠ авто-сборка упала: ${e.message || e}`;
         }
+      }
 
-        // Fire-and-forget music generation if series has it enabled.
-        // Backend spawns daemon threads per scene; we just kick it off and
-        // let the UI poll status via _sdRefreshMusic when user opens the
-        // episode. Failing here must not block range-gen progression.
+      // Music generation is INDEPENDENT of auto-assemble: it can fire even
+      // when the user turned auto-assemble off. Gate is purely the per-series
+      // enable_music flag + a successful run.
+      if (completedAll && !RANGE.cancelRequested) {
         const musicEnabled = (S.series?.id === RANGE.seriesId)
           ? (S.series?.settings?.enable_music !== false)
           : true;
         if (musicEnabled) {
           try {
-            await api.post(
+            const r = await api.post(
               `/api/series/${RANGE.seriesId}/episodes/${epNum}/music/generate`,
               {}
             );
-            assembleNote += ' · 🎵 музыка запущена';
+            if (r?.ok) assembleNote += ` · 🎵 музыка запущена (${r.scenes?.length || 0} сцен)`;
+            else if (r?.error) assembleNote += ` · 🎵 ⚠ ${r.error}`;
           } catch (e) {
             assembleNote += ` · 🎵 ⚠ ${e.message || e}`;
           }
@@ -12771,6 +13176,13 @@ async function sdCompose() {
     if (res.auto_close_up_detected) {
       msg += ' · 🎯 auto-close-up hint';
     }
+    // Auto-fit the duration slider to the composed chunk — runs `chunk_text`
+    // through the same estimator used for badges + segmentation. Respects
+    // manual overrides (won't fight a user who dragged the slider away from
+    // the last auto-set value).
+    _sdAutoSetDurationIfManual();
+    const recDur = _sdRecommendedDurationFromChunkText(chunk);
+    if (recDur != null) msg += ` · ⏱ ${recDur}с`;
     st.textContent = msg;
   } catch (e) {
     st.textContent = '✗ ' + (e.message || e);
@@ -12799,13 +13211,13 @@ function sdSavePrefs() {
       duration: document.getElementById('sd-duration').value,
       resolution: document.getElementById('sd-resolution').value,
       moderation_bypass: modBypass,    // also kept globally as fallback default for new series
+      model_tier: document.getElementById('sd-model-tier')?.value || 'reference-fast',
       use_prev_lastframe: !!document.getElementById('sd-use-lastframe')?.checked,
       use_prev_cutframes: !!document.getElementById('sd-use-cutframes')?.checked,
       use_style: !!document.getElementById('sd-use-style')?.checked,
       style: (document.getElementById('sd-style')?.value || '').trim(),
       base_outfits_only: !!document.getElementById('sd-base-only')?.checked,
       close_up_only: !!document.getElementById('sd-close-up-only')?.checked,
-      establishing_shot: !!document.getElementById('sd-establishing-shot')?.checked,
     }));
     // Per-series override
     if (S.seriesId) {
@@ -12836,8 +13248,11 @@ function sdLoadPrefs() {
     if (bo && typeof p.base_outfits_only === 'boolean') bo.checked = p.base_outfits_only;
     const cu = document.getElementById('sd-close-up-only');
     if (cu && typeof p.close_up_only === 'boolean') cu.checked = p.close_up_only;
-    const es = document.getElementById('sd-establishing-shot');
-    if (es && typeof p.establishing_shot === 'boolean') es.checked = p.establishing_shot;
+    const mt = document.getElementById('sd-model-tier');
+    if (mt && typeof p.model_tier === 'string'
+        && (p.model_tier === 'reference-pro' || p.model_tier === 'reference-fast')) {
+      mt.value = p.model_tier;
+    }
   } catch (e) {}
 }
 
@@ -12859,6 +13274,7 @@ async function sdGenerate() {
   const duration = parseInt(document.getElementById('sd-duration').value) || 15;
   const resolution = document.getElementById('sd-resolution').value;
   const moderation_bypass = document.getElementById('sd-mod-bypass').value;
+  const model_tier = document.getElementById('sd-model-tier')?.value || 'reference-fast';
   sdSavePrefs();
 
   const btn = document.querySelector('#seedance-panel button[onclick="sdGenerate()"]');
@@ -12885,6 +13301,7 @@ async function sdGenerate() {
     const submitPrompt = _sdRemapPromptForSubmit(prompt, SD.refs);
     const startBody = {
       prompt: submitPrompt, chunk_text: chunk, duration, resolution, moderation_bypass,
+      model: model_tier,
       refs: SD.refs.map(r => ({ kind: r.kind, id: r.id, outfit: r.outfit || null, url: r.url || null })),
     };
     // B1: carry the «continuity reset by composer» reason from the last
@@ -12940,7 +13357,7 @@ async function sdAssembleEpisode(btn) {
   const chunks = (SD._lastChunks || []).filter(c => c.status === 'completed' && c.video_path);
   if (!chunks.length) { showToast('Нет готовых чанков для сборки', 3000); return; }
   // Warn if some segments are missing (not all rendered yet).
-  const segmentCount = _autoCollectSegments({ forceEstablishing: true }).length || chunks.length;
+  const segmentCount = _autoCollectSegments().length || chunks.length;
   if (chunks.length < segmentCount) {
     const proceed = await appConfirm({
       title: '⚠ Серия собрана не полностью',
@@ -13071,66 +13488,68 @@ function _sdUpdateMusicUI(chunks, music) {
   counter.style.display = '';
   counter.textContent = `🎵 ${completed}/${totalScenes}` + (generating > 0 ? ` · ${generating} gen` : '') + (failed > 0 ? ` · ${failed} fail` : '');
 
-  _sdRenderMusicPlayers(available, byIdx);
+  const playBtn = document.getElementById('sd-music-play-btn');
+  if (playBtn) {
+    if (completed > 0) {
+      playBtn.style.display = '';
+      // The previewed track is the concatenated /music/download stream. The
+      // signature changes whenever any scene was regenerated, so the audio
+      // element src needs a cache-buster keyed on the latest generated_at.
+      const latestGen = Math.max(0, ...(scenes || []).filter(s => s.generated_at).map(s => s.generated_at));
+      playBtn.dataset.cacheKey = String(latestGen);
+    } else {
+      playBtn.style.display = 'none';
+      _sdStopMusicPreview();
+    }
+  }
 }
 
-// Inline <audio> per completed scene. Renders into #sd-music-players.
-// Preserves the currently-playing element's state across re-renders (poll
-// tick would otherwise reset playback every 8s).
-function _sdRenderMusicPlayers(available, byIdx) {
-  const host = document.getElementById('sd-music-players');
-  if (!host) return;
-  const completedScenes = available.filter(a => byIdx.get(a.sceneIdx)?.status === 'completed');
-  if (!completedScenes.length) {
-    host.style.display = 'none';
-    host.innerHTML = '';
-    return;
-  }
+// Single hidden <audio> shared across the toolbar. Toggled by sdToggleMusicPreview.
+// Plays the concatenated /music/download stream (all scenes back-to-back).
+let _SD_MUSIC_AUDIO = null;
+function _sdGetMusicAudio() {
+  if (_SD_MUSIC_AUDIO) return _SD_MUSIC_AUDIO;
+  const a = document.createElement('audio');
+  a.preload = 'none';
+  a.style.display = 'none';
+  a.addEventListener('ended', _sdStopMusicPreview);
+  a.addEventListener('pause', () => _sdUpdateMusicPlayBtn(false));
+  a.addEventListener('play',  () => _sdUpdateMusicPlayBtn(true));
+  document.body.appendChild(a);
+  _SD_MUSIC_AUDIO = a;
+  return a;
+}
 
-  // Snapshot current playback so we don't interrupt the user on each poll.
-  const prev = {};
-  host.querySelectorAll('audio[data-scene]').forEach(a => {
-    prev[a.dataset.scene] = { t: a.currentTime, paused: a.paused, src: a.src };
-  });
+function _sdUpdateMusicPlayBtn(playing) {
+  const btn = document.getElementById('sd-music-play-btn');
+  if (!btn) return;
+  btn.innerHTML = playing ? '⏸' : '▶';
+  btn.title = playing ? 'Пауза' : 'Прослушать музыку этой серии (все сцены подряд)';
+}
 
-  host.style.display = '';
-  const rows = completedScenes.map(a => {
-    const rec = byIdx.get(a.sceneIdx);
-    const path = rec?.audio_path;
-    if (!path) return '';
-    // ?v=ts cache-buster so a regen reloads the new file in the player.
-    const url = `/assets/${S.seriesId}/${path}?v=${rec.generated_at || ''}`;
-    const hint = rec.user_hint ? ` · «${rec.user_hint}»` : '';
-    const dur = rec.duration_ms ? `${Math.round(rec.duration_ms/1000)}с` : `~${Math.round(a.total_sec)}с`;
-    return `
-      <div style="display:flex;align-items:center;gap:10px;padding:4px 0">
-        <span style="min-width:88px;font-size:0.82rem;color:#a78bfa;font-weight:600">Сцена ${a.sceneIdx + 1}</span>
-        <audio controls preload="metadata" data-scene="${a.sceneIdx}" src="${url}" style="flex:1;height:32px"></audio>
-        <span style="font-size:0.74rem;color:var(--muted);min-width:96px;text-align:right" title="${esc(hint || '')}">${dur}${hint ? ' 💬' : ''}</span>
-        <a href="${url}" download style="font-size:0.78rem;color:#a78bfa;text-decoration:underline" title="Скачать только эту сцену">⬇</a>
-      </div>`;
-  }).join('');
+function _sdStopMusicPreview() {
+  if (!_SD_MUSIC_AUDIO) return;
+  try { _SD_MUSIC_AUDIO.pause(); } catch {}
+  try { _SD_MUSIC_AUDIO.currentTime = 0; } catch {}
+  _sdUpdateMusicPlayBtn(false);
+}
 
-  host.innerHTML = `
-    <div style="font-size:0.78rem;color:#a78bfa;margin-bottom:6px;font-weight:600">
-      🎵 Прослушать музыку (${completedScenes.length} ${completedScenes.length === 1 ? 'сцена' : 'сцен'})
-    </div>
-    ${rows}
-  `;
-
-  // Restore prior playback state — match by data-scene since src may have
-  // a new ?v= cache-buster after a regen.
-  host.querySelectorAll('audio[data-scene]').forEach(a => {
-    const p = prev[a.dataset.scene];
-    if (!p) return;
-    const stripV = (u) => (u || '').split('?')[0];
-    if (stripV(p.src) === stripV(a.src)) {
-      a.addEventListener('loadedmetadata', () => {
-        try { a.currentTime = p.t || 0; } catch {}
-        if (!p.paused) { try { a.play(); } catch {} }
-      }, { once: true });
+function sdToggleMusicPreview(btn) {
+  if (!S.seriesId || !S.episode) return;
+  const audio = _sdGetMusicAudio();
+  const url = `/api/series/${S.seriesId}/episodes/${S.episode.number}/music/download?v=${btn?.dataset?.cacheKey || ''}`;
+  // First play, or src changed (regen happened) → set src and play.
+  if (audio.paused) {
+    if (audio.src !== url) {
+      try { audio.src = url; } catch {}
     }
-  });
+    audio.play().catch(e => {
+      showToast('Не удалось запустить плеер: ' + (e.message || e), 4000);
+      _sdUpdateMusicPlayBtn(false);
+    });
+  } else {
+    audio.pause();
+  }
 }
 
 async function _sdRefreshMusic() {
@@ -13492,8 +13911,7 @@ function _sdCardHTML(c, labelInfo) {
     <div class="sd-thumb"
          onclick="sdOpenChunkModal(${c.idx})"
          onmouseenter="_sdThumbHoverPlay(this)"
-         onmouseleave="_sdThumbHoverStop(this)"
-         title="Наведи — превью играет с начала со звуком. Клик — большой плеер + промпт.">
+         onmouseleave="_sdThumbHoverStop(this)">
       ${videoUrl
         ? `<video src="${videoUrl}" preload="metadata" playsinline></video>`
         : `<span>${esc(placeholderText)}</span>`}
@@ -14225,16 +14643,14 @@ function sdEnsurePoll() {
   tick();
 }
 
-// Recompute the duration the chunk_text would naturally need (sum of
-// per-line durations + 1.5s padding, clamped to Seedance's 5-15s window).
-// Mirrors the per-segment math in scriptToSegments() so manual chunks
-// auto-fit without the user having to count seconds in their head.
+// Recompute the duration the chunk_text would naturally need, clamped to
+// Seedance's 5-15s window. Delegates to `_estimateChunkDurationSec` so the
+// auto-set slider value matches the badge shown next to each segment AND
+// the Seedance API target — single source of truth across UI, manual paste,
+// segmentation, and the compose→generate handoff.
 function _sdRecommendedDurationFromChunkText(text) {
-  const lines = (text || '').split(/\r?\n/);
-  const contentSec = lines.reduce((s, ln) => s + (typeof _lineDuration === 'function' ? _lineDuration(ln) : 0), 0);
-  if (contentSec <= 0) return null;  // nothing to estimate from
-  const target = Math.ceil(contentSec + 1.5);
-  return Math.max(5, Math.min(15, target));
+  if (!text || !text.trim()) return null;
+  return _estimateChunkDurationSec(text);
 }
 
 function _sdAutoSetDurationIfManual() {

@@ -12468,8 +12468,13 @@ def _next_chunk_idx(ep):
     return (max((c.get('idx', -1) for c in chunks), default=-1)) + 1
 
 def _extract_last_frame(sid, video_relpath):
-    """Extract a JPEG of the last frame of a chunk's video.
+    """Extract a PNG of the last frame of a chunk's video.
     Cached: returns (relpath, abs_path). Re-extracted if missing.
+
+    Real production bug: `-sseof -0.1` returns empty on many Seedance MP4s
+    because the last keyframe is often 0.2-0.3s before the absolute end, so
+    the 0.1s window catches nothing decodable. Walk a stepladder of -sseof
+    values, then fall back to ffprobe-based absolute output-seek.
     """
     src = series_path(sid) / video_relpath
     if not src.exists():
@@ -12479,23 +12484,45 @@ def _extract_last_frame(sid, video_relpath):
         return (str(out.relative_to(series_path(sid))), out)
     ffmpeg_bin = shutil.which('ffmpeg')
     if not ffmpeg_bin:
+        print(f'[_extract_last_frame] ffmpeg binary not found', flush=True)
         return None
-    try:
-        # -sseof -0.1 → seek to 0.1s before end (works without re-encode).
-        # PNG = lossless. Seedance uses these as input refs, so any JPEG
-        # compression artifacts get amplified in the next chunk's first frame
-        # (visible as quality drop at chunk transitions). PNG eliminates that.
-        # `-pred mixed -compression_level 1` = fast PNG encode (~50ms vs 200ms default).
-        subprocess.run(
-            [ffmpeg_bin, '-y', '-sseof', '-0.1', '-i', str(src),
-             '-frames:v', '1', '-c:v', 'png', '-pred', 'mixed', '-compression_level', '1',
-             str(out)],
-            capture_output=True, timeout=30, check=True
-        )
-        if out.exists() and out.stat().st_size > 0:
-            return (str(out.relative_to(series_path(sid))), out)
-    except Exception:
-        return None
+    png_args = ['-frames:v', '1', '-c:v', 'png', '-update', '1',
+                '-pred', 'mixed', '-compression_level', '1', str(out)]
+    # Pass 1: input-seek before -i (fast). Widen window until ffmpeg actually
+    # decodes a frame. 0.1s is too tight on many real videos.
+    last_err = None
+    for sseof in ('-0.3', '-0.6', '-1.2', '-2.5'):
+        try:
+            subprocess.run(
+                [ffmpeg_bin, '-y', '-sseof', sseof, '-i', str(src)] + png_args,
+                capture_output=True, timeout=30, check=True,
+            )
+            if out.exists() and out.stat().st_size > 0:
+                return (str(out.relative_to(series_path(sid))), out)
+        except Exception as e:
+            last_err = e
+            continue
+    # Pass 2: ffprobe → absolute output-seek.
+    ffprobe_bin = shutil.which('ffprobe')
+    if ffprobe_bin:
+        try:
+            res = subprocess.run(
+                [ffprobe_bin, '-v', 'error', '-show_entries', 'format=duration',
+                 '-of', 'csv=p=0', str(src)],
+                capture_output=True, timeout=15, check=True,
+            )
+            dur = float((res.stdout or b'').decode().strip())
+            ss = max(0.0, dur - 0.08)
+            subprocess.run(
+                [ffmpeg_bin, '-y', '-ss', f'{ss:.3f}', '-i', str(src)] + png_args,
+                capture_output=True, timeout=30, check=True,
+            )
+            if out.exists() and out.stat().st_size > 0:
+                return (str(out.relative_to(series_path(sid))), out)
+        except Exception as e:
+            last_err = e
+    if last_err is not None:
+        print(f'[_extract_last_frame] all attempts failed for {video_relpath}: {type(last_err).__name__}: {last_err}', flush=True)
     return None
 
 
