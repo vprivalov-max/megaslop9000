@@ -35,7 +35,7 @@ def slugify(title):
     """Convert series/character title to a safe folder name."""
     s = ''.join(_TRANSLIT.get(c.lower(), c) if c.lower() in _TRANSLIT else c for c in title)
     s = re.sub(r'[^\w\s-]', '', s)
-    s = re.sub(r'[\s_-]+', '-', s).strip('-')
+    s = re.sub(r'[\s_-]+', '_', s).strip('_')
     return s[:40] or 'series'
 
 def asset_name(*parts):
@@ -3460,6 +3460,8 @@ def import_from_script():
         do_extract_locs   = _flag('extract_locations',  do_extract)
         do_extract_items  = _flag('extract_items',      do_extract)
         dialogue_lang_hint = (form.get('dialogue_language_hint') or '').strip().lower()
+        style_type = (form.get('style_type') or 'cinematic').strip().lower() or 'cinematic'
+        style_custom_desc = (form.get('style_custom_description') or '').strip()
         char_files = request.files.getlist('character_files') or request.files.getlist('character_files[]')
         loc_files  = request.files.getlist('location_files')  or request.files.getlist('location_files[]')
     else:
@@ -3472,6 +3474,8 @@ def import_from_script():
         do_extract_locs  = bool(data.get('extract_locations',  do_extract))
         do_extract_items = bool(data.get('extract_items',      do_extract))
         dialogue_lang_hint = (data.get('dialogue_language_hint') or '').strip().lower()
+        style_type = (data.get('style_type') or 'cinematic').strip().lower() or 'cinematic'
+        style_custom_desc = (data.get('style_custom_description') or '').strip()
         char_files, loc_files = [], []
 
     if not title:
@@ -3486,6 +3490,15 @@ def import_from_script():
     # Build the series shell — same defaults as create_series().
     slug = slugify(title)
     sid = slug if slug and not (user_root() / slug).exists() else f"{slug}-{str(uuid.uuid4())[:6]}"
+    # Resolve user-chosen style: preset → canonical desc from _VISUAL_STYLE_PRESETS,
+    # or 'custom' → use user-supplied description. visual_style is what the
+    # background extraction worker reads when generating char/loc portraits,
+    # so it MUST be populated correctly BEFORE the worker fires below.
+    visual_style_value = ''
+    if style_type == 'custom' and style_custom_desc:
+        visual_style_value = style_custom_desc
+    elif style_type in _VISUAL_STYLE_PRESETS:
+        visual_style_value = _VISUAL_STYLE_PRESETS[style_type].get('desc', '') or ''
     series_data = {
         'id': sid, 'title': title,
         'genre': '', 'tone': '', 'target_audience': '', 'world_description': '',
@@ -3496,7 +3509,12 @@ def import_from_script():
         'created_at': datetime.datetime.utcnow().isoformat(),
         'video_provider': 'seedance',
         'characters': [], 'locations': [], 'items': [],
-        'style': {'type': 'cinematic', 'custom_description': '', 'ref_images': []},
+        'style': {
+            'type': style_type if style_type in _VISUAL_STYLE_PRESETS or style_type == 'custom' else 'cinematic',
+            'custom_description': style_custom_desc if style_type == 'custom' else '',
+            'ref_images': [],
+        },
+        'visual_style': visual_style_value,
         'settings': {
             'voice': 'Enceladus', 'tts_provider': 'elevenlabs',
             'image_provider': 'banana', 'aspect_ratio': '9:16',
@@ -4109,6 +4127,31 @@ def get_series(sid):
     s = load_series(sid)
     if not s:
         return jsonify({'error': 'not found'}), 404
+    # ── Cache-buster ground truth: derive image_version from file mtime ──
+    # Real production bug: user clicks «Перегенерировать локацию», server
+    # overwrites the JPG in place under the SAME path, but the asset URL
+    # `/assets/<sid>/<rel_path>` is byte-identical → browser serves the old
+    # bytes from its 1-year cache. The asset serve handler explicitly relies
+    # on the frontend appending `?v=<ts>` to bypass cache (see serve_asset's
+    # Cache-Control header). We compute that `?v` from the FILE'S actual
+    # mtime so any disk-level change forces a fresh fetch — works on every
+    # ref kind regardless of whether the regenerate endpoint wrote a
+    # persisted version field. Cheap: one stat per ref image per GET.
+    def _stat_mtime(p):
+        try:
+            return int(p.stat().st_mtime)
+        except Exception:
+            return 0
+    sp = series_path(sid)
+    for kind_key in ('locations', 'characters', 'items'):
+        for ent in (s.get(kind_key) or []):
+            refs = ent.get('ref_images') or []
+            if not refs:
+                continue
+            primary = sp / refs[0]
+            mtime = _stat_mtime(primary)
+            if mtime:
+                ent['image_version'] = max(int(ent.get('image_version') or 0), mtime)
     # Auto-heal: default auto_generate_assets to True for legacy series, sync stale episode refs.
     healed = False
     if 'auto_generate_assets' not in s:
@@ -5011,6 +5054,355 @@ def save_outfit_frame(sid, char_id, outfit_id, project_id):
     return jsonify({'ready': True, 'url': f'/assets/{sid}/{rel_path}'})
 
 
+# ── Anthropomorphic-animal detection (shared) ────────────────────────────────
+# Real production bug: «The Fox CEO's Trap» — script extraction wrote
+# appearance "A tired man in worn-out clothes" for a character named "Wolf",
+# "A man holding interview papers" for "Hyena", etc. Pixar style + "a man"
+# prefix → image gen produced regular humans. Animal nature ONLY readable
+# from the name, not from appearance. Detect species from the name and
+# override "a man/woman" framing with explicit anthropomorphic species hint.
+_ANIMAL_SPECIES = {
+    # canonical singular → species hint phrase
+    'fox':       'anthropomorphic fox',
+    'vixen':     'anthropomorphic fox',
+    'wolf':      'anthropomorphic wolf',
+    'bear':      'anthropomorphic bear',
+    'hyena':     'anthropomorphic hyena',
+    'raccoon':   'anthropomorphic raccoon',
+    'lion':      'anthropomorphic lion',
+    'lioness':   'anthropomorphic lioness',
+    'tiger':     'anthropomorphic tiger',
+    'cat':       'anthropomorphic cat',
+    'kitten':    'anthropomorphic kitten',
+    'dog':       'anthropomorphic dog',
+    'pup':       'anthropomorphic puppy',
+    'puppy':     'anthropomorphic puppy',
+    'rabbit':    'anthropomorphic rabbit',
+    'bunny':     'anthropomorphic rabbit',
+    'hare':      'anthropomorphic hare',
+    'rat':       'anthropomorphic rat',
+    'mouse':     'anthropomorphic mouse',
+    'mice':      'anthropomorphic mouse',
+    'deer':      'anthropomorphic deer',
+    'fawn':      'anthropomorphic fawn',
+    'stag':      'anthropomorphic stag',
+    'doe':       'anthropomorphic doe',
+    'horse':     'anthropomorphic horse',
+    'pony':      'anthropomorphic pony',
+    'sheep':     'anthropomorphic sheep',
+    'lamb':      'anthropomorphic lamb',
+    'goat':      'anthropomorphic goat',
+    'cow':       'anthropomorphic cow',
+    'bull':      'anthropomorphic bull',
+    'pig':       'anthropomorphic pig',
+    'boar':      'anthropomorphic boar',
+    'panda':     'anthropomorphic panda',
+    'koala':     'anthropomorphic koala',
+    'sloth':     'anthropomorphic sloth',
+    'monkey':    'anthropomorphic monkey',
+    'ape':       'anthropomorphic ape',
+    'gorilla':   'anthropomorphic gorilla',
+    'elephant':  'anthropomorphic elephant',
+    'rhino':     'anthropomorphic rhinoceros',
+    'rhinoceros':'anthropomorphic rhinoceros',
+    'hippo':     'anthropomorphic hippopotamus',
+    'hippopotamus':'anthropomorphic hippopotamus',
+    'giraffe':   'anthropomorphic giraffe',
+    'zebra':     'anthropomorphic zebra',
+    'camel':     'anthropomorphic camel',
+    'crocodile': 'anthropomorphic crocodile',
+    'alligator': 'anthropomorphic alligator',
+    'lizard':    'anthropomorphic lizard',
+    'frog':      'anthropomorphic frog',
+    'penguin':   'anthropomorphic penguin',
+    'bat':       'anthropomorphic bat',
+    'skunk':     'anthropomorphic skunk',
+    'hedgehog':  'anthropomorphic hedgehog',
+    'mole':      'anthropomorphic mole',
+    'badger':    'anthropomorphic badger',
+    'weasel':    'anthropomorphic weasel',
+    'ferret':    'anthropomorphic ferret',
+    'otter':     'anthropomorphic otter',
+    'beaver':    'anthropomorphic beaver',
+    'squirrel':  'anthropomorphic squirrel',
+    'cheetah':   'anthropomorphic cheetah',
+    'leopard':   'anthropomorphic leopard',
+    'jaguar':    'anthropomorphic jaguar',
+    'panther':   'anthropomorphic panther',
+    'lynx':      'anthropomorphic lynx',
+    'bobcat':    'anthropomorphic bobcat',
+    'coyote':    'anthropomorphic coyote',
+    'jackal':    'anthropomorphic jackal',
+    'bird':      'anthropomorphic bird',
+    'hawk':      'anthropomorphic hawk',
+    'eagle':     'anthropomorphic eagle',
+    'owl':       'anthropomorphic owl',
+    'snake':     'anthropomorphic snake',
+    'shark':     'anthropomorphic shark',
+    'whale':     'anthropomorphic whale',
+    'dolphin':   'anthropomorphic dolphin',
+    'donkey':    'anthropomorphic donkey',
+    'mule':      'anthropomorphic mule',
+    'buffalo':   'anthropomorphic buffalo',
+    'bison':     'anthropomorphic bison',
+    'moose':     'anthropomorphic moose',
+    'elk':       'anthropomorphic elk',
+}
+
+def _detect_animal_species(name, appearance=None):
+    """Detect anthropomorphic species from a character's name (and as a
+    secondary signal, from appearance keywords). Returns the species hint
+    string (e.g. "anthropomorphic fox") or '' if the character is human.
+
+    Tolerates plurals («Bear Guards» → bear), gender qualifiers («Fox Woman»
+    → fox, «Lioness» → lioness), and compound names («Mr. Wolf» → wolf).
+    """
+    if not name:
+        return ''
+    # Token-scan the name. Strip plural 's' from each token before lookup.
+    raw = re.sub(r"[^A-Za-zА-Яа-яЁё ]+", ' ', name or '').lower()
+    for tok in raw.split():
+        # Plural normalization: «foxes» → «fox», «bears» → «bear», «wolves» → «wolf»
+        candidates = {tok}
+        if tok.endswith('ies') and len(tok) > 4:
+            candidates.add(tok[:-3] + 'y')
+        if tok.endswith('ves') and len(tok) > 4:
+            candidates.add(tok[:-3] + 'f')
+        if tok.endswith('es') and len(tok) > 3:
+            candidates.add(tok[:-2])
+        if tok.endswith('s') and len(tok) > 2:
+            candidates.add(tok[:-1])
+        for c in candidates:
+            if c in _ANIMAL_SPECIES:
+                return _ANIMAL_SPECIES[c]
+    # Secondary: appearance keywords (existing _gen_char_inline logic).
+    if appearance:
+        low = appearance.lower()
+        if any(w in low for w in ('fur', 'muzzle', 'snout', 'tail', 'paws',
+                                   'claws', 'whiskers', 'mane', 'feathers',
+                                   'beak', 'fang', 'fangs')):
+            return 'anthropomorphic animal'
+    return ''
+
+
+# ── Script-pose extraction (Vision-override guard) ──────────────────────────
+# Pose verbs we recognise in chunk_text. Each maps char-name-appearance → the
+# canonical pose label that Vision uses, plus a short script-clip we'll embed
+# in the override so the composer LLM (and downstream Seedance) sees WHY we
+# overrode and what the exact scripted pose is. Patterns are intentionally
+# loose — script writing is messy.
+_SCRIPT_POSE_PATTERNS = [
+    # (regex with optional named groups «prep» + «obj» for location capture,
+    #  pose label). When prep+obj matched, override layer also rewrites the
+    #  «где=» field on the Vision line, not just «поза=» — see user bug
+    #  «Fox Woman: поза=лежит | где=рядом с машиной» where pose was correct
+    #  but location field still said «next to» instead of «under».
+    (r'\b(?:lies?|lying|lay|laid)\s+(?:halfway\s+)?(?P<prep>under|underneath|beneath)\s+(?P<obj>(?:the|a|an)\s+[A-Za-z][A-Za-z\s\-\']{0,30}?)(?=[\s.,;!?]|$)', 'лежит'),
+    (r'\b(?:lies?|lying|lay|laid)\s+(?P<prep>on top of|on|across|over)\s+(?P<obj>(?:the|a|an)\s+[A-Za-z][A-Za-z\s\-\']{0,30}?)(?=[\s.,;!?]|$)', 'лежит'),
+    (r'\b(?:lies?|lying|lay|laid)\s+(?:down|flat|prone|supine)\b',                  'лежит'),
+    (r'\bkneel(?:s|ing|ed)?\s+(?P<prep>in front of|beside|next to)\s+(?P<obj>(?:the|a|an)\s+[A-Za-z][A-Za-z\s\-\']{0,30}?)(?=[\s.,;!?]|$)', 'на коленях'),
+    (r'\bkneel(?:s|ing|ed)?\b',                                                    'на коленях'),
+    (r'\bsits?\s+(?P<prep>on|at|behind|in)\s+(?P<obj>(?:the|a|an)\s+[A-Za-z][A-Za-z\s\-\']{0,30}?)(?=[\s.,;!?]|$)', 'сидит'),
+    (r'\bsits?\s+(?:down|cross-legged)\b',                                         'сидит'),
+    (r'\bsit(?:ting|s)?\b',                                                        'сидит'),
+    (r'\bcrouch(?:es|ing|ed)?\b',                                                  'приседает'),
+    (r'\bsquat(?:s|ting)?\b',                                                      'приседает'),
+    (r'\bleans?\s+(?P<prep>against|on|onto)\s+(?P<obj>(?:the|a|an)\s+[A-Za-z][A-Za-z\s\-\']{0,30}?)(?=[\s.,;!?]|$)', 'опирается'),
+    (r'\bleans?\s+(?:against|on|onto)\b',                                          'опирается'),
+    (r'\bslump(?:s|ed|ing)?\b',                                                    'опирается'),
+    (r'\bstands?\b',                                                               'стоит'),
+    (r'\bstand(?:s|ing)?\b',                                                       'стоит'),
+    # Russian patterns (in case script is bilingual / russian)
+    (r'\bлежит\b|\bлёжа\b|\bлежу\b|\bлежал[аи]?\b',                                'лежит'),
+    (r'\bна коленях\b|\bопустил[аи]?ся\b|\bприклонил[аи]? колен',                  'на коленях'),
+    (r'\bсидит\b|\bсидя\b|\bсадится\b|\bуселся\b|\bусел[аи]?сь\b',                 'сидит'),
+    (r'\bстоит\b|\bстоя\b|\bвстал[аи]?\b',                                          'стоит'),
+]
+
+# English preposition → Russian preposition (used by location override).
+_PREP_EN_TO_RU = {
+    'under': 'под', 'underneath': 'под', 'beneath': 'под',
+    'on': 'на', 'on top of': 'на', 'over': 'над', 'across': 'поперёк',
+    'in front of': 'перед', 'beside': 'рядом с', 'next to': 'рядом с',
+    'at': 'у', 'behind': 'за', 'in': 'в',
+    'against': 'прислонился к', 'onto': 'на',
+}
+
+def _detect_script_pose_for_char(chunk_text, char_name):
+    """Scan chunk_text for explicit pose verbs near the character's name.
+    Returns (pose_label, sentence_clip, where_phrase). where_phrase is a
+    server-side translation of the matched prepositional context («under
+    the car» → «под the car») used to override the «где=» field on the
+    Vision-analysis line — without this, the location was preserved from
+    a misread render («рядом с машиной») even when the pose was patched
+    to «лежит». Empty strings when nothing matches."""
+    if not chunk_text or not char_name:
+        return '', '', ''
+    # Normalize name for fuzzy match: try full name and first token.
+    name_tokens = [char_name.strip()]
+    first = char_name.split()[0] if char_name.split() else char_name
+    if first and first != char_name:
+        name_tokens.append(first)
+    # Walk sentences (split on . ! ? newline) — we want pose verbs in the same
+    # sentence as the char's name to avoid cross-character leakage.
+    sentences = re.split(r'(?<=[.!?])\s+|\n+', chunk_text)
+    for sent in sentences:
+        s_low = sent.lower()
+        if not any(t.lower() in s_low for t in name_tokens):
+            continue
+        for pat, pose in _SCRIPT_POSE_PATTERNS:
+            m = re.search(pat, sent, re.IGNORECASE)
+            if not m:
+                continue
+            clip = sent.strip()
+            if len(clip) > 140:
+                # Trim at the last word boundary inside the budget so we
+                # don't slice mid-word («sticking out fro...»). Falls back
+                # to a hard slice only if there's no space in range.
+                cut = clip.rfind(' ', 0, 137)
+                clip = (clip[:cut] if cut > 60 else clip[:137]) + '...'
+            # Compose where-phrase from named «prep» / «obj» groups when present.
+            where_phrase = ''
+            try:
+                prep = (m.groupdict().get('prep') or '').strip().lower()
+                obj  = (m.groupdict().get('obj') or '').strip()
+                if prep and obj:
+                    rus_prep = _PREP_EN_TO_RU.get(prep, prep)
+                    # Strip leading article ("the car" → "the car" kept; LLM
+                    # composer understands "под the car" fine and will write
+                    # "под машиной" in the final Russian SUBJECT line).
+                    where_phrase = f'{rus_prep} {obj}'
+            except (IndexError, AttributeError):
+                pass
+            return pose, clip, where_phrase
+    return '', '', ''
+
+
+def _override_vision_with_script_poses(analysis_text, prev_chunk_text, prev_chars):
+    """Edit a Vision-analysis block in-place: for each character listed,
+    look up the pose word in `prev_chunk_text` and replace the «поза=X»
+    field on the Vision line if it disagrees. Adds «(по сценарию: <clip>)»
+    so the downstream composer sees the source of truth and can override
+    its own state echo with the script's pose."""
+    if not analysis_text or not prev_chunk_text or not prev_chars:
+        return analysis_text
+    # Pre-compute script pose + where-phrase per known character.
+    name_to_pose = {}
+    for c in prev_chars:
+        nm = (c.get('name') or '').strip()
+        if not nm:
+            continue
+        pose, clip, where_phrase = _detect_script_pose_for_char(prev_chunk_text, nm)
+        if pose:
+            name_to_pose[nm.lower()] = (pose, clip, where_phrase)
+            first = nm.split()[0] if nm.split() else nm
+            if first.lower() != nm.lower():
+                name_to_pose.setdefault(first.lower(), (pose, clip, where_phrase))
+    if not name_to_pose:
+        return analysis_text
+    out_lines = []
+    overrode_any = False
+    # Tolerate markdown bold around the name («**Fox Woman**: поза=...») —
+    # Haiku Vision sometimes returns markdown-formatted analysis. Earlier
+    # regex required a bare letter start which silently skipped every
+    # «**Name**» line → override didn't fire → bug stayed alive.
+    # Capture pose-field and the trailing «| где=X | ...» tail SEPARATELY
+    # so we can patch the «где=» segment when script gives explicit location.
+    line_re = re.compile(
+        r'^(\s*[•\-\*]\s*)(\*{0,2})([A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё\s\-\']{0,40})(\*{0,2})(:\s*поза=)(\S[^|]*?)(\s*\|.*)$'
+    )
+    where_re = re.compile(r'(\|\s*где=)(\S[^|]*?)(\s*\|)', re.UNICODE)
+    for ln in analysis_text.splitlines():
+        m = line_re.match(ln)
+        if not m:
+            out_lines.append(ln)
+            continue
+        bullet, lpad, name, rpad, sep, current_pose, rest = m.groups()
+        norm_name = name.strip().lower()
+        forced = name_to_pose.get(norm_name)
+        if not forced:
+            first = norm_name.split()[0] if norm_name.split() else ''
+            forced = name_to_pose.get(first) if first else None
+        if not forced:
+            out_lines.append(ln)
+            continue
+        scripted_pose, clip, where_phrase = forced
+        pose_matches = (current_pose.strip().lower() == scripted_pose.lower())
+        # When script also nailed location (under X / on X / etc.), override
+        # the «где=» field too. Patch is applied to the line tail before we
+        # rejoin everything. If the line has no где= field (some edge cases)
+        # the regex sub silently no-ops.
+        rest_patched = rest
+        if where_phrase:
+            def _patch_where(wm):
+                # Don't overwrite if the existing где= already mentions our
+                # location phrase (composer / Vision occasionally already
+                # got it right) — avoid double labels.
+                if where_phrase.lower() in wm.group(2).lower():
+                    return wm.group(0)
+                return f'{wm.group(1)}{where_phrase} (по сценарию){wm.group(3)}'
+            rest_patched = where_re.sub(_patch_where, rest, count=1)
+        if pose_matches and rest_patched == rest:
+            # Nothing to patch — leave the line untouched.
+            out_lines.append(ln)
+            continue
+        # Replace pose field (if needed); embed script note for composer.
+        # Preserve original markdown-bold wrappers around the name.
+        new_pose = scripted_pose if not pose_matches else current_pose
+        note = ''
+        if not pose_matches:
+            note = f' (СЦЕНАРИЙ ВЫШЕ АНАЛИЗА: «{clip}» → {scripted_pose})'
+        out_lines.append(f'{bullet}{lpad}{name}{rpad}{sep}{new_pose}{note}{rest_patched}')
+        overrode_any = True
+    if not overrode_any:
+        return analysis_text
+    # Detect if any override involved a «hard» pose (lying under / beneath /
+    # halfway sticking out etc.) — those need extra cinematographic anchors
+    # because vanilla Pixar/Banana gen has weak priors for «person halfway
+    # under car, torso visible from beneath the bumper» and defaults to
+    # «person lying next to car» 75% of the time. User-reported: 4 retakes
+    # of «Fox Woman lies halfway under the car», only 1 placed her under,
+    # and even that one put her behind the car instead of sticking out
+    # from the side. Adding photography-style framing vocabulary to the
+    # composer's instructions improves the hit rate.
+    hard_pose_hints = []
+    for pose, clip, where_phrase in name_to_pose.values():
+        wl = (where_phrase or '').lower()
+        cl = (clip or '').lower()
+        if pose == 'лежит' and ('под' in wl or 'under' in cl or 'beneath' in cl or 'underneath' in cl):
+            hard_pose_hints.append('hard-pose:under-car')
+            break
+    nb = (
+        '\n\n[NB] Поля «поза=» / «где=» помеченные «(СЦЕНАРИЙ ВЫШЕ АНАЛИЗА:...)» или '
+        '«(по сценарию)» — это server-side override Vision-анализа сценарным текстом '
+        'прошлого чанка. Считай эту позу/локацию аутентичной; Vision видел рендер, '
+        'рендер мог не справиться со сложной позой и нарисовал персонажа стоящим/сбоку. '
+        'Сценарий — ground truth.'
+    )
+    if 'hard-pose:under-car' in hard_pose_hints:
+        nb += (
+            '\n\nДОПОЛНИТЕЛЬНО — РЕНДЕРНЫЕ ПОДСКАЗКИ для позы «лежит под объектом» (Pixar/Banana '
+            'часто проваливают сложные позы и кладут персонажа РЯДОМ с машиной вместо ПОД ней). '
+            'В SUBJECT/ACTION текущего промпта используй ТЕХНИЧЕСКУЮ КИНЕМАТОГРАФИЧЕСКУЮ ФОРМУЛИРОВКУ '
+            'с явными визуальными якорями:\n'
+            '  • «low-angle shot of [name]\'s head, shoulders and upper torso EMERGING from beneath '
+            '    the front bumper / underside of the car, the rest of her body HIDDEN under the chassis, '
+            '    she lies SUPINE (на спине) on the asphalt, face turned up toward [other char]»;\n'
+            '  • не пиши «lying next to the car» / «лежит рядом с машиной» — эти формулировки '
+            '    модель интерпретирует как «на боку у машины» и теряет «under» полностью;\n'
+            '  • не пиши «lying behind the car» — модель прячет её за машиной целиком;\n'
+            '  • явно укажи СТОРОНУ откуда она торчит: «her torso sticks out from the LEFT/RIGHT side '
+            '    of the front of the vehicle» (или какая сторона прописана в lastframe / cutframe);\n'
+            '  • CAMERA: low angle, knee-height looking slightly downward; визуально подсказывает '
+            '    модели что персонаж НИЖЕ машины, а не рядом с ней.\n'
+            'Composition anchor: если среди cutframe\'ов прошлого чанка ЕСТЬ кадр где этот '
+            'персонаж правильно показан полу-под машиной — explicitly reference it («композиция '
+            'персонажа повторяет @ImageN cutframe — голова и плечи выглядывают из-под передней '
+            'части автомобиля»). Это сильнее всего повышает шанс корректного рендера.'
+        )
+    return '\n'.join(out_lines) + nb
+
+
 # ── Generate character image via Reteller/Banana ─────────────────────────────
 
 @app.route('/api/series/<sid>/characters/<char_id>/generate-image', methods=['POST'])
@@ -5020,13 +5412,30 @@ def generate_character_image(sid, char_id):
     if not char:
         return jsonify({'error': 'not found'}), 404
 
-    gender = 'woman' if char.get('gender') == 'female' else 'man'
     style_clause = _series_style_clause(s)
     _appearance = char.get('appearance', '')
     _desc = char.get('description', '')
+    # Species-aware framing — see _detect_animal_species docstring for context.
+    species_hint = _detect_animal_species(char.get('name'), _appearance)
+    if species_hint:
+        gender_word = 'female' if char.get('gender') == 'female' else 'male'
+        kind_label = f', a {gender_word} {species_hint}'
+        species_override = (
+            f" CRITICAL: {char['name']} is an ANTHROPOMORPHIC {species_hint.split()[-1].upper()}, "
+            f"NOT a human. The character has a {species_hint.split()[-1]}'s head/face "
+            f"(realistic snout, ears, eyes typical of the species) with appropriate fur/feathers/scales, "
+            f"walking upright with anthropomorphic body proportions, wearing human-style clothing. "
+            f"Zootopia/Pixar-style anthropomorphic animal — DO NOT render as a plain human. "
+            f"Ignore any wording like «a man» / «a woman» in the description below — those describe "
+            f"the character's gender role, not human anatomy."
+        )
+    else:
+        gender = 'woman' if char.get('gender') == 'female' else 'man'
+        kind_label = f', a {gender}'
+        species_override = ''
     prompt = (
-        f"Full body portrait of {char['name']}, a {gender}. "
-        f"{_appearance}. {_desc}. "
+        f"Full body portrait of {char['name']}{kind_label}. "
+        f"{_appearance}. {_desc}.{species_override} "
         f"{_clothing_clause(_appearance, _desc)}"
         f"Standing facing camera, slight 3/4 angle. Neutral relaxed pose. "
         f"Arms hanging loosely at sides, hands open and empty — no objects held, no props, not in pockets. "
@@ -5073,6 +5482,39 @@ def regenerate_character(sid, char_id):
     # When true: rewrite appearance via Claude before generating (breaks
     # out of the «same prompt → same result» loop when appearance is stale).
     rewrite_appearance = bool(body.get('rewrite_appearance', False))
+
+    # AUTO-rewrite when name implies an anthropomorphic animal AND appearance
+    # text currently describes a plain human. Without this, the canonical
+    # APPEARANCE field that gets fed into the Seedance binding later still
+    # reads "A man holding interview papers" → Seedance keeps drawing a man
+    # even when the ref portrait is now an anthropomorphic hyena. Bug case:
+    # «The Fox CEO's Trap» — user clicked regenerate, got a Pixar man back.
+    species_hint_pre = _detect_animal_species(char.get('name'), char.get('appearance'))
+    if species_hint_pre:
+        appearance_raw_check = (char.get('appearance') or '').lower()
+        species_word = species_hint_pre.split()[-1].lower()
+        already_animal = (
+            species_word in appearance_raw_check
+            or 'anthropomorphic' in appearance_raw_check
+            or any(w in appearance_raw_check for w in (
+                'fur', 'muzzle', 'snout', 'tail', 'paws', 'whiskers', 'mane',
+                'fang', 'fangs', 'feathers', 'beak'))
+        )
+        looks_human = any(w in appearance_raw_check for w in (
+            ' man ', ' man.', ' man,', ' woman ', ' woman.', ' woman,',
+            ' boy ', ' boy.', ' boy,', ' girl ', ' girl.', ' girl,',
+            'a man', 'a woman', 'a boy', 'a girl',
+            'young man', 'young woman', 'beautiful woman', 'businessman',
+        ))
+        if looks_human and not already_animal:
+            rewrite_appearance = True
+            # Stuff the species hint into wishes so the rewriter knows what
+            # to make. Preserve user-provided wishes too.
+            extra = (f"Character is an ANTHROPOMORPHIC {species_word.upper()} — "
+                     f"rewrite appearance with {species_word} features (snout, ears, "
+                     f"fur color/pattern, body type), NOT a human. Keep human-style "
+                     f"clothing and the named props/gender role.")
+            wishes = (wishes + ' ' + extra).strip() if wishes else extra
 
     # Persist constraints onto the character so future inline generations
     # also respect them. Empty wishes => clear them.
@@ -5153,14 +5595,35 @@ def regenerate_character(sid, char_id):
             _log_event('WARN', 'appearance_cleanup_failed',
                        char_id=char_id, err=str(e)[:200])
 
-    gender = 'woman' if char.get('gender') == 'female' else 'man'
     constraints_clause = f" IMPORTANT — strictly follow these constraints: {wishes}." if wishes else ""
     style_clause = _series_style_clause(s)
     _desc = char.get('description', '')
+    # Species-aware framing — same logic as generate_character_image. Without
+    # this, regenerate_character would re-render a Wolf/Hyena/Fox as a human
+    # because the hardcoded ", a man/woman" prefix overpowers any anthro hint.
+    species_hint = _detect_animal_species(char.get('name'), appearance_for_prompt)
+    if species_hint:
+        gender_word = 'female' if char.get('gender') == 'female' else 'male'
+        kind_label = f', a {gender_word} {species_hint}'
+        species_override = (
+            f" CRITICAL: {char['name']} is an ANTHROPOMORPHIC {species_hint.split()[-1].upper()}, "
+            f"NOT a human. The character has a {species_hint.split()[-1]}'s head/face "
+            f"(realistic snout, ears, eyes typical of the species) with appropriate fur/feathers/scales, "
+            f"walking upright with anthropomorphic body proportions, wearing human-style clothing. "
+            f"Zootopia/Pixar-style anthropomorphic animal — DO NOT render as a plain human. "
+            f"Ignore any wording like «a man» / «a woman» in the description below — those describe "
+            f"the character's gender role, not human anatomy."
+        )
+        clothing_fallback = ''
+    else:
+        gender = 'woman' if char.get('gender') == 'female' else 'man'
+        kind_label = f', a {gender}'
+        species_override = ''
+        clothing_fallback = _clothing_clause(appearance_for_prompt, _desc)
     prompt = (
-        f"Full body portrait of {char['name']}, a {gender}. "
-        f"{appearance_for_prompt}. {_desc}.{constraints_clause} "
-        f"{_clothing_clause(appearance_for_prompt, _desc)}"
+        f"Full body portrait of {char['name']}{kind_label}. "
+        f"{appearance_for_prompt}. {_desc}.{constraints_clause}{species_override} "
+        f"{clothing_fallback}"
         f"Standing facing camera, slight 3/4 angle. Neutral relaxed pose. "
         f"Arms hanging loosely at sides, hands open and empty — no objects held, no props, not in pockets. "
         f"STRICT BACKGROUND: ONLY a flat featureless gray (#808080) studio cyclorama behind the character. ABSOLUTELY NO windows, doors, walls, room interiors, furniture, plants, objects, decor, outdoor scenes, or any environmental elements whatsoever. Character must be isolated against the gray field — no setting, no architecture, no context. No shadows or reflections on the background. "
@@ -5437,8 +5900,10 @@ def generate_location_image(sid, loc_id):
         refs[:] = [r for r in refs if Path(r).stem != out_path.stem]
         refs.insert(0, rel_path)
         loc['avai_url'] = image_url  # used by Seedance for video refs
+        loc['image_version'] = int(time.time())  # cache-bust marker for UI
         save_series(sid, s)
-        return jsonify({'ready': True, 'url': f'/assets/{sid}/{rel_path}', 'image_url': image_url})
+        return jsonify({'ready': True, 'url': f'/assets/{sid}/{rel_path}',
+                        'image_url': image_url, 'image_version': loc['image_version']})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -5479,8 +5944,10 @@ def regenerate_location(sid, loc_id):
         refs[:] = [r for r in refs if Path(r).stem != out_path.stem]
         refs.insert(0, rel_path)
         loc['avai_url'] = image_url
+        loc['image_version'] = int(time.time())
         save_series(sid, s)
-        return jsonify({'ready': True, 'url': f'/assets/{sid}/{rel_path}', 'image_url': image_url})
+        return jsonify({'ready': True, 'url': f'/assets/{sid}/{rel_path}',
+                        'image_url': image_url, 'image_version': loc['image_version']})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -6560,18 +7027,25 @@ def _gen_char_base_inline(s, sid, char):
     constraints_clause = f" IMPORTANT — strictly follow these constraints: {constraints}." if constraints else ""
     appearance = (char.get('appearance') or '').strip()
     description = (char.get('description') or '').strip()
-    # Detect animal/anthropomorphic chars by appearance keywords — don't add
-    # "a man/woman" prefix when char has fur/muzzle/tail/etc, otherwise the
-    # model defaults to a HUMAN even though appearance says "grey wolf".
-    appearance_low = appearance.lower()
-    animal_words = ('fur', 'muzzle', 'snout', 'tail', 'paws', 'claws', 'whiskers',
-                    'mane', 'feathers', 'beak', 'horns', 'antlers', 'hooves', 'scales',
-                    'cub', 'pup', 'kitten', 'fang', 'fangs',
-                    'шерсть', 'мордa', 'морду', 'морды', 'хвост', 'лапы', 'когти',
-                    'клыки', 'грива', 'перья', 'клюв', 'рога', 'копыта')
-    is_animal = any(w in appearance_low for w in animal_words)
+    # Detect anthropomorphic species — check NAME first (catches «Wolf»/
+    # «Hyena»/«Fox Woman» where appearance text was written as «a man in
+    # worn-out clothes»), fall back to appearance keywords for human-named
+    # chars described with fur/muzzle markers.
+    species_hint = _detect_animal_species(char.get('name'), appearance)
+    is_animal = bool(species_hint)
+    species_override = ''
     if is_animal:
-        kind_label = ''   # appearance describes the species — no "a man" prefix
+        gender_word = 'female' if char.get('gender') == 'female' else 'male'
+        kind_label = f', a {gender_word} {species_hint}'
+        species_override = (
+            f" CRITICAL: {char['name']} is an ANTHROPOMORPHIC {species_hint.split()[-1].upper()}, "
+            f"NOT a human. The character has a {species_hint.split()[-1]}'s head/face "
+            f"(realistic snout, ears, eyes typical of the species) with appropriate fur/feathers/scales, "
+            f"walking upright with anthropomorphic body proportions, wearing human-style clothing. "
+            f"Zootopia/Pixar-style anthropomorphic animal — DO NOT render as a plain human. "
+            f"Ignore any wording like «a man» / «a woman» in the description above — those describe "
+            f"the character's gender role, not human anatomy."
+        )
     else:
         gender = 'woman' if char.get('gender') == 'female' else 'man'
         kind_label = f', a {gender}'
@@ -6587,7 +7061,7 @@ def _gen_char_base_inline(s, sid, char):
     prompt = (
         f"{style_prefix}"
         f"Full body portrait of {char['name']}{kind_label}. "
-        f"{appearance}. {description}.{constraints_clause} "
+        f"{appearance}. {description}.{constraints_clause}{species_override} "
         f"{clothing_fallback}"
         f"Standing facing camera, slight 3/4 angle. Neutral relaxed pose. "
         f"Arms hanging loosely at sides, hands open and empty — no objects held, no props, not in pockets. "
@@ -8492,13 +8966,14 @@ CAST BLOCK RULES — MANDATORY:
    If you catch yourself writing a new proper name for someone the synopsis treats as a main character — STOP. Find the matching SERIES CHARACTER and use that name instead.
 
 3. OUTFITS ARE SCENE-DEPENDENT — pick the outfit_label that fits this scene's context:
-   - Morning in bedroom / just woke up → underwear, lingerie, sleep shirt — NEVER street clothes
-   - Shower scene → towel / bare
+   - THIS CHARACTER is in bed / lying down / going to sleep / waking up → pajamas / nightgown / sleepwear. NOTE: a bedroom scene does NOT auto-pajama everyone — only the character who is actually in bed. A visitor sitting next to the bed stays in their normal outfit.
+   - Shower scene → towel / bare / bathrobe
    - Workout / gym → activewear
    - Formal event → gown / suit
    - Hospital → gown / patient
    - Late night work → shirt sleeves, jacket off
-   If the existing AVAILABLE_OUTFITS list does NOT contain a label that fits the scene, INVENT a new one with a short snake_case label (e.g. `morning_lingerie`, `shower_towel`, `hotel_robe`, `workout_set`).
+   CRITICAL: The OUTFIT: hint in the SERIES CHARACTERS list above shows the CHARACTER'S CURRENT DEFAULT — it is NOT a suggestion for THIS episode. You MUST override it whenever the scene context requires different clothing (bedroom → pajamas, beach → swimwear, etc.).
+   If the existing AVAILABLE_OUTFITS list does NOT contain a label that fits the scene, INVENT a new one with a short snake_case label (e.g. `boy_pajamas`, `morning_lingerie`, `shower_towel`, `hotel_robe`, `workout_set`).
 
 4. OUTFIT_DESC is REQUIRED whenever you introduce a NEW outfit label not already in AVAILABLE_OUTFITS. Be concrete: garment names + colors + materials (e.g. "white cotton tank top, grey boxer briefs, bare feet"). For outfits that already exist in AVAILABLE_OUTFITS you can omit OUTFIT_DESC or set it to "—".
 
@@ -9902,8 +10377,11 @@ def _build_cast_block(s, ep):
                 f'in the === EPISODE CAST === block, once per outfit, each with the matching outfit_label and OUTFIT_DESC)'
             )
 
+        # When no outfit pre-selected, signal to writer that "base" is the default
+        # but scene context may require inventing a new one (bedroom→pajamas, etc.)
+        outfit_hint = outfit_label if outfit else f'{outfit_label} ← default; override if scene requires it'
         lines.append(
-            f'  {marker} NAME: "{c["name"]}" | OUTFIT: "{outfit_label}"{available_str}{asset_str}{selected_str}'
+            f'  {marker} NAME: "{c["name"]}" | OUTFIT: "{outfit_hint}"{available_str}{asset_str}{selected_str}'
             + (f' ({outfit_desc[:80]})' if outfit_desc else '')
         )
 
@@ -12097,17 +12575,25 @@ def _extract_keyframes_at_cuts(sid, video_relpath, cut_timestamps, max_frames=3,
 
 def _avai_seedance_start(prompt, ref_urls, duration, resolution, moderation_bypass,
                           aspect_ratio='9:16', generate_audio=True,
-                          moderation_bypass_prompt=None, avai_key=None):
-    """Kick off an async Seedance 2.0 reference-pro job.
+                          moderation_bypass_prompt=None, avai_key=None,
+                          model='reference-fast'):
+    """Kick off an async Seedance 2.0 reference-* job.
     Returns dict {job_id, status_url, raw}.
+
+    model: 'reference-pro' (premium) or 'reference-fast' (~1.5× cheaper,
+    slightly lower quality but supports the same up-to-9 contextImages
+    reference flow). Plain 'pro'/'fast' max 2 contextImages — NOT compatible
+    with our 4-9 ref pipeline (chars + location + lastframe + cutframes).
 
     avai_key: REQUIRED when called from a background thread (no Flask request
     context). Caller must resolve it via _get_user_avai_key() inside the request
     handler and pass it explicitly. Falls back to _get_user_avai_key() only when
     called inline from a request handler (image-style sync calls)."""
+    if model not in ('reference-pro', 'reference-fast'):
+        model = 'reference-fast'
     payload = {
         'provider': 'seedance2',
-        'model': 'reference-pro',
+        'model': model,
         'prompt': prompt,
         'duration': str(int(duration)),
         'resolution': resolution,        # '720p' | '480p'
@@ -13444,13 +13930,37 @@ If a location stays the same across segments → COPY the description verbatim, 
 EPISODE-LEVEL — fixed by the server BEFORE you see the input. The TAG MAPPING input gives you `@Image1`, `@Image2`, ... mapped to specific characters and locations by first-appearance order in the script. Use ONLY these tags. Locations get tags too.
 
 ═══ WARDROBE FIDELITY ═══
-Each character in TAG MAPPING has a `wardrobe` field — the canonical description of what they're wearing in this episode. This is a CLOSED list. No other clothing exists on them.
+Each character in TAG MAPPING has a `wardrobe` field (their base/default outfit) and an `outfit_options` list (available costume variants). The ACTIVE wardrobe for a character in a segment is the outfit matching their chosen `variantId` — see OUTFIT SELECTION below. Clothing words in actionTimeline must come from the chosen outfit's description.
 
 Rules for actionTimeline.description:
-1. NEVER mention clothing/footwear/headwear/outerwear/accessories that aren't in the character's `wardrobe`. Specifically, before writing words like: jacket, blazer, coat, overcoat, suit jacket, tie, scarf, hat, cap, beanie, gloves, boots, sunglasses, glasses, watch, belt, vest, hoodie, sweater — verify they appear in `wardrobe`. If not — DO NOT write them.
-2. Pockets and clothing-interaction: when a character pulls something from a pocket, pick a pocket consistent with what they actually have on. Safe defaults: `trouser pocket`. `inside breast pocket of the jacket` ONLY if jacket is in wardrobe.
+1. NEVER mention clothing/footwear/headwear/outerwear/accessories that aren't in the character's active outfit. Before writing: jacket, blazer, coat, suit jacket, tie, scarf, hat, cap, beanie, gloves, boots, sunglasses, watch, belt, vest, hoodie, sweater — verify they appear in the chosen outfit. If not — DO NOT write them.
+2. Pockets: pick a pocket consistent with what they have on. Safe default: `trouser pocket`. `inside breast pocket of the jacket` ONLY if jacket is in active outfit.
 3. Pose, dirt, blood, tears, hair state, expression, flushed cheeks, trembling hands — describe freely. The ban is ONLY about wardrobe items / accessories.
-4. Before submitting, re-check each `description` and verify that every clothing/accessory word appears in the wardrobe of one of `charactersInSegment`. If not — rephrase (use a safe pocket / drop the mention / describe via posture instead).
+4. Before submitting, re-check each `description` and verify that every clothing/accessory word appears in the active outfit of one of `charactersInSegment`. If not — rephrase.
+
+═══ OUTFIT SELECTION ═══
+Each character entry in TAG MAPPING has `wardrobe` (base/default outfit) and `outfit_options` (available variants with descriptions). Choose the right outfit per character per segment:
+
+BASE = character's PRIMARY outfit — what they naturally wear in their default environment. Use `"base"` whenever the scene is within that character's normal domain. Do NOT switch to a variant just because one exists.
+
+NON-BASE = use ONLY when this specific character's situation in the scene explicitly requires different clothing:
+  • THIS character is in bed / lying down / going to sleep / waking up → look for: pajamas, nightgown, sleepwear. NOTE: being in a bedroom does NOT trigger this for every character — only for the one who is actually in bed. A character sitting next to a bed, visiting a bedroom, or standing in the room keeps their base outfit.
+  • THIS character at beach / pool / swimming → swimsuit, swimwear, bikini
+  • THIS character at gym / workout / training → sportswear, athletic, gym
+  • THIS character at funeral / mourning → black_dress, dark_suit, formal
+  • THIS character at wedding / ceremony → wedding_dress, tuxedo, formal
+  • THIS character in court / legal hearing → business_suit, court_suit
+  • THIS character as hospital PATIENT (not staff) → hospital_gown — staff who work there keep base
+  • THIS character in prison / arrested → prison_jumpsuit, inmate
+  • THIS character in shower / bath → bathrobe, towel
+  • THIS character off-duty / at home when base is a work uniform → casual, street, home
+
+ALGORITHM per character per segment:
+  1. Read segment text + scene heading. Does THIS character (not the scene location) have a context trigger?
+  2. YES → scan this character's `outfit_options` labels and descriptions for a semantic match.
+  3. Found → set `variantId` to that label.
+  4. No match or no trigger → set `variantId` to `"base"` (never invent a label not in `outfit_options`).
+  5. SAME-SCENE LOCK: once variantId is set for a character in a scene, keep it for subsequent segments of that same scene unless the script shows an explicit costume change.
 
 ═══ SHOT RHYTHM ═══
 - A 15-second segment is split into 2-4 shots, each 2-7 seconds. Sum of shot lengths = durationSec.
@@ -13539,6 +14049,7 @@ Constraints: use <Name1> as @Image1, use <Name2> as @Image2, keep exact facial i
         "locationDescription": "<full English location description>",
         "charactersInSegment": [
           { "tag": "@Image1", "name": "Lina", "slug": "<id from tag mapping>", "variantId": "base" }
+          // variantId: "base" = default outfit, OR a label from outfit_options (e.g. "pajamas") when THIS character's situation requires it — see OUTFIT SELECTION.
         ],
         "actionTimeline": [
           {
@@ -13638,8 +14149,21 @@ def seedance_batch_compose(sid, num):
                 base_outfit = ch['outfits'][0]
             base_label = (base_outfit or {}).get('label')
             canonical = _canonical_char_description(s, ch['id'], base_label)
-            outfit_options = [o.get('label') for o in (ch.get('outfits') or []) if o.get('avai_url') and o.get('label')]
-            wardrobe_by_tag[t['tag']] = canonical
+            # outfit_options as objects with label+description so Claude can
+            # match scene context semantically, not just by label string.
+            outfit_options_full = [
+                {'label': o.get('label'), 'description': (o.get('description') or '')[:120], 'is_base': bool(o.get('is_base'))}
+                for o in (ch.get('outfits') or [])
+                if o.get('avai_url') and o.get('label')
+            ]
+            # Wardrobe validation pool = base + all variant descriptions so
+            # the validator doesn't false-flag clothing from a chosen variant.
+            all_outfit_descs = ' '.join(
+                (o.get('description') or '')
+                for o in (ch.get('outfits') or [])
+                if o.get('avai_url')
+            )
+            wardrobe_by_tag[t['tag']] = canonical + (' ' + all_outfit_descs if all_outfit_descs.strip() else '')
             tag_descriptors.append({
                 'tag': t['tag'],
                 'kind': 'character',
@@ -13647,8 +14171,8 @@ def seedance_batch_compose(sid, num):
                 'name': ch['name'],
                 'gender': ch.get('gender', ''),
                 'appearance': (ch.get('appearance') or '')[:300],
-                'wardrobe': canonical,                  # canonical: appearance + outfit
-                'outfit_options': outfit_options,
+                'wardrobe': canonical,                  # base outfit description
+                'outfit_options': outfit_options_full,  # variants with descriptions
             })
         else:
             lc = next((x for x in active_locs if x['id'] == t['id']), None)
@@ -14209,10 +14733,21 @@ def seedance_compose(sid, num):
                 1 if c.get('status') == 'completed' else 0, # 3) completed wins
                 int(c.get('created_at') or 0),              # 4) newer wins
             )
+        # Compose-time chunk_text equality check — covers the case where retry
+        # chunks share text with what user is composing right now (or with each
+        # other). Without this, prev_neighbour could pick a duplicate-segment
+        # chunk that overlaps the current one. Bug: «The Fox CEO's Trap» ep 1
+        # — 7 chunks shared «The Raccoon steps closer...» text; compose of a
+        # later segment picked one of those as «prev» because its byte range
+        # differed by a few chars due to trailing-newline trim.
+        cur_text_norm = (chunk_text or '').strip()
         best_prev = None  # (score_tuple, chunk)
         for sp, ep_pos, c in located:
+            c_text_norm = (c.get('chunk_text') or '').strip()
+            if c_text_norm == cur_text_norm:
+                continue   # same segment (incl. retries of current)
             if sp == cur_start and ep_pos == cur_end:
-                continue   # same chunk
+                continue   # same range
             if ep_pos <= cur_start + 5:           # tolerate tiny overlap of 5 chars
                 sc = _prev_score(c, ep_pos)
                 if best_prev is None or sc > best_prev[0]:
@@ -14288,6 +14823,15 @@ def seedance_compose(sid, num):
             if prev_neighbour:
                 prev_neighbour_ep = num - 1
                 prev_neighbour_obj = prev_ep_obj_x
+
+    # Surface which prev_neighbour got picked so user can see why continuity
+    # refs landed (or didn't) for this compose. Diagnostic only.
+    print(f'[seedance_compose] composing chunk_text head={(chunk_text or "")[:80]!r} script_range=({cur_start},{cur_end})', flush=True)
+    if prev_neighbour:
+        prev_head = (prev_neighbour.get('chunk_text') or '')[:80]
+        print(f'[seedance_compose] prev_neighbour: idx={prev_neighbour.get("idx")} ep={prev_neighbour_ep} so={prev_neighbour.get("script_order")} status={prev_neighbour.get("status")} vp={prev_neighbour.get("video_path")} text_head={prev_head!r}', flush=True)
+    else:
+        print(f'[seedance_compose] prev_neighbour: NONE (first chunk in ep or no in-ep candidate matched)', flush=True)
 
     def _summarize_neighbour(c, where, ep_label=None):
         if not c:
@@ -14398,7 +14942,7 @@ def seedance_compose(sid, num):
 
     sysprompt = (
         "Ты — режиссёр-композитор шотов для коротких драм TikTok, генерируемых через ByteDance Seedance 2.0 "
-        "(reference-pro: до 9 картинок-референсов, видео ~5–15 сек, аспект 9:16).\n\n"
+        "(reference-fast: до 9 картинок-референсов, видео ~5–15 сек, аспект 9:16).\n\n"
         "ЯЗЫК ПРОМПТА — ЖЁСТКОЕ ПРАВИЛО: ВЕСЬ описательный текст промпта (subject/action/scene/camera/style/constraints, "
         "эмоции/тон перед репликами, ярлыки @Image*) пиши ИСКЛЮЧИТЕЛЬНО НА РУССКОМ. Никакого английского в описаниях. "
         "ЕДИНСТВЕННОЕ ИСКЛЮЧЕНИЕ — сами реплики персонажей внутри кавычек: их сохраняй verbatim из сценария "
@@ -14813,7 +15357,7 @@ def seedance_compose(sid, num):
         "     по описанию: чувствуется ли разница ракурсов? Если оба читаются как 'X смотрит вперёд, Y тоже "
         "     смотрит вперёд' — пересмотри, добавь направления взглядов и зеркальные OTS.\n\n"
         "АНТИ-ДУБЛИРОВАНИЕ ПЕРСОНАЖЕЙ — КРИТИЧНО (частый баг 'две Maya в одном кадре'):\n"
-        "Seedance с reference-pro может рендерить персонажа дважды если получит несколько визуальных "
+        "Seedance с reference-* может рендерить персонажа дважды если получит несколько визуальных "
         "источников одного и того же перса. ЖЁСТКИЕ правила:\n"
         "  1. Каждый персонаж = РОВНО ОДИН char-ref в массиве refs[]. Не пихай Maya дважды с разными outfit'ами. "
         "Если по сценарию ей надо переодеться — это либо новая сцена (тогда новый compose с новым outfit'ом), "
@@ -14832,11 +15376,13 @@ def seedance_compose(sid, num):
         "('Maya видит себя в отражении', 'два разных временных Maya'). В этом случае пиши явно: "
         "'@Image1 — настоящая Maya у окна, отражение в зеркале справа дублирует её' — и это всё равно "
         "ОДИН char-ref.\n"
-        "  6. ОБЯЗАТЕЛЬНАЯ ДЕКЛАРАЦИЯ HEADCOUNT в первой строке SUBJECT каждого compose:\n"
-        "     'PEOPLE IN FRAME: ровно N человек — [имя1] (@ImageX), [имя2] (@ImageY), [unnamed extra: краткое описание]'.\n"
-        "     Это форсит модель посчитать людей и не плодить копии. Если в кадре только Maya — пиши "
-        "     'PEOPLE IN FRAME: ровно 1 человек — Maya (@Image1)'. Если Maya+Ethan — 'ровно 2 человека — "
-        "     Maya (@Image1), Ethan (@Image2)'. БЕЗ ЭТОЙ СТРОКИ модель часто дорисовывает лишних людей.\n"
+        "  6. ОБЯЗАТЕЛЬНАЯ ДЕКЛАРАЦИЯ CAST в первой строке SUBJECT каждого compose:\n"
+        "     'CAST IN FRAME: ровно N — [имя1] (@ImageX), [имя2] (@ImageY), [unnamed extra: краткое описание]'.\n"
+        "     Это форсит модель посчитать персонажей и не плодить копии. Если в кадре только Maya — пиши "
+        "     'CAST IN FRAME: ровно 1 — Maya (@Image1)'. Если Maya+Ethan — 'ровно 2 — "
+        "     Maya (@Image1), Ethan (@Image2)'. БЕЗ ЭТОЙ СТРОКИ модель часто дорисовывает лишних. "
+        "     НЕ пиши слова «человек / people / men / women» — персонажи могут быть НЕ людьми (звери, "
+        "     антропоморфные существа, мультяшки). Используй только число и имена.\n"
         "  7. UNNAMED EXTRAS / БЕЗЫМЯННЫЕ ПЕРСОНАЖИ (адвокат, охранник, прохожий, официант) — "
         "     САМЫЙ ЧАСТЫЙ источник бага 'два одинаковых лица в кадре'. У них НЕТ char-ref'а, поэтому "
         "     Seedance копирует лицо ближайшего ref-перса (главгероя). Правила:\n"
@@ -14859,11 +15405,11 @@ def seedance_compose(sid, num):
         "     – 'на фоне толпы похожих людей' — НЕТ. Толпа клонирует ref-лицо.\n"
         "     – Зеркальное расположение двух людей по бокам от третьего — НЕТ если в refs не два разных перса.\n"
         "     Используй ассиметрию: один человек на foreground + локация на background, без фигур-двойников.\n"
-        "  9. САМОПРОВЕРКА HEADCOUNT перед выводом:\n"
-        "     – Посчитай людей, которые ПОДРАЗУМЕВАЮТСЯ в prompt-е (по SUBJECT/ACTION/SCENE).\n"
-        "     – Сверь с PEOPLE IN FRAME строкой и количеством char-ref'ов.\n"
+        "  9. САМОПРОВЕРКА CAST перед выводом:\n"
+        "     – Посчитай персонажей, которые ПОДРАЗУМЕВАЮТСЯ в prompt-е (по SUBJECT/ACTION/SCENE).\n"
+        "     – Сверь с CAST IN FRAME строкой и количеством char-ref'ов.\n"
         "     – Если есть extras без ref'ов — у каждого должна быть отличающая фраза в SUBJECT.\n"
-        "     – Если число людей в SUBJECT > 1 и char-ref только один — это красный флаг, либо убери "
+        "     – Если число персонажей в SUBJECT > 1 и char-ref только один — это красный флаг, либо убери "
         "       extras, либо дай им жёсткую визуальную дифференциацию.\n\n"
         "ОПИСАНИЕ ПЕРСОНАЖА И ОДЕЖДЫ — ТОЛЬКО В BINDING, БОЛЬШЕ НИГДЕ:\n"
         "Сервер автоматически вставит в BINDING-строку каноническое описание каждого персонажа, "
@@ -15359,6 +15905,9 @@ def seedance_compose(sid, num):
                         'name': f'last frame · prev #{prev_neighbour.get("idx")}',
                         'url': lf_url,
                     })
+                    print(f'[seedance_compose] lastframe attached: prev_idx={prev_neighbour.get("idx")} url={lf_url[:60]}', flush=True)
+                else:
+                    print(f'[seedance_compose] lastframe MISSING for prev_idx={prev_neighbour.get("idx")}: extraction or upload failed silently', flush=True)
                     extra = (
                         f"\n\nДополнительно: @Image{img_idx} — это ПОСЛЕДНИЙ КАДР предыдущего чанка "
                         f"эпизода. Биндить его в BINDING-строке НЕ надо (это композиционный референс, не персонаж/локация). "
@@ -15371,8 +15920,8 @@ def seedance_compose(sid, num):
                     )
                     data['prompt'] = (data.get('prompt') or '').rstrip() + extra
                     lastframe_attached = True
-        except Exception:
-            pass
+        except Exception as e:
+            print(f'[seedance_compose] lastframe attach raised: {type(e).__name__}: {e}', flush=True)
 
     # Optional: ALSO attach pre-cut keyframes from prev chunk's video.
     # Detects internal cuts (склейки) inside the prev clip and grabs the last
@@ -15392,6 +15941,7 @@ def seedance_compose(sid, num):
                 cuts = _detect_cuts(str(video_abs))
                 prev_neighbour['cuts_detected'] = cuts
                 save_episode(sid, prev_neighbour_ep, prev_neighbour_obj)
+            print(f'[seedance_compose] cutframes: prev_idx={prev_neighbour.get("idx")} detected_cuts={len(cuts or [])} cached_urls={len(prev_neighbour.get("cutframes_avai_urls") or [])}', flush=True)
             if cuts:
                 # Cache uploaded urls per-cut on the chunk to avoid re-uploading.
                 cf_urls = list(prev_neighbour.get('cutframes_avai_urls') or [])
@@ -15406,12 +15956,15 @@ def seedance_compose(sid, num):
                     extracted = _extract_keyframes_at_cuts(
                         sid, prev_neighbour['video_path'], wanted_cuts, max_frames=max_attach
                     )
+                    print(f'[seedance_compose] cutframes: wanted={len(wanted_cuts)} extracted={len(extracted)} starting_uploaded={len(cf_urls)}', flush=True)
                     while len(cf_urls) < len(extracted):
                         relpath, abs_path = extracted[len(cf_urls)]
                         try:
                             cf_urls.append(_avai_upload_local_image(abs_path))
-                        except Exception:
+                        except Exception as e:
+                            print(f'[seedance_compose] cutframe upload #{len(cf_urls)+1} FAILED: {type(e).__name__}: {e}', flush=True)
                             break
+                    print(f'[seedance_compose] cutframes: final_uploaded={len(cf_urls)}', flush=True)
                     prev_neighbour['cutframes_avai_urls'] = cf_urls
                     save_episode(sid, prev_neighbour_ep, prev_neighbour_obj)
                 # Attach as refs (cap to budget)
@@ -15455,18 +16008,26 @@ def seedance_compose(sid, num):
     state_analysis_attached = False
     state_frames = [r for r in ref_meta if r.get('kind') in ('lastframe', 'cutframe')]
     if state_frames and prev_neighbour:
-        # v2 = structured-fields format (posture / location / hands / contact /
-        # emotion / damage). Bumping invalidates v1 cache entries that only had
-        # a free-form one-liner → next compose re-runs vision with new schema.
-        cache_key = 'v2|' + '|'.join(r.get('url', '') for r in state_frames)
+        # v7 = clip truncation now respects word boundaries («out fro...»
+        # → «out from beneath...» or trimmed cleanly at the last space).
+        # Bump invalidates v6 blocks with ugly mid-word ellipsis.
+        cache_key = 'v7|' + '|'.join(r.get('url', '') for r in state_frames)
+        # Always resolve prev_chars — needed by override pass even on cache hit.
+        prev_char_ids = [r['id'] for r in (prev_neighbour.get('refs') or []) if r.get('kind') == 'char']
+        prev_chars = [c for c in (s.get('characters') or []) if c['id'] in prev_char_ids]
         cached = prev_neighbour.get('frame_state_analysis') or {}
         analysis_text = ''
         if cached.get('cache_key') == cache_key and cached.get('text'):
             analysis_text = cached['text']
+            # Re-apply override on cache hit too — script changes between
+            # composes (user edits chunk_text) without invalidating Vision
+            # cache should still flow into the analysis. Cheap regex pass.
+            analysis_text = _override_vision_with_script_poses(
+                analysis_text,
+                prev_neighbour.get('chunk_text') or '',
+                prev_chars,
+            )
         else:
-            # Roster of chars who were in prev chunk — bound the labelling task
-            prev_char_ids = [r['id'] for r in (prev_neighbour.get('refs') or []) if r.get('kind') == 'char']
-            prev_chars = [c for c in (s.get('characters') or []) if c['id'] in prev_char_ids]
             roster_lines = '\n'.join(
                 f'  - {c["name"]}: {c.get("appearance","")[:140]}'
                 for c in prev_chars
@@ -15511,6 +16072,21 @@ def seedance_compose(sid, num):
                 urls_only = [r.get('url') for r in state_frames if r.get('url')]
                 analysis_text = claude_ask_vision(v_prompt, urls_only).strip()
                 if analysis_text:
+                    # ── Script-pose override (Vision misread guard) ────────────
+                    # Real production bug: «The Fox CEO's Trap» ep 1 — chunk 0's
+                    # script said «Fox Woman lies halfway under the car». Pixar
+                    # render botched the pose and drew her standing. Vision then
+                    # honestly transcribed the broken render as «поза=стоит»
+                    # for the POSTURE LOCK fed to chunk 1. Chunk 1 inherited
+                    # «стоит» and re-rendered her standing — propagating the
+                    # error. We pull pose verbs directly from the prev chunk's
+                    # script text and overwrite the Vision line when they
+                    # disagree. Script = ground truth, Vision = best-guess.
+                    analysis_text = _override_vision_with_script_poses(
+                        analysis_text,
+                        prev_neighbour.get('chunk_text') or '',
+                        prev_chars,
+                    )
                     prev_neighbour['frame_state_analysis'] = {
                         'cache_key': cache_key,
                         'text': analysis_text,
@@ -15530,13 +16106,21 @@ def seedance_compose(sid, num):
                 "(например: 'Maya, на губе кровь из разбитой губы, мокрые волосы, разорванная блузка, дрожит'). "
                 "НЕ описывай персонажей как «свежих» / в базовом виде — они продолжаются из прошлого кадра.\n\n"
                 "POSTURE/STATE LOCK ИЗ ЭТОГО АНАЛИЗА:\n"
-                "Состояние выше — это твой ENDING STATE предыдущего чанка. ВСЁ что там описано (поза стоя/сидя, "
-                "где стоит, что в руках, физический контакт) ПЕРЕНОСИТСЯ в начало текущего чанка ОДИН-В-ОДИН — "
-                "пока в тексте CHUNK'а нет ЯВНОГО ГЛАГОЛА смены позы (садится, встаёт, берёт, кладёт, выходит). "
-                "Если в анализе «Marcus стоит у книжного шкафа, бокал в руке» и в CHUNK нет «садится» — Marcus "
-                "в твоём ACTION продолжает СТОЯТЬ у шкафа с бокалом. Не «оба сели за стол» из головы.\n"
-                "ОБЯЗАТЕЛЬНАЯ первая строка ACTION: «Продолжая с прошлого чанка: [имя1] [поза] [где] [с чем]; "
-                "[имя2] [поза] [где] [с чем]». Это эхо состояния — модель должна увидеть его в prompt-е."
+                "Состояние выше — это твой ENDING STATE предыдущего чанка. По умолчанию переноси его в начало "
+                "текущего чанка (поза стоя/сидя, где стоит, что в руках, физический контакт).\n"
+                "ВАЖНОЕ ИСКЛЮЧЕНИЕ — СЦЕНАРИЙ ВЫШЕ POSTURE LOCK'а: если CHUNK TEXT этого чанка ИЛИ предыдущего "
+                "явно описывает позу/положение которое ПРОТИВОРЕЧИТ анализу (например chunk_text: «Fox Woman lies "
+                "halfway under the car», а Vision-анализ говорит «Fox Woman стоит») — ВЕРЬ СЦЕНАРИЮ, не анализу. "
+                "Vision-анализ может ошибаться когда предыдущий рендер не справился со сложной позой "
+                "(persona под машиной, на коленях, в нестандартной позе) и нарисовал её в дефолтной стоячей позе. "
+                "Сценарий — ground truth, анализ — лучшая догадка по картинке. При конфликте: "
+                "  • В SUBJECT/ACTION пиши позу ИЗ СЦЕНАРИЯ («Fox Woman продолжает лежать наполовину под машиной, "
+                "    голова и плечи торчат наружу»).\n"
+                "  • НЕ повторяй неправильную позу из анализа в первой строке ACTION.\n"
+                "Если в CHUNK явный глагол смены позы (садится, встаёт, выходит) — это нормальный переход, "
+                "выполняй сценарий.\n"
+                "ОБЯЗАТЕЛЬНАЯ первая строка ACTION: «Продолжая с прошлого чанка: [имя1] [поза по сценарию] "
+                "[где] [с чем]; [имя2] [поза по сценарию] [где] [с чем]»."
             )
             data['prompt'] = (data.get('prompt') or '').rstrip() + state_extra
             state_analysis_attached = True
@@ -15697,8 +16281,10 @@ def seedance_compose(sid, num):
     # context, this echo reinforces «don't change pose» right before generation.
     if pose_lock_fallback in ('vision', 'ending_state', 'chunk_text_regex'):
         data['prompt'] = (data.get('prompt') or '').rstrip() + (
-            "\n\nКРИТИЧНО: НЕ меняй позы персонажей из POSTURE LOCK выше пока в этом chunk'е "
-            "нет ЯВНОГО ГЛАГОЛА смены позы (садится, встаёт, выходит, ложится). "
+            "\n\nКРИТИЧНО: позы из CHUNK TEXT (сценарий выше) — ground truth. Если сценарий говорит "
+            "«Fox Woman lies under the car», а POSTURE LOCK анализ говорит «стоит» — рендери "
+            "позу ИЗ СЦЕНАРИЯ. Анализ полезен только когда сценарий не уточняет позу. "
+            "Не меняй позы из головы — следуй сценарию + POSTURE LOCK как fallback. "
             "Continuity > свобода интерпретации."
         )
 
@@ -15876,6 +16462,9 @@ def seedance_start(sid, num):
     mod = body.get('moderation_bypass') or 'collage_grid'
     if mod not in ('off', 'grid', 'collage_grid', 'cartoon'):
         mod = 'collage_grid'
+    model_tier = body.get('model') or 'reference-fast'
+    if model_tier not in ('reference-pro', 'reference-fast'):
+        model_tier = 'reference-fast'
     aspect = body.get('aspect_ratio') or '9:16'
     gen_audio = bool(body.get('generate_audio', True))
     # Optional canonical script order — set by auto-mode parallel so the UI
@@ -15920,6 +16509,7 @@ def seedance_start(sid, num):
             'duration': duration,
             'resolution': resolution,
             'moderation_bypass': mod,
+            'model': model_tier,
             'aspect_ratio': aspect,
             'created_at': int(time.time()),
             'video_url': '',
@@ -15945,6 +16535,25 @@ def seedance_start(sid, num):
     # context, silently returns '', and AVAI gets `x-api-key: ` → on prod the
     # request hangs until our 240s read timeout (videos die, images survive
     # only because image calls are synchronous within the request handler).
+    # Anti-grid-leak instruction for grid-based moderation bypass modes.
+    # Real production bug: «Diner Opens at Midnight» ep 3 chunk «1 доп 4»
+    # — Seedance's grid-tiling bypass failed to de-tile cleanly, output
+    # video had visible grid lines across the whole frame for the full
+    # duration. Telling the model explicitly to deliver a single clean
+    # frame without visible cell borders / tiling artifacts pushes the
+    # de-tiling stage to do its job. `cartoon` and `off` don't tile so
+    # they don't need this hint.
+    mod_bypass_prompt = None
+    if mod in ('grid', 'collage_grid'):
+        mod_bypass_prompt = (
+            "Final output MUST be a single continuous full-frame composition. "
+            "NO visible grid lines, NO cell borders, NO tiling artifacts, NO "
+            "panel separators, NO visible seams between regions of the frame. "
+            "The frame fills 100% of the canvas as one unified shot — any "
+            "grid used internally for moderation bypass must be fully removed "
+            "from the rendered output."
+        )
+
     def _submit():
         try:
             job = _avai_seedance_start(
@@ -15952,6 +16561,8 @@ def seedance_start(sid, num):
                 duration=duration, resolution=resolution,
                 moderation_bypass=mod, aspect_ratio=aspect,
                 generate_audio=gen_audio,
+                moderation_bypass_prompt=mod_bypass_prompt,
+                model=model_tier,
             )
             with _episode_lock(sid, num):
                 ep2 = load_episode(sid, num)
