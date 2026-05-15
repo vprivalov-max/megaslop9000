@@ -4,7 +4,8 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>MegaSlop 9000</title>
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='%230a0e14'/><text x='50' y='79' font-size='78' font-family='Impact,Arial Black,sans-serif' font-weight='900' text-anchor='middle' fill='%23a855f7'>M</text></svg>">
+<link rel="icon" type="image/svg+xml" href="/static/favicon.svg?v={{ static_v }}">
+<link rel="shortcut icon" href="/static/favicon.svg?v={{ static_v }}">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&display=swap" rel="stylesheet">
@@ -506,10 +507,12 @@
                 <input type="checkbox" id="sd-close-up-only" style="margin:0">
                 🎯 close-up only
               </label>
-              <label style="font-size:0.78rem;color:var(--muted);display:inline-flex;align-items:center;gap:4px"
-                     title="При смене локации (новая сцена) в первый чанк новой сцены добавляется 2-секундный wide shot фасада/экстерьера. Длительность чанка увеличивается на 2с (clamp ≤15с).">
-                <input type="checkbox" id="sd-establishing-shot" style="margin:0">
-                🏛️ заставка локации (2с)
+              <!-- Removed «🏛️ заставка локации (2с)» — per-location facades now
+                   auto-generate as standalone clips at assembly time; the
+                   in-chunk 2-second wide-shot pre-roll was eating dialogue
+                   budget for nothing. -->
+              <label style="display:none">
+                <input type="checkbox" id="sd-establishing-shot">
               </label>
               <input type="text" id="sd-style" class="hidden" placeholder="Pixar, anime, film noir, oil-painting, cyberpunk..."
                      style="flex:1;min-width:220px;padding:5px 10px;font-size:0.8rem">
@@ -535,6 +538,12 @@
                 <select id="sd-resolution">
                   <option value="720p">720p</option>
                   <option value="480p" selected>480p</option>
+                </select>
+              </label>
+              <label title="reference-fast (~×1.5 дешевле, чуть ниже качество) vs reference-pro (премиум). Оба поддерживают до 9 контекстных рефов — наш pipeline идентичен на обеих моделях.">Модель:
+                <select id="sd-model-tier">
+                  <option value="reference-fast" selected>fast</option>
+                  <option value="reference-pro">pro</option>
                 </select>
               </label>
               <label>Обход модер:
@@ -571,6 +580,9 @@
             <button class="btn-ghost btn-sm" id="sd-music-regen-btn" onclick="sdRegenMusicDialog()"
                     title="Перегенерировать музыку одной сцены с пожеланием («повеселей», «понапряжённее»…)"
                     style="display:none">↻ Перегенерить музыку</button>
+            <button class="btn-ghost btn-sm" id="sd-music-play-btn" onclick="sdToggleMusicPreview(this)"
+                    title="Прослушать музыку этой серии (все сцены подряд)"
+                    style="display:none">▶</button>
             <a id="sd-music-dl-link" href="#" onclick="downloadMusicOnly(event)" style="display:none;font-size:0.82rem;color:#a78bfa;text-decoration:underline" title="Скачать музыку отдельным WAV-файлом MUS_<сериал>_<эпизод>.wav">⬇ Скачать музыку</a>
             <span id="sd-music-counter" style="display:none;font-size:0.78rem;color:#a78bfa"></span>
             <span class="muted" id="sd-list-count" style="font-size:0.78rem;margin-left:auto"></span>
@@ -850,8 +862,12 @@
           </div>
         </div>
         <div class="field-group">
-          <button type="button" class="btn-ghost btn-sm" onclick="importPreviewSplit()">👁 Превью разбивки на серии</button>
+          <div style="display:flex;gap:8px;flex-wrap:wrap">
+            <button type="button" class="btn-ghost btn-sm" onclick="importPreviewSplit()">👁 Превью разбивки на серии</button>
+            <button type="button" class="btn-ghost btn-sm" onclick="importLogicCheck(this)">🧠 Проверить логику</button>
+          </div>
           <div id="import-series-preview" style="margin-top:8px"></div>
+          <div id="import-series-logic" style="margin-top:8px"></div>
         </div>
         <!-- ─── Per-type extraction toggles + manual uploads ─── -->
         <div style="background:rgba(132,94,247,0.06);border:1px solid rgba(132,94,247,0.2);border-radius:8px;padding:12px 14px;margin-top:6px">
@@ -905,6 +921,17 @@
 
           <div style="font-size:0.72rem;color:var(--muted);margin-top:10px;padding-top:8px;border-top:1px dashed var(--border)">
             ⏱ Извлечение на 70 серий ≈ 5-15 минут (в фоне). Можно сразу заходить в сериал.
+          </div>
+
+          <div style="margin-top:14px;padding-top:10px;border-top:1px solid var(--border)">
+            <div style="font-weight:600;color:var(--text);font-size:0.92rem;margin-bottom:4px">🎨 Визуальный стиль</div>
+            <div style="font-size:0.74rem;color:var(--muted);margin-bottom:8px">
+              Выбери ДО создания — иначе персонажи и локации генерятся в кинематографе по дефолту, потом пересоздавать.
+            </div>
+            <div id="import-style-chips" style="display:flex;flex-wrap:wrap;gap:6px"></div>
+            <input type="hidden" id="import-style-type" value="cinematic">
+            <textarea id="import-style-custom-desc" placeholder="Своё описание стиля (опционально, активируется при выборе «Свой»)"
+              style="width:100%;margin-top:8px;padding:6px 8px;font-size:0.82rem;background:#1a1a1f;border:1px solid #333;border-radius:6px;color:#eee;resize:vertical;display:none" rows="2"></textarea>
           </div>
         </div>
         <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:14px">
@@ -1353,6 +1380,15 @@
             💡 Толпа / массовка / гости мероприятия — НЕ считаются. Это лимит на главных героев которые активно
             ведут сцену. Claude получает указание: в большинстве сцен 2 спикера, изредка 3, максимум 4 для
             эмоциональной кульминации. Сцены где 4 главных персонажа постоянно мусолят что-то — недопустимы.
+          </div>
+          <div style="margin-top:12px;padding-top:10px;border-top:1px solid rgba(132,94,247,0.12)">
+            <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:0.85rem;user-select:none">
+              <input type="checkbox" id="append-gen-no-interruptions" checked style="width:15px;height:15px;cursor:pointer">
+              <span>✋ Запретить персонажам перебивать друг друга</span>
+            </label>
+            <div style="font-size:0.72rem;color:var(--muted);margin-top:3px;margin-left:23px">
+              Каждый персонаж договаривает реплику до конца прежде чем следующий начнёт. Снятие галочки разрешает естественные перебивания и накладки реплик.
+            </div>
           </div>
         </details>
         <div class="field-group">
