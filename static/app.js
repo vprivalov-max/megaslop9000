@@ -8476,6 +8476,17 @@ async function startAutoMode() {
         return { ok: true, chunk };
       }
       if (chunk.status === 'completed' && qcStatus === 'fail') {
+        // Hard cap on retry-storm: if 3+ chunks already exist for this
+        // segment text, accept and move on. Belt-and-suspenders for the
+        // case where server `attempts` somehow didn't reach the cap.
+        const segText2 = (segText || '').trim();
+        const dupCount = (polled || []).reduce(
+          (n, c) => n + ((c.chunk_text || '').trim() === segText2 ? 1 : 0), 0
+        );
+        if (dupCount >= 3) {
+          showToast(`⚠ Уже ${dupCount} попыток для чанка #${curIdx} (${(chunk.qc?.fails || []).join(', ')}) — продолжаем дальше без ретрая`, 8000);
+          return { ok: true, chunk };
+        }
         // QC failed and we still have retry budget — trigger fresh start
         // with the same prompt + a server-injected hint about what to fix.
         AUTO.lastStatus = `🔁 #${curIdx} QC retry ${chunk.qc.attempts}/3 (${(chunk.qc.fails || []).slice(0, 2).join(',')})`;
@@ -9314,7 +9325,8 @@ async function startRangeGen() {
           useLastframe: true, useCutframes: true,
           useStyle: false, styleVal: '',
           baseOnly: false, closeUpOnly: false,
-          duration: 15, resolution: '480p', moderation_bypass: 'collage_grid',
+          duration: 15, resolution: '480p',
+          moderation_bypass: document.getElementById('sd-mod-bypass')?.value || 'off',
           model_tier: document.getElementById('sd-model-tier')?.value || 'reference-fast',
           errorMode: 'heal',
           maxParallelScenes: 2,
@@ -13386,6 +13398,19 @@ function sdToggleStyleField() {
 // drama works fine with `grid` while a violent thriller needs `cartoon`).
 function _sdModKey(sid) { return `sd_mod_bypass_${sid || ''}`; }
 
+// True when project's visual style is animated/cartoonish (Pixar, anime, etc).
+// Used to auto-default mod-bypass to `cartoon` for new series with no per-series
+// override yet. Mirrors the backend `stylised` check in _series_style_clause.
+function _seriesIsCartoonish(s) {
+  if (!s) return false;
+  const type = (s.style && s.style.type || '').toLowerCase();
+  if (type === 'pixar' || type === 'anime') return true;
+  const v = (s.visual_style || '').toLowerCase();
+  if (!v) return false;
+  return ['pixar','anime','manga','cartoon','claymation','studio ghibli','arcane','comic','graphic novel']
+    .some(k => v.includes(k));
+}
+
 function sdSavePrefs() {
   try {
     const modBypass = document.getElementById('sd-mod-bypass').value;
@@ -13413,9 +13438,10 @@ function sdLoadPrefs() {
     const p = JSON.parse(localStorage.getItem('sd_prefs') || '{}');
     if (p.duration) document.getElementById('sd-duration').value = p.duration;
     if (p.resolution) document.getElementById('sd-resolution').value = p.resolution;
-    // moderation_bypass: per-series override wins over global default
+    // moderation_bypass: per-series override > cartoon-style auto-default > global
     const seriesMod = S.seriesId ? localStorage.getItem(_sdModKey(S.seriesId)) : null;
-    const finalMod = seriesMod || p.moderation_bypass;
+    const cartoonAuto = (!seriesMod && _seriesIsCartoonish(S.series)) ? 'cartoon' : null;
+    const finalMod = seriesMod || cartoonAuto || p.moderation_bypass;
     if (finalMod) document.getElementById('sd-mod-bypass').value = finalMod;
     const cb = document.getElementById('sd-use-lastframe');
     if (cb && typeof p.use_prev_lastframe === 'boolean') cb.checked = p.use_prev_lastframe;
@@ -14878,17 +14904,55 @@ function _qcBuildPromptHint(fails) {
 }
 
 // In-flight set guards against duplicate retry posts when poll ticks fire
-// faster than a retry can complete. Keyed by `${epNumber}#${chunkIdx}`.
+// faster than a retry can complete. Keyed by `${epNumber}#${chunkText}` —
+// chunkIdx changes each retry (new chunk created), so keying by idx never
+// blocked the re-fire. ChunkText is stable across retries of same segment.
 const _QC_RETRY_INFLIGHT = new Set();
 
-async function _qcAutoRetryManualMode(chunks) {
+// HARD KILL-SWITCH for the auto-fire path. The previous behaviour was:
+// every 8s poll tick scans ALL completed chunks with qc.status='fail' and
+// fires retries on all of them automatically. This caused real prod incident
+// 2026-05-19 on «My Stepmother Made Me a Servant», ep 40 — opening the
+// episode page spawned 11 retries without any user click. User wants
+// explicit consent for every retry POST (AVAI costs money).
+//
+// Behaviour now: function is a no-op. The button «🔁 Retry» on each chunk
+// card (sdRetry) is the only retry path. If we ever bring back automation,
+// it MUST be opt-in via a toggle and have a dialog with cost estimate.
+async function _qcAutoRetryManualMode(_chunks) {
+  return;
+}
+
+// Original retry-storm loop, kept as reference / for a future opt-in toggle.
+// Do NOT call without explicit user gating. The guards below (chunk_text
+// keyed in-flight, 5-min TTL, parallel-sibling skip, dupCount cap 2 instead
+// of 3, attempts cap 1 instead of 3) are correct — the issue was just
+// firing this on every poll tick without consent.
+async function _qcAutoRetryStormDangerous(chunks) {
   if (!chunks || !chunks.length) return;
+  const textCounts = {};
+  const runningTexts = new Set();
+  for (const c of chunks) {
+    const k = (c.chunk_text || '').trim();
+    if (!k) continue;
+    textCounts[k] = (textCounts[k] || 0) + 1;
+    // Any in-flight sibling for the same chunk_text means a retry is
+    // already running. Don't pile on.
+    if (c.status === 'submitted' || c.status === 'running' ||
+        c.status === 'queued'    || c.status === 'processing') {
+      runningTexts.add(k);
+    }
+  }
   for (const c of chunks) {
     if (c.status !== 'completed') continue;
     const qc = c.qc;
     if (!qc || qc.status !== 'fail') continue;
-    if ((qc.attempts || 0) >= 3) continue;   // retry_exhausted already returned by server
-    const key = `${S.episode.number}#${c.idx}`;
+    if ((qc.attempts || 0) >= 1) continue;     // one auto-retry max, then human
+    const txt = (c.chunk_text || '').trim();
+    if (!txt) continue;
+    if (runningTexts.has(txt)) continue;       // sibling already running
+    if ((textCounts[txt] || 0) >= 2) continue; // already 2 attempts of this text
+    const key = `${S.episode.number}#${txt}`;
     if (_QC_RETRY_INFLIGHT.has(key)) continue;
     _QC_RETRY_INFLIGHT.add(key);
     try {
@@ -14914,9 +14978,10 @@ async function _qcAutoRetryManualMode(chunks) {
     } catch (e) {
       console.warn(`[qc] manual retry post for chunk ${c.idx} failed:`, e);
     } finally {
-      // Hold the inflight flag for 10s so a single failed POST doesn't
-      // immediately reattempt on the next 8s poll tick.
-      setTimeout(() => _QC_RETRY_INFLIGHT.delete(key), 10_000);
+      // 5-minute TTL — enough for a Seedance chunk to actually finish so
+      // the next poll sees the new state. 10s was way too short — the
+      // original chunk still showed qc.fail and re-triggered.
+      setTimeout(() => _QC_RETRY_INFLIGHT.delete(key), 300_000);
     }
   }
 }
