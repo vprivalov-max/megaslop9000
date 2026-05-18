@@ -402,6 +402,13 @@
               <label style="display:inline-flex;align-items:center;gap:4px;font-size:0.78rem;color:var(--muted);cursor:pointer;margin-left:6px" title="Звуковой сигнал по завершению генерации сценария">
                 <input type="checkbox" id="ep-script-sounds" checked style="cursor:pointer;margin:0"> 🔔
               </label>
+              <label style="display:inline-flex;align-items:center;gap:4px;font-size:0.78rem;color:var(--muted);margin-left:6px"
+                     title="Сценарист для этого эпизода. Дефолт берётся из настроек серии (writer_model), можно поменять перед клик-генерацией.">🖋
+                <select id="writer-model-ep" style="font-size:0.78rem;padding:3px 5px;background:#1a1a1f;border:1px solid #333;border-radius:5px;color:#eee">
+                  <option value="claude-sonnet-4-5">Claude</option>
+                  <option value="gpt-5.5">GPT-5.5</option>
+                </select>
+              </label>
               <button class="ep-script-btn ready" id="ep-gen-script-btn" onclick="generateEpisodeScript()">⚡ Сгенерировать</button>
               <button class="ep-script-btn ready" id="ep-accept-script-btn" onclick="acceptScript()" title="Сохранить сценарий, найти новых персонажей/локации/предметы, при необходимости показать модалку для drag-drop фоток, потом перейти в режим сцен и запустить автоген"
                       style="background:linear-gradient(135deg,#10b981,#059669);color:#fff;font-weight:700">✅ Принять сценарий</button>
@@ -932,6 +939,17 @@
             <textarea id="import-style-custom-desc" placeholder="Своё описание стиля (опционально, активируется при выборе «Свой»)"
               style="width:100%;margin-top:8px;padding:6px 8px;font-size:0.82rem;background:#1a1a1f;border:1px solid #333;border-radius:6px;color:#eee;resize:vertical;display:none" rows="2"></textarea>
           </div>
+
+          <div style="margin-top:14px;padding-top:10px;border-top:1px solid var(--border)">
+            <label style="font-weight:600;color:var(--text);font-size:0.92rem;display:inline-flex;align-items:center;gap:8px"
+                   title="Сценарист-LLM для всей серии: используется при генерации синопсисов / скриптов / арки. Можно переопределить per-episode прямо во время работы.">🖋 Сценарист для эпизодов:
+              <select id="import-writer-model" style="font-size:0.85rem;padding:4px 6px;background:#1a1a1f;border:1px solid #333;border-radius:6px;color:#eee">
+                <option value="claude-sonnet-4-5">Claude Sonnet 4.5</option>
+                <option value="gpt-5.5">GPT-5.5</option>
+              </select>
+            </label>
+            <div style="font-size:0.74rem;color:var(--muted);margin-top:4px">Можно поменять в любой момент в эпизод-вью.</div>
+          </div>
         </div>
         <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:14px">
           <button class="btn-primary" onclick="importCreateSeries()" id="import-create-btn" style="background:linear-gradient(135deg,#10b981,#059669)">📜 Создать из сценария</button>
@@ -954,7 +972,14 @@
         </div>
         <div id="genre-tooltip" class="genre-tooltip hidden"></div>
 
-        <div style="margin-top:6px;display:flex;justify-content:flex-end">
+        <div style="margin-top:6px;display:flex;justify-content:space-between;align-items:center;gap:8px">
+          <label style="font-size:0.85rem;color:var(--muted);display:inline-flex;align-items:center;gap:4px"
+                 title="Сценарист-LLM. Claude — текущий дефолт, заточен под наш формат. GPT-5.5 — альтернатива, может выдавать другой стиль. Влияет на «5 идей» / «по идее» здесь и на синопсисы/скрипты эпизодов далее.">🖋 Сценарист:
+            <select id="writer-model-create" style="font-size:0.85rem;padding:4px 6px;background:#1a1a1f;border:1px solid #333;border-radius:6px;color:#eee">
+              <option value="claude-sonnet-4-5">Claude</option>
+              <option value="gpt-5.5">GPT-5.5</option>
+            </select>
+          </label>
           <button type="button" class="btn-ghost" id="btn-randomize-genres" onclick="randomizeGenres()" style="font-size:0.85rem;padding:4px 10px">🎲 Случайные жанры</button>
         </div>
 

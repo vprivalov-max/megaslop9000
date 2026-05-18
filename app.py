@@ -303,12 +303,16 @@ ANTHROPIC_KEY  = _load_secret('ANTHROPIC_API_KEY',  'anthropic_key')
 AVAI_KEY       = _load_secret('AVAI_API_KEY',       'avai_key')
 RETELLER_KEY   = _load_secret('RETELLER_API_KEY',   'reteller_key')
 ELEVENLABS_KEY = _load_secret('ELEVENLABS_API_KEY', 'elevenlabs_key')
+# OPENAI key used ONLY by the chunk-QC pipeline (Whisper language detection).
+# Optional — if missing, language QC stage degrades to a no-op (pass-through).
+OPENAI_KEY     = _load_secret('OPENAI_API_KEY',     'openai_key')
 
 # Warn loudly at startup if anything is missing — easier than debugging 401s later.
 for _name, _val in (('ANTHROPIC_API_KEY',  ANTHROPIC_KEY),
                     ('AVAI_API_KEY',       AVAI_KEY),
                     ('RETELLER_API_KEY',   RETELLER_KEY),
-                    ('ELEVENLABS_API_KEY', ELEVENLABS_KEY)):
+                    ('ELEVENLABS_API_KEY', ELEVENLABS_KEY),
+                    ('OPENAI_API_KEY',     OPENAI_KEY)):
     if not _val:
         print(f'[config] WARNING {_name} is not set — related features will fail')
 
@@ -917,6 +921,104 @@ _MODEL_ALIAS = {
 }
 
 _anthropic_client = None
+_openai_client = None
+
+# Allowed writer-model ids — frontend dropdown surfaces these. Anything else
+# coming in body params falls back to the default. Keep this list tight so
+# we don't accidentally route creative writing through Whisper or vision-
+# only models.
+WRITER_MODEL_DEFAULT = 'claude-sonnet-4-5'
+WRITER_MODEL_WHITELIST = {'claude-sonnet-4-5', 'gpt-5.5'}
+
+
+def _get_openai_client():
+    """Lazy OpenAI client init. Returns None if no key — callers must check."""
+    global _openai_client
+    if _openai_client is None:
+        if not OPENAI_KEY:
+            return None
+        import openai as _openai
+        _openai_client = _openai.OpenAI(api_key=OPENAI_KEY)
+    return _openai_client
+
+
+def _openai_ask(prompt: str, system: str = '', model: str = 'gpt-5.5', max_tokens: int = 8192) -> str:
+    """OpenAI Chat Completions wrapper. Mirrors `claude_ask` return shape
+    (returns the assistant message content as a string). Retries up to 3
+    times on 429/5xx with exponential backoff. Used by `llm_ask` when the
+    selected model id starts with 'gpt'."""
+    client = _get_openai_client()
+    if client is None:
+        raise RuntimeError('OPENAI_KEY не задан — пропиши openai_key в config.json или env')
+    prompt_kb = len((system + prompt).encode('utf-8')) / 1024
+    t0 = time.time()
+    print(f'[openai_ask] {prompt_kb:.1f}KB → {model}', flush=True)
+    messages = []
+    if system:
+        messages.append({'role': 'system', 'content': system})
+    messages.append({'role': 'user', 'content': prompt})
+
+    last_err = None
+    for attempt in range(4):   # 4 attempts total: 0 + 3 retries
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                max_tokens=max_tokens,
+            )
+            text = (resp.choices[0].message.content or '').strip()
+            print(f'[openai_ask] done in {time.time()-t0:.1f}s ({len(text)} chars)', flush=True)
+            return text
+        except Exception as e:
+            last_err = e
+            # Classify retriable: rate limit / 5xx / connection blips.
+            msg = str(e).lower()
+            transient = (
+                'rate' in msg or '429' in msg or '5xx' in msg
+                or '500' in msg or '502' in msg or '503' in msg or '529' in msg
+                or 'overloaded' in msg or 'connection' in msg or 'timeout' in msg
+            )
+            if not transient or attempt == 3:
+                print(f'[openai_ask] non-retriable / out of retries: {e}', flush=True)
+                raise
+            backoff = (2 ** attempt) + (0.3 * attempt)
+            print(f'[openai_ask] attempt {attempt+1} failed ({type(e).__name__}: {str(e)[:120]}), retrying in {backoff:.1f}s', flush=True)
+            time.sleep(backoff)
+    raise last_err or RuntimeError('OpenAI call exhausted retries')
+
+
+def _resolve_writer_model(body=None, series=None) -> str:
+    """Pick the writer model for a creative-writing call: body param wins
+    (per-call override from a UI chip), then series['writer_model'] (series-
+    level default set at creation time), then global default."""
+    body = body or {}
+    requested = (body.get('model') or '').strip().lower()
+    if requested:
+        return requested if requested in WRITER_MODEL_WHITELIST else WRITER_MODEL_DEFAULT
+    series_default = ((series or {}).get('writer_model') or '').strip().lower()
+    if series_default in WRITER_MODEL_WHITELIST:
+        return series_default
+    return WRITER_MODEL_DEFAULT
+
+
+def llm_ask(model: str, prompt: str, system: str = '', max_tokens: int = 8192) -> str:
+    """Route a text-generation call to the appropriate provider based on the
+    model id prefix. Used for CREATIVE-WRITING calls only (ideas + episode
+    scripts) where the user gets a choice. Everything else stays on Claude.
+
+      model='gpt-*'  → OpenAI Chat Completions
+      anything else  → Anthropic Claude (claude_ask)
+    """
+    if not model:
+        model = WRITER_MODEL_DEFAULT
+    if model not in WRITER_MODEL_WHITELIST:
+        print(f'[llm_ask] unknown writer model {model!r}, falling back to {WRITER_MODEL_DEFAULT}', flush=True)
+        model = WRITER_MODEL_DEFAULT
+    if model.startswith('gpt'):
+        return _openai_ask(prompt, system=system, model=model, max_tokens=max_tokens)
+    return claude_ask(prompt, system=system, model=model, max_tokens=max_tokens)
+
+
 def _get_anthropic_client():
     global _anthropic_client
     if _anthropic_client is None:
@@ -1024,6 +1126,112 @@ def claude_ask_vision(prompt: str, image_urls, system: str = '',
     text = ''.join(b.text for b in msg.content if getattr(b, 'type', '') == 'text').strip()
     print(f'[claude_vision] done in {time.time()-t0:.1f}s', flush=True)
     return text
+
+
+def _describe_character_visual(image_url: str, char_name: str = '') -> str:
+    """Vision-extract a FULL character appearance description from a user-
+    uploaded portrait. Used by import-from-script to backfill an empty
+    `appearance` field on chars the user pre-uploaded (only ref_images
+    saved, no text → BINDING line was just the name → Seedance lost the
+    text-side anchor for outfit/style continuity).
+
+    Returns a Russian descriptive sentence covering: возраст, телосложение,
+    волосы, лицо, одежда. Suitable as drop-in for `char.appearance` which
+    feeds `_canonical_char_description` → Seedance BINDING.
+    """
+    if not image_url or not image_url.lower().startswith(('http://', 'https://')):
+        return ''
+    name_hint = f' Персонаж в сериале называется "{char_name}".' if char_name else ''
+    prompt = (
+        "Опиши внешность человека на фото для AI-генерации последующих "
+        "изображений того же персонажа в разных сценах." + name_hint + "\n\n"
+        "Ровно 1-2 предложения на русском, comma-separated descriptors, "
+        "максимум 250 символов. Покрой:\n"
+        "  • возраст (примерный диапазон, e.g. «около 30 лет», «лет 50»)\n"
+        "  • пол / телосложение (e.g. «худощавый мужчина», «стройная женщина»)\n"
+        "  • волосы (цвет, длина, причёска)\n"
+        "  • лицо (один-два запоминающихся черта: «волевая челюсть», «миндалевидные глаза»)\n"
+        "  • одежда (top + bottom + ключевые аксессуары)\n\n"
+        "Примеры выходов:\n"
+        "  «Молодая женщина около 28 лет, стройная, длинные тёмно-каштановые волосы убраны в "
+        "    хвост, миндалевидные карие глаза, тёмно-синие медицинские scrubs, бейдж на груди»\n"
+        "  «Мужчина средних лет, около 45, плотного телосложения, короткие седеющие волосы, "
+        "    тёплые серые глаза, угольно-серый трёхпредметный костюм, белая рубашка»\n"
+        "  «Подросток лет 16, худощавый, коротко стриженые чёрные волосы, бледная кожа, "
+        "    потёртая джинсовая куртка, серая толстовка»\n\n"
+        "ВАЖНО: НЕ описывай фон, освещение, позу, выражение эмоций, мимику. "
+        "ТОЛЬКО физический look + одежда. Без кавычек, без префикса «Это:», "
+        "без «На фото мы видим». Только описание."
+    )
+    try:
+        text = claude_ask_vision(prompt, [image_url]).strip()
+        text = text.replace('\n', ' ').strip().strip('"').strip('«»').strip("'").rstrip('.')
+        # Hard-cap so we don't pollute BINDING with a wall of text.
+        if len(text) > 280:
+            text = text[:277] + '...'
+        return text
+    except Exception as e:
+        print(f'[char_vision] failed for {char_name or image_url}: {e}', flush=True)
+        return ''
+
+
+def _backfill_uploaded_char_appearances(sid, char_ids):
+    """Background worker for import-from-script: for each char id, lazy-upload
+    the first ref image to AVAI storage, call Vision to extract a Russian
+    `appearance` description, and persist back to series. Safe to run in
+    parallel with `_import_worker` — each takes a fresh `load_series` and
+    only mutates fields the worker doesn't touch.
+
+    Uses a ThreadPoolExecutor with 3 lanes so 5+ uploads finish in ~10-15s
+    instead of 30-60s sequential. Each char's Vision call is independent."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _one(cid):
+        try:
+            s = load_series(sid)
+            if not s:
+                return
+            char = next((c for c in (s.get('characters') or []) if c['id'] == cid), None)
+            if not char:
+                return
+            if (char.get('appearance') or '').strip():
+                return   # already populated — don't overwrite user-edited or worker-set text
+            refs = char.get('ref_images') or []
+            if not refs:
+                return
+            primary_rel = refs[0]
+            primary_abs = series_path(sid) / primary_rel
+            if not primary_abs.exists():
+                return
+            # AVAI public URL (Claude Vision needs HTTPS, can't read local files).
+            try:
+                avai_url = char.get('avai_base_url') or _avai_upload_local_image(primary_abs)
+            except Exception as e:
+                print(f'[backfill_char] AVAI upload failed for {char.get("name")}: {e}', flush=True)
+                return
+            description = _describe_character_visual(avai_url, char.get('name', ''))
+            if not description:
+                return
+            # Persist atomically — re-load to avoid clobbering parallel updates.
+            with _series_lock(sid):
+                s2 = load_series(sid)
+                if not s2:
+                    return
+                ch2 = next((c for c in (s2.get('characters') or []) if c['id'] == cid), None)
+                if not ch2:
+                    return
+                # Don't overwrite if some other code path filled it meanwhile.
+                if not (ch2.get('appearance') or '').strip():
+                    ch2['appearance'] = description
+                    if avai_url and not ch2.get('avai_base_url'):
+                        ch2['avai_base_url'] = avai_url
+                    save_series(sid, s2)
+                    print(f'[backfill_char] filled appearance for {ch2.get("name")}: {description[:80]}...', flush=True)
+        except Exception as e:
+            print(f'[backfill_char] crashed for cid={cid}: {type(e).__name__}: {e}', flush=True)
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        list(pool.map(_one, char_ids))
 
 
 def _describe_outfit_visual(image_url: str) -> str:
@@ -3462,6 +3670,7 @@ def import_from_script():
         dialogue_lang_hint = (form.get('dialogue_language_hint') or '').strip().lower()
         style_type = (form.get('style_type') or 'cinematic').strip().lower() or 'cinematic'
         style_custom_desc = (form.get('style_custom_description') or '').strip()
+        writer_model_in = (form.get('writer_model') or '').strip().lower()
         char_files = request.files.getlist('character_files') or request.files.getlist('character_files[]')
         loc_files  = request.files.getlist('location_files')  or request.files.getlist('location_files[]')
     else:
@@ -3476,7 +3685,9 @@ def import_from_script():
         dialogue_lang_hint = (data.get('dialogue_language_hint') or '').strip().lower()
         style_type = (data.get('style_type') or 'cinematic').strip().lower() or 'cinematic'
         style_custom_desc = (data.get('style_custom_description') or '').strip()
+        writer_model_in = (data.get('writer_model') or '').strip().lower()
         char_files, loc_files = [], []
+    writer_model_value = writer_model_in if writer_model_in in WRITER_MODEL_WHITELIST else WRITER_MODEL_DEFAULT
 
     if not title:
         return jsonify({'error': 'title required'}), 400
@@ -3515,6 +3726,7 @@ def import_from_script():
             'ref_images': [],
         },
         'visual_style': visual_style_value,
+        'writer_model': writer_model_value,
         'settings': {
             'voice': 'Enceladus', 'tts_provider': 'elevenlabs',
             'image_provider': 'banana', 'aspect_ratio': '9:16',
@@ -3642,6 +3854,17 @@ def import_from_script():
             create_locs=do_extract_locs,
             create_items=do_extract_items,
         )
+
+    # Auto-Vision appearance backfill for pre-uploaded characters. Each char
+    # uploaded by the user lands with empty `appearance` — BINDING line for
+    # Seedance is just the name, no text anchor for outfit / build / hair.
+    # Run a background job per uploaded char that: (1) uploads the local
+    # ref image to AVAI public storage to get a URL, (2) asks Claude Haiku
+    # Vision for a Russian appearance description, (3) writes it to the
+    # char's `appearance` field. Latency ~5-8s per char in parallel.
+    if uploaded_chars_count:
+        uploaded_char_ids = [c['id'] for c in series_data['characters'][-uploaded_chars_count:]]
+        _spawn_with_keys(_backfill_uploaded_char_appearances, sid, uploaded_char_ids)
 
     return jsonify({
         'sid': sid,
@@ -4086,6 +4309,10 @@ def create_series():
         'target_audience': data.get('target_audience', ''),
         'world_description': data.get('world_description', ''),
         'synopsis': data.get('synopsis', ''),
+        # Creative-writing model selector (ideas + episode scripts). Set at
+        # creation time, can be overridden per-call from UI. Whitelist enforced
+        # in _resolve_writer_model. Unknown / missing → default Claude.
+        'writer_model': (data.get('writer_model') or '').strip().lower() or WRITER_MODEL_DEFAULT,
         'auto_generate_assets': bool(data.get('auto_generate_assets', True)),
         'batch_mode':           bool(data.get('batch_mode', False)),
         'batch_size':           int(data.get('batch_size', 5)) if data.get('batch_mode') else 1,
@@ -8251,6 +8478,7 @@ _IDEA_AVOID_REPETITIVE_FRAMES = [
 @app.route('/api/generate-series-ideas', methods=['POST'])
 def generate_series_ideas():
     data_in = request.json or {}
+    writer_model = _resolve_writer_model(data_in)
     genres = data_in.get('genres') or []
     # Free-text avoid-list: user-curated tropes/words that must NOT appear in
     # any of the 5 ideas (titles, synopses, character roles). Comma-separated
@@ -8335,7 +8563,7 @@ def generate_series_ideas():
         f"Return JSON matching this schema:\n{_IDEAS_SCHEMA}"
     )
     try:
-        data = json.loads(strip_json(claude_ask(prompt, system=_IDEAS_SYSTEM)))
+        data = json.loads(strip_json(llm_ask(writer_model, prompt, system=_IDEAS_SYSTEM)))
         return jsonify(data.get('ideas', data))
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -8375,6 +8603,7 @@ _FROM_IDEA_ANGLES = [
 @app.route('/api/generate-series-from-idea', methods=['POST'])
 def generate_series_from_idea():
     data_in = request.json or {}
+    writer_model = _resolve_writer_model(data_in)
     idea   = data_in.get('idea', '').strip()
     genres = data_in.get('genres') or []
     if not idea:
@@ -8411,7 +8640,7 @@ def generate_series_from_idea():
         "synopsis should be 3-5 sentences summarizing the full series arc."
     )
     try:
-        data = json.loads(strip_json(claude_ask(prompt, system=_IDEAS_SYSTEM)))
+        data = json.loads(strip_json(llm_ask(writer_model, prompt, system=_IDEAS_SYSTEM)))
         return jsonify(data)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -9443,7 +9672,7 @@ def generate_arcs(sid):
         'Return JSON: {"arcs": [{"title": "...", "summary": "2-3 paragraphs"}, ...]}'
     )
     try:
-        data = json.loads(strip_json(claude_ask(prompt, system=_WRITER_SYSTEM)))
+        data = json.loads(strip_json(llm_ask(_resolve_writer_model(request.json or {}, s), prompt, system=_WRITER_SYSTEM)))
         arcs = data.get('arcs', data)
         s['arc_variants'] = arcs
         save_series(sid, s)
@@ -9507,7 +9736,7 @@ def generate_milestones(sid):
             'Return JSON: {"milestones": {"1": "...", "10": "...", "70": "..."}}'
         )
     try:
-        data = json.loads(strip_json(claude_ask(prompt, system=_WRITER_SYSTEM)))
+        data = json.loads(strip_json(llm_ask(_resolve_writer_model(request.json or {}, s), prompt, system=_WRITER_SYSTEM)))
         milestones = data.get('milestones', {})
         s.setdefault('milestone_synopses', {}).update({str(k): v for k, v in milestones.items()})
         save_series(sid, s)
@@ -9550,7 +9779,7 @@ def regenerate_milestone(sid, ep_num):
         'Return JSON: {"synopsis": "..."}'
     )
     try:
-        data = json.loads(strip_json(claude_ask(prompt, system=_WRITER_SYSTEM)))
+        data = json.loads(strip_json(llm_ask(_resolve_writer_model(request.json or {}, s), prompt, system=_WRITER_SYSTEM)))
         syn = data.get('synopsis', '')
         s.setdefault('milestone_synopses', {})[str(ep_num)] = syn
         save_series(sid, s)
@@ -9589,7 +9818,7 @@ def extract_from_story(sid):
         '"locations": [{"name":"...","description":"..."},...] }'
     )
     try:
-        data = json.loads(strip_json(claude_ask(prompt, system=_WRITER_SYSTEM)))
+        data = json.loads(strip_json(llm_ask(_resolve_writer_model(request.json or {}, s), prompt, system=_WRITER_SYSTEM)))
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -9890,7 +10119,7 @@ def extract_characters_from_script(sid, num):
         '}'
     )
     try:
-        data = json.loads(strip_json(claude_ask(prompt, system=_WRITER_SYSTEM)))
+        data = json.loads(strip_json(llm_ask(_resolve_writer_model(request.json or {}, s), prompt, system=_WRITER_SYSTEM)))
     except Exception as e:
         return jsonify({'error': f'Не удалось разобрать ответ Claude: {e}'}), 500
 
@@ -10227,7 +10456,7 @@ def generate_next_episode_synopsis(sid):
             )
 
     try:
-        data = json.loads(strip_json(claude_ask(prompt, system=_WRITER_SYSTEM)))
+        data = json.loads(strip_json(llm_ask(_resolve_writer_model(request.json or {}, s), prompt, system=_WRITER_SYSTEM)))
         syn = data.get('synopsis', '')
         dsp = data.get('days_since_previous')
         # If the episode ALREADY exists (user pre-created it), just patch its
@@ -10305,7 +10534,7 @@ def generate_episode_synopses(sid):
             'Return JSON: {"episodes": {"1": {"synopsis":"...", "days_since_previous": 0}, "2": {"synopsis":"...", "days_since_previous": 1}, ...}}'
         )
     try:
-        data = json.loads(strip_json(claude_ask(prompt, system=_WRITER_SYSTEM)))
+        data = json.loads(strip_json(llm_ask(_resolve_writer_model(request.json or {}, s), prompt, system=_WRITER_SYSTEM)))
         synopses = data.get('episodes', {})
         result = {}
         for num_str, payload in synopses.items():
@@ -11568,6 +11797,24 @@ def _episode_lock(sid, num):
             lock = threading.Lock()
             _EPISODE_LOCKS[key] = lock
     return lock
+
+
+_SERIES_LOCKS = {}
+_SERIES_LOCKS_GUARD = threading.Lock()
+
+def _series_lock(sid):
+    """Get-or-create the lock for a series sid. Used to serialize read-
+    modify-write of series.json (characters, locations, settings, etc.)
+    when multiple bg workers update concurrently — e.g. import-from-script
+    spawns BOTH `_import_worker` (script-based extraction) AND
+    `_backfill_uploaded_char_appearances` (Vision-based appearance fill);
+    both touch series.characters and need to interleave safely."""
+    with _SERIES_LOCKS_GUARD:
+        lock = _SERIES_LOCKS.get(sid)
+        if lock is None:
+            lock = threading.Lock()
+            _SERIES_LOCKS[sid] = lock
+    return lock
 # Idempotency cache for POST /episodes — avoids duplicate creation when the
 # same POST fires twice (browser retry, ext, double-handler). Keyed by
 # (sid, idempotency_key); value = (timestamp, response_dict). TTL 60s.
@@ -12795,7 +13042,305 @@ def _avai_upload_local_image(local_path: Path) -> str:
         raise RuntimeError(f'AVAI upload: no url in response: {str(data)[:300]}')
     return url
 
-def _ensure_loc_avai_url(sid, loc):
+
+# ════════════════════════════════════════════════════════════════════════════
+# CHUNK QC PIPELINE — pre-flight + post-completion checks before auto-mode
+# proceeds to the next chunk (or before user accepts a manual generation).
+#
+# Stages:
+#   0) prompt-english   — scan SUBJECT/ACTION for quoted non-English dialogue.
+#   1) lang             — Whisper transcription on the chunk's audio.
+#   2) grid-and-subs    — Claude Haiku Vision on probe frames.
+#
+# Result persisted on chunk['qc'] = {status, attempts, details, last_check_at}.
+# Auto-retry (capped at QC_MAX_RETRIES=3) is dispatched from seedance_poll
+# when status='fail'.
+# ════════════════════════════════════════════════════════════════════════════
+
+QC_MAX_RETRIES = 3
+
+# Words that legitimately appear in English dialogue but use non-ASCII letters
+# (loanwords, names with diacritics). Anything else with a Cyrillic / CJK char
+# inside a quoted line is treated as a non-English dialogue leak.
+_QC_NON_ENGLISH_RE = re.compile(r'[Ѐ-ӿ぀-ヿ一-鿿]')
+
+
+def _qc_extract_audio(sid, video_relpath):
+    """Extract mono 16kHz mp3 audio track from a chunk video. Returns abs path
+    on success, None on failure (silent video, ffmpeg missing, etc.)."""
+    src = series_path(sid) / video_relpath
+    if not src.exists():
+        return None
+    out = src.with_name(src.stem + '_qc.mp3')
+    if out.exists() and out.stat().st_size > 0:
+        return out
+    ffmpeg_bin = shutil.which('ffmpeg')
+    if not ffmpeg_bin:
+        return None
+    try:
+        subprocess.run(
+            [ffmpeg_bin, '-y', '-i', str(src),
+             '-vn', '-ac', '1', '-ar', '16000', '-b:a', '64k', str(out)],
+            capture_output=True, timeout=60, check=True,
+        )
+        if out.exists() and out.stat().st_size > 1024:
+            return out
+    except Exception as e:
+        print(f'[qc] audio extract failed for {video_relpath}: {e}', flush=True)
+    return None
+
+
+def _qc_extract_frame_at(sid, video_relpath, sec, label):
+    """Extract a PNG frame at the given timestamp. Returns (rel, abs) or None."""
+    src = series_path(sid) / video_relpath
+    if not src.exists():
+        return None
+    out = src.with_name(f'{src.stem}_qc_{label}.png')
+    if out.exists() and out.stat().st_size > 0:
+        return (str(out.relative_to(series_path(sid))), out)
+    ffmpeg_bin = shutil.which('ffmpeg')
+    if not ffmpeg_bin:
+        return None
+    try:
+        subprocess.run(
+            [ffmpeg_bin, '-y', '-ss', f'{float(sec):.2f}', '-i', str(src),
+             '-frames:v', '1', '-c:v', 'png', '-update', '1',
+             '-pred', 'mixed', '-compression_level', '1', str(out)],
+            capture_output=True, timeout=30, check=True,
+        )
+        if out.exists() and out.stat().st_size > 0:
+            return (str(out.relative_to(series_path(sid))), out)
+    except Exception as e:
+        print(f'[qc] frame@{sec}s extract failed for {video_relpath}: {e}', flush=True)
+    return None
+
+
+def _qc_whisper_detect(audio_abs_path):
+    """Run OpenAI Whisper on the chunk's audio. Returns dict with detected
+    language code, confidence, and transcript text. Falls through to a
+    pass-through result when OPENAI_KEY is missing — language QC stage is
+    OPTIONAL by design (silent video / no key both → skip)."""
+    if not OPENAI_KEY:
+        return {'lang': '', 'confidence': 0.0, 'transcript': '', 'skipped': 'no_openai_key'}
+    if not audio_abs_path or not Path(audio_abs_path).exists():
+        return {'lang': '', 'confidence': 0.0, 'transcript': '', 'skipped': 'no_audio'}
+    try:
+        import openai
+        client = openai.OpenAI(api_key=OPENAI_KEY)
+        with open(audio_abs_path, 'rb') as f:
+            resp = client.audio.transcriptions.create(
+                model='whisper-1',
+                file=f,
+                response_format='verbose_json',
+            )
+        # whisper-1 verbose_json fields: language (ISO code), text, segments[],
+        # duration. No per-segment confidence by default; we treat language
+        # as high-confidence when transcript has >= 6 alphabetic chars.
+        transcript = (getattr(resp, 'text', '') or '').strip()
+        lang = (getattr(resp, 'language', '') or '').lower().strip()
+        alphabetic = sum(1 for ch in transcript if ch.isalpha())
+        confidence = 1.0 if alphabetic >= 6 else (alphabetic / 6.0)
+        return {'lang': lang, 'confidence': confidence, 'transcript': transcript[:500]}
+    except Exception as e:
+        print(f'[qc] whisper call failed: {type(e).__name__}: {e}', flush=True)
+        return {'lang': '', 'confidence': 0.0, 'transcript': '', 'skipped': f'whisper_error:{type(e).__name__}'}
+
+
+def _qc_vision_grid_and_subs(frame_urls, frame_labels):
+    """Single Claude Haiku Vision call that checks each attached frame for
+    (a) residual moderation-bypass grid lines / panel borders / tiling
+    artifacts and (b) burned-in subtitle text. Returns dict keyed by label
+    with {grid, subs, confidence} per frame."""
+    urls = [u for u in (frame_urls or []) if u]
+    if not urls:
+        return {'frames': {}, 'skipped': 'no_urls'}
+    label_list = '\n'.join(f'  • Кадр {i+1}: {lbl}' for i, lbl in enumerate(frame_labels))
+    sys = "You are a strict visual QC inspector. Output JSON only, no prose."
+    user = (
+        "Inspect the attached frames from a generated Pixar-style short-drama "
+        "video. For EACH frame answer two binary questions:\n\n"
+        "GRID — does the frame contain visible white grid lines, panel borders, "
+        "tiling artifacts, or compositing seams that span across the whole image "
+        "(typical residue when the moderation-bypass 'grid' mode failed to "
+        "fully de-tile)? Faint motion-blur lines, hair strands, or background "
+        "architecture grids are NOT this — only deliberate evenly-spaced "
+        "horizontal+vertical guides covering the frame.\n\n"
+        "SUBS — is there any burned-in subtitle / caption / dialog text "
+        "overlaid on the frame (typically white text near the bottom with "
+        "a dark stroke or background)? Diegetic text on signs, papers, "
+        "phone screens does NOT count.\n\n"
+        f"Frames in attached order:\n{label_list}\n\n"
+        "Output STRICT JSON:\n"
+        '{ "frames": [\n'
+        '  {"grid": true|false, "subs": true|false, "confidence": "low"|"med"|"high"},\n'
+        '  ...\n'
+        '] }\n'
+        "One object per frame in the same order they were attached."
+    )
+    try:
+        raw = claude_ask_vision(user, urls, system=sys, model='haiku', max_tokens=512)
+        # The model sometimes wraps JSON in ```json fences — strip if present.
+        raw = raw.strip()
+        if raw.startswith('```'):
+            raw = re.sub(r'^```(?:json)?\s*', '', raw)
+            raw = re.sub(r'\s*```\s*$', '', raw)
+        parsed = json.loads(raw)
+        frames_arr = parsed.get('frames') or []
+        out = {}
+        for i, lbl in enumerate(frame_labels):
+            if i < len(frames_arr):
+                f = frames_arr[i] or {}
+                out[lbl] = {
+                    'grid': bool(f.get('grid')),
+                    'subs': bool(f.get('subs')),
+                    'confidence': f.get('confidence', 'low'),
+                }
+            else:
+                out[lbl] = {'grid': False, 'subs': False, 'confidence': 'low'}
+        return {'frames': out}
+    except Exception as e:
+        print(f'[qc] vision QC call failed: {type(e).__name__}: {e}', flush=True)
+        return {'frames': {}, 'skipped': f'vision_error:{type(e).__name__}'}
+
+
+def _qc_check_prompt_english(prompt):
+    """Scan the composer-built prompt for non-English dialogue. We only care
+    about content INSIDE quoted spoken lines («"..."»), not the surrounding
+    Russian/English narration. Returns dict with list of offending lines."""
+    if not prompt:
+        return {'ok': True, 'non_english_lines': []}
+    offending = []
+    # Find quoted text spans. We use a non-greedy regex tolerating both
+    # ASCII " and curly-quote variants used by Claude.
+    for m in re.finditer(r'[\"«„]([^\"»“]{2,200}?)[\"»“]', prompt):
+        text = m.group(1).strip()
+        if not text:
+            continue
+        if _QC_NON_ENGLISH_RE.search(text):
+            offending.append(text[:120])
+    return {'ok': not offending, 'non_english_lines': offending[:5]}
+
+
+def _qc_run_chunk(sid, num, idx):
+    """Run all QC stages on a completed chunk. Persists result on chunk['qc'].
+    Returns the qc dict. Safe to call multiple times — stages are idempotent
+    and use the chunk's own scratch files (`_qc_*.png` / `_qc.mp3`)."""
+    ep = load_episode(sid, num)
+    if not ep:
+        return None
+    chunks = _seedance_chunks(ep)
+    chunk = next((c for c in chunks if c.get('idx') == idx), None)
+    if not chunk:
+        return None
+    if chunk.get('status') != 'completed':
+        return None
+    video_relpath = chunk.get('video_path')
+    if not video_relpath:
+        return None
+    prev_qc = chunk.get('qc') or {}
+    attempts = int(prev_qc.get('attempts') or 0)
+
+    details = {}
+    fails = []
+
+    # Stage 0 — prompt english check (cheap, no API)
+    p_res = _qc_check_prompt_english(chunk.get('prompt') or '')
+    details['prompt'] = p_res
+    if not p_res['ok']:
+        fails.append('prompt_non_english')
+
+    # Stage 1 — extract probe frames (frame@2s if duration > 2.5s, else mid; + lastframe)
+    duration_sec = float(chunk.get('duration') or chunk.get('durationSec') or 10)
+    probe_times = []
+    if duration_sec > 2.5:
+        probe_times.append((2.0, 'frame_2s'))
+    midpoint = max(1.0, duration_sec / 2.0)
+    probe_times.append((midpoint, 'frame_mid'))
+    last = _extract_last_frame(sid, video_relpath)
+    probe_assets = []  # list of (label, abs_path)
+    for sec, lbl in probe_times:
+        ex = _qc_extract_frame_at(sid, video_relpath, sec, lbl)
+        if ex:
+            probe_assets.append((lbl, ex[1]))
+    if last:
+        probe_assets.append(('lastframe', last[1]))
+
+    # Stage 2 — vision QC
+    if probe_assets:
+        avai_urls = []
+        used_labels = []
+        for lbl, abs_path in probe_assets:
+            try:
+                url = _avai_upload_local_image(abs_path)
+                avai_urls.append(url)
+                used_labels.append(lbl)
+            except Exception as e:
+                print(f'[qc] frame upload failed ({lbl}): {e}', flush=True)
+        if avai_urls:
+            v_res = _qc_vision_grid_and_subs(avai_urls, used_labels)
+            details['vision'] = v_res
+            for lbl, info in (v_res.get('frames') or {}).items():
+                if info.get('grid'):
+                    fails.append(f'grid:{lbl}')
+                if info.get('subs'):
+                    fails.append(f'subs:{lbl}')
+        else:
+            details['vision'] = {'skipped': 'no_uploads'}
+    else:
+        details['vision'] = {'skipped': 'no_frames'}
+
+    # Stage 3 — whisper lang
+    audio = _qc_extract_audio(sid, video_relpath)
+    if audio:
+        l_res = _qc_whisper_detect(audio)
+        details['lang'] = l_res
+        # Speech detected AND language not English AND confident enough → fail
+        if (l_res.get('lang') and l_res.get('lang') != 'en'
+                and (l_res.get('confidence') or 0) >= 0.5):
+            fails.append(f'lang:{l_res["lang"]}')
+    else:
+        details['lang'] = {'skipped': 'no_audio'}
+
+    new_attempts = attempts + 1
+    status = 'pass' if not fails else (
+        'retry_exhausted' if new_attempts >= QC_MAX_RETRIES else 'fail'
+    )
+
+    qc_entry = {
+        'status': status,
+        'attempts': new_attempts,
+        'fails': fails,
+        'details': details,
+        'last_check_at': int(time.time()),
+    }
+
+    # Persist (re-load to avoid clobbering parallel updates).
+    with _episode_lock(sid, num):
+        ep_fresh = load_episode(sid, num)
+        chunks_f = _seedance_chunks(ep_fresh)
+        chunk_f = next((c for c in chunks_f if c.get('idx') == idx), None)
+        if chunk_f:
+            chunk_f['qc'] = qc_entry
+            save_episode(sid, num, ep_fresh)
+
+    print(f'[qc] chunk {idx} → {status} (attempts={new_attempts}, fails={fails})', flush=True)
+    return qc_entry
+
+
+def _qc_can_pass(chunk):
+    """Helper for the auto-mode poll loop: returns True only when the chunk
+    is unambiguously usable downstream — status=completed AND qc=pass (or
+    QC disabled / not yet implemented for this chunk-shape)."""
+    if chunk.get('status') != 'completed':
+        return False
+    qc = chunk.get('qc') or {}
+    # No QC entry yet → not ready. Auto-mode should wait for QC to run.
+    if not qc:
+        return False
+    return qc.get('status') in ('pass', 'retry_exhausted')
+
+
+
     """Locations created before Seedance was added store only ref_images. Lazy-upload
     the first ref to AVAI to get a public URL, persist it on the loc."""
     if loc.get('avai_url'):
@@ -16787,7 +17332,45 @@ def seedance_poll(sid, num):
             changed = True
         if changed:
             save_episode(sid, num, ep)
-        return jsonify({'chunks': chunks})
+
+        # ── QC trigger: spawn background QC for each newly-completed chunk
+        #    that hasn't been checked yet. We snapshot the idx list under the
+        #    lock and dispatch threads AFTER releasing it so QC API calls
+        #    (Whisper, Vision, AVAI upload) don't block the lock.
+        qc_targets = []
+        for c in chunks:
+            if c.get('status') == 'completed' and c.get('video_path') and not c.get('qc'):
+                qc_targets.append(c.get('idx'))
+
+    # ── Out of lock — dispatch QC threads
+    if qc_targets:
+        avai_key = _get_user_avai_key() or ''
+        anthropic_key = ANTHROPIC_KEY
+        openai_key = OPENAI_KEY
+        def _qc_runner(target_idx):
+            # _qc_run_chunk reads OPENAI_KEY / AVAI key from module globals;
+            # `_spawn_with_keys` passes them through thread-local for AVAI.
+            try:
+                _qc_run_chunk(sid, num, target_idx)
+            except Exception as e:
+                print(f'[qc] background runner for chunk {target_idx} crashed: {e}', flush=True)
+        for tidx in qc_targets:
+            _spawn_with_keys(_qc_runner, tidx)
+    return jsonify({'chunks': chunks})
+
+
+@app.route('/api/series/<sid>/episodes/<int:num>/seedance/<int:idx>/qc', methods=['POST'])
+def seedance_qc(sid, num, idx):
+    """Manually trigger QC on a single chunk. Synchronous — returns the qc
+    dict so the caller can decide what to do (retry / accept). Used by the
+    UI «🔍 Re-check QC» button and by frontend auto-retry recovery flow."""
+    s = load_series(sid)
+    if not s:
+        return jsonify({'error': 'not found'}), 404
+    qc = _qc_run_chunk(sid, num, idx)
+    if qc is None:
+        return jsonify({'error': 'chunk not found or not completed'}), 400
+    return jsonify({'qc': qc})
 
 @app.route('/api/series/<sid>/episodes/<int:num>/seedance/<int:idx>', methods=['DELETE'])
 def seedance_delete(sid, num, idx):

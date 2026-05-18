@@ -1342,6 +1342,7 @@ async function importCreateSeries() {
     // generating realistic portraits before that prompt opened.
     const styleType = (document.getElementById('import-style-type')?.value || 'cinematic').trim();
     const styleCustomDesc = (document.getElementById('import-style-custom-desc')?.value || '').trim();
+    const writerModel = _selectedWriterModel('import-writer-model');
     let r;
     if (hasFiles) {
       // Multipart path — pre-upload files alongside the script.
@@ -1354,6 +1355,7 @@ async function importCreateSeries() {
       if (langHint) fd.append('dialogue_language_hint', langHint);
       fd.append('style_type', styleType);
       if (styleCustomDesc) fd.append('style_custom_description', styleCustomDesc);
+      fd.append('writer_model', writerModel);
       // Rename file to the user-edited name (preserving extension) so the
       // backend stem→name converter picks up edits made in the chip UI.
       const _renamed = (entry) => {
@@ -1372,6 +1374,7 @@ async function importCreateSeries() {
         extract_items:      extractItems,
         style_type: styleType,
         style_custom_description: styleCustomDesc,
+        writer_model: writerModel,
       };
       if (langHint) body.dialogue_language_hint = langHint;
       r = await api.post('/api/series/import-from-script', body);
@@ -2168,6 +2171,29 @@ function _renderImportBanner(st) {
   });
 }
 
+// Writer-model dropdown helper. Two chip-pickers exist:
+//   #writer-model-create   — in the «Create series» modal (drives ideas + initial fill)
+//   #writer-model-ep       — in the episode view (drives per-episode synopsis/script)
+// Returns 'claude-sonnet-4-5' or 'gpt-5.5'. Default = claude.
+const WRITER_MODELS = [
+  { id: 'claude-sonnet-4-5', label: 'Claude Sonnet 4.5', short: 'Claude' },
+  { id: 'gpt-5.5',           label: 'GPT-5.5',           short: 'GPT-5.5' },
+];
+function _selectedWriterModel(elementId) {
+  const el = document.getElementById(elementId);
+  if (!el) return 'claude-sonnet-4-5';
+  const v = (el.value || '').trim().toLowerCase();
+  return WRITER_MODELS.some(m => m.id === v) ? v : 'claude-sonnet-4-5';
+}
+function _renderWriterModelChip(elementId, defaultModel) {
+  const sel = document.getElementById(elementId);
+  if (!sel) return;
+  sel.innerHTML = WRITER_MODELS.map(m =>
+    `<option value="${m.id}">${m.short}</option>`
+  ).join('');
+  sel.value = (defaultModel && WRITER_MODELS.some(m => m.id === defaultModel)) ? defaultModel : 'claude-sonnet-4-5';
+}
+
 async function generateFromIdea() {
   const idea = val('series-idea-input');
   if (!idea) return alert('Опиши идею для сериала');
@@ -2178,8 +2204,9 @@ async function generateFromIdea() {
   status.textContent = '';
   try {
     const genres = getSelectedGenres();
+    const model = _selectedWriterModel('writer-model-create');
     const data = await trackTask('Сериал по идее', {}, () =>
-      api.post('/api/generate-series-from-idea', { idea, genres })
+      api.post('/api/generate-series-from-idea', { idea, genres, model })
     );
     fillSeriesForm(data);
     status.textContent = '✓ Поля заполнены — проверь и отредактируй если нужно';
@@ -2329,7 +2356,8 @@ async function generateSeriesIdeas() {
   list.classList.add('hidden');
   list.innerHTML = '';
   try {
-    const ideas = await api.post('/api/generate-series-ideas', { genres, avoid });
+    const model = _selectedWriterModel('writer-model-create');
+    const ideas = await api.post('/api/generate-series-ideas', { genres, avoid, model });
     list.innerHTML = ideas.map((idea, i) => `
       <div class="idea-card" onclick="pickSeriesIdea(${i})">
         <div class="idea-card-title">${esc(idea.title)}</div>
@@ -2382,6 +2410,7 @@ async function createSeries() {
       auto_generate_assets: autogen,
       batch_mode: false,
       batch_size: 1,
+      writer_model: _selectedWriterModel('writer-model-create'),
     });
     closeModal('modal-create-series');
     if (data?._scaffold?.prproj_warning) {
@@ -5960,7 +5989,7 @@ async function generateEpisodeSynopsisInline() {
     const ctx = { seriesId: S.seriesId, seriesTitle: S.series?.title, episodeNum: S.episode.number };
     const res = await trackTask(`Синопсис Эп. ${S.episode.number}`, ctx, () =>
       api.post(`/api/series/${S.seriesId}/generate-next-episode-synopsis`,
-               { episode_number: S.episode.number })
+               { episode_number: S.episode.number, model: _selectedWriterModel('writer-model-ep') })
     );
     if (res?.synopsis) {
       ta.value = res.synopsis;
@@ -5986,7 +6015,7 @@ async function generateNewEpSynopsis() {
   try {
     const ctx = { seriesId: S.seriesId, seriesTitle: S.series?.title, episodeNum: epNum || undefined };
     const res = await trackTask(`Синопсис${epNum ? ' Эп. ' + epNum : ''}`, ctx, () =>
-      api.post(`/api/series/${S.seriesId}/generate-next-episode-synopsis`, { episode_number: epNum })
+      api.post(`/api/series/${S.seriesId}/generate-next-episode-synopsis`, { episode_number: epNum, model: _selectedWriterModel('writer-model-ep') })
     );
     document.getElementById('new-ep-synopsis').value = res.synopsis || '';
     status.textContent = '✓ Готово';
@@ -6070,6 +6099,9 @@ async function loadEpisodeView() {
   if (typeof checkAutogenOnLoad === 'function') checkAutogenOnLoad();
 
   document.getElementById('ep-number-badge').textContent = chunkLabel(S.series, S.episodeNum, { short: true });
+  // Sync the per-episode writer-model chip to whatever the series saved as
+  // its default. User can still override per-click before they hit «Сгенерировать».
+  _renderWriterModelChip('writer-model-ep', S.series?.writer_model);
   renderEpisodeNeighbours();
   _epnEnsureRefresh();
   setVal('ep-title-input', S.episode.title);
@@ -8425,11 +8457,49 @@ async function startAutoMode() {
         _autoUpdateStatusUI();
         continue;
       }
-      AUTO.lastStatus = chunk.status === 'processing' && chunk.progress != null
-        ? `⏳ #${curIdx} ${chunk.progress}%`
-        : `⏳ #${curIdx} ${chunk.status}`;
+      const qcStatus = chunk.qc?.status || null;
+      if (chunk.status === 'completed' && qcStatus == null) {
+        AUTO.lastStatus = `🔍 #${curIdx} QC...`;
+      } else {
+        AUTO.lastStatus = chunk.status === 'processing' && chunk.progress != null
+          ? `⏳ #${curIdx} ${chunk.progress}%`
+          : `⏳ #${curIdx} ${chunk.status}${qcStatus ? ' · QC '+qcStatus : ''}`;
+      }
       _autoUpdateStatusUI();
-      if (chunk.status === 'completed') return { ok: true, chunk };
+      // QC gate: completed alone isn't enough — wait for qc.status='pass'
+      // (or 'retry_exhausted'; that means QC gave up and we accept as-is).
+      if (chunk.status === 'completed' && qcStatus === 'pass') {
+        return { ok: true, chunk };
+      }
+      if (chunk.status === 'completed' && qcStatus === 'retry_exhausted') {
+        showToast(`⚠ QC сдался на чанке #${curIdx} после ${chunk.qc?.attempts || '?'} попыток (${(chunk.qc?.fails || []).join(', ')}) — принимаем как есть`, 8000);
+        return { ok: true, chunk };
+      }
+      if (chunk.status === 'completed' && qcStatus === 'fail') {
+        // QC failed and we still have retry budget — trigger fresh start
+        // with the same prompt + a server-injected hint about what to fix.
+        AUTO.lastStatus = `🔁 #${curIdx} QC retry ${chunk.qc.attempts}/3 (${(chunk.qc.fails || []).slice(0, 2).join(',')})`;
+        _autoUpdateStatusUI();
+        const retryHint = _qcBuildPromptHint(chunk.qc.fails || []);
+        const restart = await api.post(
+          `/api/series/${epSid}/episodes/${epNumber}/seedance/start`,
+          {
+            prompt: (composeRes.prompt || chunk.prompt || '') + retryHint,
+            chunk_text: segText,
+            duration: segDuration || sharedOpts.duration, resolution: sharedOpts.resolution,
+            moderation_bypass: sharedOpts.moderation_bypass,
+            model: sharedOpts.model_tier,
+            refs: (composeRes.refs || []).map(r => ({
+              kind: r.kind, id: r.id, outfit: r.outfit || null, url: r.url || null,
+              source: r.source, prev_idx: r.prev_idx, name: r.name,
+              cut_index: r.cut_index, cut_time: r.cut_time,
+            })),
+          }
+        );
+        if (restart?.chunk?.idx != null) curIdx = restart.chunk.idx;
+        await sdRefreshList();
+        continue;
+      }
       if (chunk.status === 'failed') {
         if (AUTO.errorMode === 'heal' && healAttempts < sharedOpts.MAX_HEAL_RETRIES) {
           healAttempts++;
@@ -8872,10 +8942,44 @@ async function _runEpisodeAutoStandalone(sid, num, opts = {}) {
           continue;
         }
         firstMissingAt = 0;
-        R.lastStatus = chunk.status === 'processing' && chunk.progress != null
-          ? `⏳ #${curIdx} ${chunk.progress}%` : `⏳ #${curIdx} ${chunk.status}`;
+        const qcStatus2 = chunk.qc?.status || null;
+        if (chunk.status === 'completed' && qcStatus2 == null) {
+          R.lastStatus = `🔍 #${curIdx} QC...`;
+        } else {
+          R.lastStatus = chunk.status === 'processing' && chunk.progress != null
+            ? `⏳ #${curIdx} ${chunk.progress}%`
+            : `⏳ #${curIdx} ${chunk.status}${qcStatus2 ? ' · QC '+qcStatus2 : ''}`;
+        }
         _autoUpdateFloatingWidget();
-        if (chunk.status === 'completed') return { ok: true, chunk };
+        if (chunk.status === 'completed' && qcStatus2 === 'pass') return { ok: true, chunk };
+        if (chunk.status === 'completed' && qcStatus2 === 'retry_exhausted') {
+          showToast(`⚠ QC сдался на чанке #${curIdx} (${(chunk.qc?.fails || []).join(', ')})`, 6000);
+          return { ok: true, chunk };
+        }
+        if (chunk.status === 'completed' && qcStatus2 === 'fail') {
+          R.lastStatus = `🔁 #${curIdx} QC retry ${chunk.qc.attempts}/3`;
+          _autoUpdateFloatingWidget();
+          const hint = _qcBuildPromptHint(chunk.qc.fails || []);
+          try {
+            const restart = await api.post(`/api/series/${epSid}/episodes/${epNumber}/seedance/start`, {
+              prompt: (composeRes.prompt || chunk.prompt || '') + hint,
+              chunk_text: segText,
+              duration: segDuration || shared.duration,
+              resolution: shared.resolution,
+              moderation_bypass: shared.moderation_bypass,
+              model: shared.model_tier,
+              refs: (composeRes.refs || []).map(r => ({
+                kind: r.kind, id: r.id, outfit: r.outfit || null, url: r.url || null,
+                source: r.source, prev_idx: r.prev_idx, name: r.name,
+                cut_index: r.cut_index, cut_time: r.cut_time,
+              })),
+            });
+            if (restart?.chunk?.idx != null) curIdx = restart.chunk.idx;
+            continue;
+          } catch (e) {
+            return { ok: false, error: 'qc-retry-failed: ' + (e?.message || e) };
+          }
+        }
         if (chunk.status === 'failed') {
           if (R.errorMode === 'heal' && healAttempts < MAX_HEAL_RETRIES) {
             healAttempts++;
@@ -9561,7 +9665,9 @@ async function generateEpisodeScript() {
   try {
     await saveEpisodeSilent();
     const res = await trackTask('Сценарий эпизода', taskCtx, () =>
-      api.post(`/api/series/${S.seriesId}/episodes/${S.episodeNum}/generate-script`, {})
+      api.post(`/api/series/${S.seriesId}/episodes/${S.episodeNum}/generate-script`, {
+        model: _selectedWriterModel('writer-model-ep'),
+      })
     );
     setVal('ep-script', res.script);
     S.episode.script = res.script;
@@ -14004,6 +14110,7 @@ function _sdCardHTML(c, labelInfo) {
       </div>
       ${c.error && c.status !== 'completed' ? `<div class="sd-card-err" title="${esc(c.error)}">${esc(c.error)}</div>` : ''}
       ${c.continuity_reset_reason ? `<div class="sd-card-warn" title="${esc(c.continuity_reset_reason)}" style="background:rgba(251,191,36,0.12);border:1px solid rgba(251,191,36,0.4);border-radius:4px;padding:3px 6px;margin-top:3px;color:#fbbf24;font-size:0.74rem">⚠ континьюити сброшен</div>` : ''}
+      ${_qcBadgeHTML(c)}
     </div>
     <div class="sd-gen-actions">
       ${videoUrl ? `<a class="btn-ghost btn-sm" href="${videoUrl}" download onclick="event.stopPropagation()">⬇ Скачать</a>` : '<span></span>'}
@@ -14699,17 +14806,144 @@ async function sdPollOnce() {
     const chunks = res.chunks || [];
     _sdNotifyTransitions(chunks);  // beep + toast on completed/failed transitions
     sdRenderList(chunks);
+    // Manual-mode auto-retry: if any chunk has qc.status='fail' AND retry
+    // budget left, fire a fresh start with QC-feedback hint appended. Skipped
+    // when AUTO mode is running — auto-mode handles its own QC retry loop.
+    if (!AUTO.active) {
+      _qcAutoRetryManualMode(chunks).catch(e =>
+        console.warn('[qc] manual auto-retry failed:', e));
+    }
     return chunks;
   } catch (e) { return null; }
+}
+
+// Visual badge for a chunk card summarizing QC status. Returns '' for non-
+// completed chunks (status badge already shown elsewhere). Colour codes:
+//   gray   — QC pending (server bg run not finished yet)
+//   green  — pass
+//   yellow — retrying (fail with attempts<3)
+//   red    — retry_exhausted (gave up, accepted as-is)
+function _qcBadgeHTML(c) {
+  if (c.status !== 'completed') return '';
+  const qc = c.qc;
+  if (!qc) {
+    return '<div class="sd-card-qc" style="background:rgba(120,120,120,0.18);border:1px solid rgba(120,120,120,0.35);border-radius:4px;padding:3px 6px;margin-top:3px;color:#aaa;font-size:0.74rem">🔍 QC...</div>';
+  }
+  const fails = qc.fails || [];
+  if (qc.status === 'pass') {
+    return '<div class="sd-card-qc" style="background:rgba(34,197,94,0.10);border:1px solid rgba(34,197,94,0.35);border-radius:4px;padding:3px 6px;margin-top:3px;color:#22c55e;font-size:0.74rem">✓ QC pass</div>';
+  }
+  if (qc.status === 'retry_exhausted') {
+    return `<div class="sd-card-qc" style="background:rgba(239,68,68,0.10);border:1px solid rgba(239,68,68,0.40);border-radius:4px;padding:3px 6px;margin-top:3px;color:#ef4444;font-size:0.74rem" title="${esc(fails.join(', '))}">⛔ QC ${qc.attempts}/3 exhausted (${esc(fails.slice(0, 2).join(', '))})</div>`;
+  }
+  if (qc.status === 'fail') {
+    return `<div class="sd-card-qc" style="background:rgba(251,191,36,0.10);border:1px solid rgba(251,191,36,0.40);border-radius:4px;padding:3px 6px;margin-top:3px;color:#fbbf24;font-size:0.74rem" title="${esc(fails.join(', '))}">🔁 QC retry ${qc.attempts}/3 (${esc(fails.slice(0, 2).join(', '))})</div>`;
+  }
+  return '';
+}
+
+// Build a short hint to append to the prompt when retrying a chunk whose
+// QC failed. Each failure type gets a targeted instruction so the next
+// generation has the best chance of passing. Shared between auto-mode and
+// manual-mode retries.
+function _qcBuildPromptHint(fails) {
+  if (!fails || !fails.length) return '';
+  const bits = [];
+  if (fails.some(f => f === 'prompt_non_english' || f.startsWith('lang:'))) {
+    bits.push(
+      'ALL spoken dialogue MUST be performed in clear standard American '
+      + 'English (General American accent). No Russian, no other language. '
+      + 'Translate any non-English lines from the prompt into natural English '
+      + 'before vocalizing.'
+    );
+  }
+  if (fails.some(f => f.startsWith('grid:'))) {
+    bits.push(
+      'Final output MUST be a single continuous full-frame composition. '
+      + 'NO visible grid lines, NO cell borders, NO tiling artifacts, NO '
+      + 'panel separators, NO visible seams between regions. Any internal '
+      + 'moderation-bypass grid must be fully removed from the rendered output.'
+    );
+  }
+  if (fails.some(f => f.startsWith('subs:'))) {
+    bits.push(
+      'NO subtitles, NO captions, NO burned-in text overlay anywhere in '
+      + 'the frame. Speech is delivered as audio only — there are no visible '
+      + 'subtitles on the bottom of the screen or anywhere else.'
+    );
+  }
+  if (!bits.length) return '';
+  return '\n\n[QC RETRY HINTS — previous take failed on: ' + fails.join(', ') + ']\n'
+    + bits.map(b => '• ' + b).join('\n');
+}
+
+// In-flight set guards against duplicate retry posts when poll ticks fire
+// faster than a retry can complete. Keyed by `${epNumber}#${chunkIdx}`.
+const _QC_RETRY_INFLIGHT = new Set();
+
+async function _qcAutoRetryManualMode(chunks) {
+  if (!chunks || !chunks.length) return;
+  for (const c of chunks) {
+    if (c.status !== 'completed') continue;
+    const qc = c.qc;
+    if (!qc || qc.status !== 'fail') continue;
+    if ((qc.attempts || 0) >= 3) continue;   // retry_exhausted already returned by server
+    const key = `${S.episode.number}#${c.idx}`;
+    if (_QC_RETRY_INFLIGHT.has(key)) continue;
+    _QC_RETRY_INFLIGHT.add(key);
+    try {
+      const hint = _qcBuildPromptHint(qc.fails || []);
+      const prompt = (c.prompt || '') + hint;
+      showToast(`🔁 QC retry #${c.idx} (${(qc.fails || []).slice(0, 2).join(', ')}) — попытка ${qc.attempts}/3`, 5000);
+      await api.post(
+        `/api/series/${S.seriesId}/episodes/${S.episode.number}/seedance/start`,
+        {
+          prompt,
+          chunk_text: c.chunk_text,
+          duration: c.duration || c.durationSec || 15,
+          resolution: c.resolution || '480p',
+          moderation_bypass: c.moderation_bypass || 'collage_grid',
+          model: c.model || 'reference-fast',
+          refs: (c.refs || []).map(r => ({
+            kind: r.kind, id: r.id, outfit: r.outfit || null, url: r.url || null,
+            source: r.source, prev_idx: r.prev_idx, name: r.name,
+            cut_index: r.cut_index, cut_time: r.cut_time,
+          })),
+        }
+      );
+    } catch (e) {
+      console.warn(`[qc] manual retry post for chunk ${c.idx} failed:`, e);
+    } finally {
+      // Hold the inflight flag for 10s so a single failed POST doesn't
+      // immediately reattempt on the next 8s poll tick.
+      setTimeout(() => _QC_RETRY_INFLIGHT.delete(key), 10_000);
+    }
+  }
 }
 
 function sdEnsurePoll() {
   if (SD.pollTimer) return;
   const tick = async () => {
     const chunks = await sdPollOnce();
-    const anyPending = (chunks || []).some(c => c.status !== 'completed' && c.status !== 'failed');
+    // «pending» = generation not final OR QC still running / mid-retry.
+    // We keep polling so background QC + auto-retry are visible to the UI.
+    const anyPending = (chunks || []).some(c => {
+      if (c.status !== 'completed' && c.status !== 'failed') return true;
+      if (c.status !== 'completed') return false;
+      const qs = c.qc?.status;
+      // No qc entry yet → QC hasn't run; we expect a server-side bg run.
+      // qc.status='fail' → manual-mode retry will be triggered.
+      // qc.status='pass'/'retry_exhausted' → terminal, can stop polling.
+      return qs == null || qs === 'fail';
+    });
     const st = document.getElementById('sd-poll-status');
-    if (st) st.textContent = anyPending ? '⏳ ждём генерации...' : '';
+    if (st) {
+      st.textContent = anyPending
+        ? ((chunks || []).some(c => c.status === 'completed' && (c.qc?.status == null || c.qc?.status === 'fail'))
+            ? '🔍 QC + ретраи...'
+            : '⏳ ждём генерации...')
+        : '';
+    }
     if (!anyPending) {
       clearInterval(SD.pollTimer);
       SD.pollTimer = null;
