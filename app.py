@@ -3844,6 +3844,16 @@ def generate_script_batch(sid):
         scene_clause = f"МАКСИМУМ {max_scenes} сцены — не больше."
     hard_caps_block = (
         "\n=== ЖЁСТКИЕ ЛИМИТЫ (обязательные, проверяй САМ перед выводом) ===\n"
+        "0. 🚨 ЛОКАЦИЯ — ПРАВИЛО №1, СТРОЖАЙШЕЕ:\n"
+        "   ПОСЛЕ строки «Кратко: ...» ПЕРВАЯ строка серии = ЗАГОЛОВОК СЦЕНЫ С ЛОКАЦИЕЙ.\n"
+        "   НЕ диалог. НЕ действие. СНАЧАЛА ЛОКАЦИЯ.\n"
+        "   Формат: ИНТА. ENGLISH LOCATION NAME — ВРЕМЯ\n"
+        "   Примеры: ИНТА. STORAGE UNIT — ДЕНЬ / ИНТА. PROSECUTOR'S OFFICE — УТРО / ИНТА. PRISON VISITING ROOM — ДЕНЬ\n"
+        "   ❌ ЗАПРЕЩЕНО начинать серию так: 'SOPHIE: There's one more box.' (диалог без локации)\n"
+        "   ❌ ЗАПРЕЩЕНО начинать серию так: 'Sophie открывает коробку.' (действие без локации)\n"
+        "   ✅ ПРАВИЛЬНО: 'ИНТА. STORAGE UNIT — ДЕНЬ\\nSophie открывает коробку.'\n"
+        "   Это правило применяется к КАЖДОЙ серии, даже если она продолжает ту же локацию.\n"
+        "   Русские названия локаций в заголовках ЗАПРЕЩЕНЫ (не КАБИНЕТ — пиши FATHER'S STUDY).\n\n"
         f"1. РЕПЛИКИ: ровно {eff_lines} (±2). Реплика = одна строка диалога ИЛИ закадровый VO ИЛИ короткое действие (action line). "
         f"VOICEOVER считается как обычная реплика — он жрёт хронометраж так же. Если насчитал больше {eff_lines + 2} — режь беспощадно (включая VO). "
         "НЕ ВЫХОДИ за лимит «у меня важная сцена не помещается» — значит сцена слишком жирная, упрощай.\n"
@@ -3904,10 +3914,12 @@ def generate_script_batch(sid):
         + "ФОРМАТ ВЫХОДА — СТРОГО:\n"
         + f"Episode {first_new_num}: <короткое название серии>\n"
         + f"Кратко: <1-2 предложения о чём серия>\n"
+        + f"ИНТА. LOCATION NAME — ВРЕМЯ  ← ОБЯЗАТЕЛЬНО, первая строка до любого диалога/действия\n"
         + f"<реплики и действия персонажей — диалог, action lines>\n"
         + "\n"
         + f"Episode {first_new_num + 1}: <название>\n"
         + f"Кратко: <синопсис>\n"
+        + f"ИНТА. LOCATION NAME — ВРЕМЯ  ← обязательно каждый раз\n"
         + f"<содержимое>\n"
         + "\n"
         + f"... и так далее до Episode {last_new_num}.\n\n"
@@ -8899,15 +8911,35 @@ def rollback_canon_for_episode(sid, num):
 
 _SCRIPT_SYSTEM = """You are a professional screenwriter for short-form drama series (TikTok/Reels).
 
+🚨 LOCATION — RULE #1 — HARDEST RULE IN THIS ENTIRE PROMPT:
+
+THE VERY FIRST LINE AFTER THE CAST BLOCK MUST BE A SCENE HEADING.
+NOT dialogue. NOT action. NOT a character name. A SCENE HEADING.
+
+Correct format (mandatory):
+    ИНТА. STORAGE UNIT — ДЕНЬ
+    [Sophie открывает коробку.]
+    SOPHIE: There's something in here.
+
+Wrong (FORBIDDEN — this is a generation failure):
+    Sophie: There's something in here.   ← starts with dialogue, NO SCENE HEADING = FAIL
+    Sophie открывает коробку.            ← starts with action, NO SCENE HEADING = FAIL
+
+Rules for the scene heading:
+- Location name MUST be in ENGLISH (e.g. FATHER'S STUDY, DETECTIVE'S OFFICE, STORAGE UNIT, COURTROOM)
+- FORBIDDEN Russian location names: КАБИНЕТ, СКЛАД, ЗАЛ СУДА, ОФИС, ГОСТИНАЯ, etc. — always translate to English
+- Format: ИНТА. ENGLISH LOCATION NAME — ВРЕМЯ
+- Even if the scene CONTINUES from the same location as the previous episode — write the heading again
+- Every new scene within the episode also gets its own heading
+
 LANGUAGE RULES — NON-NEGOTIABLE:
 - DIALOGUE: English only — all spoken lines must be in English
 - ACTION LINES: Russian — описания действий, ремарки пиши на русском
-- SCENE HEADINGS: location PART of the heading must be in ENGLISH (e.g. "ИНТА. HOTEL ROOM — УТРО", "ИНТА. BASE HQ OFFICE — УТРО"). Time-of-day and INT/EXT can stay Russian, but the location name itself is ENGLISH always — no "ГОСТИНИЧНЫЙ НОМЕР", no "ШТАБ БАЗЫ".
+- SCENE HEADINGS: ИНТА. ENGLISH LOCATION — ВРЕМЯ (location MUST be in English — no Cyrillic)
 - EPISODE NOTES: Russian
 - Character names in dialogue cues: ALL CAPS, exact spelling as given — never translate names
-- Any new location you introduce in the cast block or in scene headings MUST be named in English. Russian/Cyrillic location names are FORBIDDEN.
 - Example of correct format:
-    ИНТА. РЕСТОРАН — НОЧЬ
+    ИНТА. RESTAURANT — НОЧЬ
     [Виктория входит, не снимая пальто. Кладёт папку на стол между ними.]
     VICTORIA: You signed the contract. Every word of it.
     MARCUS: (тихо) That was before I knew—
@@ -9248,6 +9280,15 @@ Total chunk length: {N} × ~60 sec = ~{TOTAL} seconds of finished video.
 Total spoken word budget: ~{TOTAL_WORDS} English words (range {WMIN}–{WMAX}).
 Total locations: 2–4 (NEVER more — use them across the whole chunk).
 Total speaking characters: 3–6.
+
+═══════════════════════════════════════
+🚨 LOCATION RULE — HARDEST RULE IN THIS PROMPT
+═══════════════════════════════════════
+THE VERY FIRST LINE OF EVERY SUB-EPISODE AND EVERY NEW SCENE = SCENE HEADING. NOT dialogue. NOT action.
+Format: ИНТА. ENGLISH LOCATION NAME — ВРЕМЯ
+Location name MUST be in English (e.g. STORAGE UNIT, FATHER'S STUDY, COURTROOM, DETECTIVE'S OFFICE).
+Russian location names (КАБИНЕТ, СКЛАД, ЗАЛ СУДА etc.) are FORBIDDEN in headings.
+Starting with dialogue or action WITHOUT a scene heading = GENERATION FAILURE.
 
 ═══════════════════════════════════════
 LANGUAGE RULES — NON-NEGOTIABLE
@@ -13462,7 +13503,7 @@ def _scene_wav_path(sid, num, scene_idx):
     return _episode_music_dir(sid) / f'ep{int(num):03d}_sc{int(scene_idx)}.wav'
 
 
-def _generate_scene_music_worker(sid, num, scene_idx, user_hint, force, attempts_max=3):
+def _generate_scene_music_worker(sid, num, scene_idx, user_hint, force, attempts_max=3, target_duration_ms_override=None):
     """Pipeline for ONE scene. Runs in a daemon thread (spawn via _spawn_with_keys).
     Idempotent unless `force=True`: skip if status already 'completed'."""
     try:
@@ -13496,11 +13537,19 @@ def _generate_scene_music_worker(sid, num, scene_idx, user_hint, force, attempts
 
         groups = _group_chunks_by_scene(_seedance_chunks(ep))
         grp = next((g for g in groups if g['sceneIdx'] == int(scene_idx)), None)
-        if not grp:
+
+        if grp:
+            target_sec = max(5.0, grp['total_sec'] * 0.9)
+            target_ms = int(round(target_sec * 1000))
+            chunk_texts = [c.get('chunk_text') or '' for c in grp['chunks']]
+        elif target_duration_ms_override:
+            # Early-fire path: music kicked before video generation starts.
+            # Duration comes from the script-based duration estimate on the client.
+            target_ms = int(target_duration_ms_override)
+            chunk_texts = []  # no video chunks yet; script context is still used below
+        else:
             raise RuntimeError(f'no completed chunks for sceneIdx={scene_idx}')
 
-        target_sec = max(5.0, grp['total_sec'] * 0.9)
-        target_ms = int(round(target_sec * 1000))
         # ElevenLabs hard bound: sections in [8s, 18s] each, 4..6 sections → 32s..108s
         target_ms = max(32_000, min(target_ms, 110_000))
 
@@ -13509,7 +13558,6 @@ def _generate_scene_music_worker(sid, num, scene_idx, user_hint, force, attempts
         scene_text = scene_blocks[int(scene_idx)] if 0 <= int(scene_idx) < len(scene_blocks) else (ep.get('script') or '')
         prev_tail = scene_blocks[int(scene_idx) - 1][-400:] if int(scene_idx) - 1 >= 0 and int(scene_idx) - 1 < len(scene_blocks) else ''
         next_head = scene_blocks[int(scene_idx) + 1][:400] if int(scene_idx) + 1 < len(scene_blocks) else ''
-        chunk_texts = [c.get('chunk_text') or '' for c in grp['chunks']]
         episode_blocking = (ep.get('batch_episode_blocking') or ep.get('scene_blocking') or '')
 
         ffmpeg_bin = shutil.which('ffmpeg')
@@ -13621,11 +13669,17 @@ def _generate_scene_music_worker(sid, num, scene_idx, user_hint, force, attempts
             pass
 
 
-def _kick_music_generation(sid, num, scene_indices, user_hint, force):
+def _kick_music_generation(sid, num, scene_indices, user_hint, force, scenes_plan=None):
     """Spawn one worker per scene index. Workers are independent (ElevenLabs
     handles concurrency fine for low-N parallelism, and Claude has its own
     retry/backoff). Returns the list of (sceneIdx, status_after_spawn) for
-    immediate response to the client."""
+    immediate response to the client.
+
+    scenes_plan: optional dict {sceneIdx (int) → target_duration_ms (int)}.
+    When provided, passed to the worker so it can generate music even before
+    video chunks exist (early-fire mode — music starts while videos are rendering).
+    """
+    scenes_plan = scenes_plan or {}
     started = []
     with _episode_lock(sid, num):
         ep = load_episode(sid, num)
@@ -13646,10 +13700,13 @@ def _kick_music_generation(sid, num, scene_indices, user_hint, force):
 
     for entry in started:
         if entry['status'] == 'pending':
+            si = int(entry['sceneIdx'])
+            override_ms = scenes_plan.get(si)
             _spawn_with_keys(
                 _generate_scene_music_worker,
-                sid, int(num), int(entry['sceneIdx']),
+                sid, int(num), si,
                 user_hint or '', bool(force),
+                target_duration_ms_override=override_ms,
             )
     return started
 
@@ -13677,13 +13734,28 @@ def music_generate(sid, num):
             save_episode(sid, num, ep_fresh)
             ep = ep_fresh
 
+    # Optional early-fire plan: [{sceneIdx, target_duration_ms}] — sent by the
+    # frontend right after the script is segmented, before any video chunk exists.
+    scenes_plan_raw = body.get('scenes_plan') or []
+    scenes_plan = {}
+    for sp in scenes_plan_raw:
+        try:
+            scenes_plan[int(sp['sceneIdx'])] = int(sp['target_duration_ms'])
+        except (KeyError, TypeError, ValueError):
+            pass
+
     groups = _group_chunks_by_scene(_seedance_chunks(ep))
-    if not groups:
+    if groups:
+        all_indices = [g['sceneIdx'] for g in groups]
+    elif scenes_plan:
+        # Early-fire: no video chunks yet, but client sent a duration plan.
+        all_indices = sorted(scenes_plan.keys())
+    else:
         return jsonify({
             'error': 'нет готовых чанков со сценами для генерации музыки. '
                      'Запусти сначала видео-генерацию (она проставит sceneIdx).',
         }), 400
-    all_indices = [g['sceneIdx'] for g in groups]
+
     if isinstance(requested, list) and requested:
         try:
             scene_indices = [int(x) for x in requested if int(x) in all_indices]
@@ -13692,7 +13764,7 @@ def music_generate(sid, num):
     else:
         scene_indices = all_indices
 
-    started = _kick_music_generation(sid, num, scene_indices, user_hint, force)
+    started = _kick_music_generation(sid, num, scene_indices, user_hint, force, scenes_plan=scenes_plan)
     return jsonify({'ok': True, 'scenes': started, 'total_scenes': len(all_indices)})
 
 

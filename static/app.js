@@ -7432,11 +7432,34 @@ function sendSegmentToSeedance(segText) {
     return;
   }
   ta.value = segText;
-  // Trigger any onchange/oninput hooks listening on the textarea
+  // FORCE the duration slider to the chunk's chrono — no override-respect
+  // logic, no listener round-trip. Clicking "В Сиданс" on a chunk is an
+  // explicit intent to use that chunk's chrono; wipe any prior state.
+  const durEl  = document.getElementById('sd-duration');
+  const durVal = document.getElementById('sd-duration-val');
+  let recDur = null;
+  if (durEl) {
+    try {
+      recDur = _estimateChunkDurationSec(segText);
+    } catch (e) {
+      console.warn('chunk duration estimate failed', e);
+    }
+    if (recDur != null && Number.isFinite(recDur) && recDur > 0) {
+      durEl.value = String(recDur);
+      durEl.dataset.autoVal = String(recDur);
+      if (durVal) durVal.textContent = recDur + 'с';
+      durEl.dispatchEvent(new Event('input',  { bubbles: true }));
+      durEl.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+  }
+  // Notify textarea listeners (auto-resize, prefs save, etc.) AFTER the slider
+  // is already locked in — so listener-driven auto-set logic can't overwrite
+  // our explicit value.
   ta.dispatchEvent(new Event('input', { bubbles: true }));
   document.getElementById('seedance-panel')?.scrollIntoView({behavior:'smooth', block:'start'});
   setTimeout(() => ta.focus(), 350);
-  showToast('✓ Сегмент отправлен в Сиданс — нажми "⚙ Скомпоновать (LLM)"', 4000);
+  const durMsg = recDur != null ? ` (⏱ ${recDur}с)` : '';
+  showToast('✓ Сегмент отправлен в Сиданс' + durMsg + ' — нажми "⚙ Скомпоновать (LLM)"', 4000);
 }
 
 // Internal: gather plain text for the Nth segment of the Mth scene.
@@ -8529,6 +8552,31 @@ async function startAutoMode() {
           showToast(`⚠ batch: не все сегменты в ответе (${batchRes.unresolved_anchors.length}). Откатимся на per-chunk compose для них.`, 6000);
         }
         showToast(`🧠 batch готов · ${Object.keys(batchPrompts).length}/${AUTO.segments.length} сегментов`, 4000);
+
+        // ── Early-fire music (turbo mode) ──────────────────────────────────
+        // batch-compose just ran: we have sceneIdx + durationSec for every
+        // segment. Fire music now — in parallel with the upcoming /start calls.
+        // Backend is idempotent: if music already generated it will be skipped.
+        const musicEnabled = S.series?.settings?.enable_music !== false;
+        if (musicEnabled) {
+          // Build scene plan: group AUTO.segments by sceneIdx, sum durations.
+          const planMap = new Map();
+          for (const s of AUTO.segments) {
+            const k = s.sceneIdx ?? 0;
+            planMap.set(k, (planMap.get(k) || 0) + (s.durationSec || 15));
+          }
+          const scenesPlan = [...planMap.entries()].map(([sceneIdx, totalSec]) => ({
+            sceneIdx,
+            target_duration_ms: Math.round(totalSec * 0.9 * 1000),
+          }));
+          api.post(
+            `/api/series/${epSid}/episodes/${epNumber}/music/generate`,
+            { scenes_plan: scenesPlan }
+          ).then(r => {
+            if (r?.ok) showToast(`🎵 Музыка запущена — ${r.scenes?.length || 0} сцен (параллельно с видео)`, 4000);
+          }).catch(() => {});
+        }
+        // ───────────────────────────────────────────────────────────────────
       } catch (e) {
         showToast(`⚠ batch-compose упал — использую per-chunk: ${e.message || e}`, 6000);
         batchPrompts = null;
@@ -8747,6 +8795,29 @@ async function _runEpisodeAutoStandalone(sid, num, opts = {}) {
       }
       return [...m.values()];
     })();
+
+    // ── Early-fire music ────────────────────────────────────────────────────
+    // We have the full scene structure with duration estimates right now —
+    // before any video is generated. Fire music generation immediately so it
+    // runs in parallel with video rendering (saves 30-60+ minutes of waiting).
+    if (opts.enableMusic !== false) {
+      const scenesPlan = sceneGroups.map(grp => ({
+        sceneIdx: grp[0].sceneIdx,
+        // sum of all segment durations × 0.9 headroom, in ms
+        target_duration_ms: Math.round(
+          grp.reduce((acc, s) => acc + (s.durationSec || 15), 0) * 0.9 * 1000
+        ),
+      }));
+      api.post(
+        `/api/series/${epSid}/episodes/${epNumber}/music/generate`,
+        { scenes_plan: scenesPlan }
+      ).then(r => {
+        if (r?.ok) clog('INFO', 'parallel.music_early', { ep: epNumber, scenes: r.scenes?.length || 0 });
+      }).catch(e => {
+        clog('WARN', 'parallel.music_early_fail', { ep: epNumber, err: (e?.message || String(e)).slice(0, 200) });
+      });
+    }
+    // ────────────────────────────────────────────────────────────────────────
 
     const POLL_INTERVAL_MS = 8000;
     const MAX_HEAL_RETRIES = 1;
@@ -9143,6 +9214,11 @@ async function startRangeGen() {
           model_tier: document.getElementById('sd-model-tier')?.value || 'reference-fast',
           errorMode: 'heal',
           maxParallelScenes: 2,
+          // Pass enable_music so music fires immediately after script segmentation,
+          // in parallel with video generation (not waiting for videos to finish).
+          enableMusic: (S.series?.id === RANGE.seriesId)
+            ? (S.series?.settings?.enable_music !== false)
+            : true,
         });
       }
 

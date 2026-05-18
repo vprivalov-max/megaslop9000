@@ -57,20 +57,66 @@ percussion. NOT trap. NOT pop. NOT EDM.
 
 STEP 1 — MUSIC STRATEGY (think first, write JSON second):
   Decide:
-    - SUB-GENRE within film-score family. Pick ONE primary family from:
-        * Neo-classical piano-driven score — felt piano motifs, soft
-          string pad, intimate chamber feel.
-        * Hybrid orchestral thriller — large strings, taiko / hybrid
-          drums, brass swells, electronic bass pulse.
+    - SUB-GENRE within film-score family. READ THE SCENE MOOD FIRST,
+      then pick the sub-genre that fits. Do NOT default to thriller.
+      Available sub-genres — choose based on scene emotion:
+
+      TENSION / CONFRONTATION / CHASE / ACTION:
+        * Hybrid orchestral thriller — large strings, taiko / epic hybrid
+          drums, brass stabs, electronic bass pulse, aggressive ostinato.
+        * Tense orchestral action score — driving brass, full hybrid
+          percussion ensemble, tremolo strings, urgent rhythmic figure.
+        * Dark chamber thriller — solo cello or bass clarinet, col legno
+          strings, sparse unpitched percussion, angular dissonance.
+
+      ROMANCE / LONGING / TENDER MOMENT / REUNION:
+        * Neo-classical piano romance — grand or felt piano legato melody,
+          warm cello countermelody, soft string pad, harp shimmer.
+        * Lyrical string score — expressive violin solo cantabile, lush
+          string orchestra, gentle harmonic motion, no percussion.
+        * Chamber intimacy score — piano trio (piano + violin + cello),
+          delicate texture, rubato feel, intimate hall reverb.
+
+      MYSTERY / SUSPENSE / SLOW REVEAL / DREAD:
+        * Minimalist suspense score — low string ostinato, sparse piano
+          tones, long silences filled with harmonic tension, no melody.
         * Dark electronic score with orchestral layers — sparse analog
-          synths + real strings, NO trap drums.
-        * Chamber-score intimate drama — solo cello / piano / sustained
-          strings, no percussion.
-        * Minimalist string score — repeating patterns, ostinato strings,
-          subtle harmonic shifts.
-        * Period-orchestral noir — full strings, French horn, harp,
-          muted piano.
-      AVOID: cinematic trap, pop-cinematic, R&B-noir, EDM hybrid.
+          synths + real strings, prepared piano clusters, sub-bass pulse,
+          NO trap drums.
+        * Period-orchestral noir — muted strings, French horn low register,
+          harp harmonics, muted piano, walking bass figure.
+
+      TRIUMPH / HOPE / EMOTIONAL PEAK / RESOLUTION:
+        * Sweeping orchestral drama — full string orchestra, choir swells,
+          brass fanfare, timpani rolls, triumphant major-key resolution.
+        * Epic hybrid score — large brass ensemble, massive hybrid
+          percussion, choir, synthetic texture layers, cinematic swell.
+
+      MELANCHOLY / GRIEF / LOSS / REFLECTION:
+        * Minimal piano elegy — solo piano, few notes, long silences,
+          sparse cello or violin comment, no percussion.
+        * Orchestral elegy — sustained strings pppp, solo oboe or cor
+          anglais melody, harp accents, grief-laden minor key.
+        * Chamber string lament — string quartet, sul tasto tone,
+          sorrow arc across the section, barely any movement.
+
+      COMEDY / LIGHTNESS / PLAYFUL / RELIEF:
+        * Whimsical orchestral score — pizzicato strings, light woodwind
+          melody (flute / clarinet), staccato brass comic punctuation,
+          bright major key, light percussion (triangle, wood block).
+        * Neo-baroque playful score — harpsichord or celesta lead,
+          busy string runs, comic timing hits, bouncy rhythm.
+
+      NEUTRAL / TRANSITION / DIALOGUE / EXPOSITION:
+        * Minimalist string score — slow repeating ostinato strings,
+          subtle harmonic shifts, background pulse, no strong lead.
+        * Warm orchestral underscore — gentle string pad, soft piano
+          arpeggio, harp fill, background presence only.
+
+      AVOID ALWAYS: cinematic trap, pop-cinematic, R&B-noir, EDM hybrid.
+      IMPORTANT: vary your choice. Different scenes in the SAME episode
+      SHOULD use DIFFERENT sub-genres — match the emotional beat of THIS
+      specific scene, not the overall series tone.
     - TEMPO (BPM) — usually 60–110 for drama; 110–140 only for chases.
       Meter 4/4 default, 3/4 for waltz / lullaby, 6/8 for flowing tension.
     - KEY — minor keys for drama (D minor / F# minor / A minor / C minor
@@ -82,9 +128,14 @@ STEP 1 — MUSIC STRATEGY (think first, write JSON second):
       Synths allowed as TEXTURE / ambient pad, NOT as the lead hook.
     - RHYTHMIC FOUNDATION — orchestral / hybrid percussion:
       pizzicato strings ostinato, timpani, low-string pulse, taiko hits,
-      epic hybrid drums (Zimmer-style), heartbeat kick, brushed snare,
-      bowed bass tremolo. NEVER trap hi-hats, NEVER 808 bass, NEVER
-      modern hip-hop drum kit.
+      epic hybrid drums, heartbeat kick, brushed snare, bowed bass tremolo,
+      orchestral snare roll, hybrid percussion ensemble, frame drums,
+      cinematic hybrid kit. Use real drums whenever the scene calls for
+      tension, action, or urgency — DO NOT omit percussion by default.
+      NEVER trap hi-hats, NEVER 808 bass, NEVER modern hip-hop drum kit.
+      Use PERCUSSION when the scene has: confrontation, chase, action,
+      revelation/shock, emotional climax. Chamber/intimate scenes may omit
+      drums, but ANY thriller / action / dramatic scene MUST include them.
     - HARMONIC MOVEMENT — real chord progression, modulations, suspended
       chords resolving, parallel motion. Not one static pedal-point drone.
     - ENERGY ARC across sections.
@@ -137,12 +188,17 @@ STEP 5 — STYLE FORMULA per section:
   not generic ("synth", "drums", "strings").
 
 STEP 6 — GLOBAL STYLES:
-  positive_global_styles: 5–8 elements covering: series DNA + score
-  sub-genre + tempo + key + lead-instrument family + production aesthetic
-  (e.g. "warm analog orchestral mix", "modern hybrid score production",
-  "intimate chamber recording aesthetic").
-  ALWAYS include at least one explicit "cinematic film score" descriptor
-  so the engine commits to the right aesthetic.
+  positive_global_styles: 5–8 elements covering: series DNA + the
+  sub-genre YOU chose for THIS scene + tempo + key + lead-instrument
+  family + production aesthetic. Make these SPECIFIC to this scene's
+  chosen sub-genre, NOT generic. Examples by sub-genre:
+    thriller: "modern hybrid score production", "aggressive orchestral mix"
+    romance: "warm intimate chamber recording", "lyrical string aesthetic"
+    mystery: "dark minimal orchestral texture", "cold reverb hall"
+    triumph: "epic orchestral swell", "cinematic concert hall reverb"
+    elegy: "sparse intimate piano recording", "dry close-mic cello"
+    comedy: "bright staccato orchestral production", "light playful mix"
+  ALWAYS include at least one "cinematic film score" descriptor.
   negative_global_styles MUST include (at minimum):
     vocals, lyrics, copyrighted artist references,
     pure ambient drone, sound design only, noise wash,
@@ -190,24 +246,41 @@ _EXAMPLE_JSON = '''\
         "felt piano motif descending fifth A-D-A",
         "low strings divisi pedal tone sustained",
         "timpani slow heartbeat pulse beats 1 and 3",
+        "orchestral snare ghost notes sparse",
         "wordless choir pad distant atmosphere",
         "frozen dread to dawning realization arc"
       ],
-      "negative_local_styles": ["bright major chords", "fast percussion"],
+      "negative_local_styles": ["bright major chords", "trap hi-hats"],
       "lines": []
     },
     {
-      "section_name": "12-24s: ostinato build dialogue-friendly, accusation",
+      "section_name": "12-27s: tension build with percussion, confrontation erupts",
+      "duration_ms": 15000,
+      "positive_local_styles": [
+        "hybrid orchestral thriller, D minor 92 BPM",
+        "epic hybrid percussion ensemble full kit driving",
+        "taiko hits on downbeats accenting peaks",
+        "low brass stab syncopated rhythm",
+        "violin section tremolo sul ponticello high register",
+        "felt piano cluster chords off-beat",
+        "mounting confrontation — control giving way to chaos"
+      ],
+      "negative_local_styles": ["808 bass", "trap hi-hats"],
+      "lines": []
+    },
+    {
+      "section_name": "27-39s: ostinato build dialogue-friendly, accusation",
       "duration_ms": 12000,
       "positive_local_styles": [
         "chamber-score intimate drama, 78 BPM",
         "pizzicato strings ostinato sixteenth notes",
         "cello legato sustained mid register",
+        "brushed snare quiet pulse underneath",
         "soft piano broken arpeggio supporting",
         "choir pad held suspended chord D minor 9",
         "claustrophobic mounting accusation tension"
       ],
-      "negative_local_styles": ["lead melody on top", "rhythmic drums"],
+      "negative_local_styles": ["lead melody on top"],
       "lines": []
     }
   ]
@@ -299,6 +372,16 @@ duration_ms MUST sum to EXACTLY {target_duration_ms} ms (~{target_sec}s).
 5. negative_global_styles includes ALL of: {', '.join(_NEGATIVE_FLOOR)}
 6. No banned volume words anywhere: {', '.join(_BANNED_VOLUME_WORDS)}
 7. First section starts at FULL density, last section closes the emotional arc.
+8. PERCUSSION CHECK: if ANY section involves tension / action / confrontation /
+   revelation / urgency — that section MUST include orchestral or hybrid
+   percussion in its positive_local_styles (timpani, taiko, hybrid drums,
+   brushed snare, orchestral snare roll, heartbeat kick, etc.). Pure chamber/
+   intimate sections may omit drums, but thriller/drama scenes cannot.
+9. STYLE VARIETY CHECK: re-read the scene. Does your chosen sub-genre
+   actually match the dominant emotion? "Hybrid orchestral thriller" is
+   correct ONLY for tension/action. Romance, grief, comedy, mystery each
+   need a DIFFERENT sub-genre from the list in STEP 1. Do not default to
+   thriller because the series is dramatic — match THIS scene specifically.
 
 Return ONLY the JSON object. No markdown fences, no prose.
 """
