@@ -712,6 +712,11 @@ function navigate(view, params = {}) {
   } else if (view === 'montage') {
     loadMontageView();
   }
+  // Re-scope suspended Auto-mode placeholders to the new series (or clear them
+  // entirely on /projects). Without this, refreshing inside Series A while a
+  // suspended run for Series B sits in localStorage would show B's «Продолжить»
+  // button — clicking it would yank the user away to Series B.
+  try { if (typeof _autoRestoreSuspendedRuns === 'function') _autoRestoreSuspendedRuns(); } catch {}
 }
 
 function _navFromHash() {
@@ -8576,29 +8581,52 @@ function _autoClearPersistedRun(epSid, epNumber) {
   } catch {}
 }
 
-// Restore suspended runs from localStorage. Runs as soon as app.js loads —
-// the placeholder entry has active=true + suspended=true so the floating
-// widget renders it with the «▶ Продолжить» button.
+// Restore suspended runs from localStorage, SCOPED to the currently-open
+// series. The widget must never show «▶ Продолжить» for a series the user
+// isn't currently inside — clicking it would yank them away to a different
+// project. So:
+//   • If no series is open (e.g. /projects page) → no placeholders, widget
+//     stays clean. Snapshots for OTHER series remain in localStorage and
+//     will pop back up when the user navigates into their series.
+//   • If user is in series X → only X's runs become suspended placeholders;
+//     any previously-injected placeholders for other series are cleared.
+// Called on DOMContentLoaded AND on every navigate() into a series view.
 function _autoRestoreSuspendedRuns() {
+  // 1. Drop existing suspended placeholders — about to recompute from scratch.
+  for (const [k, r] of [...AUTO_RUNS.entries()]) {
+    if (r && r.suspended) AUTO_RUNS.delete(k);
+  }
+  const currentSid = (typeof S !== 'undefined' && S) ? S.seriesId : null;
   let snapshots;
   try {
     const raw = localStorage.getItem(_AUTO_LS_KEY);
-    if (!raw) return;
+    if (!raw) {
+      if (typeof _autoUpdateFloatingWidget === 'function') _autoUpdateFloatingWidget();
+      return;
+    }
     snapshots = JSON.parse(raw);
     if (!Array.isArray(snapshots) || !snapshots.length) return;
   } catch { return; }
   const fresh = snapshots.filter(s => (Date.now() - (s.timestamp || 0)) < _AUTO_LS_TTL_MS);
-  if (!fresh.length) {
-    localStorage.removeItem(_AUTO_LS_KEY);
+  // Trim stale entries from storage so it doesn't grow forever.
+  if (fresh.length !== snapshots.length) {
+    if (fresh.length) localStorage.setItem(_AUTO_LS_KEY, JSON.stringify(fresh));
+    else localStorage.removeItem(_AUTO_LS_KEY);
+  }
+  // Without an open series, nothing to render — but keep snapshots alive so
+  // navigating into their series later picks them back up.
+  if (!currentSid) {
+    if (typeof _autoUpdateFloatingWidget === 'function') _autoUpdateFloatingWidget();
     return;
   }
   for (const snap of fresh) {
     if (!snap.epSid || snap.epNumber == null) continue;
+    if (snap.epSid !== currentSid) continue;     // ← series-scope filter
     const key = `${snap.epSid}:${snap.epNumber}`;
-    if (AUTO_RUNS.has(key)) continue;   // a live run already exists, prefer it
+    if (AUTO_RUNS.has(key)) continue;            // live run already exists
     AUTO_RUNS.set(key, {
       active: true,
-      suspended: true,                  // marker for the widget renderer
+      suspended: true,
       _epSid: snap.epSid,
       _epNumber: snap.epNumber,
       total: snap.total,
