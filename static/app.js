@@ -1058,10 +1058,7 @@ function openCreateSeries() {
   const singleMode = document.querySelector('input[name="new-series-mode"][value="single"]');
   if (singleMode) singleMode.checked = true;
   buildGenreFilters();
-  // Reset import-mode fields too.
-  setVal('import-series-title', '');
-  setVal('import-series-script', '');
-  document.getElementById('import-series-script-stats').textContent = '0 символов';
+  // Clear UI-only state for import mode; content restored from draft below
   document.getElementById('import-series-preview').innerHTML = '';
   // Reset per-type extraction toggles + picked-file chips when modal reopens
   // so the previous session's state doesn't leak into the next series.
@@ -1082,6 +1079,14 @@ function openCreateSeries() {
     _seriesIdeasAvoidHydrate(avoidEl);
   }
   openModal('modal-create-series');
+  // Restore import-mode draft and wire autosave
+  _createSeriesDraftRestore();
+  _createSeriesDraftWire();
+  // Update char counter if script was restored
+  const importScriptEl = document.getElementById('import-series-script');
+  const importStatsEl  = document.getElementById('import-series-script-stats');
+  if (importScriptEl && importStatsEl)
+    importStatsEl.textContent = (importScriptEl.value.length || 0).toLocaleString('ru') + ' символов';
 }
 
 // ── Series-create mode picker ────────────────────────────────────────────────
@@ -1381,6 +1386,7 @@ async function importCreateSeries() {
     }
     if (r.error) throw new Error(r.error);
     closeModal('modal-create-series');
+    _createSeriesDraftClear();
     const summaryBits = [`${r.episodes_created} эпизодов`];
     if (r.characters_uploaded) summaryBits.push(`${r.characters_uploaded} персов`);
     if (r.locations_uploaded)  summaryBits.push(`${r.locations_uploaded} локаций`);
@@ -1409,58 +1415,113 @@ document.addEventListener('DOMContentLoaded', () => {
 // Twin of the import-from-script flow above, but adds episodes to the CURRENT
 // series instead of creating a new one. Numbering continues from the highest
 // existing episode (so a 38-episode series + 12 new ones → episodes 39-50).
-// Generate-mode form fields whose values should persist between sessions.
-// Skipped on purpose: `append-gen-direction` (idea text — different every
-// time) and `append-script-text` (the script content itself).
-const _APPEND_PERSIST_FIELDS = [
-  'append-gen-count',
-  'append-gen-duration-sec',
-  'append-gen-lines-count',
-  'append-gen-style',
-  'append-gen-max-chars',
-];
-function _appendPersistKey(id) { return `appendGenPrefs:${id}`; }
-function _appendRestorePrefs() {
-  for (const id of _APPEND_PERSIST_FIELDS) {
-    try {
-      const v = localStorage.getItem(_appendPersistKey(id));
-      if (v == null) continue;
+
+// ── Generic modal draft helpers ───────────────────────────────────────────────
+function _draftSave(prefix, fields) {
+  try {
+    const obj = {};
+    for (const id of fields) {
       const el = document.getElementById(id);
-      if (el) el.value = v;
-    } catch {}
+      if (el) obj[id] = el.type === 'checkbox' ? el.checked : (el.value || '');
+    }
+    localStorage.setItem(prefix, JSON.stringify(obj));
+  } catch {}
+}
+function _draftRestore(prefix, fields) {
+  try {
+    const raw = localStorage.getItem(prefix);
+    if (!raw) return;
+    const obj = JSON.parse(raw);
+    for (const id of fields) {
+      if (!(id in obj)) continue;
+      const el = document.getElementById(id);
+      if (!el) continue;
+      if (el.type === 'checkbox') el.checked = !!obj[id];
+      else el.value = obj[id];
+    }
+  } catch {}
+}
+function _draftClear(prefix) {
+  try { localStorage.removeItem(prefix); } catch {}
+}
+function _draftWire(prefix, fields, extraCb) {
+  for (const id of fields) {
+    const el = document.getElementById(id);
+    if (!el || el.dataset.draftWired === prefix) continue;
+    el.dataset.draftWired = prefix;
+    const save = () => { _draftSave(prefix, fields); if (extraCb) extraCb(); };
+    el.addEventListener('change', save);
+    el.addEventListener('input',  save);
   }
 }
-function _appendWireAutosave() {
-  for (const id of _APPEND_PERSIST_FIELDS) {
-    const el = document.getElementById(id);
-    if (!el || el.dataset.appendAutosaveWired) continue;
-    el.dataset.appendAutosaveWired = '1';
-    const save = () => {
-      try { localStorage.setItem(_appendPersistKey(id), el.value || ''); } catch {}
-    };
-    el.addEventListener('change', save);
-    el.addEventListener('input', save);
+
+// ── Append-script modal draft ─────────────────────────────────────────────────
+const _APPEND_DRAFT_KEY = 'modalDraft:append-script';
+const _APPEND_DRAFT_FIELDS = [
+  'append-gen-count', 'append-gen-duration-sec', 'append-gen-lines-count',
+  'append-gen-style', 'append-gen-max-chars', 'append-gen-no-interruptions',
+  'append-script-text', 'append-gen-direction',
+];
+// Keep old aliases so nothing breaks
+function _appendPersistKey(id) { return `appendGenPrefs:${id}`; }
+function _appendRestorePrefs() { _draftRestore(_APPEND_DRAFT_KEY, _APPEND_DRAFT_FIELDS); }
+function _appendWireAutosave() { _draftWire(_APPEND_DRAFT_KEY, _APPEND_DRAFT_FIELDS); }
+function _appendDraftClear()   { _draftClear(_APPEND_DRAFT_KEY); }
+
+// ── Create-series modal draft (import-mode fields) ────────────────────────────
+const _CREATE_DRAFT_KEY = 'modalDraft:create-series';
+const _CREATE_DRAFT_FIELDS = [
+  'import-series-title', 'import-series-script',
+];
+function _createSeriesDraftRestore() {
+  _draftRestore(_CREATE_DRAFT_KEY, _CREATE_DRAFT_FIELDS);
+  // Restore mode — if we had script content, switch to import mode
+  try {
+    const raw = localStorage.getItem(_CREATE_DRAFT_KEY);
+    if (!raw) return;
+    const obj = JSON.parse(raw);
+    if (obj['import-series-script']?.trim()) setSeriesCreateMode('import');
+  } catch {}
+}
+function _createSeriesDraftWire() {
+  _draftWire(_CREATE_DRAFT_KEY, _CREATE_DRAFT_FIELDS);
+  // Also save on mode-switch (wired via setSeriesCreateMode callers)
+}
+function _createSeriesDraftClear() { _draftClear(_CREATE_DRAFT_KEY); }
+
+async function backfillDevices() {
+  if (!S.seriesId) { showToast('Открой сериал'); return; }
+  showToast('🔄 Анализирую сюжетные приёмы…', 3000);
+  try {
+    const r = await api.post(`/api/series/${S.seriesId}/backfill-devices`, {});
+    showToast(`✓ Реестр устройств обновлён (${r.updated} серий)`, 4000);
+  } catch (e) {
+    showToast('✗ Ошибка: ' + (e?.message || e), 5000);
   }
 }
 
 function openAppendScript() {
   if (!S.seriesId) { showToast('Открой сериал'); return; }
-  const ta = document.getElementById('append-script-text');
-  if (ta) ta.value = '';
+  // Clear only UI state — script text is restored from draft below
   const previewEl = document.getElementById('append-script-preview');
   if (previewEl) previewEl.innerHTML = '';
   const logicEl = document.getElementById('append-script-logic');
   if (logicEl) logicEl.innerHTML = '';
+  const adaptEl = document.getElementById('append-adapt-result');
+  if (adaptEl) adaptEl.innerHTML = '';
   const statusEl = document.getElementById('append-gen-status');
   if (statusEl) statusEl.textContent = '';
-  // Default to paste mode each time the modal opens.
-  setAppendMode('paste');
-  appendUpdateStats();
   openModal('modal-append-script');
-  // Restore last-used generate-mode form values + attach autosave listeners
-  // so the next change/input writes back to localStorage immediately.
+  // Restore draft (script text, direction, gen params) from localStorage
   _appendRestorePrefs();
   _appendWireAutosave();
+  // Set mode based on restored content: paste if script has text, else default paste
+  const ta = document.getElementById('append-script-text');
+  const hasDraft = (ta?.value || '').trim().length > 0;
+  const dirTa = document.getElementById('append-gen-direction');
+  const hasDirDraft = (dirTa?.value || '').trim().length > 0;
+  setAppendMode(hasDirDraft && !hasDraft ? 'generate' : 'paste');
+  appendUpdateStats();
 }
 
 // Switch between «📋 Вставить готовый» and «✨ Сгенерировать новые» modes.
@@ -1916,6 +1977,335 @@ function importLogicUndo() {
   if (out) out.innerHTML = '';
 }
 
+// ── Shared adapt-to-standard rendering ────────────────────────────────────────
+// Suggestion store: avoids encoding issues with onclick + JSON.stringify in HTML attrs
+const _adaptStore = {};   // key → { ta, original, replacement }
+
+function _adaptApplyKey(key) {
+  const d = _adaptStore[key];
+  if (!d) return;
+  const btn = document.querySelector(`[data-adapt-key="${key}"]`);
+  const before = d.ta.value;
+  if (!before.includes(d.original)) {
+    showToast('Строка не найдена в сценарии — возможно уже заменена', 3000);
+    if (btn) { btn.disabled = true; btn.style.opacity = '0.4'; }
+    return;
+  }
+  d.ta.value = before.replace(d.original, d.replacement);
+  d.ta.dispatchEvent(new Event('input'));
+  if (btn) { btn.disabled = true; btn.style.opacity = '0.4'; btn.textContent = '✓ Применено'; }
+  showToast('✓ Реплика заменена', 2500);
+}
+
+// Renders the result box (changes list + moderation warnings) into `out` element.
+// undoFn: string name of undo function. ta: the textarea that was adapted.
+function _renderAdaptResult(out, r, undoFn, ta) {
+  if (!out) return;
+  const changes = r.changes || [];
+  const warnings = r.moderation_warnings || [];
+
+  // Register suggestions in store and build HTML
+  const ts = Date.now();
+  // Only show warnings that have actual suggestions
+  const actionableWarnings = warnings.filter(w => (w.suggestions || []).length > 0);
+  const warnHtml = actionableWarnings.length ? `
+    <div style="margin-top:10px;padding:10px 12px;background:rgba(245,158,11,0.10);border:1px solid rgba(245,158,11,0.40);border-radius:6px;font-size:0.82rem">
+      <div style="color:#f59e0b;font-weight:700;margin-bottom:8px">⚠️ Возможные проблемы с модерацией Seedance (${actionableWarnings.length}):</div>
+      ${actionableWarnings.map((w, wi) => {
+        const suggBtns = (w.suggestions || []).map((s, si) => {
+          const key = `as_${ts}_${wi}_${si}`;
+          _adaptStore[key] = { ta, original: w.original, replacement: s };
+          return `<button class="btn-ghost btn-sm" data-adapt-key="${key}"
+            style="display:block;width:100%;text-align:left;margin-bottom:3px;font-size:0.79rem;padding:4px 8px"
+            onclick="_adaptApplyKey('${key}')">↩ ${esc(s)}</button>`;
+        }).join('');
+        return `
+        <div style="margin-bottom:10px;padding:8px;background:rgba(0,0,0,0.15);border-radius:5px">
+          <div style="color:var(--muted);margin-bottom:4px;font-size:0.79rem">🚩 <em>${esc(w.reason)}</em></div>
+          <div style="color:var(--text);margin-bottom:6px;word-break:break-word"><code style="font-size:0.8rem;background:rgba(255,255,255,0.06);padding:2px 5px;border-radius:3px">${esc(w.original)}</code></div>
+          <div style="font-size:0.79rem;color:var(--muted);margin-bottom:4px">Варианты замены:</div>
+          ${suggBtns}
+        </div>`;
+      }).join('')}
+    </div>` : '';
+
+  out.innerHTML = `
+    <div style="padding:10px 12px;background:rgba(16,185,129,0.10);border:1px solid rgba(16,185,129,0.35);border-radius:6px;font-size:0.82rem">
+      <div style="color:#10b981;font-weight:700;margin-bottom:6px">✓ Адаптировано. Изменения:</div>
+      <ul style="margin:4px 0 4px 16px;color:var(--text)">
+        ${changes.map(c => `<li>${esc(c)}</li>`).join('') || '<li>(нет деталей)</li>'}
+      </ul>
+      <button class="btn-ghost btn-sm" onclick="${undoFn}()" style="margin-top:6px">↶ Отменить</button>
+    </div>
+    ${warnHtml}`;
+}
+
+// ── Import modal adapt ─────────────────────────────────────────────────────────
+async function importAdaptToStandard(btn) {
+  const ta = document.getElementById('import-series-script');
+  const script = (ta?.value || '').trim();
+  const out = document.getElementById('import-adapt-result');
+  if (!script) { if (out) out.innerHTML = '<div style="color:var(--warning);font-size:0.85rem">Сценарий пустой</div>'; return; }
+  const oldHtml = btn ? btn.innerHTML : '';
+  if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Адаптирую…'; }
+  if (out) out.innerHTML = '<div style="font-size:0.85rem;color:var(--muted)"><span class="spinner"></span> Claude добавляет позиции, адаптирует диалоги и сканирует модерацию… ~30-60 сек</div>';
+  try {
+    const r = await api.post('/api/adapt-script-to-standard', { script }, { timeoutMs: 180000 });
+    if (r.error) throw new Error(r.error);
+    ta.dataset.preAdaptSnapshot = script;
+    ta.value = r.script;
+    const stats = document.getElementById('import-series-script-stats');
+    if (stats) stats.textContent = r.script.length.toLocaleString('ru') + ' символов';
+    _renderAdaptResult(out, r, 'importAdaptUndo', ta);
+    showToast('🔧 Сценарий адаптирован под стандарт', 4000);
+  } catch (e) {
+    if (out) out.innerHTML = `<div style="color:var(--danger);font-size:0.85rem">Ошибка: ${esc(e?.message || e)}</div>`;
+  } finally {
+    if (btn) { btn.disabled = false; btn.innerHTML = oldHtml || '🔧 Адаптировать под стандарт'; }
+  }
+}
+
+function importAdaptUndo() {
+  const ta = document.getElementById('import-series-script');
+  if (!ta || !ta.dataset.preAdaptSnapshot) { showToast('Нет снапшота для отката', 3000); return; }
+  ta.value = ta.dataset.preAdaptSnapshot;
+  delete ta.dataset.preAdaptSnapshot;
+  const stats = document.getElementById('import-series-script-stats');
+  if (stats) stats.textContent = ta.value.length.toLocaleString('ru') + ' символов';
+  showToast('↶ Откачено к оригиналу', 3000);
+  const out = document.getElementById('import-adapt-result');
+  if (out) out.innerHTML = '';
+}
+
+// ── Append modal adapt ─────────────────────────────────────────────────────────
+async function appendAdaptToStandard(btn) {
+  const ta = document.getElementById('append-script-text');
+  const script = (ta?.value || '').trim();
+  const out = document.getElementById('append-adapt-result');
+  if (!script) { if (out) out.innerHTML = '<div style="color:var(--warning);font-size:0.85rem">Сценарий пустой</div>'; return; }
+  const oldHtml = btn ? btn.innerHTML : '';
+  if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Адаптирую…'; }
+  if (out) out.innerHTML = '<div style="font-size:0.85rem;color:var(--muted)"><span class="spinner"></span> Claude добавляет позиции, адаптирует диалоги и сканирует модерацию… ~30-60 сек</div>';
+  try {
+    const r = await api.post('/api/adapt-script-to-standard', { script }, { timeoutMs: 180000 });
+    if (r.error) throw new Error(r.error);
+    ta.dataset.preAdaptSnapshot = script;
+    ta.value = r.script;
+    appendUpdateStats();
+    _renderAdaptResult(out, r, 'appendAdaptUndo', ta);
+    showToast('🔧 Сценарий адаптирован под стандарт', 4000);
+  } catch (e) {
+    if (out) out.innerHTML = `<div style="color:var(--danger);font-size:0.85rem">Ошибка: ${esc(e?.message || e)}</div>`;
+  } finally {
+    if (btn) { btn.disabled = false; btn.innerHTML = oldHtml || '🔧 Адаптировать под стандарт'; }
+  }
+}
+
+function appendAdaptUndo() {
+  const ta = document.getElementById('append-script-text');
+  if (!ta || !ta.dataset.preAdaptSnapshot) { showToast('Нет снапшота для отката', 3000); return; }
+  ta.value = ta.dataset.preAdaptSnapshot;
+  delete ta.dataset.preAdaptSnapshot;
+  appendUpdateStats();
+  showToast('↶ Откачено к оригиналу', 3000);
+  const out = document.getElementById('append-adapt-result');
+  if (out) out.innerHTML = '';
+}
+
+// ── Episode editor adapt ───────────────────────────────────────────────────────
+async function epAdaptToStandard(btn) {
+  const ta = document.getElementById('ep-script');
+  const script = (ta?.value || '').trim();
+  const out = document.getElementById('ep-adapt-result');
+  if (!script) { if (out) out.innerHTML = '<div style="color:var(--warning);font-size:0.85rem">Сценарий пустой</div>'; return; }
+  const oldHtml = btn ? btn.innerHTML : '';
+  if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>…'; }
+  if (out) out.innerHTML = '<div style="font-size:0.85rem;color:var(--muted)"><span class="spinner"></span> Адаптирую под стандарт и сканирую модерацию… ~30-60 сек</div>';
+  try {
+    const r = await api.post('/api/adapt-script-to-standard', { script }, { timeoutMs: 180000 });
+    if (r.error) throw new Error(r.error);
+    ta.dataset.preAdaptSnapshot = script;
+    ta.value = r.script;
+    // trigger char count update
+    ta.dispatchEvent(new Event('input'));
+    // show save button
+    const applyBtn = document.getElementById('ep-script-apply-btn');
+    if (applyBtn) applyBtn.style.display = '';
+    _renderAdaptResult(out, r, 'epAdaptUndo', ta);
+    showToast('🔧 Сценарий адаптирован под стандарт', 4000);
+  } catch (e) {
+    if (out) out.innerHTML = `<div style="color:var(--danger);font-size:0.85rem">Ошибка: ${esc(e?.message || e)}</div>`;
+  } finally {
+    if (btn) { btn.disabled = false; btn.innerHTML = oldHtml || '🔧 Под стандарт'; }
+  }
+}
+
+function epAdaptUndo() {
+  const ta = document.getElementById('ep-script');
+  if (!ta || !ta.dataset.preAdaptSnapshot) { showToast('Нет снапшота для отката', 3000); return; }
+  ta.value = ta.dataset.preAdaptSnapshot;
+  delete ta.dataset.preAdaptSnapshot;
+  ta.dispatchEvent(new Event('input'));
+  showToast('↶ Откачено к оригиналу', 3000);
+  const out = document.getElementById('ep-adapt-result');
+  if (out) out.innerHTML = '';
+}
+
+// ── Episode phrase check (moderation scan only) ────────────────────────────────
+// Renders moderation warnings into `outEl` using the shared _adaptStore system.
+// `ta` is the textarea (ep-script). Returns true if any warnings found.
+function _renderPhraseWarnings(outEl, warnings, ta) {
+  if (!outEl) return false;
+  if (!warnings || warnings.length === 0) {
+    outEl.innerHTML = `
+      <div style="padding:8px 12px;background:rgba(16,185,129,0.08);border:1px solid rgba(16,185,129,0.3);border-radius:6px;font-size:0.82rem;color:#10b981;margin-top:6px">
+        ✓ Проблемных фраз не обнаружено
+      </div>`;
+    return false;
+  }
+  const ts = Date.now();
+  // Filter out warnings with no suggestions (model flagged but couldn't suggest — skip)
+  const actionable = warnings.filter(w => (w.suggestions || []).length > 0);
+  if (actionable.length === 0) {
+    outEl.innerHTML = `
+      <div style="padding:8px 12px;background:rgba(16,185,129,0.08);border:1px solid rgba(16,185,129,0.3);border-radius:6px;font-size:0.82rem;color:#10b981;margin-top:6px">
+        ✓ Проблемных фраз не обнаружено
+      </div>`;
+    return false;
+  }
+  const items = actionable.map((w, wi) => {
+    const suggBtns = (w.suggestions || []).map((s, si) => {
+      const key = `pc_${ts}_${wi}_${si}`;
+      _adaptStore[key] = { ta, original: w.original, replacement: s };
+      return `<button class="btn-ghost btn-sm" data-adapt-key="${key}"
+        style="display:block;width:100%;text-align:left;margin-bottom:3px;font-size:0.79rem;padding:4px 8px"
+        onclick="_adaptApplyKey('${key}')">↩ ${esc(s)}</button>`;
+    }).join('');
+    return `
+      <div style="margin-bottom:10px;padding:8px;background:rgba(0,0,0,0.15);border-radius:5px">
+        <div style="color:var(--muted);margin-bottom:4px;font-size:0.79rem">🚩 <em>${esc(w.reason)}</em></div>
+        <div style="color:var(--text);margin-bottom:6px;word-break:break-word"><code style="font-size:0.8rem;background:rgba(255,255,255,0.06);padding:2px 5px;border-radius:3px">${esc(w.original)}</code></div>
+        <div style="font-size:0.79rem;color:var(--muted);margin-bottom:4px">Варианты замены:</div>
+        ${suggBtns}
+      </div>`;
+  }).join('');
+  outEl.innerHTML = `
+    <div style="margin-top:6px;padding:10px 12px;background:rgba(245,158,11,0.10);border:1px solid rgba(245,158,11,0.40);border-radius:6px;font-size:0.82rem">
+      <div style="color:#f59e0b;font-weight:700;margin-bottom:8px">⚠️ Возможные проблемы с модерацией Seedance (${warnings.length}):</div>
+      ${items}
+    </div>`;
+  return true;
+}
+
+// Manual phrase-check button handler
+async function epCheckPhrases(btn) {
+  const ta = document.getElementById('ep-script');
+  const script = (ta?.value || '').trim();
+  const out = document.getElementById('ep-postgen-checks');
+  if (!script) { showToast('Сценарий пустой', 2000); return; }
+  const oldHtml = btn ? btn.innerHTML : '';
+  if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>'; }
+  if (out) out.innerHTML = '<div style="font-size:0.82rem;color:var(--muted);margin-top:6px"><span class="spinner"></span> Сканирую диалоги на проблемные фразы…</div>';
+  try {
+    const r = await api.post('/api/check-moderation', { script }, { timeoutMs: 60000 });
+    if (r.error) throw new Error(r.error);
+    _renderPhraseWarnings(out, r.moderation_warnings || [], ta);
+  } catch (e) {
+    if (out) out.innerHTML = `<div style="color:var(--danger);font-size:0.82rem;margin-top:6px">Ошибка скана: ${esc(e?.message || e)}</div>`;
+  } finally {
+    if (btn) { btn.disabled = false; btn.innerHTML = oldHtml || '🚨 Фразы'; }
+  }
+}
+
+// Auto-run after script generation: show audit violations + run phrase scan in bg
+function _epPostGenChecks(script, auditReport) {
+  const ta = document.getElementById('ep-script');
+  const out = document.getElementById('ep-postgen-checks');
+  if (!out) return;
+
+  // 1. Surface logic audit violations (from backend, already available)
+  let auditHtml = '';
+  if (auditReport) {
+    const violations = (auditReport.violations || []).filter(v => v.severity === 'critical' || v.severity === 'warning');
+    if (violations.length > 0) {
+      const rows = violations.map(v => `
+        <div style="margin-bottom:6px;padding:6px 8px;background:rgba(0,0,0,0.15);border-radius:4px">
+          <span style="color:${v.severity === 'critical' ? '#ef4444' : '#f59e0b'};font-weight:600;font-size:0.79rem">${v.severity === 'critical' ? '🔴' : '🟡'} ${esc(v.type || v.severity)}</span>
+          <div style="font-size:0.79rem;color:var(--text);margin-top:2px">${esc(v.description || v.message || '')}</div>
+        </div>`).join('');
+      auditHtml = `
+        <div style="margin-top:6px;padding:10px 12px;background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.30);border-radius:6px;font-size:0.82rem">
+          <div style="color:#ef4444;font-weight:700;margin-bottom:6px">🧠 Логика — найдены проблемы (${violations.length}):</div>
+          ${rows}
+        </div>`;
+    } else if (auditReport.passes !== false) {
+      auditHtml = `<div style="margin-top:6px;padding:6px 12px;background:rgba(16,185,129,0.08);border:1px solid rgba(16,185,129,0.3);border-radius:6px;font-size:0.82rem;color:#10b981">✓ Логика — нарушений не найдено</div>`;
+    }
+  }
+
+  // 2. Show audit result + phrase scan spinner
+  out.innerHTML = auditHtml + `<div id="ep-phrase-scan-inline" style="font-size:0.82rem;color:var(--muted);margin-top:6px"><span class="spinner"></span> Сканирую фразы на модерацию Seedance…</div>`;
+
+  // 3. Run phrase scan asynchronously (don't block the UI)
+  api.post('/api/check-moderation', { script }, { timeoutMs: 60000 })
+    .then(r => {
+      const inlineEl = document.getElementById('ep-phrase-scan-inline');
+      if (!inlineEl) return;
+      const warnDiv = document.createElement('div');
+      inlineEl.replaceWith(warnDiv);
+      _renderPhraseWarnings(warnDiv, r.moderation_warnings || [], ta);
+    })
+    .catch(e => {
+      const inlineEl = document.getElementById('ep-phrase-scan-inline');
+      if (inlineEl) inlineEl.innerHTML = `<span style="color:var(--muted)">Скан фраз: ${esc(e?.message || e)}</span>`;
+    });
+}
+
+// Show toast + postgen-checks banner when backend auto-created outfits from [BLOCKING].
+// Then immediately refresh the in-memory series + character sidebar so the new
+// outfits appear on the cards, and poll autogen status so when the avai i2i
+// call completes the new outfit photo shows up without a manual reload.
+function _notifyNewOutfits(newOutfits) {
+  if (!newOutfits || !newOutfits.length) return;
+  const names = newOutfits.map(o => `${esc(o.char_name)}: «${esc(o.outfit.label)}»`).join(', ');
+  showToast(`👗 Новых образов: ${newOutfits.length} — ${names} · картинки генерируются в фоне`, 8000);
+  const out = document.getElementById('ep-postgen-checks');
+  if (out) {
+    const banner = document.createElement('div');
+    banner.innerHTML = `
+      <div style="margin-top:6px;padding:8px 12px;background:rgba(132,94,247,0.10);border:1px solid rgba(132,94,247,0.35);border-radius:6px;font-size:0.82rem">
+        <div style="color:var(--accent);font-weight:700;margin-bottom:4px">👗 Созданы новые образы из [BLOCKING] (${newOutfits.length}):</div>
+        <ul style="margin:2px 0 2px 16px;color:var(--text)">
+          ${newOutfits.map(o => `<li><strong>${esc(o.char_name)}</strong> — ${esc(o.outfit.label)}${o.outfit.description && o.outfit.description !== o.outfit.label ? `: <span style="color:var(--muted)">${esc(o.outfit.description)}</span>` : ''} <span style="color:var(--accent);font-size:0.75rem;margin-left:6px">⚙ генерируется...</span></li>`).join('')}
+        </ul>
+        <div style="font-size:0.78rem;color:var(--muted);margin-top:4px">Картинки появятся в карточках персонажей автоматически как только AVAI i2i завершится (обычно 20-60 сек).</div>
+      </div>`;
+    out.prepend(banner);
+  }
+  // Pull fresh series state so the sidebar character cards reflect the new
+  // outfit objects right away (badge count, click-through). Without this the
+  // user has to F5 to see the change.
+  _refreshSeriesAfterOutfitSync();
+}
+
+// After backend reports `_new_outfits`, immediately reload the series so the
+// sidebar shows the newly-created outfit chips, then arm the existing autogen
+// poller (pollAutogenStatus) which already handles spinner overlays, live
+// refresh on each item completion, and final image swap-in.
+async function _refreshSeriesAfterOutfitSync() {
+  try {
+    const fresh = await api.get(`/api/series/${S.seriesId}`);
+    if (fresh && !fresh.error) {
+      S.series = fresh;
+      if (typeof renderCharactersList === 'function') renderCharactersList();
+    }
+  } catch (e) { /* swallow — best-effort refresh */ }
+  // Arm the canonical poller; it handles in_progress spinners + per-item refresh.
+  try {
+    if (typeof pollAutogenStatus === 'function') pollAutogenStatus();
+  } catch (e) { /* swallow */ }
+}
+
 async function appendScriptGo() {
   const script = (document.getElementById('append-script-text')?.value || '').trim();
   const extract = !!document.getElementById('append-extract-entities')?.checked;
@@ -1931,6 +2321,7 @@ async function appendScriptGo() {
     const r = await api.post(`/api/series/${S.seriesId}/append-from-script`, body);
     if (r.error) throw new Error(r.error);
     closeModal('modal-append-script');
+    _appendDraftClear();
     const range = (r.first_episode === r.last_episode)
       ? `№${r.first_episode}`
       : `№${r.first_episode}–${r.last_episode}`;
@@ -2413,6 +2804,7 @@ async function createSeries() {
       writer_model: _selectedWriterModel('writer-model-create'),
     });
     closeModal('modal-create-series');
+    _createSeriesDraftClear();
     if (data?._scaffold?.prproj_warning) {
       showToast('⚠ ' + data._scaffold.prproj_warning + ' (templates/empty.prproj)');
     }
@@ -3398,6 +3790,67 @@ function clearEpisodeSelection() {
 let _logicMultiIssues = [];
 let _logicMultiEpNums = [];
 
+// Bulk re-parse [BLOCKING] outfits across episodes. Uses S._genSelected when
+// non-empty, otherwise runs on ALL episodes that have a script (the legacy
+// fix path — series with episodes generated before outfit-sync was working).
+async function reanalyzeOutfitsForSelected() {
+  if (!S.seriesId) { showToast('Открой сериал'); return; }
+  if (!S._genSelected) _restoreGenSelection();
+  const selectedNums = [...(S._genSelected || [])].sort((a, b) => a - b);
+  const eps = (S.episodes || []);
+  const scope = selectedNums.length > 0 ? 'выделенных' : 'всех серий со сценарием';
+  let validNums = selectedNums.filter(n => {
+    const ep = eps.find(e => e.number === n);
+    return ep && (ep.script || '').trim().length > 0;
+  });
+  if (selectedNums.length === 0) {
+    validNums = eps.filter(e => (e.script || '').trim().length > 0).map(e => e.number);
+  }
+  if (!validNums.length) {
+    showToast('Нет эпизодов со сценарием для перепроанализирования', 4000);
+    return;
+  }
+  const btn = event && event.target ? event.target : null;
+  const orig = btn ? btn.innerHTML : '';
+  if (btn) { btn.disabled = true; btn.innerHTML = `<span class="spinner"></span> Парсю ${validNums.length}…`; }
+  try {
+    const r = await api.post(
+      `/api/series/${S.seriesId}/reanalyze-outfits`,
+      { episode_numbers: validNums }
+    );
+    if (r.error) throw new Error(r.error);
+    const total = r.total_new_outfits || 0;
+    const weak = r.total_weak_descs_fixed || 0;
+    if (total === 0 && weak === 0) {
+      showToast(`✓ Перепарсил ${r.episodes_processed} эпизод${r.episodes_processed === 1 ? '' : (r.episodes_processed < 5 ? 'а' : 'ов')} — всё актуально, слабых описаний не найдено`, 5500);
+    } else {
+      const flat = (r.by_episode || []).flatMap(b => (b.new_outfits || []));
+      if (flat.length) _notifyNewOutfits(flat);
+      const bits = [];
+      if (total > 0) bits.push(`+${total} нов${total === 1 ? 'ый' : 'ых'} образ${total === 1 ? '' : (total < 5 ? 'а' : 'ов')}`);
+      if (weak > 0) bits.push(`усилил описания у ${weak} существующ${weak === 1 ? 'его' : 'их'} (картинки перегенерятся)`);
+      showToast(`✓ Перепарсил ${r.episodes_processed} (${scope}) — ${bits.join(', ')}, генерация в фоне`, 9000);
+    }
+    // Refresh series + episodes so the new outfit chips appear immediately
+    try {
+      const fresh = await api.get(`/api/series/${S.seriesId}`);
+      if (fresh && !fresh.error) {
+        S.series = fresh;
+        if (typeof renderCharactersList === 'function') renderCharactersList();
+      }
+      const epsRes = await api.get(`/api/series/${S.seriesId}/episodes`);
+      if (Array.isArray(epsRes)) {
+        S.episodes = epsRes;
+        if (typeof renderEpisodesList === 'function') renderEpisodesList();
+      }
+    } catch (e) { /* best-effort refresh */ }
+  } catch (e) {
+    showToast('Ошибка перепроанализа: ' + (e.message || e), 6000);
+  } finally {
+    if (btn) { btn.disabled = false; btn.innerHTML = orig; }
+  }
+}
+
 async function checkLogicOnSelected() {
   if (!S.seriesId) { showToast('Открой сериал'); return; }
   if (!S._genSelected) _restoreGenSelection();
@@ -3606,6 +4059,19 @@ function renderCharactersList() {
     const hasRefs = c.ref_images && c.ref_images.length > 0;
     const v = c.image_version ? `?v=${c.image_version}` : '';
     const imgUrl = hasRefs ? `/assets/${s.id}/${c.ref_images[0]}${v}` : null;
+    // Outfit chips — exclude base (it's the ref portrait) and show generation state.
+    const outfits = (c.outfits || []).filter(o => !o.is_base);
+    const pendingCount = outfits.filter(o => !o.photo).length;
+    const readyCount = outfits.length - pendingCount;
+    const chips = outfits.slice(0, 4).map(o => {
+      const ready = !!o.photo;
+      const label = esc(o.label || '?');
+      return `<span class="outfit-chip ${ready ? 'ready' : 'pending'}" title="${ready ? 'Фото готово' : 'Генерируется...'}">${ready ? '👗' : '⚙'} ${label}</span>`;
+    }).join('');
+    const moreChip = outfits.length > 4 ? `<span class="outfit-chip more">+${outfits.length - 4}</span>` : '';
+    const outfitRow = outfits.length
+      ? `<div class="outfit-chips-row">${chips}${moreChip}</div>`
+      : '';
     return `
       <div class="char-item" data-autogen-kind="char" data-autogen-id="${c.id}" onclick="openCharAssets('${c.id}')"
            ondragover="_dropAssetOver(event)" ondragleave="_dropAssetLeave(event)"
@@ -3616,8 +4082,9 @@ function renderCharactersList() {
           <div class="autogen-overlay" hidden><span class="spinner"></span></div>
         </div>
         <div class="char-info">
-          <div class="char-name">${esc(c.name)}</div>
+          <div class="char-name">${esc(c.name)}${outfits.length ? ` <span class="outfit-count-badge" title="${readyCount}/${outfits.length} образов готово">👗${readyCount}/${outfits.length}</span>` : ''}</div>
           <div class="char-role">${esc(c.gender === 'male' ? 'М' : 'Ж')} · ${esc(c.description?.slice(0,30) || '—')}</div>
+          ${outfitRow}
         </div>
         <div class="char-ref-dot ${hasRefs ? 'has-refs' : 'no-refs'}" title="${hasRefs ? 'Есть фото' : 'Нет фото'}"></div>
         <button class="btn-icon" onclick="event.stopPropagation();openEditCharacter('${c.id}')" title="Редактировать">✎</button>
@@ -3968,15 +4435,19 @@ function openBibleEditor() {
   setVal('bible-audience', s.target_audience);
   setVal('bible-world', s.world_description);
   setVal('bible-visual-style', s.visual_style || '');
+  setVal('bible-max-chars-per-scene', s.max_main_chars_per_scene || '');
   openModal('modal-bible');
 }
 
 async function saveBible() {
+  const maxCharsRaw = val('bible-max-chars-per-scene');
+  const maxChars = maxCharsRaw ? Math.max(1, Math.min(6, parseInt(maxCharsRaw, 10))) : null;
   const data = {
     title: val('bible-title'), genre: val('bible-genre'),
     tone: val('bible-tone'), target_audience: val('bible-audience'),
     world_description: val('bible-world'),
     visual_style: val('bible-visual-style'),
+    max_main_chars_per_scene: maxChars,
   };
   S.series = await api.put(`/api/series/${S.seriesId}`, data);
   closeModal('modal-bible');
@@ -6299,10 +6770,14 @@ const SCENE_BORDERS = [
 const SCENE_HEADING_RE = /^[\s*_#>]*(INT\.|EXT\.|INT\.?\s*\/\s*EXT\.?|I\/E\.|ИНТ\.|ИНТА\.|ЭКСТ\.|ЭКС\.|НАТ\.|НАТУРА\.|ВНУТР\.|ИНТЕРЬЕР|ВНЕ\.|СНАРУЖИ)\s+/i;
 
 // Inferred scene heading: when the writer didn't bother with INT./EXT./ИНТ.
-// — but the line still clearly opens a new scene. Three sub-patterns:
+// — but the line still clearly opens a new scene. Sub-patterns:
 //   • "Локация: ..." or "LOCATION: ..." context preamble
 //   • Numbered: "СЦЕНА 5", "Сцена 5.", "SCENE 12"
-const SCENE_HEADING_INFER_RE = /^[\s*_#>]*(Локация\s*[:：]|Location\s*[:：]|СЦЕНА\s*\d|Сцена\s*\d|SCENE\s*\d)/i;
+//   • Time-coded beat: "0:00—0:05 — Hook" / "0:05–0:15 — Arrival" / "1:30 —
+//     On the way" — common in short-drama / vertical TikTok formats where
+//     the writer marks beats by timestamp instead of slug. Each beat is
+//     typically a new shot/location, so treat as scene break.
+const SCENE_HEADING_INFER_RE = /^[\s*_#>]*(Локация\s*[:：]|Location\s*[:：]|СЦЕНА\s*\d|Сцена\s*\d|SCENE\s*\d|\d{1,2}:\d{2}\s*[—–\-])/i;
 
 // Control / structural tokens that LOOK slug-ish but aren't scene starts.
 const _SLUG_BLOCKLIST_RE = /^(REVERSAL|END|FIN|КОНЕЦ|TBD|TBC|БИТ|BIT|HOOK|TWIST|CLIFFHANGER|КЛИФФХЭНГЕР|РАЗВОРОТ|ПАУЗА|ТИШИНА|FLASHBACK|FLASH BACK|MONTAGE|МОНТАЖ|VOICE OVER|V\.O\.|O\.S\.)$/i;
@@ -6373,6 +6848,19 @@ const _SCRIPT_SKIP_PATTERNS = [
   // until the next script-style line — handled in the loop via a tracker
   // flag, not just regex match here.
   /^(?:кратко|синопсис|summary|brief|logline|premise|tldr)\s*[:\-—]/i,
+  // Episode meta-header block — short-drama scripts often start with:
+  //   Episode 1 — Welcome to Palm City
+  //     o Length: ~60 seconds
+  //     o Dialogue: English
+  //     o Style: animated crime drama, tropical 80s city, anthropomorphic
+  // These are metadata, NOT visible screen content. Without skipping they
+  // turn into a phantom chunk-0 with ~5s duration that renders nothing
+  // meaningful. Added 2026-05-19 after user-reported empty chunk in Vice Beasts ep 1.
+  /^Episode\s+\d+\s*[—–\-:]/i,
+  /^Эпизод\s+\d+\s*[—–\-:]/i,
+  // Bulleted meta keys (with `o`, `○`, `•`, `-`, `*` prefix OR no prefix):
+  /^\s*[o○•·]\s+(Length|Duration|Dialogue|Language|Style|Tone|Theme|Mood|Genre|Setting|Format|Logline|Pacing)\s*[:：]/i,
+  /^(Length|Duration|Dialogue|Language|Style|Tone|Theme|Mood|Genre|Setting|Format|Pacing)\s*[:：]\s*\S/i,
 ];
 
 // Heuristic per-line duration in seconds (only counts what's actually on screen).
@@ -6676,6 +7164,13 @@ function _parseScriptScenes(scriptText, overrides) {
   let inCast = false;
   let inNotes = false;
   let inSynopsis = false;   // tracks multi-line «Кратко: …» / «Summary: …» blocks
+  let inBlocking = false;   // tracks [BLOCKING]…[/BLOCKING] and [BLOCKING_OUT]…[/BLOCKING_OUT]
+                            // — visual/spatial setup metadata, NOT story content.
+                            // Lines inside contribute 0 chrono, never form a segment.
+                            // Server-side compose reads them from the raw script
+                            // and injects them into the Seedance prompt.
+  let blockingKind = '';    // 'in' or 'out' — appended to current scene's metadata
+  let pendingEpisodeBlocking = [];  // [BLOCKING] before any scene heading lands here
   let cur = null;
   let runningOffset = 0;
   // Heuristic for «is this line a real script-style content line?» — used to
@@ -6692,7 +7187,55 @@ function _parseScriptScenes(scriptText, overrides) {
   // True after we've just seen a bare speaker cue ("SOFIA", "DANTE (V.O.)")
   // and are waiting for the dialogue text line that belongs to it.
   let expectingDialogue = false;
-  for (const rawLine of rawLines) {
+
+  // IMPLICIT-BLOCKING PRE-PASS. Some writer-LLMs emit a setup block WITHOUT
+  // fence markers ([BLOCKING_START] / etc.), relying on content patterns like
+  // `NAME: position :: OUTFIT: clothes` or standalone `LOCATION:`. Without
+  // explicit fences the segmenter happily turns "LOCATION:" into a scene
+  // heading and the `:: OUTFIT:` lines into bogus dialogue. Detect those
+  // signatures and mark indices to skip from segmentation (they still stay
+  // in the raw script so server-side compose injects them).
+  const implicitBlockingIdx = new Set();
+  const _isOutfitLine = (t) => /::\s*(?:OUTFIT|WEARING|WEAR|CLOTHES|COSTUME)\s*[:：]/i.test(t);
+  const _isBlockingMetaKey = (t) =>
+    /^(?:LOCATION|MOOD|LIGHTING|PROPS|CAMERA|FRAMING|SETTING|TIME|WEATHER|ATMOSPHERE|ATMOSFERA|ОСВЕЩЕНИЕ|РЕКВИЗИТ|ЛОКАЦИЯ|АТМОСФЕРА)\s*[:：]\s*\S/i.test(t);
+  // Stative position verbs (RU + EN) at the START of `NAME: <text>` distinguish
+  // a "blocking position line" from real dialogue. Real dialogue starts with
+  // pronouns ("I/Я/Ты"), quote, or action — not "стоит/sits".
+  // Use a lookahead boundary instead of \b because JS \b doesn't recognise
+  // Cyrillic letters as word characters → \b after "стоит" never matches.
+  const _POSITION_VERB_RE = /^(?:стои[тю]|стоят|сиди[тю]|сидят|лежи[тшю]|лежат|держи[тшю]|держат|смотри[тшю]|смотрят|одет[аоы]?|оперевш\w*|прислон\w*|сжима\w*|стиска\w*|наблюда\w*|замер\w*|опуст\w*|поднят\w*|опущен\w*|облокот\w*|прижим\w*|нависа\w*|нагиба\w*|склон\w*|присел\w*|развалил\w*|wears?|stands?|sits?|lies?|holds?|looks?\s+at|watches?|leans?|grips?|clenches?|presses?|tilts?|rests?|stays?|crouches?|kneels?|squats?|positions?)(?=[\s,.;:!?]|$)/i;
+  // A `NAME: text` line whose text starts with a stative-position verb.
+  const _isPositionLine = (t) => {
+    const m = t.match(/^[A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё0-9 \-'.#]{0,40}\s*[:：]\s*(.+)$/);
+    if (!m) return false;
+    return _POSITION_VERB_RE.test(m[1].trim());
+  };
+  const _isBlockingContent = (t) => _isOutfitLine(t) || _isPositionLine(t) || _isBlockingMetaKey(t);
+  for (let i = 0; i < rawLines.length; i++) {
+    const t = rawLines[i].trim();
+    // Primary trigger: outfit-line OR position-NAME line. Don't trigger on a
+    // lone LOCATION: — it might be a real (inferred) scene heading.
+    if (!_isOutfitLine(t) && !_isPositionLine(t)) continue;
+    implicitBlockingIdx.add(i);
+    // Walk BACKWARDS through blanks + blocking-content lines (meta/outfit/pos).
+    for (let j = i - 1; j >= 0; j--) {
+      const tj = rawLines[j].trim();
+      if (!tj) continue;
+      if (_isBlockingContent(tj)) { implicitBlockingIdx.add(j); continue; }
+      break;
+    }
+    // Walk FORWARDS too — pick up subsequent blocking-content lines.
+    for (let j = i + 1; j < rawLines.length; j++) {
+      const tj = rawLines[j].trim();
+      if (!tj) continue;
+      if (_isBlockingContent(tj)) { implicitBlockingIdx.add(j); continue; }
+      break;
+    }
+  }
+
+  for (let _lineIdx = 0; _lineIdx < rawLines.length; _lineIdx++) {
+    const rawLine = rawLines[_lineIdx];
     const lineStart = runningOffset;
     const lineEnd = runningOffset + rawLine.length;
     runningOffset = lineEnd + 1; // +1 for the \n we removed
@@ -6701,6 +7244,55 @@ function _parseScriptScenes(scriptText, overrides) {
     if (/^={3,}\s*EPISODE CAST/i.test(t)) { inCast = true;  continue; }
     if (/^={3,}\s*END CAST/i.test(t))     { inCast = false; continue; }
     if (inCast) continue;
+
+    // Implicit blocking — line is part of a fence-less setup block detected
+    // by the pre-pass (`:: OUTFIT:` pattern or LOCATION:/MOOD:/etc adjacent
+    // to one). Treat as blockingIn for the current scene (or pending if no
+    // scene open yet), then continue.
+    if (implicitBlockingIdx.has(_lineIdx)) {
+      if (cur) {
+        (cur.blockingIn = cur.blockingIn || []).push(rawLine);
+      } else {
+        pendingEpisodeBlocking.push(rawLine);
+      }
+      continue;
+    }
+
+    // BLOCKING fence — visual/spatial setup metadata. Lines inside the fence
+    // are NOT story content: 0 chrono, no segment, no scene heading detection.
+    // Ultra-permissive marker detection: accepts ALL common variants different
+    // LLMs / writers tend to emit:
+    //   [BLOCKING]       [/BLOCKING]
+    //   [BLOCKING_START] [BLOCKING_END]
+    //   [BLOCKING_BEGIN] [BLOCKING_CLOSE]
+    //   [BLOCKING_OPEN]  [/BLOCKING_END]
+    //   plus _OUT variants for closing-scene mise-en-scène.
+    // Classification: a fence is a CLOSER if it has `[/` prefix OR ends with
+    // `_END]` / `_CLOSE]`. Otherwise it's an OPENER. `_OUT` anywhere → maps
+    // to scene's `blockingOut` instead of `blockingIn`.
+    const _isBlockingFence = /^\[\/?\s*BLOCKING(?:_OUT)?(?:_(?:START|BEGIN|OPEN|END|CLOSE))?\s*\]\s*$/i.test(t);
+    if (_isBlockingFence) {
+      const isClose = /^\[\s*\//.test(t) || /_(?:END|CLOSE)\s*\]/i.test(t);
+      const isOut   = /BLOCKING_OUT/i.test(t);
+      if (isClose) {
+        inBlocking = false;
+        blockingKind = '';
+      } else {
+        inBlocking = true;
+        blockingKind = isOut ? 'out' : 'in';
+      }
+      continue;
+    }
+    if (inBlocking) {
+      if (!t) continue;
+      if (cur) {
+        const key = blockingKind === 'out' ? 'blockingOut' : 'blockingIn';
+        (cur[key] = cur[key] || []).push(rawLine);
+      } else {
+        pendingEpisodeBlocking.push(rawLine);
+      }
+      continue;
+    }
     // Synopsis block — enter on «Кратко:» / «Summary:» / «Brief:» / etc.
     // Stay inside until we hit either a blank line OR a real script-style
     // line (CHAR: / [action] / scene heading). Meant for the 1-3 sentences
@@ -6746,6 +7338,12 @@ function _parseScriptScenes(scriptText, overrides) {
     const headMatch = _matchSceneHeading(t);
     if (headMatch.match) {
       cur = { id: scenes.length, heading: t, lines: [], totalSec: 0, inferred: headMatch.inferred };
+      // Hand off any [BLOCKING] block that appeared BEFORE this heading to the
+      // new scene — it was setup for THIS scene, just placed early.
+      if (pendingEpisodeBlocking.length) {
+        cur.blockingIn = pendingEpisodeBlocking.slice();
+        pendingEpisodeBlocking = [];
+      }
       scenes.push(cur);
       expectingDialogue = false;  // reset cross-scene state
       continue;
@@ -6760,6 +7358,10 @@ function _parseScriptScenes(scriptText, overrides) {
     // so the script doesn't disappear entirely from the scene view.
     if (!cur) {
       cur = { id: 0, heading: '', lines: [], totalSec: 0, inferred: true, synthetic: true };
+      if (pendingEpisodeBlocking.length) {
+        cur.blockingIn = pendingEpisodeBlocking.slice();
+        pendingEpisodeBlocking = [];
+      }
       scenes.push(cur);
     }
 
@@ -6984,14 +7586,29 @@ function _buildSeedanceCoverage(scriptText, chunks) {
   return ranges;
 }
 function _statusForLine(line, coverage) {
-  // Return tightest covering range (latest start that contains the line)
-  let best = null;
-  for (const r of coverage) {
-    if (r.start <= line.offset + 5 && r.end >= line.offsetEnd - 5) {
-      if (!best || r.start > best.start) best = r;
-    }
+  // Find all ranges covering this line. Multiple chunks can share the same
+  // chunk_text (original + retries) — they all cover the same line range.
+  // OLD bug: used strict `>` on start, so the FIRST-iterated range won and
+  // stayed even if a later retry succeeded. Result: failed-then-succeeded
+  // segments stayed red in UI.
+  // FIX: prefer status by priority (completed > pending > failed) regardless
+  // of which chunk came first.
+  const covering = coverage.filter(r =>
+    r.start <= line.offset + 5 && r.end >= line.offsetEnd - 5
+  );
+  if (!covering.length) return null;
+  // 1) Any completed range wins. Pick latest by idx if multiple completed.
+  const completed = covering.filter(r => r.status === 'completed');
+  if (completed.length) {
+    return completed.reduce((best, r) => (r.idx ?? 0) > (best.idx ?? 0) ? r : best);
   }
-  return best;
+  // 2) Any in-progress (running/pending/submitted/etc.) wins over failed.
+  const inProgress = covering.filter(r => r.status !== 'failed');
+  if (inProgress.length) {
+    return inProgress.reduce((best, r) => (r.idx ?? 0) > (best.idx ?? 0) ? r : best);
+  }
+  // 3) Everything failed — show the latest failed for user info.
+  return covering.reduce((best, r) => (r.idx ?? 0) > (best.idx ?? 0) ? r : best);
 }
 
 function _renderScenesHTML(scenes, coverage = []) {
@@ -7125,13 +7742,17 @@ function _renderScenesHTML(scenes, coverage = []) {
             <input type="checkbox" ${isAutoSkipped ? '' : 'checked'} onchange="toggleSegmentAutoInclude('${autoSkipKey}')">
             <span>auto</span>
           </label>`;
-        html += `<div class="ep-seg${isAutoSkipped ? ' auto-skipped' : ''}" data-seg="${l.segIdx + 1}">
+        html += `<div class="ep-seg${isAutoSkipped ? ' auto-skipped' : ''}" data-seg="${l.segIdx + 1}" data-scene-idx="${sIdx}" data-seg-idx="${l.segIdx}">
           <div class="ep-seg-bracket" title="Seedance-сегмент ${l.segIdx + 1}">${l.segIdx + 1}</div>
           <div class="ep-seg-body">
             <div class="ep-seg-toolbar">
               <button class="ep-seg-send" onclick="sendSceneSegmentToSeedance(${sIdx}, ${l.segIdx})"
                 title="Скопировать сегмент в Seedance compose и прокрутить вниз">
                 🎬 в Сиданс
+              </button>
+              <button class="ep-seg-send" onclick="showChunksForSegment(${sIdx}, ${l.segIdx})"
+                title="Прокрутить вниз к сгенерированным видео-чанкам для этого сегмента и подсветить их">
+                📺 К видео
               </button>
               ${autoCb}
               ${overflowWarn}
@@ -7457,37 +8078,75 @@ function toggleSegmentEditMode(on) {
 
 // Compose segment text from auto-collected lines, then send to Seedance compose
 // textarea + scroll the compose panel into view + focus.
+// Manual force-setter exposed for console debugging. Type into DevTools:
+//    forceSdDuration(12)
+// and watch the [sd-duration WRITE] log fire. If the slider visually changes,
+// listener-based code is working. If not, something else is rendering the UI.
+window.forceSdDuration = function(n) {
+  const el = document.getElementById('sd-duration');
+  const label = document.getElementById('sd-duration-val');
+  if (!el) { console.error('sd-duration element not found'); return false; }
+  const v = Math.max(5, Math.min(15, Math.round(Number(n) || 5)));
+  console.log('[forceSdDuration] writing', v, 'to slider (currently', el.value, ')');
+  el.value = String(v);
+  if (label) label.textContent = v + 'с';
+  el.dataset.autoVal = String(v);
+  el.dispatchEvent(new Event('input',  { bubbles: true }));
+  el.dispatchEvent(new Event('change', { bubbles: true }));
+  console.log('[forceSdDuration] after writes, slider reads', el.value, '/ label reads', label?.textContent);
+  return el.value;
+};
+
 function sendSegmentToSeedance(segText) {
   const ta = document.getElementById('sd-chunk-text');
   if (!ta) {
     showToast('⚠ Seedance-панель не найдена на этом эпизоде', 4000);
     return;
   }
-  ta.value = segText;
-  // FORCE the duration slider to the chunk's chrono — no override-respect
-  // logic, no listener round-trip. Clicking "В Сиданс" on a chunk is an
-  // explicit intent to use that chunk's chrono; wipe any prior state.
+  // Lock the slider FIRST, before the textarea even gets the new text. This
+  // way listener-driven auto-set (which fires on textarea `input`) sees the
+  // dataset.autoVal already matching our recDur and stays out of the way.
   const durEl  = document.getElementById('sd-duration');
   const durVal = document.getElementById('sd-duration-val');
   let recDur = null;
-  if (durEl) {
-    try {
-      recDur = _estimateChunkDurationSec(segText);
-    } catch (e) {
-      console.warn('chunk duration estimate failed', e);
-    }
-    if (recDur != null && Number.isFinite(recDur) && recDur > 0) {
-      durEl.value = String(recDur);
-      durEl.dataset.autoVal = String(recDur);
-      if (durVal) durVal.textContent = recDur + 'с';
+  try {
+    recDur = _estimateChunkDurationSec(segText);
+  } catch (e) {
+    console.warn('[sendSegmentToSeedance] duration estimate threw:', e);
+  }
+  console.log('[sendSegmentToSeedance] segText length=' + segText.length + ' recDur=' + recDur + ' durEl=' + !!durEl);
+  if (durEl && recDur != null && Number.isFinite(recDur) && recDur > 0) {
+    // Clamp to the slider's min/max so the browser doesn't silently reject.
+    const min = parseInt(durEl.min || '5', 10) || 5;
+    const max = parseInt(durEl.max || '15', 10) || 15;
+    const v = Math.max(min, Math.min(max, Math.round(recDur)));
+    durEl.value = String(v);
+    durEl.setAttribute('value', String(v));   // some browsers need attr too
+    durEl.dataset.autoVal = String(v);
+    if (durVal) durVal.textContent = v + 'с';
+    durEl.dispatchEvent(new Event('input',  { bubbles: true }));
+    durEl.dispatchEvent(new Event('change', { bubbles: true }));
+    console.log('[sendSegmentToSeedance] slider set to ' + v + ' (was=' + durEl.value + ' after=' + durEl.value + ')');
+  }
+  // Now set the textarea. Any cascading input listener that sets durEl will
+  // see dataset.autoVal === recDur and bail out of the override-respect path.
+  ta.value = segText;
+  ta.dispatchEvent(new Event('input', { bubbles: true }));
+  // Re-affirm slider once more AFTER the textarea event chain, defensively —
+  // covers any listener that decided to write durEl despite our handshake.
+  if (durEl && recDur != null && Number.isFinite(recDur) && recDur > 0) {
+    const min = parseInt(durEl.min || '5', 10) || 5;
+    const max = parseInt(durEl.max || '15', 10) || 15;
+    const v = Math.max(min, Math.min(max, Math.round(recDur)));
+    if (String(durEl.value) !== String(v)) {
+      console.warn('[sendSegmentToSeedance] slider drifted after textarea input; restoring', durEl.value, '→', v);
+      durEl.value = String(v);
+      durEl.dataset.autoVal = String(v);
+      if (durVal) durVal.textContent = v + 'с';
       durEl.dispatchEvent(new Event('input',  { bubbles: true }));
       durEl.dispatchEvent(new Event('change', { bubbles: true }));
     }
   }
-  // Notify textarea listeners (auto-resize, prefs save, etc.) AFTER the slider
-  // is already locked in — so listener-driven auto-set logic can't overwrite
-  // our explicit value.
-  ta.dispatchEvent(new Event('input', { bubbles: true }));
   document.getElementById('seedance-panel')?.scrollIntoView({behavior:'smooth', block:'start'});
   setTimeout(() => ta.focus(), 350);
   const durMsg = recDur != null ? ` (⏱ ${recDur}с)` : '';
@@ -7854,10 +8513,16 @@ function _autoRegisterRun(R) {
 function _autoUnregisterRun(R) {
   if (!R) return;
   AUTO_RUNS.delete(`${R._epSid}:${R._epNumber}`);
+  // Run completed / stopped → drop its persisted snapshot so the next page
+  // load doesn't pop the «▶ Продолжить» widget for a long-finished episode.
+  try { _autoClearPersistedRun(R._epSid, R._epNumber); } catch {}
   _autoUpdateFloatingWidget();
 }
 function _autoAllRuns() {
   // Primary AUTO + any extras. Filtered to active=true.
+  // Includes "suspended" placeholders restored from localStorage after a page
+  // refresh — they have active=true but a flag indicating they need a manual
+  // resume click before the JS loop spins up again.
   const out = [];
   if (AUTO.active) out.push(AUTO);
   for (const r of AUTO_RUNS.values()) {
@@ -7866,6 +8531,106 @@ function _autoAllRuns() {
   }
   return out;
 }
+
+// ── Persistence — survive page refresh ─────────────────────────────────────
+// The JS loop dies on refresh (any open Seedance jobs still finish on the
+// backend), so we serialize active-run state to localStorage. On next page
+// load `_autoRestoreSuspendedRuns` re-injects them as suspended placeholders
+// in AUTO_RUNS, the floating widget reappears with a «▶ Продолжить» button,
+// and the user can resume from where it stopped — already-completed chunks
+// (matched by script_order) are skipped to avoid duplicating work.
+const _AUTO_LS_KEY = 'auto_runs_state_v1';
+const _AUTO_LS_TTL_MS = 24 * 60 * 60 * 1000;   // 24h — stale states age out
+
+function _autoSerializeRun(r) {
+  return {
+    epSid: r._epSid,
+    epNumber: r._epNumber,
+    total: r.total || 0,
+    completedCount: r.completedCount || 0,
+    parallel: !!r.parallel,
+    errorMode: r.errorMode || 'heal',
+    lastStatus: r.lastStatus || '',
+    timestamp: Date.now(),
+  };
+}
+
+function _autoPersistRuns() {
+  try {
+    const runs = _autoAllRuns().filter(r => r._epSid && r._epNumber != null && !r.suspended);
+    if (!runs.length) {
+      localStorage.removeItem(_AUTO_LS_KEY);
+      return;
+    }
+    localStorage.setItem(_AUTO_LS_KEY, JSON.stringify(runs.map(_autoSerializeRun)));
+  } catch {}
+}
+
+function _autoClearPersistedRun(epSid, epNumber) {
+  try {
+    const raw = localStorage.getItem(_AUTO_LS_KEY);
+    if (!raw) return;
+    const arr = JSON.parse(raw).filter(s => !(s.epSid === epSid && s.epNumber === epNumber));
+    if (arr.length) localStorage.setItem(_AUTO_LS_KEY, JSON.stringify(arr));
+    else localStorage.removeItem(_AUTO_LS_KEY);
+  } catch {}
+}
+
+// Restore suspended runs from localStorage. Runs as soon as app.js loads —
+// the placeholder entry has active=true + suspended=true so the floating
+// widget renders it with the «▶ Продолжить» button.
+function _autoRestoreSuspendedRuns() {
+  let snapshots;
+  try {
+    const raw = localStorage.getItem(_AUTO_LS_KEY);
+    if (!raw) return;
+    snapshots = JSON.parse(raw);
+    if (!Array.isArray(snapshots) || !snapshots.length) return;
+  } catch { return; }
+  const fresh = snapshots.filter(s => (Date.now() - (s.timestamp || 0)) < _AUTO_LS_TTL_MS);
+  if (!fresh.length) {
+    localStorage.removeItem(_AUTO_LS_KEY);
+    return;
+  }
+  for (const snap of fresh) {
+    if (!snap.epSid || snap.epNumber == null) continue;
+    const key = `${snap.epSid}:${snap.epNumber}`;
+    if (AUTO_RUNS.has(key)) continue;   // a live run already exists, prefer it
+    AUTO_RUNS.set(key, {
+      active: true,
+      suspended: true,                  // marker for the widget renderer
+      _epSid: snap.epSid,
+      _epNumber: snap.epNumber,
+      total: snap.total,
+      completedCount: snap.completedCount,
+      parallel: snap.parallel,
+      errorMode: snap.errorMode,
+      lastStatus: '⏸ Прервано обновлением страницы — нажми «▶ Продолжить»',
+    });
+  }
+  if (typeof _autoUpdateFloatingWidget === 'function') _autoUpdateFloatingWidget();
+}
+
+// Resume a suspended run. Navigates to the target episode if not already
+// there, then triggers startAutoMode — its built-in pre-flight will
+// re-collect segments from the current script and the new completed-chunks
+// filter (added in startAutoMode) skips anything already finished on the
+// backend so we don't redo successful work.
+async function _autoResumeRun(epSid, epNumber) {
+  if (!epSid || epNumber == null) return;
+  const key = `${epSid}:${epNumber}`;
+  // Mark as cleared so the user immediately sees we picked up the request.
+  AUTO_RUNS.delete(key);
+  _autoClearPersistedRun(epSid, epNumber);
+  _autoUpdateFloatingWidget();
+  if (S.seriesId !== epSid || !S.episode || S.episode.number !== epNumber) {
+    try { navigate('episode', { seriesId: epSid, episodeNum: epNumber }); } catch {}
+    // Give the episode-open render cycle a moment to land before kicking off.
+    await new Promise(r => setTimeout(r, 800));
+  }
+  try { startAutoMode(); } catch (e) { console.warn('[auto resume] start failed', e); }
+}
+window._autoResumeRun = _autoResumeRun;   // exposed for inline onclick
 
 function _autoSaveErrMode(mode) {
   if (mode !== 'heal' && mode !== 'stop') return;
@@ -7891,6 +8656,14 @@ function _applyAutoModeUI() {
 }
 // Run on episode-view render so visibility matches saved choice
 document.addEventListener('DOMContentLoaded', _applyAutoModeUI);
+// Restore any auto-mode runs that were active when the page was refreshed —
+// they re-appear as suspended placeholders in the floating widget with a
+// «▶ Продолжить» button. Wrapped in setTimeout so AUTO_RUNS / widget code
+// is fully parsed (defensive — function declarations are hoisted but the
+// floating widget DOM root is created lazily, so we wait until ticking).
+document.addEventListener('DOMContentLoaded', () => {
+  setTimeout(_autoRestoreSuspendedRuns, 0);
+});
 
 function _autoCollectSegments(opts = {}) {
   const ta = document.getElementById('ep-script');
@@ -8001,12 +8774,20 @@ function _autoUpdateFloatingWidget() {
     else if ((r.activeChains || 0) > 1) mode = `сцены × ${r.activeChains}`;
     else mode = 'последов.';
     const ep = r._epNumber != null ? `Эп.${r._epNumber}` : '';
+    // Suspended (restored from localStorage after a refresh) → show resume btn
+    // instead of the live spinner, and freeze the status string so it doesn't
+    // pretend the loop is still chugging.
+    const resumeBtn = r.suspended
+      ? `<button class="auto-float-resume" data-sid="${esc(r._epSid || '')}" data-ep="${esc(String(r._epNumber || ''))}" title="Возобновить — пропустит уже готовые чанки">▶ Продолжить</button>`
+      : '';
+    const spinHtml = r.suspended ? '⏸' : '<span class="auto-float-spin"></span>';
     return `
-      <div class="auto-float-row" data-sid="${esc(r._epSid || '')}" data-ep="${esc(String(r._epNumber || ''))}">
+      <div class="auto-float-row${r.suspended ? ' auto-float-row-suspended' : ''}" data-sid="${esc(r._epSid || '')}" data-ep="${esc(String(r._epNumber || ''))}">
         <div class="auto-float-row-head">
-          <span class="auto-float-spin"></span>
+          ${spinHtml}
           <span class="auto-float-row-label">${esc(ep)}</span>
           <span class="auto-float-row-count">${total ? `${done}/${total} · ${pct}%` : '…'}</span>
+          ${resumeBtn}
         </div>
         <div class="auto-float-bar"><div class="auto-float-bar-fill" style="width:${pct}%"></div></div>
         <div class="auto-float-status">${esc(mode)} · ${esc(r.lastStatus || '...')}</div>
@@ -8027,6 +8808,16 @@ function _autoUpdateFloatingWidget() {
     try { if (typeof stopRangeGen === 'function' && (typeof RANGE !== 'undefined') && RANGE.active) stopRangeGen(); } catch {}
     try { if (typeof stopAutoMode === 'function') stopAutoMode(); } catch {}
   });
+  // Resume buttons on suspended rows — must run BEFORE the row-level
+  // navigation handler binds, otherwise the row click intercepts the button.
+  w.querySelectorAll('.auto-float-resume').forEach(btn => {
+    btn.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      const sid = btn.dataset.sid;
+      const ep  = parseInt(btn.dataset.ep, 10);
+      if (sid && !Number.isNaN(ep)) _autoResumeRun(sid, ep);
+    });
+  });
   w.querySelectorAll('.auto-float-row').forEach(row => {
     row.addEventListener('click', () => {
       const sid = row.dataset.sid, ep = row.dataset.ep;
@@ -8041,6 +8832,8 @@ function _autoUpdateFloatingWidget() {
     w.dataset.sid = runs[0]._epSid || '';
     w.dataset.ep  = String(runs[0]._epNumber || '');
   }
+  // Persist active runs to localStorage so a page refresh can restore them.
+  _autoPersistRuns();
 }
 function _autoUpdateFloatingWidget_LEGACY_HEAD_NOT_USED() {
   // Stub — original code path that referenced AUTO directly. Kept for safety
@@ -8287,7 +9080,22 @@ async function startAutoMode() {
   // autoSkipKey (`s{sceneIdx}g{segIdx}`), NOT the first-line text — see
   // toggleSegmentAutoInclude for why.
   const skippedCount = allSegs.filter(s => _isSegmentAutoSkipped(s.autoSkipKey)).length;
-  AUTO.segments = allSegs.filter(s => !_isSegmentAutoSkipped(s.autoSkipKey));
+  // Drop segments whose chunk is already finished on the backend (matched by
+  // script_order). This is what makes resume-after-refresh non-destructive —
+  // re-running auto-mode picks up exactly where the previous run died.
+  // `completed` is the success status set when Seedance returns the mp4; QC
+  // may still be pending but the chunk file exists, so re-generating it would
+  // overwrite working output for no benefit.
+  const existingChunks = (S.episode && S.episode.seedance_chunks) || [];
+  const completedOrders = new Set(
+    existingChunks
+      .filter(c => c && c.status === 'completed' && typeof c.script_order === 'number')
+      .map(c => c.script_order)
+  );
+  const alreadyDoneCount = allSegs.filter(s => completedOrders.has(s.scriptOrder)).length;
+  AUTO.segments = allSegs.filter(s =>
+    !_isSegmentAutoSkipped(s.autoSkipKey) && !completedOrders.has(s.scriptOrder)
+  );
   AUTO.total    = AUTO.segments.length;
   AUTO.cursor   = 0;             // back-compat with status UI
   AUTO.completedCount = 0;       // atomic counter across chains
@@ -8327,8 +9135,9 @@ async function startAutoMode() {
         : 'последовательно (1 сцена)');
   const errWord  = AUTO.errorMode === 'heal' ? 'авто-лечение' : 'останов + сигнал';
   const skipNote = skippedCount ? `\nПропущено по чекбоксу: ${skippedCount}` : '';
+  const doneNote = alreadyDoneCount ? `\nУже сгенерены (пропустим): ${alreadyDoneCount}` : '';
   const _confirmMsg =
-    `Сегментов: ${AUTO.total}${skipNote}\n` +
+    `Сегментов: ${AUTO.total}${skipNote}${doneNote}\n` +
     `Режим: ${modeWord}\n` +
     `На ошибке модерации: ${errWord}\n\n` +
     (AUTO.parallel
@@ -9673,6 +10482,8 @@ async function generateEpisodeScript() {
   btn.innerHTML = '<span class="spinner"></span>';
   status.textContent = 'Генерируем сценарий...';
   status.style.color = 'var(--warning)';
+  const postgenEl = document.getElementById('ep-postgen-checks');
+  if (postgenEl) postgenEl.innerHTML = '';
   const taskCtx = { seriesId: S.seriesId, episodeNum: S.episodeNum, seriesTitle: S.series?.title };
   try {
     await saveEpisodeSilent();
@@ -9723,6 +10534,10 @@ async function generateEpisodeScript() {
     if (_scriptSoundsEnabled()) {
       try { Sounds.playSuccess(); } catch (e) {}
     }
+    // Auto-run post-gen checks: surface logic audit violations + phrase scan
+    _epPostGenChecks(res.script, res.audit_report);
+    // Notify about auto-created outfits from SCENE_OPEN
+    _notifyNewOutfits(res._new_outfits);
     // NOTE: auto-extraction of chars/locations is INTENTIONALLY skipped here.
     // User wants explicit control — they'll click "🤖 Извлечь персонажей и локации"
     // when ready. Backend also no longer auto-syncs cast block on script-save.
@@ -9797,8 +10612,14 @@ async function acceptScript(opts = {}) {
   btn.disabled = true;
   btn.innerHTML = '<span class="spinner"></span> Анализирую...';
   try {
-    // 1+2: Save script + snapshot before-IDs.
-    await api.put(`/api/series/${S.seriesId}/episodes/${S.episodeNum}`, { script });
+    // 1+2: Save script + snapshot before-IDs. Capture the PUT response so we
+    // can surface any outfits the [BLOCKING] sync auto-created — without this
+    // the toast/banner from _notifyNewOutfits never fires inside the accept
+    // flow and the user has no feedback that new outfits were detected.
+    const putResp = await api.put(`/api/series/${S.seriesId}/episodes/${S.episodeNum}`, { script });
+    if (putResp && putResp._new_outfits && putResp._new_outfits.length) {
+      _notifyNewOutfits(putResp._new_outfits);
+    }
     const beforeChars = new Set((S.series?.characters || []).map(c => c.id));
     const beforeLocs  = new Set((S.series?.locations  || []).map(l => l.id));
     const beforeItems = new Set((S.series?.items      || []).map(it => it.id));
@@ -10085,6 +10906,8 @@ async function applyScriptChanges() {
       btn.style.display = 'none';
       btn.dataset.dirty = '';
     }
+    // Notify about auto-created outfits from SCENE_OPEN
+    _notifyNewOutfits(updated._new_outfits);
   } catch (e) {
     if (status) { status.textContent = '✗ ' + (e.message || e); status.style.color = 'var(--danger)'; }
   } finally {
@@ -11894,9 +12717,10 @@ async function loadBalance() {
 function openModal(id) { document.getElementById(id).classList.remove('hidden'); }
 function closeModal(id) { document.getElementById(id).classList.add('hidden'); }
 
-// Close modal on backdrop click
+// Close modal on backdrop click — skip modals marked no-backdrop-close
 document.addEventListener('click', e => {
-  if (e.target.classList.contains('modal')) closeModal(e.target.id);
+  if (e.target.classList.contains('modal') && !e.target.classList.contains('no-backdrop-close'))
+    closeModal(e.target.id);
 });
 
 // ── DOM helpers ───────────────────────────────────────────────────────────────
@@ -12003,6 +12827,14 @@ const Sounds = (() => {
     if (!isVoiceEnabled()) return;
     if (!('speechSynthesis' in window)) return;
     try {
+      // Cancel any pending/in-flight utterance by default. Browser's
+      // SpeechSynthesis.speak() queues utterances, so calling speak() three
+      // times in a row reads all three back-to-back. For status alerts we
+      // want the LATEST event to interrupt the previous one. Opt-out with
+      // `opts.queue=true` if a flow legitimately needs sequential reading.
+      if (!opts.queue) {
+        try { window.speechSynthesis.cancel(); } catch (_) {}
+      }
       const u = new SpeechSynthesisUtterance(text);
       u.lang = opts.lang || 'en-US';
       u.rate = opts.rate || 1.0;
@@ -12823,19 +13655,35 @@ const SD = { refs: [], pollTimer: null, lastStatuses: {} /* idx → status, used
 function _sdNotifyTransitions(chunks) {
   if (!Array.isArray(chunks)) return;
   const fresh = {};
+  const freshQc = {};
   let newCompleted = 0;
   let newFailed = 0;
+  const newExhausted = [];   // chunks whose QC just transitioned to retry_exhausted
   for (const c of chunks) {
     const idx = c.idx;
     if (idx == null) continue;
     fresh[idx] = c.status;
+    const qcStatus = (c.qc && c.qc.status) || null;
+    freshQc[idx] = qcStatus;
     const was = SD.lastStatuses[idx];
     if (was != null && was !== c.status) {
       if (c.status === 'completed') newCompleted++;
       else if (c.status === 'failed') newFailed++;
     }
+    // Detect transition INTO retry_exhausted — QC gave up on this chunk after
+    // 2 retries. User asked for voice notification ("голосовое оповещение")
+    // identifying which chunk has trouble.
+    const wasQc = (SD.lastQcStatuses || {})[idx];
+    if (qcStatus === 'retry_exhausted' && wasQc !== 'retry_exhausted') {
+      newExhausted.push({
+        idx,
+        fails: (c.qc && c.qc.fails) || [],
+        attempts: (c.qc && c.qc.attempts) || 0,
+      });
+    }
   }
   SD.lastStatuses = fresh;
+  SD.lastQcStatuses = freshQc;
   if (newCompleted > 0) {
     Sounds.playSuccess();
     showToast(`✓ Готово видео: ${newCompleted} чанк${newCompleted > 1 ? 'а' : ''}`);
@@ -12848,6 +13696,26 @@ function _sdNotifyTransitions(chunks) {
   if (newFailed > 0) {
     Sounds.playError();
     showToast(`✗ Ошибка генерации: ${newFailed} чанк${newFailed > 1 ? 'а' : ''}`);
+  }
+  // Voice + sound alert on QC give-up. Consolidated into ONE short utterance
+  // per tick so multiple simultaneous fails don't queue and chain-read.
+  // Sounds.speak() now cancels pending utterances by default — newest event
+  // interrupts old. Combined with the consolidation here, TTS stays tight.
+  if (newExhausted.length > 0) {
+    try { Sounds.playError(); } catch {}
+    try {
+      const phrase = newExhausted.length === 1
+        ? `Chunk ${newExhausted[0].idx} failed.`
+        : `${newExhausted.length} chunks failed.`;
+      Sounds.speak(phrase);
+    } catch {}
+    // Per-chunk toast remains — visual log for which chunks need review.
+    for (const ex of newExhausted) {
+      showToast(
+        `🔇 Чанк #${ex.idx} — QC сдался (${(ex.fails || []).slice(0, 2).join(', ')})`,
+        8000,
+      );
+    }
   }
 }
 
@@ -13512,6 +14380,34 @@ async function sdGenerate() {
       model: model_tier,
       refs: SD.refs.map(r => ({ kind: r.kind, id: r.id, outfit: r.outfit || null, url: r.url || null })),
     };
+    // Infer script_order from current episode script so a manual regenerate
+    // lands in the correct timeline slot during auto-assemble. Without this
+    // the new chunk has script_order=null → backend treats it as an orphan
+    // and dumps it at the tail of the final cut (out of chronological order).
+    try {
+      if (chunk && typeof _autoCollectSegments === 'function') {
+        const segs = _autoCollectSegments();
+        const _norm = (s) => (s || '').replace(/\s+/g, ' ').trim().slice(0, 200).toLowerCase();
+        const ck = _norm(chunk);
+        if (ck) {
+          let bestIdx = -1;
+          for (let i = 0; i < segs.length; i++) {
+            const sk = _norm(segs[i].text);
+            if (sk && (sk === ck || sk.startsWith(ck.slice(0, 80)) || ck.startsWith(sk.slice(0, 80)))) {
+              bestIdx = i; break;
+            }
+          }
+          if (bestIdx >= 0) {
+            startBody.script_order = bestIdx;
+            const seg = segs[bestIdx];
+            if (typeof seg.sceneIdx === 'number') startBody.sceneIdx = seg.sceneIdx;
+            if (typeof seg.segIdx === 'number')   startBody.segIdx   = seg.segIdx;
+          }
+        }
+      }
+    } catch (err) {
+      console.warn('[sdGenerate] script_order inference failed (continuing without):', err);
+    }
     // B1: carry the «continuity reset by composer» reason from the last
     // sdCompose response so it lands on the chunk record for the UI badge.
     if (SD._continuityResetReason) {
@@ -14142,6 +15038,7 @@ function _sdCardHTML(c, labelInfo) {
       ${videoUrl ? `<a class="btn-ghost btn-sm" href="${videoUrl}" download onclick="event.stopPropagation()">⬇ Скачать</a>` : '<span></span>'}
       ${videoUrl ? `<button class="btn-ghost btn-sm" onclick="event.stopPropagation();sdAddToTimeline(${c.idx}, this)">➕ На таймлайн</button>` : '<span></span>'}
       ${canRetry ? `<button class="btn-ghost btn-sm" onclick="event.stopPropagation();sdRetry(${c.idx}, this)" title="Retry: тот же промпт+refs, новый чанк">🔁 Retry</button>` : '<span></span>'}
+      <button class="btn-ghost btn-sm" onclick="event.stopPropagation();sdShowInScript(${c.idx})" title="Прокрутить вверх к сценарию и подсветить сегмент, к которому относится этот чанк">📜 В сценарии</button>
       <button class="btn-ghost btn-sm" onclick="event.stopPropagation();sdReuse(${c.idx})" title="Подставить параметры в форму выше">↻ Reuse</button>
       ${c.status === 'failed' ? `<button class="btn-ghost btn-sm full-row" onclick="event.stopPropagation();sdHealAndReuse(${c.idx}, this)" title="Переписать промпт чтобы прошёл модерацию + Reuse">🩹 Лечить промпт</button>` : ''}
       ${(c.status === 'failed' && (c.heal_count || 0) >= 1) ? `<button class="btn-ghost btn-sm full-row" style="color:var(--accent)" onclick="event.stopPropagation();sdRewriteChunk(${c.idx}, this)" title="Лечение не помогло — переписать сцену с нуля с учётом всей серии">✍️ Переписать сцену</button>` : ''}
@@ -14195,11 +15092,17 @@ function _sdCardSig(c, labelInfo) {
   // numbering shifts (v2/v3) trigger re-render. Playback isn't reset on a poll
   // when nothing user-visible changed.
   const lblKey = labelInfo ? `${labelInfo.label}|${labelInfo.take}` : '';
+  // QC fields: include status/attempts/fails so transitions (null → pass /
+  // null → fail / fail → retry_exhausted) trigger re-render of the QC badge.
+  // Without this, server-side QC updates on disk but UI shows stale «🔍 QC...»
+  // badge until hard reload (real bug 2026-05-19, user complaint).
+  const qc = c.qc || {};
+  const qcKey = `${qc.status || ''}|${qc.attempts || 0}|${(qc.fails || []).join(',')}`;
   return [
     c.idx, c.status, c.video_path || '',
     c.progress ?? '', c.error || '',
     c.prompt || '', c.duration, c.resolution, c.moderation_bypass,
-    c.cost ?? '', c.heal_count ?? 0, lblKey,
+    c.cost ?? '', c.heal_count ?? 0, lblKey, qcKey,
   ].join('|');
 }
 
@@ -14446,6 +15349,133 @@ async function sdDelete(idx) {
   await sdRefreshList();
 }
 
+// «📺 К видео» — opposite of sdShowInScript. From a scene-view segment,
+// scroll DOWN to the seedance chunks panel and highlight ALL chunks (originals
+// + retries / additionals) whose sceneIdx + segIdx match this segment.
+// Falls back to chunk_text matching for legacy chunks without these fields.
+function showChunksForSegment(sceneIdx, segIdx) {
+  const list = SD._lastChunks || [];
+  if (!list.length) {
+    showToast('Нет сгенерированных чанков для этого эпизода', 4000);
+    return;
+  }
+  // Primary match: server-stored sceneIdx/segIdx on chunks
+  let matches = list.filter(c =>
+    typeof c.sceneIdx === 'number' && typeof c.segIdx === 'number'
+    && c.sceneIdx === sceneIdx && c.segIdx === segIdx
+  );
+  // Legacy fallback — match by chunk_text first-line overlap. Read the segment
+  // text from DOM and look for chunks containing that line.
+  if (!matches.length) {
+    const seg = document.querySelector(
+      `.ep-seg[data-scene-idx="${sceneIdx}"][data-seg-idx="${segIdx}"]`
+    );
+    if (seg) {
+      const segText = (seg.textContent || '').trim();
+      // Use a substring meaningful enough to disambiguate but not too long
+      const probe = segText.split('\n').map(l => l.trim()).find(l => l.length > 8) || segText.slice(0, 80);
+      if (probe) {
+        matches = list.filter(c => (c.chunk_text || '').includes(probe.slice(0, 60)));
+      }
+    }
+  }
+  if (!matches.length) {
+    showToast(`Для сегмента ${sceneIdx + 1}/${segIdx + 1} ещё нет сгенерированных чанков`, 4000);
+    return;
+  }
+  // Scroll to the first matching chunk card. The list panel is `#sd-gen-list`.
+  const firstIdx = matches[0].idx;
+  const firstCard = document.querySelector(`.sd-gen-card[data-idx="${firstIdx}"]`);
+  if (firstCard) {
+    firstCard.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }
+  // Highlight ALL matching cards with the same flash animation as
+  // sdShowInScript (yellow outline → fade).
+  for (const c of matches) {
+    const card = document.querySelector(`.sd-gen-card[data-idx="${c.idx}"]`);
+    if (!card) continue;
+    const prevStyle = card.getAttribute('style') || '';
+    card.setAttribute('style', prevStyle +
+      ';transition:box-shadow 0.3s ease-out;' +
+      'box-shadow:0 0 0 3px rgba(251,191,36,0.85),0 0 24px rgba(251,191,36,0.5);' +
+      'border-radius:8px;'
+    );
+    setTimeout(() => {
+      card.setAttribute('style', prevStyle +
+        ';transition:box-shadow 1.5s ease-out;box-shadow:none;'
+      );
+    }, 1800);
+    setTimeout(() => {
+      card.setAttribute('style', prevStyle);
+    }, 3400);
+  }
+  if (matches.length > 1) {
+    showToast(`Подсвечено ${matches.length} чанков (оригинал + ретраи/доп)`, 3000);
+  }
+}
+
+// «📜 В сценарии» — scroll up to the script section and highlight the segment
+// this chunk was generated from. Matches by chunk.sceneIdx + chunk.segIdx
+// (server-stored). Falls back to chunk_text first-line lookup for legacy
+// chunks without these fields.
+function sdShowInScript(idx) {
+  const list = SD._lastChunks || [];
+  const c = list.find(x => x.idx === idx);
+  if (!c) { showToast(`Чанк #${idx} не найден в текущем списке`, 4000); return; }
+
+  // Make sure scene-view is open (segments only render when scene-view is on).
+  const sceneViewWrap = document.getElementById('ep-script-scenes');
+  const isSceneViewVisible = sceneViewWrap && !sceneViewWrap.classList.contains('hidden');
+  if (!isSceneViewVisible && typeof toggleSceneView === 'function') {
+    toggleSceneView();
+  }
+
+  // Try direct match by scene/seg coordinates (stored on chunk).
+  let target = null;
+  if (typeof c.sceneIdx === 'number' && typeof c.segIdx === 'number') {
+    target = document.querySelector(
+      `.ep-seg[data-scene-idx="${c.sceneIdx}"][data-seg-idx="${c.segIdx}"]`
+    );
+  }
+  // Legacy fallback — match by first 60 chars of chunk_text against rendered
+  // segment bodies. Cheap text-contains check.
+  if (!target && c.chunk_text) {
+    const firstLine = (c.chunk_text.split('\n').find(l => l.trim().length > 5) || '').trim();
+    const probe = firstLine.slice(0, 60);
+    if (probe) {
+      const segs = document.querySelectorAll('.ep-seg');
+      for (const seg of segs) {
+        if ((seg.textContent || '').includes(probe)) { target = seg; break; }
+      }
+    }
+  }
+  if (!target) {
+    showToast(`Не нашёл сегмент в сценарии для чанка #${idx}. Возможно сценарий редактировался.`, 5000);
+    return;
+  }
+
+  // Scroll + highlight. Smooth scroll first, then add a brief flash class
+  // (CSS animation defined alongside in style.css; if missing the inline
+  // box-shadow fallback still gives visible feedback).
+  target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  // Inline flash — works without CSS. Strong yellow outline + soft shadow,
+  // fades over 2 seconds.
+  const prevStyle = target.getAttribute('style') || '';
+  target.setAttribute('style', prevStyle +
+    ';transition:box-shadow 0.3s ease-out;' +
+    'box-shadow:0 0 0 3px rgba(251,191,36,0.85),0 0 24px rgba(251,191,36,0.5);' +
+    'border-radius:8px;'
+  );
+  setTimeout(() => {
+    target.setAttribute('style', prevStyle +
+      ';transition:box-shadow 1.5s ease-out;box-shadow:none;'
+    );
+  }, 1800);
+  setTimeout(() => {
+    target.setAttribute('style', prevStyle);
+  }, 3400);
+}
+
 // Instant Retry — re-fire /seedance/start with the chunk's stored prompt + refs.
 // Creates a NEW chunk. Old one stays as-is (preserves history).
 // Throws on failure so bulk-retry can count failures.
@@ -14481,6 +15511,12 @@ async function sdRetry(idx, btn) {
         // «My Roommate From Craigslist Is Hunting Me» ep 1: clothing «скачет»
         // every shot because v1 and v2 were both in the assembled cut.
         script_order: (typeof c.script_order === 'number') ? c.script_order : null,
+        // Also propagate scene coordinates so «📺 К видео» button finds the
+        // retry chunk (it filters chunks by sceneIdx+segIdx). Without these
+        // user can't navigate from script segment to its successful retry.
+        sceneIdx: (typeof c.sceneIdx === 'number') ? c.sceneIdx : null,
+        segIdx: (typeof c.segIdx === 'number') ? c.segIdx : null,
+        durationSec: c.durationSec || c.duration || 15,
         refs: (c.refs || []).map(r => ({
           kind: r.kind, id: r.id, outfit: r.outfit || null, url: r.url || null,
           source: r.source, prev_idx: r.prev_idx, name: r.name,
@@ -14829,6 +15865,18 @@ async function sdPollOnce() {
     const res = await api.post(
       `/api/series/${S.seriesId}/episodes/${S.episode.number}/seedance/poll`, {}
     );
+    // CRITICAL: kill switch check — show full-screen warning if tripped.
+    // This runs on every poll tick so user sees the warning within ~8 sec
+    // of the switch tripping, regardless of which page they're on. Also
+    // auto-dismisses if server reports cleared (e.g. operator deleted the
+    // file via shell or another tab clicked the clear button).
+    if (res.avai_kill_switch) {
+      if (res.avai_kill_switch.active) {
+        _showAvaiKillSwitchOverlay(res.avai_kill_switch);
+      } else {
+        _dismissAvaiKillSwitchOverlay();
+      }
+    }
     const chunks = res.chunks || [];
     _sdNotifyTransitions(chunks);  // beep + toast on completed/failed transitions
     sdRenderList(chunks);
@@ -14909,26 +15957,154 @@ function _qcBuildPromptHint(fails) {
 // blocked the re-fire. ChunkText is stable across retries of same segment.
 const _QC_RETRY_INFLIGHT = new Set();
 
-// HARD KILL-SWITCH for the auto-fire path. The previous behaviour was:
-// every 8s poll tick scans ALL completed chunks with qc.status='fail' and
-// fires retries on all of them automatically. This caused real prod incident
-// 2026-05-19 on «My Stepmother Made Me a Servant», ep 40 — opening the
-// episode page spawned 11 retries without any user click. User wants
-// explicit consent for every retry POST (AVAI costs money).
+// ─── AVAI Kill-Switch Full-Screen Overlay ──────────────────────────────────
+// When the server's circuit breaker auto-trips (>20 AVAI submits in 5 min),
+// show an UNDISMISSABLE full-screen red overlay so the user immediately sees
+// that something went wrong and AVAI submits are blocked.
 //
-// Behaviour now: function is a no-op. The button «🔁 Retry» on each chunk
-// card (sdRetry) is the only retry path. If we ever bring back automation,
-// it MUST be opt-in via a toggle and have a dialog with cost estimate.
-async function _qcAutoRetryManualMode(_chunks) {
-  return;
+// Real prod incident 2026-05-19: a server bug caused ~hundreds of duplicate
+// AVAI submits over hours costing ~$600. User didn't notice until checking
+// AVAI dashboard. This overlay makes it impossible to miss.
+let _AVAI_KS_SHOWN = false;
+function _showAvaiKillSwitchOverlay(state) {
+  // De-dupe: render the overlay once even if poll keeps firing.
+  if (_AVAI_KS_SHOWN) {
+    // Update timestamp in case state changed (e.g. reason updated)
+    const reasonEl = document.getElementById('avai-ks-reason');
+    if (reasonEl && state.reason) reasonEl.textContent = state.reason;
+    return;
+  }
+  _AVAI_KS_SHOWN = true;
+  // Stop any background polls / autonomous loops dead — the server will refuse
+  // anyway, but no point asking.
+  try { if (typeof AUTO !== 'undefined' && AUTO.active) AUTO.active = false; } catch (e) {}
+  try { if (typeof RANGE !== 'undefined') RANGE.active = false; } catch (e) {}
+  try { if (typeof SD !== 'undefined' && SD.pollTimer) { clearInterval(SD.pollTimer); SD.pollTimer = null; } } catch (e) {}
+
+  const sinceStr = state.since
+    ? new Date(state.since * 1000).toLocaleString()
+    : 'недавно';
+  const overlay = document.createElement('div');
+  overlay.id = 'avai-ks-overlay';
+  overlay.style.cssText = `
+    position: fixed; inset: 0; z-index: 99999;
+    background: rgba(120,0,0,0.96);
+    display: flex; align-items: center; justify-content: center;
+    padding: 24px;
+    backdrop-filter: blur(12px);
+  `;
+  overlay.innerHTML = `
+    <div style="max-width: 720px; background: #1a0000; border: 3px solid #ff3030;
+                border-radius: 16px; padding: 32px; color: #fff; font-family: system-ui;
+                box-shadow: 0 20px 60px rgba(0,0,0,0.8);">
+      <div style="font-size: 80px; text-align: center; line-height: 1; margin-bottom: 16px">🚨</div>
+      <h1 style="text-align: center; color: #ff4040; margin: 0 0 16px; font-size: 1.7rem; font-weight: 900">
+        AVAI KILL SWITCH СРАБОТАЛ
+      </h1>
+      <p style="font-size: 1.05rem; line-height: 1.5; margin: 0 0 16px; color: #fbd0d0">
+        <b>Сервер заблокировал ВСЕ AVAI submits</b> потому что было отправлено
+        <b>больше 20 генераций за 5 минут</b>. Это автоматическая защита от
+        runaway-баг'ов после прод-инцидента на $600.
+      </p>
+      <div style="background: #2a0000; border-left: 4px solid #ff3030; padding: 12px 16px;
+                  margin: 16px 0; font-family: ui-monospace, monospace; font-size: 0.85rem;
+                  color: #ffaaaa; white-space: pre-wrap; max-height: 200px; overflow-y: auto;">
+        <div style="font-weight: 700; margin-bottom: 4px">Причина:</div>
+        <div id="avai-ks-reason">${(state.reason || '(нет деталей)').replace(/[<>&"']/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;',"'":'&#39;'}[c]))}</div>
+        <div style="margin-top: 8px; opacity: 0.7">Сработал: ${sinceStr}</div>
+      </div>
+      <h2 style="color: #ffcc40; font-size: 1.1rem; margin: 20px 0 8px">Что делать:</h2>
+      <ol style="margin: 0 0 16px; padding-left: 20px; line-height: 1.6; color: #fbd0d0">
+        <li>Проверь AVAI dashboard — посмотри сколько submits улетело и оцени ущерб.</li>
+        <li>Открой Flask лог: <code style="background:#2a0000;padding:2px 6px;border-radius:3px">tail -100 /tmp/series-writer.log | grep avai-cb</code> — увидишь что именно триггерило.</li>
+        <li>Когда разберёшься — нажми кнопку «Снять kill switch» ниже ИЛИ удали файл вручную: <code style="background:#2a0000;padding:2px 6px;border-radius:3px">rm "${(state.file_path || '').replace(/[<>&"']/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;',"'":'&#39;'}[c]))}"</code></li>
+      </ol>
+      <div style="display: flex; gap: 12px; margin-top: 24px; justify-content: center">
+        <button onclick="_avaiKillSwitchClear()" style="background: #ff3030; color: white;
+                border: none; padding: 12px 24px; border-radius: 8px; font-weight: 700;
+                font-size: 1rem; cursor: pointer">
+          🔓 Снять kill switch (после разбирательства)
+        </button>
+        <button onclick="window.location.reload()" style="background: #444; color: white;
+                border: 1px solid #666; padding: 12px 24px; border-radius: 8px;
+                font-weight: 600; font-size: 1rem; cursor: pointer">
+          ↻ Перезагрузить страницу
+        </button>
+      </div>
+      <div style="margin-top: 20px; padding-top: 16px; border-top: 1px solid #4a0000;
+                  font-size: 0.78rem; opacity: 0.6; text-align: center">
+        Лимит: больше 20 AVAI submits за 5 минут = автоматический kill switch.
+        Без этой защиты loop-баг 2026-05-19 сжёг $600.
+      </div>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+  // Also try a system beep
+  try { Sounds && Sounds.playError && Sounds.playError(); } catch (e) {}
 }
 
-// Original retry-storm loop, kept as reference / for a future opt-in toggle.
-// Do NOT call without explicit user gating. The guards below (chunk_text
-// keyed in-flight, 5-min TTL, parallel-sibling skip, dupCount cap 2 instead
-// of 3, attempts cap 1 instead of 3) are correct — the issue was just
-// firing this on every poll tick without consent.
-async function _qcAutoRetryStormDangerous(chunks) {
+async function _avaiKillSwitchClear() {
+  if (!confirm('Снять kill switch? Делай это только после того как разобрался с причиной.\n\nЕсли источник проблемы не устранён — kill switch снова сработает через несколько секунд.')) {
+    return;
+  }
+  try {
+    await api.del('/api/avai/kill-switch');
+    const overlay = document.getElementById('avai-ks-overlay');
+    if (overlay) overlay.remove();
+    _AVAI_KS_SHOWN = false;
+    location.reload();
+  } catch (e) {
+    alert('Не удалось снять kill switch: ' + (e.message || e));
+  }
+}
+
+// Global poller — checks kill switch state every 10s regardless of which page
+// the user is on. Catches the case where Seedance poll isn't running (e.g.
+// user is on the script page) but a background process tripped the switch.
+// ALSO auto-dismisses the overlay if server reports active=false (e.g. file
+// was deleted externally or via the clear button on another tab).
+async function _avaiKillSwitchGlobalPoll() {
+  try {
+    const res = await fetch('/api/avai/kill-switch', { credentials: 'include' });
+    if (res.ok) {
+      const state = await res.json();
+      if (state.active) {
+        _showAvaiKillSwitchOverlay(state);
+      } else {
+        _dismissAvaiKillSwitchOverlay();
+      }
+    }
+  } catch (e) { /* ignore network blips */ }
+}
+
+function _dismissAvaiKillSwitchOverlay() {
+  const overlay = document.getElementById('avai-ks-overlay');
+  if (overlay) overlay.remove();
+  _AVAI_KS_SHOWN = false;
+}
+
+setInterval(_avaiKillSwitchGlobalPoll, 10_000);
+// Also fire once at page load so user sees overlay immediately on refresh
+window.addEventListener('load', () => setTimeout(_avaiKillSwitchGlobalPoll, 500));
+
+// Auto-retry policy (re-enabled 2026-05-19 with circuit breaker as safety net):
+//   • Trigger: completed chunk with qc.status='fail' AND qc.attempts < 3
+//   • Max: 2 retries per chunk (server-side QC_MAX_RETRIES=3 = 1 original + 2 retries)
+//   • Guards: 5-min in-flight TTL keyed by chunk_text, skip if a sibling
+//     submission for the same chunk_text is already running
+//   • Hard ceiling: AVAICircuitBreaker (server) enforces ≤20 submits per 5 min,
+//     auto-trips kill switch on excess. Worst-case bug damage ≤$12.
+//   • On retry_exhausted (2 retries also failed): server marks chunk as such,
+//     frontend fires voice alert via _sdNotifyTransitions.
+//
+// Real prod incident 2026-05-19 ($230 burn): previous version used 10s in-flight
+// guard keyed by chunk idx — too short, wrong key, fired retries every 8s for
+// hours. Fixed by chunk_text key + 5-min TTL + breaker safety net.
+async function _qcAutoRetryManualMode(chunks) {
+  return _qcAutoRetryStorm(chunks);
+}
+
+async function _qcAutoRetryStorm(chunks) {
   if (!chunks || !chunks.length) return;
   const textCounts = {};
   const runningTexts = new Set();
@@ -14947,18 +16123,20 @@ async function _qcAutoRetryStormDangerous(chunks) {
     if (c.status !== 'completed') continue;
     const qc = c.qc;
     if (!qc || qc.status !== 'fail') continue;
-    if ((qc.attempts || 0) >= 1) continue;     // one auto-retry max, then human
+    // Server gates the global cap via qc.status='retry_exhausted' when
+    // attempts >= QC_MAX_RETRIES (3). Frontend just acts on 'fail' status.
+    // We're seeing 'fail' here → server says retry is allowed.
     const txt = (c.chunk_text || '').trim();
     if (!txt) continue;
     if (runningTexts.has(txt)) continue;       // sibling already running
-    if ((textCounts[txt] || 0) >= 2) continue; // already 2 attempts of this text
+    if ((textCounts[txt] || 0) >= 3) continue; // 3 attempts total (1 original + 2 retries) reached
     const key = `${S.episode.number}#${txt}`;
     if (_QC_RETRY_INFLIGHT.has(key)) continue;
     _QC_RETRY_INFLIGHT.add(key);
     try {
       const hint = _qcBuildPromptHint(qc.fails || []);
       const prompt = (c.prompt || '') + hint;
-      showToast(`🔁 QC retry #${c.idx} (${(qc.fails || []).slice(0, 2).join(', ')}) — попытка ${qc.attempts}/3`, 5000);
+      showToast(`🔁 QC retry #${c.idx} (${(qc.fails || []).slice(0, 2).join(', ')}) — попытка ${(qc.attempts||0) + 1}/3`, 5000);
       await api.post(
         `/api/series/${S.seriesId}/episodes/${S.episode.number}/seedance/start`,
         {
@@ -14968,6 +16146,14 @@ async function _qcAutoRetryStormDangerous(chunks) {
           resolution: c.resolution || '480p',
           moderation_bypass: c.moderation_bypass || 'collage_grid',
           model: c.model || 'reference-fast',
+          // Propagate canonical script position so retries get the «v2/v3»
+          // label rather than orphan «доп.N». Same fix as sdRetry (manual
+          // retry button) — auto-retry was missing this. User complaint
+          // 2026-05-19: auto-retries showed as «#0 доп.1» instead of «#0 v2».
+          script_order: (typeof c.script_order === 'number') ? c.script_order : null,
+          sceneIdx: (typeof c.sceneIdx === 'number') ? c.sceneIdx : null,
+          segIdx: (typeof c.segIdx === 'number') ? c.segIdx : null,
+          durationSec: c.durationSec || c.duration || 15,
           refs: (c.refs || []).map(r => ({
             kind: r.kind, id: r.id, outfit: r.outfit || null, url: r.url || null,
             source: r.source, prev_idx: r.prev_idx, name: r.name,
@@ -15052,6 +16238,36 @@ function sdInitForEpisode() {
   if (SD.pollTimer) { clearInterval(SD.pollTimer); SD.pollTimer = null; }
   SD.refs = [];
   sdRenderRefs();
+  // DIAGNOSTIC: trace every write to sd-duration.value with stack trace, once.
+  // Drop this once the duration-slider behaviour is confirmed stable.
+  try {
+    const _sliderEl = document.getElementById('sd-duration');
+    if (_sliderEl && !_sliderEl._sdDbgProxyInstalled) {
+      const proto = Object.getPrototypeOf(_sliderEl);
+      const desc = Object.getOwnPropertyDescriptor(proto, 'value') ||
+                   Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
+      if (desc && desc.set && desc.get) {
+        Object.defineProperty(_sliderEl, 'value', {
+          configurable: true,
+          enumerable: true,
+          get() { return desc.get.call(this); },
+          set(v) {
+            const before = desc.get.call(this);
+            desc.set.call(this, v);
+            const after = desc.get.call(this);
+            // Capture caller via Error().stack — shows which function wrote it.
+            const stack = (new Error()).stack || '';
+            const caller = stack.split('\n').slice(2, 5).join(' | ').replace(/\s+at\s+/g, ' ');
+            console.log('[sd-duration WRITE] ' + before + ' → ' + v + ' (final=' + after + ')  ← ' + caller);
+          },
+        });
+        _sliderEl._sdDbgProxyInstalled = true;
+        console.log('[sd-duration DEBUG] value-setter proxy installed. Build:', new Date().toISOString());
+      }
+    }
+  } catch (e) {
+    console.warn('[sd-duration DEBUG] proxy install failed:', e);
+  }
   sdLoadPrefs();
   // Also persist on change
   ['sd-duration','sd-resolution','sd-mod-bypass'].forEach(id => {
