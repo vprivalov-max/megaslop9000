@@ -1581,6 +1581,235 @@ function setAppendMode(mode) {
         'Если оставить пустым — Claude сам придумает развитие из контекста уже написанных серий.';
       if (dirHint) dirHint.textContent = 'Чем конкретнее — тем точнее. Можно указать беды/повороты/cliffhanger финала.';
     }
+    // Surface landmark-attached generation if finale / nearest-checkpoint is set ahead.
+    try { refreshAppendLandmarkBlock(); } catch (e) { /* ignore */ }
+  }
+}
+
+// Show/hide the "🎯 До финала / До контрольной точки" buttons in the "Добавить сценарий"
+// modal based on whether the series has a finale/checkpoint pinned past the last written ep.
+function refreshAppendLandmarkBlock() {
+  const block = document.getElementById('append-landmark-block');
+  const info  = document.getElementById('append-landmark-info');
+  const finBtn = document.getElementById('append-to-finale-btn');
+  const cpBtn  = document.getElementById('append-to-checkpoint-btn');
+  if (!block) return;
+  const s = S.series || {};
+  const eps = S.episodes || [];
+  const writtenEps = eps.filter(e => (e.script || '').trim()).map(e => e.number).sort((a, b) => a - b);
+  const lastWritten = writtenEps.length ? writtenEps[writtenEps.length - 1] : 0;
+  const nextEp = lastWritten + 1;
+
+  const fin = s.finale;
+  const finAhead = fin && (fin.description || '').trim() && fin.episode >= nextEp;
+  const cps = (s.checkpoints || []).filter(c => (c.description || '').trim() && c.episode >= nextEp).sort((a, b) => a.episode - b.episode);
+  const nearestCp = cps[0];
+
+  // Also consider landmarks at-or-before lastWritten as "overwrite candidates"
+  const finAtOrAny = fin && (fin.description || '').trim();
+  const cpsAtOrAny = (s.checkpoints || []).filter(c => (c.description || '').trim()).sort((a, b) => a.episode - b.episode);
+  const fallbackFin = finAtOrAny ? fin : null;
+  const fallbackCp  = nearestCp || (cpsAtOrAny.length ? cpsAtOrAny[cpsAtOrAny.length - 1] : null);
+
+  if (!fallbackFin && !fallbackCp) {
+    block.style.display = 'none';
+    return;
+  }
+  block.style.display = '';
+  const lines = [];
+  if (lastWritten) {
+    lines.push(`Последняя написанная: <b>Ep ${lastWritten}</b> · Следующая: <b>Ep ${nextEp}</b>`);
+  } else {
+    lines.push(`Следующая серия для генерации: <b>Ep ${nextEp}</b>`);
+  }
+  if (fallbackFin) {
+    const target = fallbackFin.episode;
+    const overwrite = target <= lastWritten;
+    lines.push(`🏁 Финал: <b>Ep ${target}</b>` +
+      (overwrite ? ' <span style="color:#fbbf24">(уже написан — будет ПЕРЕЗАПИСЬ)</span>' : ''));
+  }
+  if (fallbackCp) {
+    const target = fallbackCp.episode;
+    const overwrite = target <= lastWritten;
+    lines.push(`📍 Чекпоинт: <b>Ep ${target}</b>` +
+      (overwrite ? ' <span style="color:#fbbf24">(уже написан — будет ПЕРЕЗАПИСЬ)</span>' : ''));
+  }
+  if (info) info.innerHTML = lines.join('<br>');
+
+  // Overwrite-from row — visible when ANY relevant landmark is at-or-before lastWritten
+  const finIsOverwrite = fallbackFin && fallbackFin.episode <= lastWritten;
+  const cpIsOverwrite  = fallbackCp && fallbackCp.episode <= lastWritten;
+  const overwriteRow   = document.getElementById('append-landmark-overwrite-row');
+  const overwriteInput = document.getElementById('append-landmark-start-ep');
+  if (overwriteRow && overwriteInput) {
+    if (finIsOverwrite || cpIsOverwrite) {
+      overwriteRow.style.display = '';
+      const targetForDefault = fallbackFin ? fallbackFin.episode : fallbackCp.episode;
+      const defaultStart = Math.max(1, targetForDefault - 2);
+      const cur = parseInt(overwriteInput.value, 10);
+      if (!cur || cur > targetForDefault || cur < 1) {
+        overwriteInput.value = String(defaultStart);
+      }
+    } else {
+      overwriteRow.style.display = 'none';
+    }
+  }
+
+  const getStartFor = (target) => {
+    if (target > lastWritten) return nextEp;       // fresh-extend mode
+    const raw = parseInt(overwriteInput?.value || '0', 10);
+    return raw && raw >= 1 && raw <= target ? raw : Math.max(1, target - 2);
+  };
+
+  if (finBtn) {
+    if (fallbackFin) {
+      const target = fallbackFin.episode;
+      const start = getStartFor(target);
+      const span = target - start + 1;
+      finBtn.textContent = `🏁 До финала (${span} сер., Ep ${start}…${target})`;
+      finBtn.style.display = span >= 1 && span <= 8 ? '' : 'none';
+      finBtn.title = span > 8 ? `Слишком далеко (${span} серий). Лимит 8 за раз.` : '';
+      finBtn.dataset.targetEp = String(target);
+      finBtn.dataset.startEp  = String(start);
+    } else {
+      finBtn.style.display = 'none';
+    }
+  }
+  if (cpBtn) {
+    if (fallbackCp) {
+      const target = fallbackCp.episode;
+      const start = getStartFor(target);
+      const span = target - start + 1;
+      cpBtn.textContent = `📍 До чекпоинта (${span} сер., Ep ${start}…${target})`;
+      cpBtn.style.display = span >= 1 && span <= 8 ? '' : 'none';
+      cpBtn.title = span > 8 ? `Слишком далеко (${span} серий). Лимит 8 за раз.` : '';
+      cpBtn.dataset.targetEp = String(target);
+      cpBtn.dataset.startEp  = String(start);
+    } else {
+      cpBtn.style.display = 'none';
+    }
+  }
+  // Wire input to re-render the buttons live
+  if (overwriteInput && !overwriteInput._wired) {
+    overwriteInput.addEventListener('input', () => refreshAppendLandmarkBlock());
+    overwriteInput._wired = true;
+  }
+}
+
+// Run /generate-to-landmark — generates episodes one-by-one from next-unwritten to landmark,
+// with synopsis overwrite from bridge plan beats. Results in directly-created episodes (no textarea).
+async function appendGenerateToLandmark(landmarkType) {
+  if (!S.seriesId) return;
+
+  const btn = document.getElementById(landmarkType === 'finale' ? 'append-to-finale-btn' : 'append-to-checkpoint-btn');
+  const targetEp = parseInt(btn?.dataset?.targetEp, 10);
+  const startEp  = parseInt(btn?.dataset?.startEp, 10);
+  if (!targetEp) {
+    showToast(`Не удалось определить целевую серию для ${landmarkType}`);
+    return;
+  }
+  if (!startEp || startEp < 1) {
+    showToast('Не удалось определить серию старта');
+    return;
+  }
+  const eps = S.episodes || [];
+  const writtenEps = eps.filter(e => (e.script || '').trim()).map(e => e.number);
+  const lastWritten = writtenEps.length ? Math.max(...writtenEps) : 0;
+  const isOverwrite = startEp <= lastWritten;
+
+  const span = targetEp - startEp + 1;
+  if (span < 1) {
+    showToast('Целевая серия уже позади');
+    return;
+  }
+  if (span > 8) {
+    showToast(`Слишком большой диапазон (${span}). Макс 8 за раз.`);
+    return;
+  }
+  const label = landmarkType === 'finale' ? 'финала' : 'контрольной точки';
+  const overwriteWarn = isOverwrite
+    ? `\n⚠ ПЕРЕЗАПИСЬ: серии Ep ${startEp}…${targetEp} уже имеют сценарии. Старые версии уйдут в history каждой серии.`
+    : '';
+  if (!await appConfirm({
+    title: `Сгенерировать ${span} серий до ${label}?`,
+    message:
+      `Диапазон: Ep ${startEp}…${targetEp}.${overwriteWarn}\n\n` +
+      `Для каждой серии:\n` +
+      `  1) Bridge-план разложит ${label} на пошаговые beat'ы\n` +
+      `  2) Синопсис будет ЗАПИСАН из bridge-beat'а (с состоянием мира в начале серии)\n` +
+      `  3) Сценарий сгенерируется с максимальным весом конвергенции\n\n` +
+      `Это займёт примерно ${Math.ceil(span * 60)}-${span * 120}с. Серии создаются напрямую.`,
+    okText: 'Поехали',
+    cancelText: 'Отмена',
+    okStyle: 'accent',
+  })) return;
+
+  const finBtn = document.getElementById('append-to-finale-btn');
+  const cpBtn  = document.getElementById('append-to-checkpoint-btn');
+  const statusEl = document.getElementById('append-landmark-status');
+  [finBtn, cpBtn].forEach(b => { if (b) b.disabled = true; });
+  if (statusEl) statusEl.innerHTML = `<span class="spinner"></span> Генерирую ${span} серий (Ep ${startEp}…${targetEp}) до ${label}…`;
+
+  try {
+    const body = {
+      landmark_type: landmarkType,
+      model: _selectedWriterModel('writer-model-create'),
+      start_episode: startEp,
+    };
+    if (landmarkType === 'checkpoint') body.landmark_episode = targetEp;
+    // POST kicks off the background worker and returns immediately (202)
+    const kickoff = await api.post(`/api/series/${S.seriesId}/generate-to-landmark`, body);
+    if (kickoff.error && !kickoff.started) {
+      throw new Error(kickoff.error);
+    }
+    // Poll status every 2.5s — show "Сейчас: Ep X из Y" updates live
+    const pollUrl = `/api/series/${S.seriesId}/generate-to-landmark/status`;
+    let lastCurrent = null;
+    const startTs = Date.now();
+    while (true) {
+      await new Promise(r => setTimeout(r, 2500));
+      let st;
+      try {
+        st = await api.get(pollUrl);
+      } catch (e) {
+        if (statusEl) statusEl.innerHTML = `<span style="color:#f87171">✗ Сеть: ${esc(e?.message || e)}</span>`;
+        continue;
+      }
+      if (!st || st.state === 'idle') continue;
+      const elapsed = Math.round((Date.now() - startTs) / 1000);
+      const done = st.completed || 0;
+      const tot = st.total || span;
+      const cur = st.current_ep;
+      if (st.state === 'running' || st.state === 'starting') {
+        if (statusEl) {
+          let html = `<span class="spinner"></span> Сейчас пишу Ep <b>${cur ?? '—'}</b> · готово ${done}/${tot} · прошло ${elapsed}с`;
+          if (st.results?.length) {
+            const okList = st.results.filter(r => r.ok).map(r => r.episode).join(', ');
+            if (okList) html += `<br><span style="color:#4ade80">✓ готовы: Ep ${okList}</span>`;
+          }
+          statusEl.innerHTML = html;
+        }
+        lastCurrent = cur;
+        continue;
+      }
+      // Terminal: done | failed
+      const errLine = st.error ? `<br><span style="color:#fbbf24">⚠ ${esc(st.error)}</span>` : '';
+      const successCount = (st.results || []).filter(r => r.ok).length;
+      if (statusEl) {
+        const colour = st.state === 'done' ? '#4ade80' : '#f87171';
+        statusEl.innerHTML = `<span style="color:${colour}">${st.state === 'done' ? '✓' : '✗'} ${st.state === 'done' ? 'Готово' : 'Остановилось'}: ${successCount} из ${tot} серий сгенерировано (Ep ${st.start_episode}…${st.target_episode}).${errLine}</span>`;
+      }
+      showToast(`${st.state === 'done' ? '✓' : '⚠'} ${successCount}/${tot} серий до ${label}`, 6000);
+      break;
+    }
+    // Refresh series + episode list so new episodes appear
+    if (typeof loadSeries === 'function') await loadSeries(S.seriesId);
+    if (typeof renderEpisodesList === 'function') renderEpisodesList();
+  } catch (e) {
+    if (statusEl) statusEl.innerHTML = `<span style="color:#f87171">✗ Ошибка: ${esc(e?.message || e)}</span>`;
+    showToast('Ошибка генерации: ' + (e?.message || e), 6000);
+  } finally {
+    [finBtn, cpBtn].forEach(b => { if (b) b.disabled = false; });
   }
 }
 
@@ -1798,6 +2027,15 @@ async function appendLogicApply(btn) {
   const orig = btn.innerHTML;
   btn.disabled = true;
   btn.innerHTML = '<span class="spinner"></span> Claude переписывает… ~30-60 сек';
+  const banner = LongOpBanner.show(
+    `🩹 Лечим ${selected.length} проблем(ы) логики`,
+    [
+      'Читаем сценарий и список проблем…',
+      'Анализируем затронутые сцены…',
+      'Переписываем минимальными правками…',
+      'Сохраняем сценарий…',
+    ],
+  );
   try {
     const r = await api.post('/api/series/import-from-script/apply-fixes',
       { script, issues: selected },
@@ -1829,6 +2067,7 @@ async function appendLogicApply(btn) {
   } catch (e) {
     showToast('Ошибка лечения: ' + (e?.message || e), 6000);
   } finally {
+    banner.close();
     btn.disabled = false;
     btn.innerHTML = orig;
   }
@@ -1938,6 +2177,15 @@ async function importLogicApply(btn) {
   const orig = btn.innerHTML;
   btn.disabled = true;
   btn.innerHTML = '<span class="spinner"></span> Claude переписывает…';
+  const banner = LongOpBanner.show(
+    `🩹 Лечим ${selected.length} проблем(ы) логики`,
+    [
+      'Читаем сценарий и список проблем…',
+      'Анализируем затронутые сцены…',
+      'Переписываем минимальными правками…',
+      'Сохраняем сценарий…',
+    ],
+  );
   try {
     const r = await api.post('/api/series/import-from-script/apply-fixes',
       { script, issues: selected }, { timeoutMs: 180000 });
@@ -1966,6 +2214,7 @@ async function importLogicApply(btn) {
   } catch (e) {
     showToast('Ошибка лечения: ' + (e?.message || e), 6000);
   } finally {
+    banner.close();
     btn.disabled = false; btn.innerHTML = orig;
   }
 }
@@ -2602,7 +2851,7 @@ async function generateFromIdea() {
     const genres = getSelectedGenres();
     const model = _selectedWriterModel('writer-model-create');
     const data = await trackTask('Сериал по идее', {}, () =>
-      api.post('/api/generate-series-from-idea', { idea, genres, model })
+      api.post('/api/generate-series-from-idea', { idea, genres, model, format_mode: getFormatMode() })
     );
     fillSeriesForm(data);
     status.textContent = '✓ Поля заполнены — проверь и отредактируй если нужно';
@@ -2735,6 +2984,7 @@ async function generateSeriesIdeas() {
   const status = document.getElementById('series-gen-status');
   const list = document.getElementById('series-ideas-list');
   const genres = getSelectedGenres();
+  const idea = (val('series-idea-input') || '').trim();
   // Avoid-list — user-curated tropes/words to never suggest. Stored in
   // localStorage between sessions so they don't have to retype every time.
   const avoidEl = document.getElementById('series-ideas-avoid');
@@ -2753,7 +3003,7 @@ async function generateSeriesIdeas() {
   list.innerHTML = '';
   try {
     const model = _selectedWriterModel('writer-model-create');
-    const ideas = await api.post('/api/generate-series-ideas', { genres, avoid, model });
+    const ideas = await api.post('/api/generate-series-ideas', { genres, avoid, model, idea, format_mode: getFormatMode() });
     list.innerHTML = ideas.map((idea, i) => `
       <div class="idea-card" onclick="pickSeriesIdea(${i})">
         <div class="idea-card-title">${esc(idea.title)}</div>
@@ -2794,6 +3044,23 @@ function fillSeriesForm(data) {
   if (data.synopsis)         setVal('new-series-synopsis', data.synopsis);
 }
 
+// Format mode picker — short_drama (TikTok serial) vs instagram_series (sitcom-style).
+// Sets the hidden input + visually toggles the two pill buttons. Read by createSeries,
+// generateFromIdea, generateSeriesIdeas so the chosen mode flows into all backend generators.
+function setFormatMode(mode) {
+  if (mode !== 'short_drama' && mode !== 'instagram_series') mode = 'short_drama';
+  const hidden = document.getElementById('new-series-format-mode');
+  if (hidden) hidden.value = mode;
+  ['short_drama', 'instagram_series'].forEach(m => {
+    const btn = document.getElementById(`format-mode-${m}-btn`);
+    if (btn) btn.classList.toggle('active', m === mode);
+  });
+}
+
+function getFormatMode() {
+  return document.getElementById('new-series-format-mode')?.value || 'short_drama';
+}
+
 async function createSeries() {
   const title = val('new-series-title');
   if (!title) return alert('Введи название');
@@ -2803,6 +3070,7 @@ async function createSeries() {
       title, genre: val('new-series-genre'), tone: val('new-series-tone'),
       target_audience: val('new-series-audience'), world_description: val('new-series-world'),
       synopsis: val('new-series-synopsis'),
+      format_mode: getFormatMode(),
       auto_generate_assets: autogen,
       batch_mode: false,
       batch_size: 1,
@@ -3321,7 +3589,33 @@ function openFinaleModal() {
   setVal('fin-description', fin ? (fin.description || '') : '');
   document.getElementById('fin-delete-btn').style.display = fin ? '' : 'none';
   document.getElementById('fin-status').textContent = '';
+  // Reset mismatch warning, then check trajectory validation in background
+  const warnBox = document.getElementById('fin-mismatch-warning');
+  if (warnBox) warnBox.style.display = 'none';
+  if (S.seriesId) checkFinaleTrajectory();
   openModal('modal-finale');
+}
+
+async function checkFinaleTrajectory() {
+  try {
+    const data = await api.get(`/api/series/${S.seriesId}/trajectory-validation`);
+    const warnBox = document.getElementById('fin-mismatch-warning');
+    const detail  = document.getElementById('fin-mismatch-detail');
+    if (!warnBox || !detail) return;
+    if (!data.has_problem) { warnBox.style.display = 'none'; return; }
+    // Build a clear message: where the bad names came from, what they were, what cast has
+    const parts = data.mismatches.map(m =>
+      `<b>${esc(m.where)}</b>: упоминаются имена <code>${m.unknown_names.map(esc).join(', ')}</code> — их нет в касте.`
+    );
+    parts.push(
+      `Каст сериала: <code>${(data.cast_names || []).map(esc).join(', ') || '—'}</code>`,
+      `Это значит что финал/чекпоинт был сгенерирован с неправильными именами. Генератор сценария будет пытаться угадать кого ты имел в виду по роли, но лучше <b>перегенерировать финал</b> кнопкой ниже — он подхватит реальный каст.`
+    );
+    detail.innerHTML = parts.join('<br>');
+    warnBox.style.display = '';
+  } catch (e) {
+    // silent — non-critical UI
+  }
 }
 
 async function generateFinaleDraft() {
@@ -3975,6 +4269,16 @@ async function _logicMultiApply(btn) {
   const orig = btn.innerHTML;
   btn.disabled = true;
   btn.innerHTML = '<span class="spinner"></span> Claude переписывает…';
+  const banner = LongOpBanner.show(
+    `🩹 Лечим ${selected.length} проблем(ы) в ${_logicMultiEpNums.length} сериях`,
+    [
+      `Загружаем сценарии серий: ${_logicMultiEpNums.map(n => '№' + n).join(', ')}…`,
+      'Claude читает контекст и список проблем…',
+      'Анализирует затронутые сцены и диалоги…',
+      'Переписывает минимально (~30-90 сек на партию)…',
+      'Сохраняет новые версии и старые в историю…',
+    ],
+  );
   try {
     const r = await api.post(
       `/api/series/${S.seriesId}/episodes/logic-apply-multi`,
@@ -4017,6 +4321,7 @@ async function _logicMultiApply(btn) {
   } catch (e) {
     showToast('Ошибка: ' + (e?.message || e), 6000);
   } finally {
+    banner.close();
     btn.disabled = false;
     btn.innerHTML = orig;
   }
@@ -4441,18 +4746,26 @@ function openBibleEditor() {
   setVal('bible-world', s.world_description);
   setVal('bible-visual-style', s.visual_style || '');
   setVal('bible-max-chars-per-scene', s.max_main_chars_per_scene || '');
+  setVal('bible-target-duration-sec', s.target_duration_sec || '');
+  setVal('bible-format-mode', s.format_mode || 'short_drama');
   openModal('modal-bible');
 }
 
 async function saveBible() {
   const maxCharsRaw = val('bible-max-chars-per-scene');
   const maxChars = maxCharsRaw ? Math.max(1, Math.min(6, parseInt(maxCharsRaw, 10))) : null;
+  const targetDurRaw = val('bible-target-duration-sec');
+  const targetDur = targetDurRaw ? Math.max(30, Math.min(240, parseInt(targetDurRaw, 10))) : null;
+  const fmRaw = (val('bible-format-mode') || 'short_drama').trim();
+  const fm = (fmRaw === 'instagram_series') ? 'instagram_series' : 'short_drama';
   const data = {
     title: val('bible-title'), genre: val('bible-genre'),
     tone: val('bible-tone'), target_audience: val('bible-audience'),
     world_description: val('bible-world'),
     visual_style: val('bible-visual-style'),
     max_main_chars_per_scene: maxChars,
+    target_duration_sec: targetDur,
+    format_mode: fm,
   };
   S.series = await api.put(`/api/series/${S.seriesId}`, data);
   closeModal('modal-bible');
@@ -5531,10 +5844,76 @@ function _buildCanonicalCharDesc(char) {
 
 function renderCharCanonicalDesc(char) {
   const el = document.getElementById('char-canonical-desc');
-  if (!el) return;
-  const text = _buildCanonicalCharDesc(char);
-  el.textContent = text || '(описание не задано — заполни appearance персонажа и/или базовый outfit)';
-  el.dataset.text = text;
+  if (el) {
+    const text = _buildCanonicalCharDesc(char);
+    el.textContent = text || '(описание не задано — заполни appearance персонажа и/или базовый outfit)';
+    el.dataset.text = text;
+  }
+  // Populate the editable appearance textarea + remember original for revert / dirty-check.
+  const ta = document.getElementById('char-appearance-edit');
+  if (ta && char) {
+    const original = (char.appearance || '');
+    ta.value = original;
+    ta.dataset.original = original;
+    ta.dataset.charId = char.id;
+    const btn = document.getElementById('char-appearance-save-btn');
+    if (btn) btn.disabled = true;
+    const st = document.getElementById('char-appearance-save-status');
+    if (st) st.textContent = '';
+  }
+}
+
+// Called on every keystroke in the appearance textarea — enables/disables
+// the Save button based on whether content differs from original.
+function _markCharAppearanceDirty() {
+  const ta = document.getElementById('char-appearance-edit');
+  if (!ta) return;
+  const dirty = ta.value !== (ta.dataset.original || '');
+  const btn = document.getElementById('char-appearance-save-btn');
+  if (btn) btn.disabled = !dirty;
+  const st = document.getElementById('char-appearance-save-status');
+  if (st) st.textContent = dirty ? '● несохранённые изменения' : '';
+}
+
+// Revert textarea to last saved value (from dataset.original).
+function _revertCharAppearance() {
+  const ta = document.getElementById('char-appearance-edit');
+  if (!ta) return;
+  ta.value = ta.dataset.original || '';
+  _markCharAppearanceDirty();
+}
+
+// Persist appearance to backend via PUT, then refresh the canonical preview.
+async function saveCharAppearance() {
+  const ta = document.getElementById('char-appearance-edit');
+  if (!ta) return;
+  const charId = ta.dataset.charId;
+  if (!charId) return;
+  const newText = (ta.value || '').trim();
+  const btn = document.getElementById('char-appearance-save-btn');
+  const st = document.getElementById('char-appearance-save-status');
+  if (btn) { btn.disabled = true; btn.innerHTML = '⏳ Сохраняю...'; }
+  if (st) st.textContent = '';
+  try {
+    const res = await api.put(
+      `/api/series/${S.seriesId}/characters/${charId}`,
+      { appearance: newText },
+    );
+    if (res && res.error) throw new Error(res.error);
+    // Update in-memory state + re-render preview
+    const ch = S.series.characters.find(x => x.id === charId);
+    if (ch) ch.appearance = newText;
+    ta.dataset.original = newText;
+    renderCharCanonicalDesc(ch || res);
+    // Also refresh sidebar list so any description-derived preview updates.
+    renderCharactersList && renderCharactersList();
+    if (st) st.textContent = '✓ сохранено';
+    setTimeout(() => { if (st) st.textContent = ''; }, 2500);
+  } catch (e) {
+    if (st) st.textContent = '✗ ' + (e?.message || e);
+  } finally {
+    if (btn) btn.innerHTML = '💾 Сохранить';
+  }
 }
 
 async function copyCanonicalDescription() {
@@ -5808,6 +6187,11 @@ async function regenerateOutfitFromLightbox(outfitId) {
     // Trigger generation (uses existing endpoint that the outfit row uses).
     const r = await api.post(`/api/series/${S.seriesId}/characters/${st.charId}/outfits/${outfitId}/generate`, {});
     if (r?.error) throw new Error(r.error);
+    // Force-bump asset version so every image URL gets a fresh `?v=N` token.
+    // Without this, browser HTTP cache serves the OLD outfit image even
+    // after AVAI returned a new one (out_path stays the same filename).
+    // User-reported 2026-05-23: «перегенерация костюмов не работает».
+    bumpAssetVersion();
     // Refresh series state and re-render the lightbox with the new image.
     const fresh = await api.get(`/api/series/${S.seriesId}`);
     if (fresh) S.series = fresh;
@@ -5863,6 +6247,17 @@ function openCharLightbox(charId, url) {
           <input type="checkbox" id="lb-rewrite-appearance">
           <span>Переписать описание персонажа заново</span>
         </label>
+        <div style="margin-top:10px">
+          <label style="font-size:0.82rem;color:var(--muted);display:block;margin-bottom:4px">
+            Image generator
+          </label>
+          <select id="lb-regen-provider" style="width:100%;padding:6px 8px;border-radius:6px;background:var(--bg-input);color:var(--text);border:1px solid var(--border)" title="Выбери движок генерации изображения. Если выбранный упадёт — автоматический fallback на банан">
+            <option value="">Auto (по умолчанию серии)</option>
+            <option value="banana">🍌 Banana (Gemini Image Pro)</option>
+            <option value="seedream">🌱 Seedream (ByteDance)</option>
+            <option value="openai">🤖 OpenAI (gpt-image-1)</option>
+          </select>
+        </div>
         <div id="lb-regen-status" class="lb-status"></div>
         <button id="lb-regen-btn" class="btn-regen" onclick="regenerateCharacterFromLightbox()">
           ↻ Перегенерировать
@@ -5902,18 +6297,21 @@ async function regenerateCharacterFromLightbox() {
   const wishes = (document.getElementById('lb-regen-wishes').value || '').trim();
   const regenOutfits = document.getElementById('lb-regen-outfits').checked;
   const rewriteAppearance = document.getElementById('lb-rewrite-appearance')?.checked || false;
+  // Provider override from dropdown — '' = auto (server uses series default).
+  const provider = (document.getElementById('lb-regen-provider')?.value || '').trim();
   const status = document.getElementById('lb-regen-status');
   const btn = document.getElementById('lb-regen-btn');
   btn.disabled = true;
   btn.innerHTML = '<span class="spinner"></span> Генерируем...';
   status.className = 'lb-status';
+  const providerLabel = provider ? ` через ${provider}` : '';
   status.textContent = (rewriteAppearance ? 'Переписываем описание + ' : '') +
-    'Перегенерируем основной образ' + (regenOutfits ? ' + костюмы' : '') + ' (~15-30 сек на каждый)...';
+    'Перегенерируем основной образ' + (regenOutfits ? ' + костюмы' : '') + providerLabel + ' (~15-30 сек на каждый)...';
 
   try {
     const res = await api.post(
       `/api/series/${S.seriesId}/characters/${currentCharId}/regenerate`,
-      { wishes, regenerate_outfits: regenOutfits, rewrite_appearance: rewriteAppearance }
+      { wishes, regenerate_outfits: regenOutfits, rewrite_appearance: rewriteAppearance, provider }
     );
     if (res.error) {
       status.className = 'lb-status err';
@@ -6076,6 +6474,10 @@ async function generateOutfit(charId, outfitId) {
     const res = await api.post(`/api/series/${S.seriesId}/characters/${charId}/outfits/${outfitId}/generate`, {});
     if (res.ready) {
       statusEl.textContent = '';
+      // Bump global asset cache token — browser was serving the OLD outfit
+      // image from HTTP cache because filename stayed the same. Without this
+      // user clicks Generate, backend returns new image, but UI shows old.
+      bumpAssetVersion();
       S.series = await api.get(`/api/series/${S.seriesId}`);
       const c = S.series.characters.find(x => x.id === charId);
       renderOutfitsList(c);
@@ -7429,10 +7831,21 @@ function _parseScriptScenes(scriptText, overrides) {
   //     1-line 4-second segment wastes a whole 15s Seedance chunk.
   //   Pass 2 (merge tiny): post-walk segments. Any segment < MIN_SEGMENT gets
   //     merged into a neighbour if the combined size stays ≤ HARD_MAX.
-  const TARGET = 11.0;          // aim around this (informational)
-  const SOFT_MAX = 13.0;        // normal break threshold (2s buffer below 15s chunk)
+  const TARGET = 14.0;          // aim around this (informational)
+  const SOFT_MAX = 16.0;        // primary pack threshold. Bumped beyond the
+                                // 15s Seedance limit so Pass 1 packs into the
+                                // luft zone directly (chunks at 15-16s show ⚡
+                                // and ride slightly-compressed pacing). Was 14.5
+                                // → many chunks ended at 11-14s with a small
+                                // tail next door; now they grow to ~15-16s
+                                // and absorb that tail naturally.
   const MIN_SEGMENT_SEC = 5.0;  // smaller than this = wasted Seedance chunk
-  const HARD_MAX_SEC = 14.5;    // absolute ceiling — Seedance chunk is 15s
+  const HARD_MAX_SEC = 14.5;    // absolute ceiling for Pass-2 small-segment merges
+  const LUFT_MAX_SEC = 17.0;    // Pass-3 luft-merge ceiling. Seedance hard-caps
+                                // at 15s, but a 16-17s content chunk renders
+                                // fine — characters just speak slightly faster.
+                                // Trading 1-2s of pacing tightness for one
+                                // fewer generation cycle is a clear net win.
   // Speaker cue detector — a line that's ONLY a character-name cue, no
   // dialogue text. Two formats supported:
   //   (a) Classic screenplay ALL-CAPS:  ETHAN  / ETHAN (CONT'D) / ETHAN (V.O.)
@@ -7523,6 +7936,121 @@ function _parseScriptScenes(scriptText, overrides) {
         continue;
       }
       // Otherwise leave alone (single huge orphan line that can't fit anywhere)
+    }
+    // Pass 3 (luft-merge): walk left-to-right and merge any adjacent pair
+    // whose combined duration ≤ LUFT_MAX_SEC (17s). The intent: a stretch of
+    // dialogue that totals 16-17s gets stuck as [10s][6.5s] because Pass-1's
+    // SOFT_MAX(13) forces a break. Sending those as a single 15s Seedance
+    // call (with slightly compressed pacing) costs us one generation cycle
+    // instead of two. Keep merging the same index while it still has a
+    // mergeable right-neighbour.
+    let _lm = 0;
+    while (_lm < segTotals.length - 1) {
+      if (segTotals[_lm] + segTotals[_lm + 1] <= LUFT_MAX_SEC) {
+        for (const l of sc.lines) {
+          if (l.segIdx === _lm + 1) l.segIdx = _lm;
+          else if (l.segIdx > _lm + 1) l.segIdx -= 1;
+        }
+        segTotals[_lm] += segTotals[_lm + 1];
+        segTotals.splice(_lm + 1, 1);
+        // stay on _lm to attempt another merge with the new right-neighbour
+      } else {
+        _lm++;
+      }
+    }
+
+    // Pass 5 (line-level fill-from-next): when Pass-3 can't merge whole
+    // chunks (combined > LUFT), still try to PULL the first dialogue/action
+    // unit from the next chunk into this one. Tightens every chunk toward
+    // 15s without breaking dialogue lines apart. "Unit" = all leading
+    // zero-duration lines (speaker cues, parentheticals) + the next single
+    // substantive line. Keeps cue+payload paired.
+    const _pullUnitFromNext = (fromSegIdx) => {
+      const idxs = [];
+      let dur = 0;
+      let firstAt = -1;
+      for (let li = 0; li < sc.lines.length; li++) {
+        if (sc.lines[li].segIdx === fromSegIdx) {
+          if (firstAt < 0) firstAt = li;
+          idxs.push(li);
+          dur += sc.lines[li].duration;
+          if (sc.lines[li].duration > 0.01) break;  // got the substantive line
+        } else if (firstAt >= 0) {
+          break;
+        }
+      }
+      return { idxs, dur, hasSubstantive: dur > 0.01 };
+    };
+    let _pi = 0;
+    while (_pi < segTotals.length - 1) {
+      const unit = _pullUnitFromNext(_pi + 1);
+      if (!unit.idxs.length || !unit.hasSubstantive) { _pi++; continue; }
+      const newCur  = segTotals[_pi]     + unit.dur;
+      const newNext = segTotals[_pi + 1] - unit.dur;
+      // Two guard rails:
+      //   (a) Current chunk must stay within luft.
+      //   (b) Next chunk must either DRAIN to zero (fully absorbed) OR keep
+      //       enough content to remain valid (≥ MIN_SEGMENT_SEC). Otherwise
+      //       we'd create a 1-2s orphan tail that wastes a Seedance call.
+      const fits = newCur <= LUFT_MAX_SEC && (newNext < 0.01 || newNext >= MIN_SEGMENT_SEC);
+      if (fits) {
+        for (const li of unit.idxs) sc.lines[li].segIdx = _pi;
+        segTotals[_pi]     = newCur;
+        segTotals[_pi + 1] = newNext;
+        if (newNext <= 0.01) {
+          for (const l of sc.lines) {
+            if (l.segIdx > _pi + 1) l.segIdx -= 1;
+          }
+          segTotals.splice(_pi + 1, 1);
+        }
+        // stay on _pi; try pulling another unit
+      } else {
+        _pi++;
+      }
+    }
+
+    // Pass 6 (cleanup): re-run the tiny-merge pass on the new layout.
+    // After Pass 5 some chunks may have shrunk under MIN_SEGMENT — try to
+    // fold them back into a neighbour if combined ≤ LUFT_MAX_SEC (more
+    // generous than Pass-2's HARD_MAX since we already accepted luft).
+    for (let i = segTotals.length - 1; i >= 0; i--) {
+      if (segTotals[i] >= MIN_SEGMENT_SEC) continue;
+      if (i > 0 && segTotals[i-1] + segTotals[i] <= LUFT_MAX_SEC) {
+        for (const l of sc.lines) {
+          if (l.segIdx === i) l.segIdx = i - 1;
+          else if (l.segIdx > i) l.segIdx -= 1;
+        }
+        segTotals[i-1] += segTotals[i];
+        segTotals.splice(i, 1);
+        continue;
+      }
+      if (i < segTotals.length - 1 && segTotals[i] + segTotals[i+1] <= LUFT_MAX_SEC) {
+        for (const l of sc.lines) {
+          if (l.segIdx === i+1) l.segIdx = i;
+          else if (l.segIdx > i+1) l.segIdx -= 1;
+        }
+        segTotals[i] += segTotals[i+1];
+        segTotals.splice(i+1, 1);
+      }
+    }
+
+    // Pass 7 (final luft sweep): re-run Pass-3-style pairwise merge AFTER
+    // line-level shuffles. Pass-5 may have pulled lines around in a way that
+    // newly-adjacent pairs are now ≤ LUFT_MAX_SEC and weren't before. Also
+    // catches the case where Pass 3's first sweep was blocked by intermediate
+    // chunk sizes that Pass-5 has since redistributed.
+    let _lm2 = 0;
+    while (_lm2 < segTotals.length - 1) {
+      if (segTotals[_lm2] + segTotals[_lm2 + 1] <= LUFT_MAX_SEC) {
+        for (const l of sc.lines) {
+          if (l.segIdx === _lm2 + 1) l.segIdx = _lm2;
+          else if (l.segIdx > _lm2 + 1) l.segIdx -= 1;
+        }
+        segTotals[_lm2] += segTotals[_lm2 + 1];
+        segTotals.splice(_lm2 + 1, 1);
+      } else {
+        _lm2++;
+      }
     }
     sc.segCount = sc.lines.length ? (sc.lines[sc.lines.length - 1].segIdx + 1) : 0;
   }
@@ -7716,8 +8244,13 @@ function _renderScenesHTML(scenes, coverage = []) {
         // Compute this segment's total seconds for the toolbar summary
         const segLines = sc.lines.filter(x => x.segIdx === l.segIdx);
         const segTotal = segLines.reduce((s, x) => s + x.duration, 0);
-        const overflowWarn = segTotal > 14.5
-          ? `<span class="ep-seg-warn" title="Содержимое выходит за 15-сек лимит Seedance">${segTotal.toFixed(1)}с ⚠</span>`
+        // Two-tier warning. Segments in (15, 17]s were intentionally luft-merged
+        // by Pass 3 (one fewer Seedance call, characters speak slightly faster
+        // — accepted). Only >17s is a real overflow that won't fit cleanly.
+        const overflowWarn = segTotal > 17.0
+          ? `<span class="ep-seg-warn" title="Содержимое сильно выходит за 15-сек лимит Seedance — нужна ручная разбивка">${segTotal.toFixed(1)}с ⚠</span>`
+          : segTotal > 15.0
+          ? `<span class="ep-seg-dur ep-seg-luft" title="Luft-merge: 16-17с контента в 15-сек чанке — пацинг будет слегка ускоренный">${segTotal.toFixed(1)}с ⚡</span>`
           : `<span class="ep-seg-dur" title="Расчётная длительность сегмента">${segTotal.toFixed(1)}с</span>`;
         // First-line anchor of this segment for the MERGE button (per-line, OK
         // if it shifts when the user edits text — merge is a local operation).
@@ -8476,6 +9009,38 @@ async function generateSceneBlocking() {
   }
 }
 
+// Manual «✨ Авто-правка» button — applies the per-user
+// «🎬 Автоматическая правка» instruction (Settings modal) to every main
+// promptEn of the current episode in one Claude call. Mirrors what
+// turbo Auto-mode does automatically as step 3/3.
+async function applyAutoRevise(btn) {
+  if (!S.episode) { showToast('⚠ Сначала открой эпизод', 3000); return; }
+  const hasBatch = !!(S.episode?.batch_prompts && Object.keys(S.episode.batch_prompts).length);
+  if (!hasBatch) {
+    showToast('⚠ Сначала запусти batch-compose (📋 batch JSON или Auto-mode турбо)', 5000);
+    return;
+  }
+  const orig = btn ? btn.innerHTML : '';
+  if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> правлю…'; }
+  try {
+    const resp = await api.post(
+      `/api/series/${S.seriesId}/episodes/${S.episodeNum}/seedance/revise-batch`,
+      {},
+      { timeoutMs: 5 * 60 * 1000 }
+    );
+    // Refresh episode so any panel that reads batch_prompts shows new text.
+    try {
+      const fresh = await api.get(`/api/series/${S.seriesId}/episodes/${S.episodeNum}`);
+      if (fresh) S.episode = fresh;
+    } catch (_) {}
+    showToast(`✓ Правка применена: ${resp.count}/${resp.expected} чанков`, 4000);
+  } catch (e) {
+    showToast('✗ Не удалось применить правку: ' + (e.message || e), 6000);
+  } finally {
+    if (btn) { btn.disabled = false; btn.innerHTML = orig; }
+  }
+}
+
 async function clearSegmentOverrides() {
   if (!_segmentOverrides().length) {
     showToast('Ручных правок и так нет', 2000);
@@ -8676,6 +9241,23 @@ function _autoSaveModeKind(kind) {
 }
 function _autoGetModeKind() {
   return localStorage.getItem('auto_mode_kind') || 'sequential';
+}
+
+// Turbo-engine selector. Two implementations of Turbo live side-by-side:
+//   • 'parallel-sequential' (default, experimental) — per-chunk Claude
+//     compose like sequential mode + parallel /start, no last-frame /
+//     cut-frames. Bypasses scene blocking, batch JSON, auto-revise entirely.
+//   • 'shadow' — colleague-ported pipeline: scene blocking → batch-compose
+//     → auto-revise → parallel /start with prebuilt prompts.
+// Stored in localStorage so rollback is one click in Settings. Sequential
+// mode is unaffected.
+function _turboEngine() {
+  const v = localStorage.getItem('turbo_engine');
+  return v === 'shadow' ? 'shadow' : 'parallel-sequential';
+}
+function _setTurboEngine(v) {
+  if (v !== 'shadow' && v !== 'parallel-sequential') return;
+  localStorage.setItem('turbo_engine', v);
 }
 function _applyAutoModeUI() {
   const kind = _autoGetModeKind();
@@ -9006,6 +9588,45 @@ async function startAutoMode() {
     }
   }
 
+  // ── INSTANT MUSIC KICK-OFF (single-episode auto-mode) ────────────────────
+  // Fire music NOW — before blocking / batch-compose / any video chunk.
+  // Script is already in the DOM, so we can compute the scene plan instantly.
+  if (S.series?.settings?.enable_music !== false && S.seriesId && S.episode?.number != null) {
+    (async () => {
+      try {
+        const epScript = (document.getElementById('ep-script')?.value || '').trim();
+        if (epScript) {
+          const scenes = _parseScriptScenes(epScript, {});
+          const planMap = new Map();
+          scenes.forEach((sc, sIdx) => {
+            for (let g = 0; g < sc.segCount; g++) {
+              const lines = sc.lines.filter(l => l.segIdx === g);
+              if (!lines.length) continue;
+              const dur = _estimateChunkDurationSec(lines.map(l => l.text).join('\n'));
+              planMap.set(sIdx, (planMap.get(sIdx) || 0) + dur);
+            }
+          });
+          if (planMap.size) {
+            const scenesPlan = [...planMap.entries()].map(([sceneIdx, totalSec]) => ({
+              sceneIdx,
+              target_duration_ms: Math.round(totalSec * 0.9 * 1000),
+            }));
+            const r = await api.post(
+              `/api/series/${S.seriesId}/episodes/${S.episode.number}/music/generate`,
+              { scenes_plan: scenesPlan }
+            );
+            if (r?.ok && r.scenes?.length) {
+              showToast(`🎵 Музыка запущена — ${r.scenes.length} сцен (параллельно с видео)`, 3000);
+            }
+          }
+        }
+      } catch (e) {
+        clog('WARN', 'auto.music_kickoff_fail', { err: (e?.message || String(e)).slice(0, 200) });
+      }
+    })();
+  }
+  // ─────────────────────────────────────────────────────────────────────────
+
   // Auto-mode behaviour is now driven by the mode toggle in the toolbar
   // (not by lastframe/cutframes checkboxes which are for manual one-shot use).
   //   sequential — last-frame + cut-frames ALWAYS on, chunks render serially
@@ -9022,6 +9643,21 @@ async function startAutoMode() {
   const baseOnly     = !!document.getElementById('sd-base-only')?.checked;
   const closeUpOnly  = !!document.getElementById('sd-close-up-only')?.checked;
   AUTO.parallel = isTurbo;
+  // ── Turbo engine selector ─────────────────────────────────────────────────
+  // Two implementations of Turbo live side-by-side, switchable in Settings:
+  //   • 'parallel-sequential' (default, experimental) — per-chunk Claude
+  //     compose like sequential mode, then ALL chunks fire in parallel
+  //     without last-frame / cut-frames continuity. No batch JSON, no scene
+  //     blocking, no character-position planning, no auto-revise. Cheap +
+  //     simple. Hypothesis: per-chunk prompts are enough; the heavy batch
+  //     prep doesn't pay off.
+  //   • 'shadow' — full Shadow Founder–style pipeline ported from the
+  //     colleague's project: scene blocking → batch-compose → auto-revise →
+  //     parallel /start with prebuilt prompts. Heavier, more deterministic
+  //     spatial continuity.
+  // Sequential mode is unaffected by this toggle.
+  const turboEngine = isTurbo ? _turboEngine() : 'n/a';
+  const turboShadow = turboEngine === 'shadow';
 
   // Turbo prerequisites: episodeBlocking + batch_prompts must exist.
   // If empty — auto-fill them before starting the parallel run, so the user
@@ -9032,7 +9668,11 @@ async function startAutoMode() {
   // first chunk creating itself (~60s of silence). Show the floating widget
   // in a «preparing» state for the duration of these prereqs so progress is
   // always visible.
-  if (isTurbo) {
+  //
+  // NOTE: this entire prep block (scene blocking + batch JSON + auto-revise)
+  // is shadow-engine-only. The experimental parallel-sequential engine skips
+  // all prep and just lets the AUTO loop run per-chunk compose in parallel.
+  if (isTurbo && turboShadow) {
     const blockingEl = document.getElementById('ep-scene-blocking');
     const blocking = (blockingEl?.value || '').trim();
     const hasBatchPrompts = !!(S.episode?.batch_prompts && Object.keys(S.episode.batch_prompts).length);
@@ -9066,12 +9706,14 @@ async function startAutoMode() {
           return;
         }
       }
+      let batchFreshlyBuilt = false;
       if (!hasBatchPrompts) {
-        AUTO.lastStatus = '⚙ Турбо 2/2: batch JSON (~15-30с)…';
+        AUTO.lastStatus = '⚙ Турбо 2/3: batch JSON (~15-30с)…';
         _autoUpdateFloatingWidget();
-        showToast('⚙ Турбо 2/2: batch JSON эпизода…', 4000);
+        showToast('⚙ Турбо 2/3: batch JSON эпизода…', 4000);
         try {
           if (typeof rebuildBatchPrompts === 'function') await rebuildBatchPrompts();
+          batchFreshlyBuilt = true;
         } catch (e) {
           AUTO.active = false;
           _autoUnregisterRun(AUTO);
@@ -9079,6 +9721,52 @@ async function startAutoMode() {
           showToast('✗ Не удалось собрать batch JSON: ' + (e.message || e), 6000);
           return;
         }
+      }
+      // ─── Турбо шаг 3/3 — авто-правка ─────────────────────────────────────
+      // Mirrors colleague's auto-pipeline step 9.5 («✨ План + правка + видео»):
+      // ONE Claude call rewrites every main promptEn so characters don't jump
+      // in space, dialogues stay readable, chunks splice cleanly. The exact
+      // wording comes from per-user settings (Modal → 🎬 Автоматическая правка).
+      //
+      // Trigger policy:
+      //   • если batch только что собрали в этом запуске Auto-mode — правим
+      //     всегда (это поведение колеги: revise после plan по умолчанию).
+      //   • если batch уже существовал (повторный запуск Auto-mode после
+      //     refresh) — правим только если правки ещё не было (нет
+      //     `batch_revised_at` на эпизоде) И флаг включён в настройках.
+      //   • если пользователь отключил флаг в настройках — правку
+      //     пропускаем целиком.
+      try {
+        let arEnabled = true;
+        try {
+          const ar = await api.get('/api/user/auto-revise');
+          arEnabled = !!ar.auto_revise_enabled;
+        } catch (_) { /* keep default */ }
+        const alreadyRevised = !!(S.episode?.batch_revised_at);
+        const shouldRevise = arEnabled && (batchFreshlyBuilt || !alreadyRevised);
+        if (shouldRevise) {
+          AUTO.lastStatus = '⚙ Турбо 3/3: авто-правка main-промптов (~15-40с)…';
+          _autoUpdateFloatingWidget();
+          showToast('⚙ Турбо 3/3: применяю автоматическую правку…', 4000);
+          const resp = await api.post(
+            `/api/series/${S.seriesId}/episodes/${S.episode.number}/seedance/revise-batch`,
+            {},
+            { timeoutMs: 5 * 60 * 1000 }
+          );
+          // Reload episode so subsequent code (segment-collect, validators)
+          // sees the revised promptEns. Best-effort: failure here is non-fatal
+          // — original promptEns are still valid Seedance input.
+          try {
+            const fresh = await api.get(`/api/series/${S.seriesId}/episodes/${S.episode.number}`);
+            if (fresh) S.episode = fresh;
+          } catch (_) {}
+          if (resp && resp.count != null) {
+            showToast(`✓ Правка применена: ${resp.count}/${resp.expected} чанков`, 3500);
+          }
+        }
+      } catch (e) {
+        // Revise is a quality booster, not a hard requirement — log and continue.
+        showToast('⚠ Авто-правка упала: ' + (e.message || e) + ' — продолжаю с исходными промптами', 6000);
       }
       // Final prep tick before segment-building / confirm dialog.
       if (needPrep) {
@@ -9164,9 +9852,14 @@ async function startAutoMode() {
   const errWord  = AUTO.errorMode === 'heal' ? 'авто-лечение' : 'останов + сигнал';
   const skipNote = skippedCount ? `\nПропущено по чекбоксу: ${skippedCount}` : '';
   const doneNote = alreadyDoneCount ? `\nУже сгенерены (пропустим): ${alreadyDoneCount}` : '';
+  const engineNote = isTurbo
+    ? (turboShadow
+        ? '\nТурбо-движок: Shadow (batch JSON + scene blocking + авто-правка)'
+        : '\nТурбо-движок: Параллельный-последовательный (per-chunk compose, без batch JSON / blocking / правки)')
+    : '';
   const _confirmMsg =
     `Сегментов: ${AUTO.total}${skipNote}${doneNote}\n` +
-    `Режим: ${modeWord}\n` +
+    `Режим: ${modeWord}${engineNote}\n` +
     `На ошибке модерации: ${errWord}\n\n` +
     (AUTO.parallel
       ? 'Параллельный режим: все сегменты отправляются в очередь Seedance подряд (~2с между запусками). Текстовый контекст между чанками сохраняется.'
@@ -9447,7 +10140,14 @@ async function startAutoMode() {
       // segments with shared episodeBlocking → guarantees consistent character
       // positioning across all chunks). Then fire /start for each pre-built
       // prompt. Falls back to per-chunk compose if batch-compose fails.
+      //
+      // Engine 'parallel-sequential' (default, experimental) skips batch-compose
+      // entirely — `batchPrompts` stays null and every segment falls through to
+      // `_autoComposeStart()` (per-chunk Claude compose, same path sequential
+      // mode uses). Concurrency cap below still applies, so they all submit in
+      // parallel. Easy rollback: flip Settings → «Турбо-движок» back to «Shadow».
       let batchPrompts = null;
+      if (turboShadow) {
       AUTO.lastStatus = '🧠 batch-compose (один Claude call на всю серию)...';
       _autoUpdateStatusUI();
       try {
@@ -9498,6 +10198,12 @@ async function startAutoMode() {
       } catch (e) {
         showToast(`⚠ batch-compose упал — использую per-chunk: ${e.message || e}`, 6000);
         batchPrompts = null;
+      }
+      } else {
+        // parallel-sequential engine: no batch-compose. batchPrompts stays null;
+        // every seg falls through to _autoComposeStart() below.
+        AUTO.lastStatus = '⚙ Турбо (параллельно): per-chunk compose в параллель…';
+        _autoUpdateStatusUI();
       }
 
       // Now fire /start for ALL segments SIMULTANEOUSLY (per the reference
@@ -10119,6 +10825,67 @@ async function startRangeGen() {
       if (typeof renderEpisodesList === 'function') renderEpisodesList();
     } catch {}
 
+    // ── INSTANT MUSIC KICK-OFF ───────────────────────────────────────────────
+    // Fire music generation RIGHT NOW — before navigate, before batch-compose,
+    // before a single video chunk is submitted. We parse the episode script
+    // client-side (same logic as _runEpisodeAutoStandalone) to get scene groups
+    // + duration estimates, then POST music/generate with scenes_plan.
+    // The backend generates music in parallel with the entire video pipeline.
+    const _musicEnabled = (S.series?.id === RANGE.seriesId)
+      ? (S.series?.settings?.enable_music !== false)
+      : true;
+    if (_musicEnabled) {
+      (async () => {
+        try {
+          // Fetch episode script (may already be in memory if same episode).
+          let epScript = '';
+          if (S.episode?.number === epNum && S.seriesId === RANGE.seriesId) {
+            epScript = document.getElementById('ep-script')?.value?.trim() || '';
+          }
+          if (!epScript) {
+            const epJson = await api.get(
+              `/api/series/${RANGE.seriesId}/episodes/${epNum}`
+            );
+            epScript = (epJson?.script || '').trim();
+          }
+          if (!epScript) return;
+
+          // Parse script into scene groups (same helper as standalone runner).
+          const scenes = _parseScriptScenes(epScript, {});
+          const planMap = new Map();
+          scenes.forEach((sc, sIdx) => {
+            for (let g = 0; g < sc.segCount; g++) {
+              const lines = sc.lines.filter(l => l.segIdx === g);
+              if (!lines.length) continue;
+              const segText = lines.map(l => l.text).join('\n');
+              const dur = _estimateChunkDurationSec(segText);
+              planMap.set(sIdx, (planMap.get(sIdx) || 0) + dur);
+            }
+          });
+          if (!planMap.size) return;
+
+          const scenesPlan = [...planMap.entries()].map(([sceneIdx, totalSec]) => ({
+            sceneIdx,
+            target_duration_ms: Math.round(totalSec * 0.9 * 1000),
+          }));
+
+          const r = await api.post(
+            `/api/series/${RANGE.seriesId}/episodes/${epNum}/music/generate`,
+            { scenes_plan: scenesPlan }
+          );
+          if (r?.ok && r.scenes?.length) {
+            showToast(`🎵 Музыка запущена — эпизод ${epNum} · ${r.scenes.length} сцен`, 3000);
+          }
+        } catch (e) {
+          // Non-fatal — video gen continues regardless.
+          clog('WARN', 'range.music_kickoff_fail', {
+            ep: epNum, err: (e?.message || String(e)).slice(0, 200),
+          });
+        }
+      })();
+    }
+    // ────────────────────────────────────────────────────────────────────────
+
     let result = { ok: false, completed: 0, total: 0, errors: 0 };
     let assembleNote = '';
     let finalStatus = 'failed';   // default — if anything below throws, we still flip away from 'generating'
@@ -10500,6 +11267,136 @@ async function extractCharsFromScript() {
   } finally {
     btn.disabled = false;
     btn.innerHTML = orig;
+  }
+}
+
+// Convergence-mode: regenerate synopsis from bridge beat + script for every episode
+// from the first unwritten one through to the chosen landmark (finale | nearest checkpoint).
+async function generateToLandmark(landmarkType) {
+  if (!S.seriesId) return;
+  const s = S.series || {};
+  // Resolve target episode locally for confirm dialog
+  let targetEp = null;
+  if (landmarkType === 'finale') {
+    const fin = s.finale;
+    if (!fin || !(fin.description || '').trim()) {
+      alert('Финал не прикреплён к сериалу. Открой «🏁 Финал» и опиши финальную серию.');
+      return;
+    }
+    targetEp = fin.episode;
+  } else if (landmarkType === 'checkpoint') {
+    const cps = (s.checkpoints || []).filter(c => (c.description || '').trim());
+    if (!cps.length) {
+      alert('Нет контрольных точек. Создай хотя бы одну через кнопку «🎯 Контрольная точка».');
+      return;
+    }
+    const currentEp = S.episodeNum || 1;
+    const upcoming = cps.filter(c => c.episode >= currentEp).sort((a, b) => a.episode - b.episode);
+    if (!upcoming.length) {
+      alert('Все контрольные точки уже позади текущей серии.');
+      return;
+    }
+    targetEp = upcoming[0].episode;
+  } else {
+    return;
+  }
+
+  const currentEp = S.episodeNum || 1;
+  const span = targetEp - currentEp + 1;
+  if (span < 1) {
+    alert('Целевая серия раньше текущей.');
+    return;
+  }
+  if (span > 8) {
+    alert(`Слишком большой диапазон: ${span} серий. Максимум 8 за раз. Сгенерь сначала промежуточные.`);
+    return;
+  }
+  const label = landmarkType === 'finale' ? 'финала' : 'контрольной точки';
+  if (!confirm(
+    `Запустить генерацию ${span} серии(й) — Ep ${currentEp}…${targetEp} — до ${label}?\n\n` +
+    `Для каждой серии:\n` +
+    `  1) Синопсис будет ПЕРЕЗАПИСАН из bridge-плана (старая версия уйдёт в history).\n` +
+    `  2) Сценарий будет сгенерирован с максимальным весом конвергенции.\n\n` +
+    `Это займёт несколько минут.`
+  )) return;
+
+  const ftBtn = document.getElementById('ep-gen-to-finale-btn');
+  const cpBtn = document.getElementById('ep-gen-to-checkpoint-btn');
+  const mainBtn = document.getElementById('ep-gen-script-btn');
+  [ftBtn, cpBtn, mainBtn].forEach(b => { if (b) b.disabled = true; });
+  const status = document.getElementById('ep-script-gen-status');
+  if (status) {
+    status.textContent = `🎯 Генерируем ${span} серий до ${label}…`;
+    status.style.color = 'var(--accent)';
+  }
+  try {
+    const taskCtx = { seriesId: S.seriesId, episodeNum: currentEp, seriesTitle: S.series?.title };
+    const res = await trackTask(`До ${label} (Ep ${currentEp}…${targetEp})`, taskCtx, () =>
+      api.post(`/api/series/${S.seriesId}/generate-to-landmark`, {
+        landmark_type: landmarkType,
+        landmark_episode: landmarkType === 'checkpoint' ? targetEp : undefined,
+        model: _selectedWriterModel('writer-model-ep'),
+      })
+    );
+    const ok = res.completed || 0;
+    const total = res.span || span;
+    const errLine = res.error ? `\n\nПерви́ ошибка: ${res.error}` : '';
+    showToast(`🎯 Готово: ${ok} из ${total} серий сгенерировано${errLine}`);
+    if (status) {
+      status.textContent = `🎯 ${ok}/${total} серий до ${label} готово.`;
+      status.style.color = ok === total ? 'var(--success)' : 'var(--warning)';
+    }
+    // Refresh current episode view + episode list
+    if (typeof loadSeries === 'function') await loadSeries(S.seriesId);
+    if (typeof renderEpisodesList === 'function') renderEpisodesList();
+    // Re-load current episode to pick up the new synopsis + script
+    if (S.episodeNum) {
+      try {
+        const ep = await api.get(`/api/series/${S.seriesId}/episodes/${S.episodeNum}`);
+        S.episode = ep;
+        setVal('ep-synopsis', ep.synopsis || '');
+        setVal('ep-script', ep.script || '');
+      } catch (e) { /* ignore */ }
+    }
+  } catch (e) {
+    showToast('Ошибка: ' + (e?.message || e));
+    if (status) {
+      status.textContent = '❌ Ошибка: ' + (e?.message || e);
+      status.style.color = 'var(--danger)';
+    }
+  } finally {
+    [ftBtn, cpBtn, mainBtn].forEach(b => { if (b) b.disabled = false; });
+  }
+}
+
+// Show/hide the "До чекпоинта / финала" buttons based on whether the current series
+// has those landmarks pinned ahead of the current episode.
+function refreshLandmarkButtonsVisibility() {
+  const ftBtn = document.getElementById('ep-gen-to-finale-btn');
+  const cpBtn = document.getElementById('ep-gen-to-checkpoint-btn');
+  const s = S.series || {};
+  const currentEp = S.episodeNum || 1;
+  // Finale
+  if (ftBtn) {
+    const fin = s.finale;
+    const hasFinAhead = fin && (fin.description || '').trim() && fin.episode >= currentEp;
+    if (hasFinAhead) {
+      ftBtn.style.display = '';
+      ftBtn.textContent = `🏁 До финала (Ep ${fin.episode})`;
+    } else {
+      ftBtn.style.display = 'none';
+    }
+  }
+  // Nearest checkpoint
+  if (cpBtn) {
+    const cps = (s.checkpoints || []).filter(c => (c.description || '').trim() && c.episode >= currentEp);
+    if (cps.length) {
+      const nearest = cps.sort((a, b) => a.episode - b.episode)[0];
+      cpBtn.style.display = '';
+      cpBtn.textContent = `📍 До чекпоинта (Ep ${nearest.episode})`;
+    } else {
+      cpBtn.style.display = 'none';
+    }
   }
 }
 
@@ -11745,6 +12642,11 @@ async function generateEpOutfit(charId, outfitId) {
       { timeoutMs: 180000 }
     );
     if (res.ready) {
+      // Bump global asset cache token — same reason as generateOutfit:
+      // filename stays the same on regen, browser HTTP cache serves the
+      // OLD image without this. Critical for ep-level outfit cards
+      // («карточки персов внутри серии») user explicitly mentioned.
+      bumpAssetVersion();
       // Refresh series so the new outfit.photo is reflected
       S.series = await api.get(`/api/series/${S.seriesId}`);
       const c = S.series.characters.find(x => x.id === charId);
@@ -12709,7 +13611,39 @@ async function openSettings() {
   if (voiceCb) voiceCb.checked = Sounds.isVoiceEnabled();
   const mlgCb = document.getElementById('settings-mlg-hitmarker');
   if (mlgCb) mlgCb.checked = Sounds.isHitmarkerEnabled();
+  // Turbo-engine radio — sync with current localStorage choice.
+  const teCur = _turboEngine();
+  const teP = document.getElementById('turbo-engine-parallel');
+  const teS = document.getElementById('turbo-engine-shadow');
+  if (teP) teP.checked = (teCur === 'parallel-sequential');
+  if (teS) teS.checked = (teCur === 'shadow');
+  // Auto-revise (Turbo-mode automatic edit) — fetch per-user setting.
+  try {
+    const ar = await api.get('/api/user/auto-revise');
+    AUTO_REVISE_DEFAULT_TEXT = ar.default || AUTO_REVISE_DEFAULT_TEXT;
+    const enCb = document.getElementById('settings-auto-revise-enabled');
+    const txt  = document.getElementById('settings-auto-revise-instruction');
+    if (enCb) enCb.checked = !!ar.auto_revise_enabled;
+    if (txt)  txt.value    = ar.auto_revise_instruction || ar.default || '';
+  } catch (_) { /* non-blocking */ }
   openModal('modal-settings');
+}
+
+// Captured from /api/user/auto-revise on first openSettings() so the "Вернуть
+// дефолт" button has the server-side default text without an extra round-trip.
+let AUTO_REVISE_DEFAULT_TEXT = '';
+function resetAutoReviseDefault() {
+  const txt = document.getElementById('settings-auto-revise-instruction');
+  if (!txt) return;
+  if (AUTO_REVISE_DEFAULT_TEXT) {
+    txt.value = AUTO_REVISE_DEFAULT_TEXT;
+  } else {
+    // Fallback: ask the server.
+    api.get('/api/user/auto-revise').then(ar => {
+      AUTO_REVISE_DEFAULT_TEXT = ar.default || '';
+      if (AUTO_REVISE_DEFAULT_TEXT) txt.value = AUTO_REVISE_DEFAULT_TEXT;
+    }).catch(()=>{});
+  }
 }
 
 async function saveSettings() {
@@ -12720,6 +13654,24 @@ async function saveSettings() {
   if (avaiVal) payload.avai_key = avaiVal;
   if (Object.keys(payload).length) {
     await api.post('/api/config', payload);
+  }
+  // Turbo-engine — persist locally (no server roundtrip).
+  const teS = document.getElementById('turbo-engine-shadow');
+  const teP = document.getElementById('turbo-engine-parallel');
+  if (teS && teS.checked) _setTurboEngine('shadow');
+  else if (teP && teP.checked) _setTurboEngine('parallel-sequential');
+  // Auto-revise (Turbo-mode automatic edit) — persist server-side.
+  try {
+    const enCb = document.getElementById('settings-auto-revise-enabled');
+    const txt  = document.getElementById('settings-auto-revise-instruction');
+    if (enCb || txt) {
+      await api.post('/api/user/auto-revise', {
+        auto_revise_enabled: enCb ? !!enCb.checked : true,
+        auto_revise_instruction: (txt?.value || '').trim(),
+      });
+    }
+  } catch (e) {
+    showToast('⚠ Не удалось сохранить «Автоматическую правку»: ' + (e.message || e), 4000);
   }
   // Local-only settings (no server roundtrip needed)
   const soundsCb = document.getElementById('settings-sounds-enabled');
@@ -12768,6 +13720,68 @@ function showToast(msg) {
   document.body.appendChild(t);
   setTimeout(() => t.remove(), 2000);
 }
+
+// ── Long-running operation banner ──────────────────────────────────────────
+// Sticky top-of-page banner that stays visible during Claude's 30-180s work.
+// Solves real complaint 2026-05-25: "нажал полечить — никакого процесса не
+// видно". Button spinner was the only feedback; if user scrolled away, they
+// saw nothing happening for a minute and thought it broke.
+//
+// Usage:
+//   const banner = LongOpBanner.show('🩹 Лечим логику', ['Читаем сценарий…', 'Анализируем противоречия…', 'Переписываем диалоги…']);
+//   try { /* await long op */ } finally { banner.close(); }
+const LongOpBanner = (() => {
+  let _el = null;
+  let _timerInt = null;
+  let _stageInt = null;
+  let _startedAt = 0;
+
+  function show(title, stages) {
+    close();   // never stack
+    _startedAt = Date.now();
+    const stageList = (stages && stages.length) ? stages : ['Работаем…'];
+    _el = document.createElement('div');
+    Object.assign(_el.style, {
+      position:'fixed', top:'0', left:'0', right:'0', zIndex:'9999',
+      background:'linear-gradient(90deg, rgba(16,185,129,0.95), rgba(59,130,246,0.95))',
+      color:'#fff', padding:'10px 16px', boxShadow:'0 2px 12px rgba(0,0,0,0.4)',
+      fontSize:'0.92rem', display:'flex', alignItems:'center', gap:'14px',
+      fontWeight:'600',
+    });
+    _el.innerHTML = `
+      <span style="font-size:1.1rem">⏳</span>
+      <span style="flex:0 0 auto">${title}</span>
+      <span data-role="stage" style="flex:1;opacity:0.92;font-weight:400">${stageList[0]}</span>
+      <span data-role="elapsed" style="flex:0 0 auto;font-family:ui-monospace,monospace;background:rgba(0,0,0,0.25);padding:3px 8px;border-radius:4px">0:00</span>
+    `;
+    document.body.appendChild(_el);
+    // Elapsed-time counter — updates every second so user sees process IS
+    // running (not frozen).
+    _timerInt = setInterval(() => {
+      if (!_el) return;
+      const sec = Math.floor((Date.now() - _startedAt) / 1000);
+      const m = Math.floor(sec / 60), s = sec % 60;
+      const elapsedEl = _el.querySelector('[data-role="elapsed"]');
+      if (elapsedEl) elapsedEl.textContent = `${m}:${s.toString().padStart(2, '0')}`;
+    }, 1000);
+    // Rotating stage labels — every 8 seconds bumps to next stage so the
+    // user feels narrative progress even when backend is still on one call.
+    let stageIdx = 0;
+    _stageInt = setInterval(() => {
+      if (!_el) return;
+      stageIdx = Math.min(stageIdx + 1, stageList.length - 1);
+      const stageEl = _el.querySelector('[data-role="stage"]');
+      if (stageEl) stageEl.textContent = stageList[stageIdx];
+    }, 8000);
+    return { close };
+  }
+  function close() {
+    if (_timerInt) { clearInterval(_timerInt); _timerInt = null; }
+    if (_stageInt) { clearInterval(_stageInt); _stageInt = null; }
+    if (_el) { _el.remove(); _el = null; }
+  }
+  return { show, close };
+})();
 
 // ── Sound effects ───────────────────────────────────────────────────────────
 // Synthesized via Web Audio API — no external assets to bundle/serve.
@@ -13888,33 +14902,88 @@ async function sdUploadCustomUrl(srcUrl) {
   }
 }
 
+// Toggle visual warning when "только базовые образы персов" is checked —
+// makes it obvious that outfits picked in [BLOCKING] are being IGNORED
+// during compose. Without this signal users frequently leave the checkbox
+// on accidentally and then can't figure out why Margaret isn't in the
+// prison jumpsuit they expected.
+function sdUpdateBaseOnlyHint() {
+  const cb = document.getElementById('sd-base-only');
+  const label = document.getElementById('sd-base-only-label');
+  if (!cb || !label) return;
+  if (cb.checked) {
+    label.style.color = '#fbbf24';
+    label.style.fontWeight = '700';
+    label.style.background = 'rgba(251,191,36,0.10)';
+    label.style.border = '1px solid rgba(251,191,36,0.45)';
+    label.style.padding = '2px 8px';
+    label.style.borderRadius = '4px';
+  } else {
+    label.style.color = '';
+    label.style.fontWeight = '';
+    label.style.background = '';
+    label.style.border = '';
+    label.style.padding = '';
+    label.style.borderRadius = '';
+  }
+  // Also reflect on the refs panel — if it's rendered, add/remove a banner
+  const refsHost = document.getElementById('sd-ref-slots');
+  if (refsHost && refsHost.parentElement) {
+    const old = document.getElementById('sd-base-only-banner');
+    if (cb.checked) {
+      if (!old) {
+        const b = document.createElement('div');
+        b.id = 'sd-base-only-banner';
+        b.style.cssText = 'margin:4px 0 6px;padding:6px 10px;background:rgba(251,191,36,0.12);border:1px solid rgba(251,191,36,0.45);border-radius:6px;color:#fbbf24;font-size:0.78rem;font-weight:600';
+        b.textContent = '⚠ Режим «только базовые образы» — outfit-варианты из [BLOCKING] игнорируются, все персонажи используют базовый портрет. Сними галочку выше чтобы Composer подбирал костюмы по сцене.';
+        refsHost.parentElement.insertBefore(b, refsHost);
+      }
+    } else {
+      if (old) old.remove();
+    }
+  }
+}
+
 function sdRenderRefs() {
   const slot = document.getElementById('sd-ref-slots');
   if (!slot) return;
+  // Keep the base-only warning in sync every time refs render
+  try { sdUpdateBaseOnlyHint(); } catch {}
   // Backfill `tag` for refs loaded from older state (chunks reused via "Reuse"
   // or sdComposeFill paths that don't go through sdSlotDrop). Use array
   // position +1 only when no stable tag exists yet — preserves backwards-compat.
   SD.refs.forEach((r, i) => { if (r && !r.tag) r.tag = i + 1; });
   slot.innerHTML = SD.refs.map((r, i) => {
     const tag = r.tag || (i + 1);
-    const subtitle = r.outfit ? `<div class="ref-sub">${esc(r.outfit)}</div>` : '';
+    // Always render an explicit outfit badge for character refs so the user
+    // can SEE at a glance whether a costume is attached or it's the base
+    // portrait. For loc/lastframe/cutframe — no outfit concept, skip badge.
+    let outfitBadge = '';
+    if (r.kind === 'char') {
+      if (r.outfit) {
+        outfitBadge = `<div class="ref-outfit named" title="Используется образ: ${esc(r.outfit)}">👗 ${esc(r.outfit)}</div>`;
+      } else {
+        outfitBadge = `<div class="ref-outfit base" title="Используется базовый портрет персонажа">⊙ BASE</div>`;
+      }
+    }
     const kindIcon = r.kind === 'loc' ? '🏛'
                   : r.kind === 'lastframe' ? '🎞'
+                  : r.kind === 'cutframe' ? '✂'
                   : r.kind === 'char' ? '👤' : '🖼';
     return `
     <div class="sd-ref-chip" data-i="${i}"
          ondragover="sdSlotDragOver(event)"
          ondragleave="sdSlotDragLeave(event)"
          ondrop="sdSlotDrop(event,${i})"
-         title="@Image${tag}: ${esc(r.name)}${r.outfit ? ' / '+esc(r.outfit) : ''} — перетащи сюда другую карточку чтобы заменить">
+         title="@Image${tag}: ${esc(r.name)}${r.outfit ? ' / '+esc(r.outfit) : (r.kind==='char' ? ' / base portrait' : '')} — перетащи сюда другую карточку чтобы заменить">
       <div class="ref-top">@Image${tag}</div>
       ${r.photoUrl
         ? `<img src="${r.photoUrl}" alt="">`
         : '<div class="ref-noimg">no photo</div>'}
+      ${outfitBadge}
       <div class="ref-bottom">
         <span class="ref-kind">${kindIcon}</span>
         <span class="ref-name">${esc(r.name || '—')}</span>
-        ${subtitle}
       </div>
       <button class="rm" onclick="sdRemoveRef(${i})" title="Убрать">×</button>
     </div>`;

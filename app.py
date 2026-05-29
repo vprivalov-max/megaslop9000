@@ -10,7 +10,9 @@ import time
 import subprocess
 import sys
 import threading
+import hashlib
 import requests
+from collections import Counter
 from pathlib import Path
 from functools import wraps
 from urllib.parse import urlencode
@@ -61,7 +63,10 @@ _SCENE_HEADING_FORMAL_RE = re.compile(
     re.IGNORECASE,
 )
 _SCENE_HEADING_INFER_RE = re.compile(
-    r'^[\s*_#>]*(Локация\s*[:：]|Location\s*[:：]|СЦЕНА\s*\d|Сцена\s*\d|SCENE\s*\d)',
+    # Time-coded beat ("0:00—0:05 — Hook" / "1:30 — On the way") added 2026-05-19
+    # — short-drama scripts often mark scene breaks by timestamp instead of
+    # INT./EXT. slug. Each beat tends to be a new location.
+    r'^[\s*_#>]*(Локация\s*[:：]|Location\s*[:：]|СЦЕНА\s*\d|Сцена\s*\d|SCENE\s*\d|\d{1,2}:\d{2}\s*[—–\-])',
     re.IGNORECASE,
 )
 _SLUG_BLOCKLIST_RE = re.compile(
@@ -194,6 +199,59 @@ def _save_user_keys(email, keys):
     }
     p.write_text(json.dumps(safe, indent=2))
 
+
+# ── Per-user app settings (auto-revise instruction, future toggles) ──────────
+# Stored separately from keys.json so concerns don't mix. Default-text mirrors
+# the colleague's `DEFAULT_AUTO_REVISE_INSTRUCTION` (src/shared/lib/auto-revise.ts)
+# but extended per the operator's preferred wording (see /Volumes/T7 S 2TB
+# screenshot — Settings → «Автоматическая правка» tab).
+DEFAULT_AUTO_REVISE_INSTRUCTION = (
+    'следи чтоб персонажи в чанках не перемещались незаметно в пространстве и не '
+    'появлялись из неотткуда и чтоб на видео было понятно кто что кому говорит , где '
+    'находится, что делает, куда передвигается, чтоб они внезапно не телепортировались '
+    'из ниоткуда или не меняли за кадром положение или состояние между чанками (между '
+    'концом одного чанка и началом другого.) Чанки должны монтажно между собой '
+    'склеиваться. и сохраняться общая стилистика.  Должно быть понятно что происходит '
+    'в серии с сохранением логики и диалогов. Внимательно следи за внешним видом/'
+    'состоянием персонажей и описывай состояние внешного вида в каждом чанке '
+    '(например наушник или кепка или что в руках держит). Следи за длинной реплик '
+    'особенно в конце чанка. Если есть риск что реплика не успеет произнестись по '
+    'факту - укороти реплики сохранив их смысл и эмоции.'
+)
+
+def _user_settings_path(email):
+    safe = re.sub(r'[^a-z0-9]+', '_', (email or '').lower()).strip('_') or 'anon'
+    return DATA_ROOT / safe / 'settings.json'
+
+def _load_user_settings(email):
+    """Returns dict with auto-revise + future per-user UI prefs."""
+    p = _user_settings_path(email)
+    if not p.exists():
+        return {
+            'auto_revise_enabled': True,
+            'auto_revise_instruction': DEFAULT_AUTO_REVISE_INSTRUCTION,
+        }
+    try:
+        d = json.loads(p.read_text())
+        return {
+            'auto_revise_enabled': bool(d.get('auto_revise_enabled', True)),
+            'auto_revise_instruction': (d.get('auto_revise_instruction') or DEFAULT_AUTO_REVISE_INSTRUCTION).strip(),
+        }
+    except Exception:
+        return {
+            'auto_revise_enabled': True,
+            'auto_revise_instruction': DEFAULT_AUTO_REVISE_INSTRUCTION,
+        }
+
+def _save_user_settings(email, settings):
+    p = _user_settings_path(email)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    safe = {
+        'auto_revise_enabled': bool(settings.get('auto_revise_enabled', True)),
+        'auto_revise_instruction': (settings.get('auto_revise_instruction') or DEFAULT_AUTO_REVISE_INSTRUCTION).strip(),
+    }
+    p.write_text(json.dumps(safe, indent=2, ensure_ascii=False))
+
 # Thread-local override for background workers spawned outside Flask request
 # context. When a request handler spawns a daemon thread, Flask's `session` is
 # torn down by the time the thread runs, so `current_user_email()` raises and
@@ -306,6 +364,16 @@ ELEVENLABS_KEY = _load_secret('ELEVENLABS_API_KEY', 'elevenlabs_key')
 # OPENAI key used ONLY by the chunk-QC pipeline (Whisper language detection).
 # Optional — if missing, language QC stage degrades to a no-op (pass-through).
 OPENAI_KEY     = _load_secret('OPENAI_API_KEY',     'openai_key')
+
+# ── EXPERIMENTAL feature flags ──────────────────────────────────────────────
+# STRICT_CHAR_FILTER: drop ALL character refs from compose if their name is
+# not in chunk_text. Catches composer over-attaching characters from episode
+# roster (e.g. «Sophie sits in chair» when chunk only has Emma+Adrian dialogue).
+# Trial flag — easy rollback: flip to '0' or remove env var.
+# Risk: false-positive drop of chars who appear physically but aren't named
+# (e.g. «her hand visible at edge of frame» — hand's owner not named).
+# Dropped chars are logged in compose_warnings so the regression is visible.
+STRICT_CHAR_FILTER = os.environ.get('STRICT_CHAR_FILTER', '1') == '1'
 
 # Warn loudly at startup if anything is missing — easier than debugging 401s later.
 for _name, _val in (('ANTHROPIC_API_KEY',  ANTHROPIC_KEY),
@@ -958,13 +1026,22 @@ def _openai_ask(prompt: str, system: str = '', model: str = 'gpt-5.5', max_token
         messages.append({'role': 'system', 'content': system})
     messages.append({'role': 'user', 'content': prompt})
 
+    # Newer OpenAI models (o-series, gpt-5+) use max_completion_tokens instead of max_tokens.
+    _model_lower = model.lower()
+    _uses_completion_tokens = (
+        _model_lower.startswith('o1') or _model_lower.startswith('o3') or
+        _model_lower.startswith('o4') or _model_lower.startswith('gpt-5') or
+        _model_lower.startswith('gpt5')
+    )
+    _tokens_kwarg = {'max_completion_tokens': max_tokens} if _uses_completion_tokens else {'max_tokens': max_tokens}
+
     last_err = None
     for attempt in range(4):   # 4 attempts total: 0 + 3 retries
         try:
             resp = client.chat.completions.create(
                 model=model,
                 messages=messages,
-                max_tokens=max_tokens,
+                **_tokens_kwarg,
             )
             text = (resp.choices[0].message.content or '').strip()
             print(f'[openai_ask] done in {time.time()-t0:.1f}s ({len(text)} chars)', flush=True)
@@ -1522,6 +1599,160 @@ def _seedance_filter_blocking_for_chunk(blocking_text, tags_in_chunk):
     return ' '.join(kept).strip()
 
 
+def _extract_script_blocking(script_text, chunk_text=None):
+    """Pull every [BLOCKING] / [BLOCKING_OUT] block out of the raw script.
+    Returns (episode_blocks, scene_blocks_for_chunk) where:
+      - episode_blocks: all [BLOCKING] content that appears BEFORE the first
+        scene heading (these are episode-wide constants like base outfits).
+      - scene_blocks_for_chunk: concatenated content of every [BLOCKING] /
+        [BLOCKING_OUT] block in the SAME scene as `chunk_text`. If chunk_text
+        is None we return ALL blocking, joined.
+    Lines inside the fences are 0-chrono in the segmenter; this function just
+    reads them as scene-setup context for the Seedance prompt builder."""
+    if not script_text:
+        return '', ''
+    lines = script_text.split('\n')
+    # Walk script and bucket blocks by scene index. Scene index increments at
+    # every scene heading; index 0 means "before any scene heading" = episode-level.
+    blocks = []   # list of {kind: 'in'|'out', scene_idx: int, text: str}
+    scene_starts = []  # byte-offset of each scene heading start
+    cur_scene_idx = 0
+    in_block = False
+    block_kind = ''
+    buf = []
+    off = 0
+    # Permissive fence detector — accepts every common variant LLM-writers emit:
+    # [BLOCKING], [BLOCKING_START], [BLOCKING_BEGIN], [BLOCKING_OPEN], [/BLOCKING],
+    # [BLOCKING_END], [BLOCKING_CLOSE], plus _OUT variants for closing setups.
+    fence_re = re.compile(
+        r'^\[/?\s*BLOCKING(?:_OUT)?(?:_(?:START|BEGIN|OPEN|END|CLOSE))?\s*\]\s*$',
+        re.IGNORECASE,
+    )
+    # Implicit-blocking signatures — for setups the writer-LLM emitted WITHOUT
+    # fence markers. Same heuristic as the client-side parser.
+    outfit_line_re = re.compile(r'::\s*(?:OUTFIT|WEARING|WEAR|CLOTHES|COSTUME)\s*[:：]', re.IGNORECASE)
+    blocking_meta_re = re.compile(
+        r'^(?:LOCATION|MOOD|LIGHTING|PROPS|CAMERA|FRAMING|SETTING|TIME|WEATHER|ATMOSPHERE|ОСВЕЩЕНИЕ|РЕКВИЗИТ|ЛОКАЦИЯ|АТМОСФЕРА)\s*[:：]\s*\S',
+        re.IGNORECASE,
+    )
+    position_verb_re = re.compile(
+        r'^(?:стои[тю]|стоят|сиди[тю]|сидят|лежи[тшю]|лежат|держи[тшю]|держат|смотри[тшю]|смотрят|одет[аоы]?|оперевш\w*|прислон\w*|сжима\w*|стиска\w*|наблюда\w*|замер\w*|опуст\w*|поднят\w*|опущен\w*|облокот\w*|прижим\w*|нависа\w*|нагиба\w*|склон\w*|присел\w*|развалил\w*|wears?|stands?|sits?|lies?|holds?|looks?\s+at|watches?|leans?|grips?|clenches?|presses?|tilts?|rests?|stays?|crouches?|kneels?|squats?|positions?)(?=[\s,.;:!?]|$)',
+        re.IGNORECASE,
+    )
+    name_cue_re = re.compile(r'^[A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё0-9 \-\'.#]{0,40}\s*[:：]\s*(.+)$')
+    def is_position_line(t):
+        m = name_cue_re.match(t)
+        return bool(m and position_verb_re.match(m.group(1).strip()))
+    def is_blocking_content(t):
+        return bool(outfit_line_re.search(t)) or is_position_line(t) or bool(blocking_meta_re.match(t))
+    # Pre-pass: mark indices that belong to implicit-blocking clusters.
+    implicit_blocking_idx = set()
+    for i, ln in enumerate(lines):
+        t = ln.strip()
+        # Primary trigger: outfit-line OR position-NAME line. A lone LOCATION:
+        # is not enough — it could still be a real (inferred) scene heading.
+        if not outfit_line_re.search(t) and not is_position_line(t):
+            continue
+        implicit_blocking_idx.add(i)
+        for j in range(i - 1, -1, -1):
+            tj = lines[j].strip()
+            if not tj:
+                continue
+            if is_blocking_content(tj):
+                implicit_blocking_idx.add(j); continue
+            break
+        for j in range(i + 1, len(lines)):
+            tj = lines[j].strip()
+            if not tj:
+                continue
+            if is_blocking_content(tj):
+                implicit_blocking_idx.add(j); continue
+            break
+
+    implicit_buf = []   # accumulator for current implicit-blocking run
+    def _flush_implicit():
+        nonlocal implicit_buf
+        if implicit_buf:
+            blocks.append({'kind': 'in', 'scene_idx': cur_scene_idx, 'text': '\n'.join(implicit_buf)})
+            implicit_buf = []
+
+    for i, ln in enumerate(lines):
+        line_off = off
+        off += len(ln) + 1   # +1 for newline
+        t = ln.strip()
+        if fence_re.match(t):
+            _flush_implicit()
+            is_close = t.lstrip().startswith('[/') or bool(re.search(r'_(?:END|CLOSE)\s*\]', t, re.IGNORECASE))
+            is_out = bool(re.search(r'BLOCKING_OUT', t, re.IGNORECASE))
+            if is_close:
+                if in_block and buf:
+                    blocks.append({'kind': block_kind, 'scene_idx': cur_scene_idx, 'text': '\n'.join(buf)})
+                in_block = False
+                block_kind = ''
+                buf = []
+            else:
+                in_block = True
+                block_kind = 'out' if is_out else 'in'
+                buf = []
+            continue
+        if in_block:
+            if t:
+                buf.append(ln)
+            continue
+        # Implicit blocking — accumulate without creating a scene from LOCATION:.
+        if i in implicit_blocking_idx:
+            if t:
+                implicit_buf.append(ln)
+            continue
+        else:
+            _flush_implicit()
+        # Scene heading detection (delegated to existing helper).
+        if is_scene_heading(t):
+            cur_scene_idx += 1
+            scene_starts.append(line_off)
+    # Flush any trailing implicit-blocking content that didn't hit a non-blocking line.
+    _flush_implicit()
+    # Episode-level blocks = those that sat before scene 1.
+    episode_blocks = '\n'.join(b['text'] for b in blocks if b['scene_idx'] == 0).strip()
+    if chunk_text is None:
+        scene_only = '\n'.join(b['text'] for b in blocks).strip()
+        return episode_blocks, scene_only
+    # Locate the chunk in the script and figure out which scene it belongs to.
+    chunk_scene_idx = 0
+    if chunk_text:
+        cands = [s.strip() for s in chunk_text.split('\n') if len(s.strip()) >= 25 and not is_scene_heading(s.strip())]
+        chunk_off = -1
+        for c in cands[:6]:
+            idx = script_text.find(c)
+            if idx >= 0 and script_text.find(c, idx + 1) == -1:
+                chunk_off = idx
+                break
+        if chunk_off < 0:
+            for c in cands[:6]:
+                idx = script_text.find(c)
+                if idx >= 0:
+                    chunk_off = idx
+                    break
+        if chunk_off >= 0:
+            # Find which scene_start the chunk_off sits inside
+            for i, start in enumerate(scene_starts, start=1):
+                if start > chunk_off:
+                    break
+                chunk_scene_idx = i
+    scene_text = '\n'.join(
+        b['text'] for b in blocks
+        if b['scene_idx'] == chunk_scene_idx and b['kind'] == 'in'
+    ).strip()
+    # Also include the PREVIOUS scene's [BLOCKING_OUT] for continuity context.
+    prev_out = '\n'.join(
+        b['text'] for b in blocks
+        if b['scene_idx'] == chunk_scene_idx - 1 and b['kind'] == 'out'
+    ).strip()
+    if prev_out:
+        scene_text = (prev_out + '\n' + scene_text).strip() if scene_text else prev_out
+    return episode_blocks, scene_text
+
+
 def _seedance_inject_blocking(prompt_text, blocking_text, chunk_tags_used):
     """Insert filtered blocking BEFORE 'Constraints:' in the 6-block promptEn.
     Falls back to append if Constraints not found. Mirrors reference injectBlocking."""
@@ -1587,7 +1818,7 @@ def _prev_episode_ending_context(sid, num):
         return None
     parts = []
 
-    prev_script = (prev_ep.get('script') or '').strip()
+    prev_script = _normalize_blocking_tags((prev_ep.get('script') or '').strip())
     if prev_script:
         last_heading = None
         for line in prev_script.split('\n'):
@@ -1605,6 +1836,18 @@ def _prev_episode_ending_context(sid, num):
         tail = clean[-6:] if len(clean) > 6 else clean
         if tail:
             parts.append("PREV EP — last 6 lines (immediate beats before cut):\n" + '\n'.join(tail))
+
+        # Extract [BLOCKING_END] position block if present
+        ep_end_start = prev_script.find('[BLOCKING_END]')
+        ep_end_finish = prev_script.find('[/BLOCKING_END]')
+        if ep_end_start != -1 and ep_end_finish != -1 and ep_end_finish > ep_end_start:
+            ep_end_block = prev_script[ep_end_start:ep_end_finish + len('[/BLOCKING_END]')].strip()
+            parts.append(
+                f"PREV_END_POSITION:\n{ep_end_block}\n"
+                "CONTINUITY RULE: If this episode opens in the same scene/location — "
+                "the [BLOCKING] block MUST exactly match this end position "
+                "(same characters, same positions). If starting a new scene, create a fresh [BLOCKING]."
+            )
 
     prev_blocking = (prev_ep.get('batch_episode_blocking') or prev_ep.get('scene_blocking') or '').strip()
     if prev_blocking:
@@ -1730,6 +1973,24 @@ def _canonical_char_description(s, char_id, outfit_label):
     if not char:
         return ''
     appearance = (char.get('appearance') or '').strip()
+    # Voice-only characters (e.g. someone on the other end of a phone call)
+    # often have the appearance field misused by the script-writer LLM to
+    # describe their ROLE ("Voice on phone delivering urgent summons...")
+    # instead of physical traits. If we dump that into BINDING it confuses
+    # the composer into placing them in frame. Replace with a clear off-screen
+    # marker so BINDING stays declarative but signals voice-only intent.
+    _VOICE_ONLY_PREFIX_RE = re.compile(
+        r'^\s*(?:voice\s+(?:on|via|through|over)\s+phone|voice-?on-?phone'
+        r'|off[\s\-]?screen\s+voice|voiceover|voice[\s\-]?only|via\s+phone'
+        r'|on\s+the\s+phone\s+(?:from|in)|phone\s+voice|голос\s+по\s+телефону'
+        r'|голос\s+за\s+кадром|закадровый\s+голос)\b',
+        re.IGNORECASE,
+    )
+    if _VOICE_ONLY_PREFIX_RE.match(appearance):
+        # Replace misused appearance with explicit off-screen voice marker.
+        # Reference image still drives Seedance lipsync, but BINDING no longer
+        # tells the composer to render this character in the room.
+        return 'off-screen voice via phone — NOT visible in frame'
     # Vague clothing tails ("and open casual clothing.", "in everyday attire")
     # cause Seedance to render a different concrete outfit per chunk because
     # the model treats them as creative freedom rather than a constraint.
@@ -1916,14 +2177,17 @@ def avai_generate(prompt: str, output_path: Path, reference_url: str = None, asp
     with the same prompt + reference. Returns the remote image URL on success,
     raises with a combined error message on total failure.
     aspect_ratio: '9:16' (vertical, default — characters/portraits) or '16:9' (horizontal — locations).
-    preferred_provider: '' / 'auto' (default banana→seedream), 'banana', 'seedream' — explicit
-    user override via per-series toggle. If specified, that provider runs FIRST."""
+    preferred_provider: '' / 'auto' (default banana→seedream), 'banana', 'seedream', 'openai' —
+    explicit user override. If specified, that provider runs FIRST."""
     errors = []
     image_url = None
     if preferred_provider == 'seedream':
         provider_chain = ('seedream', 'banana')
     elif preferred_provider == 'banana':
         provider_chain = ('banana', 'seedream')
+    elif preferred_provider == 'openai':
+        # OpenAI image gen (gpt-image-1 via AVAI). Falls back to Banana on failure.
+        provider_chain = ('openai', 'banana')
     else:
         provider_chain = ('banana', 'seedream')
     for provider in provider_chain:
@@ -2136,6 +2400,8 @@ def load_series(sid):
     data.setdefault('video_provider', 'reteller')        # 'reteller' | 'seedance'
     data.setdefault('auto_reteller_prompt', True)        # auto-build Reteller prompt after script gen
     data.setdefault('items', [])                         # story-relevant props (handbag, gun, locket...)
+    data.setdefault('devices_index', {})                 # plot-device anti-repetition registry
+    data.setdefault('cadence_policy', {'default_min_gap': 4, 'hard_limit': 3})
     return data
 
 def save_series(sid, data):
@@ -2149,6 +2415,311 @@ def load_episode(sid, num):
 def save_episode(sid, num, data):
     episodes_dir(sid).mkdir(exist_ok=True)
     _atomic_write_json(episodes_dir(sid) / f'{int(num):03d}.json', data)
+
+
+_OLD_TAG_MAP = [
+    ('[SCENE_OPEN]',    '[BLOCKING]'),
+    ('[/SCENE_OPEN]',   '[/BLOCKING]'),
+    ('[EPISODE_END]',   '[BLOCKING_END]'),
+    ('[/EPISODE_END]',  '[/BLOCKING_END]'),
+]
+
+def _normalize_blocking_tags(text: str) -> str:
+    """Replace legacy [SCENE_OPEN]/[EPISODE_END] tags with canonical [BLOCKING]/[BLOCKING_END].
+    Safe to call on any script text — no-op if already on new format."""
+    for old, new in _OLD_TAG_MAP:
+        text = text.replace(old, new)
+    return text
+
+
+def _extract_end_position(script_text: str) -> str | None:
+    """Extract [BLOCKING_END]...[/BLOCKING_END] block from script text.
+    Returns the block string (including tags) or None if not present."""
+    if not script_text:
+        return None
+    script_text = _normalize_blocking_tags(script_text)
+    start = script_text.find('[BLOCKING_END]')
+    end = script_text.find('[/BLOCKING_END]')
+    if start == -1 or end == -1 or end <= start:
+        return None
+    return script_text[start:end + len('[/BLOCKING_END]')].strip()
+
+# ── SCENE_OPEN outfit sync ─────────────────────────────────────────────────────
+
+def _expand_outfit_label_to_desc(label: str, char_appearance: str = '', char_gender: str = '') -> str:
+    """Cheap one-shot Claude call to turn a SHORT outfit label like
+    `Business Casual` / `Simple Dress` / `Pajamas` into a CONCRETE wardrobe
+    description (`tailored charcoal blazer, white shirt, dark trousers, ...`).
+
+    Why: when the writer omits `| OUTFIT_DESC:` and we fall back to
+    `description = label`, both the outfit-image gen prompt AND the seedance
+    BINDING text become weak — Seedance reinvents the cloth on each chunk
+    because there's no concrete anchor.
+
+    Cost: ~600 input + 100 output tokens of Sonnet ≈ $0.003. Runs at most ONCE
+    per (character × new-label) pair — cached as `outfit.description` forever.
+    Returns the expanded description string, or the original label on error.
+    """
+    label = (label or '').strip()
+    if not label:
+        return ''
+    gender_hint = ''
+    if char_gender:
+        gender_hint = f' for a {char_gender.lower()}' if char_gender.lower() in ('male', 'female') else ''
+    sys_prompt = (
+        "You expand a short outfit label into a concrete wardrobe description "
+        "for a stable-diffusion image prompt. Output ONLY the description — "
+        "no preamble, no quotes, no labels. 8-22 words. Comma-separated garments + colors + materials. "
+        "No body parts, no poses, no scenery. Suitable for any episode this character appears in "
+        "(don't tie it to a specific scene). Plain text only."
+    )
+    user_prompt = (
+        f"Outfit label: {label}\n"
+        f"Character context{gender_hint}: {(char_appearance or '')[:200] or '(none)'}\n\n"
+        f"Expand into a concrete wardrobe description (garments + colors + materials)."
+    )
+    try:
+        resp = claude_ask(user_prompt, system=sys_prompt, max_tokens=120, timeout=60, idle_timeout=30)
+        resp = (resp or '').strip().strip('"').strip()
+        # Sanity caps — never return raw model markup or paragraphs
+        resp = resp.split('\n')[0].strip()
+        if len(resp) < 8 or len(resp) > 300:
+            return label
+        return resp
+    except Exception as e:
+        _log_event('WARN', 'outfit_label_expand_failed', label=label, err=str(e)[:200])
+        return label
+
+
+def _resolve_char_by_script_name(script_name: str, chars: list) -> dict | None:
+    """Match a character-name token taken from a script line (typically ALL-CAPS
+    first name like `ADRIAN`, `MRS. VALE`) against the series character roster
+    where canonical names are full names like `Adrian Blackwell` / `Mrs. Vale`.
+
+    Strategy (in order):
+      1. Exact case-insensitive full-name match.
+      2. Script name matches the FIRST whitespace-separated token of a
+         character name (`ADRIAN` ↔ `Adrian Blackwell`). Common short-drama
+         pattern — scripts always use the first name in dialogue cues.
+      3. Script name matches ANY whitespace-token in a character name
+         (`VALE` ↔ `Mrs. Vale`) — last-name fallback.
+
+    Returns the matching character dict, or None. If multiple chars match
+    at the same tier the first one wins (stable order).
+    """
+    if not script_name or not chars:
+        return None
+    sn = re.sub(r'\s+', ' ', script_name.strip()).lower().rstrip('.,;:')
+    if not sn:
+        return None
+    # Tier 1 — exact full-name
+    for c in chars:
+        nm = (c.get('name') or '').strip().lower()
+        if nm == sn:
+            return c
+    # Tier 2 — first token of character name matches script name
+    sn_first = sn.split()[0]
+    for c in chars:
+        nm_parts = (c.get('name') or '').strip().lower().split()
+        if nm_parts and nm_parts[0].rstrip('.,;:') == sn_first:
+            return c
+    # Tier 3 — any token of character name matches script name
+    for c in chars:
+        nm_parts = [p.rstrip('.,;:') for p in (c.get('name') or '').strip().lower().split()]
+        if sn_first in nm_parts:
+            return c
+    return None
+
+
+def _normalize_outfit_label(label: str) -> str:
+    """Canonicalize an outfit label for case-insensitive matching.
+    'Business Suit' / 'business suit' / ' BUSINESS  SUIT ' → 'business suit'.
+    Strips trailing punctuation, collapses whitespace.
+    """
+    if not label:
+        return ''
+    s = re.sub(r'\s+', ' ', label.strip().lower()).strip(' .,;:|')
+    return s
+
+
+def _parse_scene_open_outfits(script: str) -> dict:
+    """Extract character→(label, description) mapping from EVERY [BLOCKING] block
+    in the script, merging across scenes (later scene wins for the same label).
+
+    New format: `CHAR: <position> :: OUTFIT: <Outfit Name> | OUTFIT_DESC: <desc>`
+    Legacy format (no `|`): treat the text after `OUTFIT:` as both label and
+    description so old scripts still parse.
+
+    Returns {CHAR_NAME_UPPER: [(label, description), ...]} — list because one
+    character can wear multiple outfits across scenes in one episode.
+    """
+    script = _normalize_blocking_tags(script)
+    blocks = re.findall(r'\[BLOCKING\](.*?)\[/BLOCKING\]', script, re.DOTALL)
+    if not blocks:
+        return {}
+    outfits: dict = {}
+    for block in blocks:
+        for line in block.split('\n'):
+            line = line.strip()
+            if ':: OUTFIT:' not in line:
+                continue
+            pos_part, outfit_part = line.split(':: OUTFIT:', 1)
+            outfit_part = outfit_part.strip()
+            if not outfit_part:
+                continue
+            # Split label from optional description.
+            if '|' in outfit_part:
+                head, tail = outfit_part.split('|', 1)
+                label = head.strip().rstrip(',').strip()
+                m_desc = re.search(r'OUTFIT[_ ]?DESC\s*[:\-]\s*(.+)$', tail.strip(), re.IGNORECASE)
+                description = m_desc.group(1).strip() if m_desc else tail.strip()
+            else:
+                # Legacy: whole text is both label and description.
+                label = outfit_part
+                description = outfit_part
+            if ':' in pos_part:
+                char_name = pos_part.split(':', 1)[0].strip().upper()
+                if char_name and char_name != 'LOCATION':
+                    outfits.setdefault(char_name, []).append((label, description))
+    return outfits
+
+
+def _outfit_word_similarity(desc1: str, desc2: str) -> float:
+    """Simple word-overlap similarity. Returns 0.0–1.0."""
+    w1 = set(re.findall(r'[a-z]+', desc1.lower()))
+    w2 = set(re.findall(r'[a-z]+', desc2.lower()))
+    # Ignore trivial stop words
+    stop = {'a', 'an', 'the', 'and', 'with', 'in', 'on', 'of', 'at', 'to'}
+    w1 -= stop
+    w2 -= stop
+    if not w1 or not w2:
+        return 0.0
+    return len(w1 & w2) / min(len(w1), len(w2))
+
+
+def _sync_script_outfits(sid: str, script: str) -> list:
+    """Parse [BLOCKING] outfit names from the script and reconcile against
+    the character's outfit roster. Three-tier match logic:
+
+      1. Exact label match (case-insensitive, normalized) → REUSE existing outfit.
+         If the script provides a fresh OUTFIT_DESC and the existing outfit
+         has no description yet, fill it in. Otherwise keep canonical.
+      2. No label match BUT description fuzzy-similarity >= 0.65 to an existing
+         outfit → REUSE that outfit (user's «<2 параметров отличия» rule —
+         don't proliferate near-duplicates).
+      3. Otherwise → CREATE a new outfit object with the writer's exact label
+         + description, and force-trigger background image generation so the
+         asset is ready by the time the user opens compose.
+
+    Returns list of newly created outfit dicts for UI notification.
+    """
+    scene_outfits = _parse_scene_open_outfits(script)
+    if not scene_outfits:
+        return []
+
+    s = load_series(sid)
+    chars = s.get('characters', [])
+    created = []
+    changed = False
+
+    for char_name_upper, label_desc_pairs in scene_outfits.items():
+        # Resolve script name to series character — handles `ADRIAN` ↔ `Adrian Blackwell`
+        # via the multi-tier helper (exact / first-token / any-token).
+        char = _resolve_char_by_script_name(char_name_upper, chars)
+        if not char:
+            _log_event('INFO', 'outfit_sync_char_not_found', sid=sid, script_name=char_name_upper)
+            continue
+
+        # Skip the special «Base» label — that's the character's default look,
+        # which already lives as the base reference image, not a separate outfit.
+        existing = char.setdefault('outfits', [])
+
+        # Dedup within this episode's pairs (the writer can name the same outfit
+        # multiple scenes in a row — we only need to reconcile each label once).
+        seen_in_episode = set()
+        for label, description in label_desc_pairs:
+            norm = _normalize_outfit_label(label)
+            if not norm or norm in ('base', 'baseline', 'default'):
+                continue
+            if norm in seen_in_episode:
+                continue
+            seen_in_episode.add(norm)
+
+            # 1) Exact-label match (case-insensitive)
+            match = next(
+                (o for o in existing if _normalize_outfit_label(o.get('label', '')) == norm),
+                None
+            )
+            if match:
+                # Backfill description if writer just provided one for an
+                # outfit object that was created without it earlier.
+                if description and description != label and not (match.get('description') or '').strip():
+                    match['description'] = description
+                    changed = True
+                continue
+
+            # 2) Fuzzy description match — block near-duplicate outfits
+            best_score = 0.0
+            best_obj = None
+            if description:
+                for o in existing:
+                    o_desc = (o.get('description') or '').strip()
+                    if not o_desc:
+                        continue
+                    score = _outfit_word_similarity(description, o_desc)
+                    if score > best_score:
+                        best_score = score
+                        best_obj = o
+            if best_obj is not None and best_score >= 0.65:
+                _log_event('INFO', 'outfit_deduped_by_desc', sid=sid,
+                           char=char.get('name'),
+                           new_label=label,
+                           merged_into=best_obj.get('label'),
+                           score=round(best_score, 2))
+                continue
+
+            # 3) Create new outfit; force auto-gen so the image is ready by render time.
+            # CRITICAL: if writer omitted OUTFIT_DESC the fallback is description=label
+            # (e.g. "Business Casual"). That's a USELESS text anchor — both the i2i
+            # outfit-image gen prompt AND Seedance BINDING become weak, so each chunk
+            # renders the cloth differently. Expand via Claude to a concrete description
+            # before creating the object so downstream renders have something to anchor.
+            final_description = description.strip()
+            if (not final_description) or (final_description.lower() == label.strip().lower()):
+                final_description = _expand_outfit_label_to_desc(
+                    label.strip(),
+                    char.get('appearance', ''),
+                    char.get('gender', ''),
+                ) or label.strip()
+            outfit = {
+                'id':                  str(uuid.uuid4())[:8],
+                'label':               label.strip()[:48],
+                'description':         final_description,
+                'photo':               None,
+                'reteller_project_id': None,
+                'auto_from_script':    True,
+            }
+            existing.append(outfit)
+            created.append({'char_name': char.get('name'), 'char_id': char.get('id'), 'outfit': outfit})
+            changed = True
+            _log_event('INFO', 'outfit_auto_created', sid=sid,
+                       char=char.get('name'), label=outfit['label'])
+
+    if changed:
+        save_series(sid, s)
+
+    # Force background generation regardless of the series-level
+    # auto_generate_assets flag — when the writer introduces a new outfit
+    # in a script we always want the image ready by the time the user
+    # opens compose (user request: "сразу уйти в генерацию персу").
+    if created:
+        try:
+            _spawn_with_keys(auto_generate_missing_assets, sid)
+        except Exception as e:
+            print(f'[sync_script_outfits] autogen spawn failed for {sid}: {e}')
+
+    return created
+
 
 def list_episodes(sid):
     d = episodes_dir(sid)
@@ -2194,6 +2765,42 @@ def chunk_count(s):
     Non-batch → 70, batch_size=5 → 14."""
     bs = batch_size(s) or 1
     return (TOTAL_SUB_EPS + bs - 1) // bs
+
+
+# ── Plot-device anti-repetition registry ─────────────────────────────────────
+DEVICE_TAXONOMY = [
+    "written_message",        # letter, note, diary, envelope
+    "overheard_dialogue",     # character accidentally hears
+    "phone_call_stranger",    # unknown caller delivers info
+    "dream_flashback",        # memory or dream sequence
+    "confession_direct",      # character admits/tells directly
+    "discovery_object",       # finding significant physical item
+    "confrontation_domestic", # argument/conflict at home/private
+    "confrontation_public",   # argument/conflict in public
+    "betrayal_reveal",        # ally revealed as enemy/traitor
+    "rescue_escape",          # physical rescue or escape
+    "legal_threat",           # lawsuit, police, official action
+    "ally_arrives",           # unexpected helper appears
+    "surveillance_caught",    # character discovered watching/recording
+    "blackmail",              # coercive leverage
+    "accident_staged",        # arranged accident or near-miss
+]
+DEVICE_FUNCTIONS = ["revelation", "tension", "bonding", "relief", "escalation"]
+
+NARRATIVE_ARCHETYPES = [
+    "investigation",   # protagonist actively gathers information
+    "escalation",      # protagonist gains ground, antagonist weakens
+    "setback",         # protagonist loses ground, antagonist wins
+    "revelation",      # major truth uncovered that changes everything
+    "alliance",        # new ally gained or relationship shifts
+    "confrontation",   # direct clash between protagonist and antagonist
+    "consequence",     # characters deal with fallout from prior actions
+    "twist",           # unexpected turn that subverts expectations
+    "execution",       # protagonist's plan finally plays out
+]
+NARRATIVE_POWER_DELTA = ["protagonist_wins", "antagonist_wins", "stasis"]
+NARRATIVE_EMOTIONS    = ["triumph", "hope", "dread", "grief", "rage", "confusion", "relief", "suspense"]
+NARRATIVE_ANT_MOMENTUM = ["escalating", "plateauing", "declining", "absent"]
 
 def ep_to_chunk(s, ep_num):
     """Map a sub-episode index (1..70) to its containing chunk index."""
@@ -2335,6 +2942,28 @@ def config_route():
         'avai_key_masked': ('•' * 6 + (keys['avai_key'][-4:] if keys.get('avai_key') else '')) if keys.get('avai_key') else '',
         'reteller_key_masked': ('•' * 6 + (keys['reteller_key'][-4:] if keys.get('reteller_key') else '')) if keys.get('reteller_key') else '',
     })
+
+
+@app.route('/api/user/auto-revise', methods=['GET', 'POST'])
+def user_auto_revise_route():
+    """Per-user storage for the «🎬 Автоматическая правка» instruction used by
+    Turbo-mode pipelines after batch-compose. Mirrors colleague's
+    AppSettings.autoReviseInstructionRu (src/shared/lib/auto-revise.ts)."""
+    email = current_user_email()
+    if not email:
+        return jsonify({'error': 'auth required'}), 401
+    if request.method == 'POST':
+        body = request.json or {}
+        cur = _load_user_settings(email)
+        if 'auto_revise_enabled' in body:
+            cur['auto_revise_enabled'] = bool(body.get('auto_revise_enabled'))
+        if 'auto_revise_instruction' in body:
+            text = (body.get('auto_revise_instruction') or '').strip()
+            cur['auto_revise_instruction'] = text or DEFAULT_AUTO_REVISE_INSTRUCTION
+        _save_user_settings(email, cur)
+        return jsonify({'ok': True, **cur, 'default': DEFAULT_AUTO_REVISE_INSTRUCTION})
+    cur = _load_user_settings(email)
+    return jsonify({**cur, 'default': DEFAULT_AUTO_REVISE_INSTRUCTION})
 
 
 # ── Series ───────────────────────────────────────────────────────────────────
@@ -2565,7 +3194,11 @@ def delete_checkpoint(sid, ep):
 
 @app.route('/api/series/<sid>/checkpoints/<int:ep>/generate', methods=['POST'])
 def generate_checkpoint(sid, ep):
-    """Use Claude to draft a strong story-twist for a checkpoint at episode `ep`."""
+    """Use Claude to draft a strong story-twist for a checkpoint at episode `ep`.
+
+    Includes the actual series state (cast / canon / episode synopses up to ep-1)
+    so the checkpoint can only use characters and facts that actually exist.
+    """
     s = load_series(sid)
     if not s:
         return jsonify({'error': 'not found'}), 404
@@ -2579,16 +3212,62 @@ def generate_checkpoint(sid, ep):
     fin_block = ''
     if fin and fin.get('description'):
         fin_block = f"Series finale (ep {fin.get('episode','?')}): {fin['description']}\n"
+
+    # Cast — the only characters allowed
+    cast_block = _canonical_cast_block(s)
+
+    # Canon — facts, open threads
+    try:
+        canon = load_canon(sid)
+        canon_block = _format_canon_for_prompt(canon, max_facts=25, max_timeline=6)
+        if canon_block:
+            canon_block = f'=== CANON (live story state) ===\n{canon_block}\n\n'
+    except Exception:
+        canon_block = ''
+
+    # Episode synopses — ONLY episodes before the checkpoint (so model doesn't
+    # see future episodes; future events should follow from the checkpoint)
+    try:
+        prior_eps = sorted(
+            [e for e in list_episodes(sid)
+             if (e.get('synopsis') or '').strip()
+             and int(e.get('number', 0) or 0) < int(ep)],
+            key=lambda e: int(e.get('number', 0) or 0),
+        )
+        if prior_eps:
+            ep_lines = []
+            for e in prior_eps:
+                n = e.get('number', '?')
+                syn = (e.get('synopsis') or '').strip().replace('\n', ' ')[:220]
+                ep_lines.append(f"  Ep{n}: {syn}")
+            synopses_block = (
+                f'=== EPISODE SYNOPSES SO FAR (Eps 1–{prior_eps[-1].get("number","?")}) ===\n'
+                + '\n'.join(ep_lines) + '\n\n'
+            )
+        else:
+            synopses_block = ''
+    except Exception:
+        synopses_block = ''
+
+    fmt_block = _format_mode_block(s, sections=['episode_rule', 'pace_rule'])
     prompt = (
         f'Series: "{s["title"]}" | Genre: {s.get("genre","")} | Tone: {s.get("tone","")}\n'
         f'Logline: {s.get("synopsis","")}\nArc: {s.get("arc","")}\n\n'
+        + fmt_block
+        + cast_block
+        + canon_block
+        + synopses_block
         + other_block + fin_block +
         f'\nDraft ONE strong story checkpoint that should hit at EPISODE {ep}. '
-        'It must be a single sharp dramatic event — a major reversal, betrayal, reveal, '
+        'HARD RULE: use ONLY characters from the CANONICAL CAST above. '
+        'NEVER invent new named characters — if a new role is needed, label it generically (Адвокат, Свидетель). '
+        'HARD RULE: build on threads / facts that already exist in the canon and prior episodes. '
+        'Do NOT introduce backstory or plot points that were never set up. '
+        'The checkpoint must be a single sharp dramatic event — a major reversal, betrayal, reveal, '
         'public scandal, death, return, identity exposed, or power flip — that the writer '
         'must steer toward and that will reshape the whole arc afterwards. '
-        'Be SPECIFIC: name the character(s) involved (use exact names from the bible if provided), '
-        'name the action, name the consequence. 2–4 sentences max. '
+        'Be SPECIFIC: name the canonical character(s) involved, name the action, name the consequence. '
+        '2–4 sentences max. '
         'Output ONLY the checkpoint description, no preface, no JSON, no markdown.'
     )
     try:
@@ -2596,7 +3275,9 @@ def generate_checkpoint(sid, ep):
             prompt,
             system=(
                 'You are a short-drama showrunner pitching mid-arc twists. Write in Russian. '
-                'Use exact character names. Keep it punchy, concrete, irreversible.'
+                'Use ONLY exact character names from the canonical cast provided. '
+                'Build on actual events from the episode synopses — never invent characters or backstory. '
+                'Keep it punchy, concrete, irreversible.'
             ),
         )
     except Exception as e:
@@ -2635,9 +3316,37 @@ def delete_finale(sid):
     return jsonify({'finale': None})
 
 
+@app.route('/api/series/<sid>/trajectory-validation', methods=['GET'])
+def trajectory_validation(sid):
+    """Return character-name mismatches between the canonical cast and the
+    user-pinned landmarks (finale + checkpoints). UI surfaces this as a
+    warning when the user opens the finale modal so they know to regenerate.
+    """
+    s = load_series(sid)
+    if not s:
+        return jsonify({'error': 'not found'}), 404
+    try:
+        mismatches = _extract_landmark_character_mismatch(s)
+    except Exception as e:
+        return jsonify({'error': str(e), 'mismatches': []}), 200
+    cast_names = [(c.get('name') or '').strip()
+                  for c in (s.get('characters') or [])
+                  if (c.get('name') or '').strip()]
+    return jsonify({
+        'mismatches': [{'where': label, 'unknown_names': names} for label, names in mismatches],
+        'cast_names': cast_names,
+        'has_problem': bool(mismatches),
+    })
+
+
 @app.route('/api/series/<sid>/finale/generate', methods=['POST'])
 def generate_finale(sid):
-    """Use Claude to draft a finale for a given episode number."""
+    """Use Claude to draft a finale for a given episode number.
+
+    Includes the actual series state (cast / canon / episode synopses) so the
+    finale can only use characters and facts that actually exist — no inventing
+    Сергей-the-lawyer who never appeared in any episode.
+    """
     s = load_series(sid)
     if not s:
         return jsonify({'error': 'not found'}), 404
@@ -2653,11 +3362,56 @@ def generate_finale(sid):
         cps_block = 'Checkpoints already pinned:\n' + '\n'.join(
             f"  - Ep {c['episode']}: {c.get('description','—')}" for c in cps
         ) + '\n'
+
+    # Cast — the only characters that may appear in the finale
+    cast_block = _canonical_cast_block(s)
+
+    # Canon — facts, open threads, character knowledge state
+    try:
+        canon = load_canon(sid)
+        canon_block = _format_canon_for_prompt(canon, max_facts=30, max_timeline=8)
+        if canon_block:
+            canon_block = f'=== CANON (live story state) ===\n{canon_block}\n\n'
+    except Exception:
+        canon_block = ''
+
+    # Episode synopses — ALL existing episodes with their synopses, so the finale
+    # can build on actual story events, not hallucinated ones.
+    try:
+        all_eps = sorted(
+            [e for e in list_episodes(sid) if (e.get('synopsis') or '').strip()],
+            key=lambda e: int(e.get('number', 0) or 0),
+        )
+        if all_eps:
+            ep_lines = []
+            for e in all_eps:
+                n = e.get('number', '?')
+                syn = (e.get('synopsis') or '').strip().replace('\n', ' ')[:250]
+                ep_lines.append(f"  Ep{n}: {syn}")
+            synopses_block = (
+                f'=== EPISODE SYNOPSES (Eps 1–{all_eps[-1].get("number","?")}) ===\n'
+                + '\n'.join(ep_lines) + '\n\n'
+            )
+        else:
+            synopses_block = ''
+    except Exception:
+        synopses_block = ''
+
+    fmt_block = _format_mode_block(s, sections=['episode_rule', 'pace_rule'])
     prompt = (
         f'Series: "{s["title"]}" | Genre: {s.get("genre","")} | Tone: {s.get("tone","")}\n'
         f'Logline: {s.get("synopsis","")}\nArc: {s.get("arc","")}\n\n'
+        + fmt_block
+        + cast_block
+        + canon_block
+        + synopses_block
         + cps_block +
         f'\nWrite the SERIES FINALE for episode {ep}. '
+        'HARD RULE: use ONLY characters from the CANONICAL CAST above. '
+        'NEVER invent new named characters (no Сергей-the-lawyer, no Маша-the-sister) — '
+        'if a role is needed and no canonical character fits, use a role label (Адвокат, Свидетель). '
+        'HARD RULE: build the finale on events that ACTUALLY happened in the episode synopses above '
+        '(or on threads opened in the canon). Do NOT reference plot points that were never set up. '
         'It must be a satisfying climax that pays off the central conflict and the romance/revenge/identity arc. '
         'Specify: (1) WHO is alive, dead, exposed, redeemed, in power; (2) WHAT the final emotional beat is; '
         '(3) WHAT explicitly cannot change between now and then (e.g. character X must be alive, '
@@ -2667,17 +3421,74 @@ def generate_finale(sid):
     try:
         text = claude_ask_fast(
             prompt,
-            system='You are a short-drama showrunner writing series finales. Russian. Concrete characters and stakes.',
+            system=(
+                'You are a short-drama showrunner writing series finales. Russian. '
+                'Concrete characters and stakes. Use ONLY characters that already exist in the series. '
+                'Build the finale on events that already happened on screen.'
+            ),
         )
     except Exception as e:
         return jsonify({'error': f'generation failed: {e}'}), 500
     return jsonify({'description': (text or '').strip(), 'episode': ep})
 
 
+def _extract_landmark_character_mismatch(s):
+    """Compare named characters mentioned in checkpoints + finale text against the
+    canonical cast. Returns a list of (label, [unknown_names]) tuples for any
+    landmark text that references characters NOT in the cast.
+
+    This catches the failure mode where the finale was generated with broken code
+    (used wrong names like Дарья/Виктория/Сергей while the cast is Emma/Clara/Vivian).
+    """
+    cast = (s or {}).get('characters') or []
+    cast_names = set()
+    for c in cast:
+        n = (c.get('name') or '').strip()
+        if n:
+            cast_names.add(n.lower())
+    if not cast_names:
+        return []  # no cast — can't validate
+
+    # Capitalised Latin or Cyrillic tokens of 3+ letters.
+    name_pat = re.compile(r'\b([A-ZА-ЯЁ][A-Za-zА-Яа-яЁё]{2,})\b')
+    # Common Russian role / location nouns that look capitalised in context but aren't names.
+    ROLE_WORDS = {
+        'детектив', 'адвокат', 'доктор', 'свидетель', 'полиция', 'охрана', 'соседи',
+        'семья', 'мать', 'отец', 'брат', 'сестра', 'муж', 'жена', 'сын', 'дочь',
+        'коронер', 'инспектор', 'мачеха', 'мама', 'папа', 'эпизод', 'серия', 'финал',
+        'кабинет', 'офис', 'дом', 'сад', 'улица', 'город', 'школа', 'поместье', 'estate',
+        'episode', 'series', 'finale', 'house', 'office', 'court', 'mr', 'mrs', 'ms', 'dr',
+    }
+
+    mismatches = []
+    sources = [('finale', ((s.get('finale') or {}).get('description') or ''))]
+    for c in (s.get('checkpoints') or []):
+        sources.append((f"checkpoint Ep{c.get('episode','?')}", c.get('description') or ''))
+
+    for label, text in sources:
+        if not text.strip():
+            continue
+        names_in_text = set()
+        for m in name_pat.finditer(text):
+            w = m.group(1)
+            if w.lower() in ROLE_WORDS:
+                continue
+            names_in_text.add(w)
+        unknown = sorted({n for n in names_in_text if n.lower() not in cast_names})
+        if unknown:
+            mismatches.append((label, unknown[:8]))
+    return mismatches
+
+
 # ── Story trajectory builder (used by writer prompts) ────────────────────────
 def build_trajectory_block(s, current_ep):
-    """Render upcoming checkpoints + finale into a context block injected into
-    the script writer's prompt. Empty string if nothing to steer toward."""
+    """Render upcoming checkpoints + finale into a HIGH-VISIBILITY context block
+    injected into writer / synopsis prompts.
+
+    The writer ignores soft suggestions in long prompts. This block is loud,
+    labeled MANDATORY, and includes a per-distance "what this episode must do
+    about it" rule so the model has no excuse to drift away from the finale.
+    """
     cps_all = s.get('checkpoints') or []
     fin = s.get('finale') or None
     upcoming = [c for c in cps_all if int(c.get('episode', 0)) >= current_ep and (c.get('description') or '').strip()]
@@ -2688,33 +3499,318 @@ def build_trajectory_block(s, current_ep):
     if not upcoming and not fin_relevant:
         return ''
 
-    lines = ['═══ NARRATIVE TRAJECTORY — STEER TOWARD THESE LANDMARKS ═══']
+    lines = [
+        '╔══════════════════════════════════════════════════════════════════╗',
+        '║ ⚡ NARRATIVE TRAJECTORY — MANDATORY. READ BEFORE WRITING ANYTHING ⚡║',
+        '╚══════════════════════════════════════════════════════════════════╝',
+        '',
+        'The series has user-pinned story landmarks below. Every word you write',
+        'must move the plot TOWARD them. Drift = automatic rewrite.',
+        '',
+    ]
 
     if upcoming:
-        lines.append('UPCOMING CHECKPOINTS (you must seed setup so these can hit on time):')
+        lines.append('▶ UPCOMING CHECKPOINTS (you must seed setup so these can hit on time):')
         for c in upcoming:
             ep_n = int(c['episode'])
             distance = ep_n - current_ep
-            tag = 'THIS EPISODE — must happen here' if distance == 0 else f'{distance} ep(s) away'
-            lines.append(f'  · Ep {ep_n} ({tag}): {c["description"].strip()}')
+            if distance == 0:
+                tag = '🎯 THIS EPISODE — events below MUST happen here'
+            elif distance == 1:
+                tag = '⚠ NEXT EPISODE — final setup window, get pieces in place'
+            elif distance <= 3:
+                tag = f'⏰ {distance} ep(s) away — tighten setup, do not delay'
+            else:
+                tag = f'{distance} ep(s) away — plant subtle seeds'
+            lines.append(f'  Ep {ep_n} [{tag}]:')
+            lines.append(f'    {c["description"].strip()}')
         if any(int(c["episode"]) - current_ep > 0 for c in upcoming):
-            lines.append('Rule: do NOT prematurely fire a future checkpoint. Plant seeds now (entrances, '
-                         'unspoken motives, prop placements, whispered allusions) so the checkpoint payoff '
-                         'feels earned and inevitable when its episode arrives.')
+            lines.append('')
+            lines.append('  RULE: do NOT prematurely fire a future checkpoint. Plant seeds now')
+            lines.append('  (entrances, unspoken motives, prop placements, whispered allusions)')
+            lines.append('  so the payoff feels earned and inevitable when its episode arrives.')
 
     if fin_relevant:
         ep_n = int(fin['episode'])
         distance = ep_n - current_ep
-        when = 'this episode' if distance == 0 else f'{distance} ep(s) away'
-        lines.append(f'\nSERIES FINALE (ep {ep_n}, {when}): {fin["description"].strip()}')
-        lines.append('HARD CONSTRAINTS from finale: any character or condition the finale relies on '
-                     '(alive, in power, holding a secret, separated, married, pregnant, free, etc.) '
-                     'MUST remain achievable from this episode onward. Do NOT kill, expose, or '
-                     'permanently remove anyone the finale needs — and do not resolve a conflict the '
-                     'finale needs unresolved.')
+        if distance == 0:
+            when = '🎯 THIS EPISODE IS THE FINALE'
+        elif distance == 1:
+            when = '⚠ FINALE IS NEXT EPISODE'
+        else:
+            when = f'{distance} ep(s) away'
+        lines.append('')
+        lines.append(f'▶ 🏁 SERIES FINALE (Ep {ep_n}, {when}):')
+        lines.append(f'    {fin["description"].strip()}')
+        lines.append('')
+        lines.append('  HARD CONSTRAINTS FROM FINALE:')
+        lines.append('  • Any character / power-state / secret / relationship the finale relies on')
+        lines.append('    MUST remain achievable from this episode onward.')
+        lines.append('  • Do NOT kill, expose, remove, or otherwise neutralize anyone the finale needs.')
+        lines.append('  • Do NOT resolve a conflict the finale needs unresolved.')
+        lines.append('  • Do NOT introduce a competing climax that would steal the finale\'s moment.')
+        if distance == 0:
+            lines.append('  • The finale\'s exact events MUST happen in this episode — use the')
+            lines.append('    specified characters and actions, not similar substitutes.')
+        elif distance <= 3:
+            lines.append(f'  • Only {distance} ep(s) until the finale — every plot move should now')
+            lines.append('    visibly converge toward the finale\'s climax.')
 
-    lines.append('═══════════════════════════════════════════════════')
+    # CHARACTER-NAME MISMATCH WARNING — if the finale / checkpoints reference
+    # names that don't exist in the canonical cast, the writer must MAP them
+    # by role, not abandon the trajectory.
+    try:
+        mismatches = _extract_landmark_character_mismatch(s)
+    except Exception:
+        mismatches = []
+    if mismatches:
+        lines.append('')
+        lines.append('⚠ ⚠ ⚠  CHARACTER NAME MISMATCH IN PINNED LANDMARKS  ⚠ ⚠ ⚠')
+        lines.append('The following landmark texts reference names that DO NOT EXIST in the canonical cast:')
+        for label, names in mismatches:
+            lines.append(f'  · {label}: {", ".join(names)}')
+        # Render canonical cast list inline for mapping
+        cast_inline = ', '.join((c.get('name') or '').strip()
+                                for c in (s.get('characters') or [])
+                                if (c.get('name') or '').strip())
+        if cast_inline:
+            lines.append(f'CANONICAL CAST: {cast_inline}')
+        lines.append('')
+        lines.append('RULE: the landmark texts above were likely generated with the wrong names.')
+        lines.append('Do NOT abandon the landmark just because the names differ. Instead:')
+        lines.append('  1. Identify each unknown name by its ROLE in the landmark description')
+        lines.append('     (stepmother, lawyer, sister, protagonist, daughter, etc.).')
+        lines.append('  2. Map that role to the closest CANONICAL CAST member.')
+        lines.append('     Example: landmark says "мачеха Виктория" → use canonical "Vivian".')
+        lines.append('     Example: landmark says "адвокат Сергей" → if no lawyer in cast, use role label "Lawyer".')
+        lines.append('  3. Execute the landmark EVENTS using the canonical names — keep the plot beats,')
+        lines.append('     swap the names.')
+        lines.append('  4. NEVER add an unknown name into the script — always use the canonical equivalent.')
+
+    lines.append('')
+    lines.append('═══════════════════════════════════════════════════════════════════')
     return '\n'.join(lines) + '\n\n'
+
+
+# ── Finale bridge plan — concrete plot bridge from current state to finale ───
+_BRIDGE_CACHE = {}  # in-memory: (sid, finale_ep, finale_hash, last_ep_with_script) -> plan dict
+
+
+def build_finale_bridge_plan(s, current_ep):
+    """Generate a concrete plot bridge from current series state to the pinned finale.
+
+    The problem this solves: prev_script keeps the writer in the existing plot thread,
+    while the finale describes events that may diverge. Without an explicit bridge,
+    the writer just continues prev_script and never converges to the finale.
+
+    This function asks Haiku to produce a per-episode plan (current_ep ... finale_ep),
+    where each episode is described as ONE sentence of "what concretely happens that
+    moves the plot toward the finale." The plan is cached per series-state hash so
+    repeated generation in close succession is cheap.
+
+    Returns a dict {block, this_beat, finale_ep} or {} if not applicable.
+    """
+    _EMPTY = {}
+    fin = (s or {}).get('finale') or None
+    if not fin or not (fin.get('description') or '').strip():
+        return _EMPTY
+    try:
+        fin_ep = int(fin.get('episode', 0) or 0)
+    except (TypeError, ValueError):
+        return _EMPTY
+    if fin_ep < current_ep:
+        return _EMPTY  # finale already past
+    distance = fin_ep - current_ep
+    if distance > 12:
+        # Too far out — bridge plan would be vague; rely on trajectory_block alone.
+        return _EMPTY
+
+    sid = s.get('id', '')
+    # Cache key: series id + finale ep + hash of finale text + last episode with a script
+    try:
+        all_eps = sorted(
+            [e for e in list_episodes(sid) if (e.get('script') or '').strip()],
+            key=lambda e: int(e.get('number', 0) or 0),
+        )
+        last_with_script = all_eps[-1].get('number', 0) if all_eps else 0
+    except Exception:
+        all_eps = []
+        last_with_script = 0
+    fin_hash = abs(hash(fin.get('description', '') + str(fin_ep))) % (10 ** 8)
+    cache_key = (sid, fin_ep, fin_hash, last_with_script, current_ep)
+    cached = _BRIDGE_CACHE.get(cache_key)
+    if cached:
+        return cached
+
+    # Build research context for Haiku: cast + canon + last 5 episode synopses + finale
+    cast_inline = ', '.join((c.get('name') or '').strip()
+                            for c in (s.get('characters') or [])
+                            if (c.get('name') or '').strip())
+    try:
+        canon = load_canon(sid)
+        canon_block = _format_canon_for_prompt(canon, max_facts=20, max_timeline=6)
+    except Exception:
+        canon_block = ''
+
+    # Last 5 episodes worth of synopses for grounding
+    try:
+        prior = sorted(
+            [e for e in list_episodes(sid) if (e.get('synopsis') or '').strip()
+             and int(e.get('number', 0) or 0) < current_ep],
+            key=lambda e: int(e.get('number', 0) or 0),
+        )[-5:]
+        prior_lines = []
+        for e in prior:
+            n = e.get('number', '?')
+            syn = (e.get('synopsis') or '').strip().replace('\n', ' ')[:220]
+            prior_lines.append(f"  Ep{n}: {syn}")
+        prior_block = '\n'.join(prior_lines) if prior_lines else '(no prior episodes)'
+    except Exception:
+        prior_block = '(no prior episodes)'
+
+    # Also include checkpoints between current and finale
+    cps_between = sorted(
+        [c for c in (s.get('checkpoints') or [])
+         if current_ep <= int(c.get('episode', 0) or 0) < fin_ep
+         and (c.get('description') or '').strip()],
+        key=lambda c: int(c.get('episode', 0) or 0),
+    )
+    cps_block = ''
+    if cps_between:
+        cps_block = 'CHECKPOINTS BETWEEN HERE AND FINALE:\n' + '\n'.join(
+            f"  Ep{c['episode']}: {c['description'].strip()}" for c in cps_between
+        ) + '\n\n'
+
+    prompt = (
+        f'You are a TV showrunner planning the BRIDGE from the current state of a series to its pinned finale.\n\n'
+        f'SERIES: "{s.get("title", "")}"\n'
+        f'CANONICAL CAST: {cast_inline}\n\n'
+        f'CANON STATE:\n{canon_block}\n\n'
+        f'LAST 5 EPISODE SYNOPSES (current state of the plot):\n{prior_block}\n\n'
+        f'{cps_block}'
+        f'FINALE (Ep {fin_ep}) — this is the END STATE, after all bridge episodes have played out:\n{fin["description"].strip()}\n\n'
+        f'TASK: write a step-by-step bridge plan from Ep {current_ep} through Ep {fin_ep} (finale).\n'
+        f'For EACH episode in the range Ep {current_ep}..Ep {fin_ep}, write ONE sentence in Russian describing the '
+        f'concrete plot beat that MOVES THE STORY TOWARD THE FINALE — and clearly indicate the '
+        f'TEMPORAL STATE of major characters (free, arrested, alive, etc.) at the START of that episode.\n\n'
+        f'CRITICAL RULES:\n'
+        f'• TEMPORAL DISCIPLINE — the FINALE describes the END STATE of Ep {fin_ep}. Any major status change '
+        f'  mentioned in the finale (arrest, sentencing, exposure, death, marriage, inheritance) has NOT yet '
+        f'  happened in earlier bridge episodes. Example: if finale says "Vivian is sentenced to life", then '
+        f'  in Eps {current_ep}..{fin_ep - 1} Vivian is STILL FREE, still living her normal life, possibly '
+        f'  evading suspicion. Do NOT place her in prison early.\n'
+        f'• Each bridge episode must build the EVIDENCE / PRESSURE / SETUP that makes the finale\'s climax '
+        f'  inevitable — depositions, autopsies, financial subpoenas, confrontations, allies arriving — '
+        f'  NOT the finale events themselves.\n'
+        f'• The plot in last 5 synopses may have diverged from finale events. Your job is to BRIDGE the divergence — '
+        f'  pick the plot threads from current state that can plausibly converge to the finale, '
+        f'  and PARK or RESOLVE-OFFSCREEN any threads that the finale ignores.\n'
+        f'• If a subplot in recent episodes (e.g. "hunt for Dr. X") doesn\'t appear in the finale, '
+        f'  give it a quick wrap or fold it back into a finale-relevant beat — do NOT let it dominate the bridge.\n'
+        f'• Use ONLY characters from the canonical cast. NEVER invent new named characters.\n'
+        f'• Each bridge step must be a concrete event (someone does something, evidence surfaces, '
+        f'  a confrontation happens) — not vague phrases like "tensions rise" or "secrets are uncovered".\n'
+        f'• The LAST step (Ep {fin_ep}) must match the finale description directly.\n\n'
+        f'OUTPUT FORMAT — strict JSON:\n'
+        f'{{"bridge": [{{"ep": <int>, "state_before": "<one short Russian sentence: where major characters '
+        f'are at start of this episode (e.g. \'Vivian still living at the estate, posing as innocent\')>", '
+        f'"beat": "<one Russian sentence: concrete event THIS episode>"}}, ...]}}\n'
+        f'Include exactly one entry per episode from {current_ep} to {fin_ep} inclusive.'
+    )
+
+    print(f'[bridge-plan] generating for ep {current_ep} → finale ep {fin_ep} (distance {distance})', flush=True)
+    try:
+        raw = claude_ask_fast(
+            prompt,
+            system=(
+                'You are a TV showrunner. Plan plot bridges that converge to a known ending. '
+                'Use only characters from the provided cast — never invent new named characters. '
+                'Every beat must logically derive from finale events or set them up. '
+                'Return strict JSON, no markdown.'
+            ),
+        )
+        data = json.loads(strip_json(raw))
+        bridge = data.get('bridge') or []
+    except Exception as e:
+        print(f'[bridge-plan] FAILED: {e}', flush=True)
+        _log_event('WARN', 'finale_bridge_plan_failed', err=str(e)[:200])
+        return _EMPTY
+
+    if not bridge:
+        print('[bridge-plan] empty bridge from LLM', flush=True)
+        return _EMPTY
+    print(f'[bridge-plan] generated {len(bridge)} beats', flush=True)
+    for entry in bridge:
+        try:
+            ep_n = entry.get('ep')
+            beat = (entry.get('beat') or '').strip()[:120]
+            print(f'[bridge-plan]   Ep{ep_n}: {beat}', flush=True)
+        except Exception:
+            pass
+
+    # Render the plan as a high-visibility block, highlighting THIS episode's job.
+    lines = [
+        '╔══════════════════════════════════════════════════════════════════╗',
+        '║ 🌉 FINALE BRIDGE PLAN — мост от текущей серии к финалу ║',
+        '╚══════════════════════════════════════════════════════════════════╝',
+        f'Финал зафиксирован на Ep {fin_ep}. Осталось {distance + 1} серий до финала.',
+        'План моста (по сериям) — каждая серия должна выполнить СВОЙ шаг:',
+        '',
+    ]
+    this_state_before = ''
+    for entry in bridge:
+        try:
+            ep_n = int(entry.get('ep'))
+        except (TypeError, ValueError):
+            continue
+        beat = (entry.get('beat') or '').strip()
+        state_before = (entry.get('state_before') or '').strip()
+        if not beat:
+            continue
+        if ep_n == current_ep:
+            lines.append(f'  ▶▶▶ Ep {ep_n} (ЭТА СЕРИЯ — ОБЯЗАТЕЛЬНОЕ СОБЫТИЕ):')
+            if state_before:
+                lines.append(f'      [состояние мира на старте серии]: {state_before}')
+                this_state_before = state_before
+            lines.append(f'      [beat]: {beat}')
+        elif ep_n == fin_ep:
+            lines.append(f'  🏁 Ep {ep_n} (ФИНАЛ): {beat}')
+        else:
+            tag = 'СЛЕДУЮЩАЯ' if ep_n == current_ep + 1 else f'+{ep_n - current_ep}'
+            extra = f' [состояние: {state_before}]' if state_before else ''
+            lines.append(f'  Ep {ep_n} ({tag}){extra}: {beat}')
+    lines += [
+        '',
+        f'HARD RULE: ЭТА СЕРИЯ (Ep {current_ep}) ОБЯЗАНА выполнить свой beat выше. '
+        f'Не уходи в подсюжет которого нет в этом плане. Если prev_script тянет тебя в '
+        f'другую сторону — этот план перевешивает: либо аккуратно сверни уходящие линии, '
+        f'либо переориентируй на финальные события.',
+        '',
+        f'TEMPORAL RULE: финальные события (Ep {fin_ep}) — ЕЩЁ НЕ ПРОИЗОШЛИ. Если финал говорит '
+        f'"X арестован", "Y осуждён", "Z раскрыт" — в этой серии (Ep {current_ep}) X/Y/Z ВСЕ ЕЩЁ '
+        f'в свободном/неразоблачённом состоянии. Эта серия строит ЕВИДЕНЦИЮ или ДАВЛЕНИЕ, '
+        f'которые в итоге приведут к финальному событию. Не перескакивай в "пост-финальное" состояние.',
+        '═══════════════════════════════════════════════════════════════════',
+        '',
+    ]
+    plan_text = '\n'.join(lines)
+    # Extract THIS episode's beat for separate (loud) injection downstream
+    this_beat = ''
+    for entry in bridge:
+        try:
+            if int(entry.get('ep')) == current_ep:
+                this_beat = (entry.get('beat') or '').strip()
+                break
+        except (TypeError, ValueError):
+            continue
+    result = {'block': plan_text, 'this_beat': this_beat,
+              'this_state_before': this_state_before, 'finale_ep': fin_ep}
+    _BRIDGE_CACHE[cache_key] = result
+    # Cap cache size — drop oldest
+    if len(_BRIDGE_CACHE) > 64:
+        for k in list(_BRIDGE_CACHE.keys())[:32]:
+            _BRIDGE_CACHE.pop(k, None)
+    return result
 
 
 @app.route('/api/series/<sid>/archive', methods=['POST'])
@@ -2957,10 +4053,12 @@ def _import_status(sid):
     })
 
 
-def _llm_extract_episode_entities(script_text, known_chars, known_locs, known_items):
+def _llm_extract_episode_entities(script_text, known_chars, known_locs, known_items, series=None):
     """One LLM call per episode that returns chars + locs + items in JSON.
     Faster than running /extract-characters + /detect-items separately. Passes
-    known names so the model can flag re-uses vs new entities."""
+    known names so the model can flag re-uses vs new entities.
+    `series` (optional) carries world-context — if it describes an anthropomorphic-
+    animal world, we inject a directive forcing species into every appearance."""
     if not script_text or not script_text.strip():
         return {'characters': [], 'locations': [], 'items': []}
     known_section = ''
@@ -2970,6 +4068,18 @@ def _llm_extract_episode_entities(script_text, known_chars, known_locs, known_it
             f"  characters: {', '.join(sorted(known_chars)) or '(none)'}\n"
             f"  locations:  {', '.join(sorted(known_locs))  or '(none)'}\n"
             f"  items:      {', '.join(sorted(known_items)) or '(none)'}\n"
+        )
+    # World-context block — only emitted when the series is anthropomorphic.
+    # Forces appearance text to start with the species marker so portrait gen
+    # later renders an animal, not a human.
+    world_block = ''
+    if isinstance(series, dict) and _is_anthro_world(series):
+        world_block = (
+            f"\n\nSERIES WORLD CONTEXT (CRITICAL):\n"
+            f"  title: {series.get('title','')}\n"
+            f"  world: {(series.get('world_description') or '')[:600]}\n"
+            f"  synopsis: {(series.get('synopsis') or '')[:600]}\n\n"
+            + _anthro_world_block(series)
         )
     system = (
         "You extract structured cast/crew data from a single short-drama episode script. "
@@ -2987,10 +4097,11 @@ def _llm_extract_episode_entities(script_text, known_chars, known_locs, known_it
         "  the stolen handbag). NOT random props (coffee cups, generic furniture).\n"
         "- Names: prefer the canonical full-name as it first appears in the script.\n"
         "- If an entity matches an already-known name (case-insensitive), use the EXACT known spelling so dedup works.\n"
-        "- Empty arrays are valid. No fields beyond schema."
+        "- Empty arrays are valid. No fields beyond schema.\n"
+        "- If a WORLD CONVENTION block is present in the user message, OBEY it for the 'appearance' field of every character."
     )
     raw = claude_ask(
-        f"Episode script:\n\n{script_text[:18000]}{known_section}",
+        f"Episode script:\n\n{script_text[:18000]}{known_section}{world_block}",
         system=system, model='', max_tokens=2500,
     )
     try:
@@ -3050,7 +4161,7 @@ def _import_worker(sid, episode_records, create_chars=True, create_locs=True, cr
                 for try_idx in range(3):
                     try:
                         extracted = _llm_extract_episode_entities(
-                            ep.get('script', ''), known_chars, known_locs, known_items
+                            ep.get('script', ''), known_chars, known_locs, known_items, series=s
                         )
                         # A valid response has at least one of the three lists
                         # populated (rare to have an episode with literally no
@@ -3375,6 +4486,9 @@ def episodes_logic_apply_multi(sid):
         except Exception:
             pass
         ep['script'] = body_txt
+        end_pos = _extract_end_position(body_txt)
+        if end_pos:
+            ep['end_position'] = end_pos
         save_episode(sid, num, ep)
         updated.append({'number': num, 'before_len': before_len, 'after_len': len(body_txt)})
 
@@ -3637,6 +4751,186 @@ def import_from_script_translate_dialogues():
     })
 
 
+_ADAPT_TO_STANDARD_SYSTEM = (
+    "You are a script formatter for short-form drama. Your task has THREE parts:\n\n"
+
+    "PART 1 — POSITION BLOCKS\n"
+    "Add POSITION BLOCKS to every scene:\n"
+    "[BLOCKING] — insert immediately after EVERY scene heading (ИНТА./ЭКСТ. line):\n"
+    "  [BLOCKING]\n"
+    "  LOCATION: <English location name>\n"
+    "  CHARACTER_NAME: <position in Russian> :: OUTFIT: <Outfit Name>\n"
+    "  [/BLOCKING]\n\n"
+    "[BLOCKING_END] — insert at the very end of each episode (absolute last thing):\n"
+    "  [BLOCKING_END]\n"
+    "  LOCATION: <English location name>\n"
+    "  CHARACTER_NAME: <final position at cut — in Russian>\n"
+    "  [/BLOCKING_END]\n\n"
+    "Rules for position blocks:\n"
+    "- [BLOCKING] lists ONLY characters PRESENT at scene START\n"
+    "- OUTFIT FIELD = a short Title Case NAME of the outfit asset (NOT a clothing description). Examples: `Business Suit`, `Casual`, `Pajamas`, `Red Dress`, `School Uniform`, `Hospital Gown`, `Swimsuit`. The system uses this label to reuse the same outfit asset across scenes.\n"
+    "- When the outfit NAME is new (not seen for this character before) add a description after a pipe: `OUTFIT: Pajamas | OUTFIT_DESC: light blue cotton pajamas, bare feet`. For names that were already introduced in a previous scene of this or earlier episode, OMIT `| OUTFIT_DESC:` — the system already has the description.\n"
+    "- DEDUP: don't invent 10 names for nearly-identical looks. If the character is in their default clothes use `Base` or the existing label they already have. New label = real wardrobe change.\n"
+    "- [BLOCKING_END] lists only characters present at end of episode (no OUTFIT needed — it's still the same outfit as in [BLOCKING])\n"
+    "- If consecutive episodes continue the same scene, [BLOCKING] of episode N+1 MUST match [BLOCKING_END] of episode N\n\n"
+
+    "PART 2 — DIALOGUE TRANSLATION\n"
+    "Translate any dialogue lines NOT in English to English. "
+    "Pattern: CHARACTER_NAME_ALLCAPS: \"dialogue\" or CHARACTER_NAME_ALLCAPS: (parenthetical) dialogue. "
+    "Do NOT translate action lines (in [brackets]) or scene headings or EPISODE NOTES sections. "
+    "Preserve character names exactly as written (ALL CAPS). "
+    "Already-English dialogue — leave unchanged.\n\n"
+
+    "PART 3 — SEEDANCE MODERATION SCAN\n"
+    "After adapting the script, scan ALL dialogue lines for content that may trigger Seedance AI video generation moderation filters. "
+    "Seedance flags: explicit violence (killing, blood, gore, graphic weapon use), sexual content, suicide/self-harm references, "
+    "explicit drug use, death threats. "
+    "For each flagged line provide 2-3 NATURAL alternative rewrites that sound organic in context — "
+    "based on the surrounding scene context and character relationships. "
+    "CRITICAL: rewrites must feel like real human speech in the moment. "
+    "Bad example: 'Put down the gun' → 'Remove the tactical equipment' (robotic, unnatural). "
+    "Good example: 'Put down the gun' → 'Put that down!' or 'Drop it, now!' (natural, urgent, fits the scene). "
+    "Only flag lines that are genuinely likely to cause moderation failure — do NOT flag mild drama, "
+    "emotional conflict, or normal thriller tension.\n\n"
+
+    "Output format: return a JSON object with THREE keys:\n"
+    "  script: the full adapted script as a string\n"
+    "  changes: array of short strings describing what was done, e.g. "
+    "[\"Added BLOCKING to episode 1\", \"Added BLOCKING_END to episode 3\", \"Translated 5 dialogue lines\"]\n"
+    "  moderation_warnings: array of objects, each: "
+    "{\"original\": \"JOHN: \\\"I'll kill you\\\"\", \"reason\": \"Explicit death threat\", "
+    "\"suggestions\": [\"JOHN: \\\"You'll regret this!\\\"\", \"JOHN: \\\"I swear you'll pay for this!\\\"\"]}\n"
+    "If no moderation issues found, moderation_warnings must be an empty array [].\n\n"
+    "Output ONLY valid JSON. No markdown fences."
+)
+
+
+@app.route('/api/adapt-script-to-standard', methods=['POST'])
+def adapt_script_to_standard():
+    """Takes a raw multi-episode script and adapts it to tool standard:
+    1. Adds [BLOCKING] after each scene heading and [BLOCKING_END] at end of each episode
+    2. Translates non-English dialogue to English (preserves already-English dialogue)
+    3. Does NOT change plot, character names, or action lines
+    Body: {script: str}
+    Returns: {script: str, changes: [str]}
+    """
+    data = request.json or {}
+    script = (data.get('script') or '').strip()
+    if not script:
+        return jsonify({'error': 'script required'}), 400
+    if len(script) > 300000:
+        return jsonify({'error': 'script too long (>300k chars). Split into smaller batches.'}), 400
+
+    prompt = (
+        "Adapt the following multi-episode script to the position-blocks standard. "
+        "Add [BLOCKING] blocks after every scene heading and [BLOCKING_END] at the end of every episode. "
+        "Translate any non-English dialogue lines to English. "
+        "Return JSON with 'script' and 'changes' keys.\n\n"
+        "SCRIPT:\n" + script
+    )
+
+    try:
+        raw = claude_ask(
+            prompt,
+            system=_ADAPT_TO_STANDARD_SYSTEM,
+            model='claude-sonnet-4-5',
+            max_tokens=32000,
+            timeout=180,
+        ).strip()
+    except Exception as e:
+        _log_event('WARN', 'adapt_script_to_standard_failed', err=str(e)[:300])
+        return jsonify({'error': f'Не удалось адаптировать сценарий: {e}'}), 500
+
+    # Strip accidental code-fence wrappers
+    if raw.startswith('```'):
+        raw = re.sub(r'^```[a-zA-Z]*\n?', '', raw)
+        raw = re.sub(r'\n?```\s*$', '', raw)
+        raw = raw.strip()
+
+    try:
+        result = json.loads(strip_json(raw))
+    except Exception:
+        # If JSON parse fails, return the raw text as script with no change list
+        _log_event('WARN', 'adapt_script_to_standard_json_parse_fail', raw_chars=len(raw))
+        return jsonify({'script': raw, 'changes': ['(не удалось распарсить список изменений)']})
+
+    return jsonify({
+        'script':              result.get('script', raw),
+        'changes':             result.get('changes', []),
+        'moderation_warnings': result.get('moderation_warnings', []),
+    })
+
+
+_PHRASE_CHECK_SYSTEM = (
+    "You are a content moderation advisor for short-form drama videos generated by Seedance AI. "
+    "Scan the provided script for dialogue lines that will realistically trigger Seedance moderation failure.\n\n"
+
+    "FLAG ONLY these high-risk patterns:\n"
+    "- Explicit first-person death threats: 'I will kill you', 'I'll murder you', 'I'm going to end your life'\n"
+    "- Graphic violence descriptions: 'blood everywhere', 'shot him in the head', explicit gore\n"
+    "- Sexual content: explicit acts or body parts in sexual context\n"
+    "- Suicide/self-harm: 'I want to kill myself', explicit self-harm instructions\n"
+    "- Explicit drug use: 'inject heroin', 'snort cocaine'\n\n"
+
+    "DO NOT FLAG (these pass moderation fine):\n"
+    "- Narrative references to past death: 'someone wanted me dead', 'he was killed years ago'\n"
+    "- Thematic dialogue about danger/risk: 'this job gets people killed', 'people die in this business'\n"
+    "- Emotional threats without physical violence: 'I'll ruin you', 'you'll regret this'\n"
+    "- Any line you yourself describe as 'borderline', 'acceptable', 'thematic', or 'not a direct threat' — DO NOT include it\n\n"
+
+    "STRICT RULE: If you flag a line, you MUST provide exactly 2-3 natural rewrite suggestions. "
+    "If you cannot think of good alternatives that preserve the dramatic meaning — DO NOT FLAG THE LINE. "
+    "Never include a warning with an empty suggestions array.\n\n"
+
+    "Suggestions must sound like real speech in context — organic and human, never robotic:\n"
+    "BAD: 'Drop the weapon' → 'Relinquish your tactical equipment'\n"
+    "GOOD: 'Drop the weapon' → 'Put it down!' / 'Drop it, now!'\n\n"
+
+    "Return ONLY valid JSON (no markdown):\n"
+    "{\"moderation_warnings\": [{\"original\": \"CHAR: \\\"line\\\"\", \"reason\": \"one line — what specifically is the risk\", "
+    "\"suggestions\": [\"CHAR: \\\"alt1\\\"\", \"CHAR: \\\"alt2\\\"\"]}]}\n"
+    "If nothing found: {\"moderation_warnings\": []}"
+)
+
+
+@app.route('/api/check-moderation', methods=['POST'])
+def check_moderation():
+    """Fast phrase scan: checks script dialogue for Seedance moderation risk.
+    No position blocks, no translation — only moderation_warnings.
+    Body: {script: str}
+    Returns: {moderation_warnings: [{original, reason, suggestions}]}
+    """
+    data = request.json or {}
+    script = (data.get('script') or '').strip()
+    if not script:
+        return jsonify({'moderation_warnings': []})
+    if len(script) > 200000:
+        return jsonify({'error': 'script too long (>200k chars)'}), 400
+
+    try:
+        raw = claude_ask(
+            f"Scan this script for Seedance moderation risks:\n\n{script}",
+            system=_PHRASE_CHECK_SYSTEM,
+            model='claude-haiku-4-5',   # fast + cheap — just a scan
+            max_tokens=4096,
+            timeout=60,
+        ).strip()
+    except Exception as e:
+        _log_event('WARN', 'check_moderation_failed', err=str(e)[:200])
+        return jsonify({'error': str(e)}), 500
+
+    if raw.startswith('```'):
+        raw = re.sub(r'^```[a-zA-Z]*\n?', '', raw)
+        raw = re.sub(r'\n?```\s*$', '', raw)
+        raw = raw.strip()
+
+    try:
+        result = json.loads(strip_json(raw))
+        return jsonify({'moderation_warnings': result.get('moderation_warnings', [])})
+    except Exception:
+        return jsonify({'moderation_warnings': []})
+
+
 @app.route('/api/series/import-from-script', methods=['POST'])
 def import_from_script():
     """Two-phase commit: create series + episodes (synchronous, fast),
@@ -3717,6 +5011,8 @@ def import_from_script():
         'auto_generate_assets': True, 'batch_mode': False, 'batch_size': 1,
         'stage': 4, 'arc': None, 'milestone_synopses': {},
         'checkpoints': [], 'finale': None,
+        'devices_index': {},
+        'cadence_policy': {'default_min_gap': 4, 'hard_limit': 3},
         'created_at': datetime.datetime.utcnow().isoformat(),
         'video_provider': 'seedance',
         'characters': [], 'locations': [], 'items': [],
@@ -3840,6 +5136,15 @@ def import_from_script():
         }
         save_episode(sid, e['number'], ep_dict)
         ep_records.append({'number': e['number']})
+        # Sync [BLOCKING] outfits right after save — bulk-import is the most
+        # common path where Margaret-style outfits get missed (a long import
+        # of N episodes with many one-off labels could otherwise silently lose
+        # them all until the user runs autogen). Idempotent + cheap.
+        try:
+            _sync_script_outfits(sid, e['body'])
+        except Exception as _oe:
+            _log_event('WARN', 'outfit_sync_after_import_failed',
+                       sid=sid, ep=e['number'], err=str(_oe)[:200])
 
     # Kick off the extraction worker in the background. _spawn_with_keys
     # carries the user's auth context across the thread boundary. We always
@@ -3915,12 +5220,16 @@ def generate_script_batch(sid):
         lines_count = None
     style_preset = (body.get('style') or '').strip()
     no_interruptions = bool(body.get('no_interruptions', True))  # default: interruptions forbidden
-    max_chars_raw = body.get('max_main_chars_per_scene')
+    max_chars_raw = body.get('max_main_chars_per_scene') or s.get('max_main_chars_per_scene')
     try:
         max_main_chars = int(max_chars_raw) if max_chars_raw not in (None, '', 0) else None
         if max_main_chars is not None: max_main_chars = max(1, min(6, max_main_chars))
     except (TypeError, ValueError):
         max_main_chars = None
+    # Persist to series so individual episode generation picks it up too
+    if max_main_chars and s.get('max_main_chars_per_scene') != max_main_chars:
+        s['max_main_chars_per_scene'] = max_main_chars
+        save_series(sid, s)
     # Style presets translated to Claude-friendly directives.
     _STYLE_PRESETS = {
         'short_punchy': 'Реплики КОРОТКИЕ и рваные (1-7 слов). TikTok-ритм: быстрые удары, шок-фразы, paus'
@@ -4071,12 +5380,31 @@ def generate_script_batch(sid):
         "   ПОСЛЕ строки «Кратко: ...» ПЕРВАЯ строка серии = ЗАГОЛОВОК СЦЕНЫ С ЛОКАЦИЕЙ.\n"
         "   НЕ диалог. НЕ действие. СНАЧАЛА ЛОКАЦИЯ.\n"
         "   Формат: ИНТА. ENGLISH LOCATION NAME — ВРЕМЯ\n"
-        "   Примеры: ИНТА. STORAGE UNIT — ДЕНЬ / ИНТА. PROSECUTOR'S OFFICE — УТРО / ИНТА. PRISON VISITING ROOM — ДЕНЬ\n"
+        "   Примеры: ИНТА. STORAGE UNIT — ДЕНЬ / ИНТА. HOTEL SUITE — УТРО / ИНТА. ROOFTOP TERRACE — НОЧЬ / ИНТА. HOSPITAL CORRIDOR — ВЕЧЕР\n"
+        "   ❌ Избегай как основной локации: COURTROOM, LAW FIRM, JUDGE'S CHAMBERS, DEPOSITION ROOM, PROSECUTOR'S OFFICE, PRISON VISITING ROOM, EVIDENCE LOCKER — драма живёт в спальнях, кухнях, коридорах, отелях, машинах, на крышах, в больницах, НЕ в зданиях суда.\n"
         "   ❌ ЗАПРЕЩЕНО начинать серию так: 'SOPHIE: There's one more box.' (диалог без локации)\n"
         "   ❌ ЗАПРЕЩЕНО начинать серию так: 'Sophie открывает коробку.' (действие без локации)\n"
         "   ✅ ПРАВИЛЬНО: 'ИНТА. STORAGE UNIT — ДЕНЬ\\nSophie открывает коробку.'\n"
         "   Это правило применяется к КАЖДОЙ серии, даже если она продолжает ту же локацию.\n"
         "   Русские названия локаций в заголовках ЗАПРЕЩЕНЫ (не КАБИНЕТ — пиши FATHER'S STUDY).\n\n"
+        "0b. 📍 БЛОКИ ПОЗИЦИЙ — ОБЯЗАТЕЛЬНО В КАЖДОЙ СЕРИИ:\n"
+        "   [BLOCKING] — сразу после КАЖДОГО заголовка сцены (первого и каждого нового внутри серии):\n"
+        "     [BLOCKING]\n"
+        "     LOCATION: <English location name>\n"
+        "     ИМЯ_ПЕРСОНАЖА: <что делает, где стоит/сидит> :: OUTFIT: <Outfit Name>\n"
+        "     [/BLOCKING]\n"
+        "   [BLOCKING_END] — в самом конце серии (последнее перед ничем):\n"
+        "     [BLOCKING_END]\n"
+        "     LOCATION: <English location name>\n"
+        "     ИМЯ_ПЕРСОНАЖА: <финальная позиция> (по-русски)\n"
+        "     [/BLOCKING_END]\n"
+        "   Правила: [BLOCKING] перечисляет ТОЛЬКО персонажей ПРИСУТСТВУЮЩИХ В НАЧАЛЕ сцены. "
+        "Описания позиций — по-русски, 1 строка на персонажа.\n"
+        "   OUTFIT — КОРОТКОЕ Title Case ИМЯ ассета outfit'а (НЕ описание). Примеры: `Business Suit`, `Casual`, `Pajamas`, `Red Dress`, `School Uniform`, `Hospital Gown`, `Swimsuit`. Система по этому имени переиспользует тот же визуальный ассет в разных сценах.\n"
+        "   Если в этой сцене НОВЫЙ outfit (ранее у этого перса такого имени не было) — добавь описание через пайп: `OUTFIT: Pajamas | OUTFIT_DESC: light blue cotton pajamas, bare feet`. Для уже введённых имён OUTFIT_DESC можно опустить — система знает описание.\n"
+        "   DEDUP: НЕ плоди 10 имён для практически одинаковой одежды. Если перс в своём базовом образе — пиши `Base` или существующий лейбл. Новое имя = реальная смена костюма.\n"
+        "   Если предоставлен PREV_END_POSITION и серия открывается в той же локации — [BLOCKING] ДОЛЖЕН СОВПАДАТЬ с ним.\n"
+        "   ⛔ ЗАПРЕЩЕНО писать [SCENE_OPEN], [EPISODE_END] — это старые устаревшие теги. Только [BLOCKING]/[BLOCKING_END].\n\n"
         f"1. РЕПЛИКИ: ровно {eff_lines} (±2). Реплика = одна строка диалога ИЛИ закадровый VO ИЛИ короткое действие (action line). "
         f"VOICEOVER считается как обычная реплика — он жрёт хронометраж так же. Если насчитал больше {eff_lines + 2} — режь беспощадно (включая VO). "
         "НЕ ВЫХОДИ за лимит «у меня важная сцена не помещается» — значит сцена слишком жирная, упрощай.\n"
@@ -4085,17 +5413,21 @@ def generate_script_batch(sid):
         "НЕ строй сюжет через закадр: откровения, эмоции, мотивацию персонажа показывай через диалог и действие, не через монолог в камеру. "
         "Если в серии 3+ VO-блока — это уже не сериал, а аудиокнига, переписывай.\n"
         "4. ЗАПРЕЩЕНО (нарушение = переписать с нуля):\n"
-        "   • БУМАЖНЫЕ РАСКРЫТИЯ (paperwork reveals): нельзя двигать сюжет через письмо/завещание/документ/email/SMS/курьерский конверт/папку с бумагами/фото на телефоне/«экран ноутбука прокручивает документы». "
-        "Откровения должны звучать ВСЛУХ из уст персонажа, не читаться с бумаги.\n"
+        "   • БУМАЖНЫЕ РАСКРЫТИЯ (paperwork reveals): нельзя двигать сюжет через письмо/завещание/документ/email/SMS/курьерский конверт/папку с бумагами/фото на телефоне/«экран ноутбука прокручивает документы»/диктофонную запись/USB-флешку/«запись с камеры». "
+        "Откровения должны звучать ВСЛУХ из уст персонажа, не читаться с бумаги и не доставаться из конверта.\n"
+        "   • ЮРИДИЧЕСКИЕ ДВИЖКИ (legal/courtroom engines): нельзя сводить сюжет к иску, суду, заседанию, прокурору, адвокату, судье, сбору улик/доказательств, «свидетели против него», «выиграем в суде», «возбуждено дело», «дача показаний», «экспертиза покажет». Зрителю вертикального видео не интересно смотреть процесс. "
+        "Замена: прямая личная конфронтация / шантаж в лицо / преследование / похищение / физическое столкновение / разоблачение лицом к лицу / предательство близкого / угроза ребёнку / публичное унижение. Люди против людей, не люди против бумаг и не люди против системы правосудия.\n"
         "   • ФЛЭШБЕКИ и сны в первой серии. Только настоящее время.\n"
         "   • «Тем временем в…» / «А в это время…» — параллельный монтаж сложен и жрёт хронометраж.\n"
-        "5. CLIFFHANGER в конце — да, но НЕ через прибывшее письмо/звонок/тайный документ. "
-        "Лучше: фраза которая меняет всё, неожиданное появление человека, прямая угроза в лицо, действие которое нельзя отменить.\n"
+        "5. CLIFFHANGER в конце — да, но НЕ через прибывшее письмо/звонок/тайный документ/USB-флешку/запись с камеры. И НЕ через «увидимся в суде», «подаю иск завтра», «дело передано в суд». "
+        "Лучше: фраза которая меняет всё, неожиданное появление человека, прямая угроза в лицо, действие которое нельзя отменить, оружие в кадре, удар, объятия с тем кого считали врагом.\n"
         "6. САМОПРОВЕРКА перед выводом каждой серии — посчитай:\n"
         f"   – Сколько реплик/строк действия/VO суммарно? (должно быть {eff_lines} ±2)\n"
         f"   – Сколько разных локаций/сцен? (должно быть ≤ {max_scenes})\n"
         "   – Сколько VO-блоков? (≤ 2, и сюжет НЕ должен ими двигаться)\n"
-        "   – Двигается ли сюжет через бумагу? (должно быть НЕТ)\n"
+        "   – Двигается ли сюжет через бумагу/экран/запись? (должно быть НЕТ)\n"
+        "   – Двигается ли сюжет через суд/иск/прокурора/сбор улик? (должно быть НЕТ)\n"
+        "   – Локация сцены — не суд/юр.фирма/прокуратура как основное место действия? (должно быть НЕТ)\n"
         "   Если хоть один тест провален — перепиши серию до вывода.\n"
         + (
         "7. ПЕРЕБИВАНИЯ — ЖЁСТКИЙ ЗАПРЕТ: НИКОГДА не обрывай реплику персонажа на полуслове тире (—). "
@@ -4108,8 +5440,95 @@ def generate_script_batch(sid):
         )
         + "===\n"
     )
+    # ════════════════════════════════════════════════════════════════════════
+    # HARD CONTRACT — TOP OF SYSTEM PROMPT. Two failure modes have plagued
+    # this generator: (1) every episode synopsis defaults to paperwork-reveals
+    # («показывает фото», «протягивает файл», «находит конверт», «достаёт USB
+    # с записью») because that's the easiest 1-sentence device, (2) arcs
+    # converge to courtroom / lawsuit / evidence-gathering because that's the
+    # easiest macro engine. Both kill short-drama pacing. The contract below
+    # is placed BEFORE everything else in the system message so the model
+    # cannot skip it. The `Кратко:` line spec further down is bound to this
+    # contract — if any banned token appears in Кратко, regenerate.
+    # ════════════════════════════════════════════════════════════════════════
+    hard_contract_block = (
+        "╔════════════════════════════════════════════════════════════════════╗\n"
+        "║  ЖЁСТКИЙ КОНТРАКТ — НАРУШЕНИЕ = ПЕРЕПИСАТЬ СЕРИЮ ЦЕЛИКОМ          ║\n"
+        "╚════════════════════════════════════════════════════════════════════╝\n"
+        "A. БУМАЖНЫЕ/ЭКРАННЫЕ НОСИТЕЛИ СЮЖЕТА — ЗАПРЕЩЕНЫ ВО ВСЕХ СЕРИЯХ.\n"
+        "   Сюжет НЕ ДВИГАЕТСЯ через: фотографии, фотоснимки, фото на телефоне,\n"
+        "   распечатанные фото, альбом с фото, ✦ВСЯКИЕ ФОТО ВООБЩЕ✦,\n"
+        "   письма, записки, конверты, запечатанные пакеты, визитки, флаеры,\n"
+        "   документы, контракты, договоры, завещания, файлы, папки, досье,\n"
+        "   улики, доказательства собранные в папку, evidence binders,\n"
+        "   SMS, мессенджеры, чаты, e-mail, переписку, скриншоты переписки,\n"
+        "   экраны телефонов/ноутбуков/планшетов, любые UI на экране,\n"
+        "   USB-флешки, micro-SD, жёсткие диски, «вот тут вся правда»,\n"
+        "   диктофонные записи, voice memo, hidden mic, аудиозаписи,\n"
+        "   запись с камер видеонаблюдения / CCTV / телеобъектив издалека,\n"
+        "   дневники, voiceover, news headlines, газеты, новости по ТВ.\n"
+        "   ❌ ЗАПРЕЩЕНО писать в Кратко: «показывает фото», «протягивает\n"
+        "   конверт», «вручает визитку», «открывает папку», «приносит файл»,\n"
+        "   «играет запись», «достаёт диктофон», «на флешке доказательства»,\n"
+        "   «получает SMS», «на экране видно».\n"
+        "   ✓ ВМЕСТО ЭТОГО: персонаж А ВСЛУХ обвиняет/угрожает/признаётся\n"
+        "   персонажу Б в лицо. Откровения = устные конфронтации.\n"
+        "   УЗКОЕ ИСКЛЮЧЕНИЕ — ОДИН раз на ВЕСЬ СЕРИАЛ (не на эпизод):\n"
+        "   короткий физический предмет (кольцо, тест, ключ) показан 1-2с +\n"
+        "   персонаж в той же фразе ВСЛУХ называет смысл. Если этот лимит уже\n"
+        "   израсходован в предыдущих сериях — НИКАКИХ предметов вообще.\n"
+        "\n"
+        "B. ЮРИДИЧЕСКИЕ/СУДЕБНЫЕ ДВИЖКИ — ЗАПРЕЩЕНЫ КАК ДРАЙВЕР СЮЖЕТА.\n"
+        "   Сериал НЕ должен сводиться к: иску, суду, заседанию, слушанию,\n"
+        "   депозиции, приговору, обвинительному заключению, mediation,\n"
+        "   сбору улик/доказательств как самостоятельной арке,\n"
+        "   подготовке к процессу, поиску свидетелей для суда,\n"
+        "   встречам с адвокатом/прокурором/детективом как климаксу,\n"
+        "   опеке через суд, выселению через суд, разводу через суд как\n"
+        "   главному движку, расследованию полиции как процедурной арке,\n"
+        "   рейду как климаксу, ордеру на арест как кульминации.\n"
+        "   ❌ ЗАПРЕЩЕНО в Кратко: «суд», «иск», «адвокат» как двигатель,\n"
+        "   «прокурор», «свидетель против», «доказательства против него»,\n"
+        "   «детектив приносит улики», «расследование вскрывает», «суд решит»,\n"
+        "   «выходим в суд», «подаёт иск», «пересмотр опеки в суде»,\n"
+        "   «передача дела в суд», «адвокатская фирма», «частный детектив\n"
+        "   собрал доказательства», «инвестигатор показывает файл», «открывает\n"
+        "   дело», «свидетельские показания», «слушание по опеке».\n"
+        "   ✓ ВМЕСТО ЭТОГО (замены 1-к-1):\n"
+        "   • «суд решит опеку»     → похищение ребёнка одним из родителей\n"
+        "   • «адвокат принёс файл»  → бывший муж/любовник появляется на\n"
+        "                              пороге и говорит правду в лицо\n"
+        "   • «прокурор обвиняет»    → жертва даёт пощёчину в публичном месте\n"
+        "   • «детектив принёс улики»→ родственник звонит в дверь со словами\n"
+        "                              «я знаю что ты сделал» — устная сцена\n"
+        "   • «сбор свидетелей»      → свидетель сам приходит и устраивает\n"
+        "                              скандал на свадьбе/похоронах\n"
+        "   • «расследование»        → личное преследование, погоня, засада\n"
+        "   Закон может СУЩЕСТВОВАТЬ в мире (один намёк на одну серию: «мой\n"
+        "   адвокат уже едет», полицейский в дверях на 5 секунд), но НЕ как\n"
+        "   двигатель сюжета и НЕ как место действия.\n"
+        "\n"
+        "C. ЛОКАЦИИ — избегай как ОСНОВНОЕ место сцены: COURTROOM, LAW FIRM,\n"
+        "   JUDGE'S CHAMBERS, DEPOSITION ROOM, PROSECUTOR'S OFFICE, DA'S\n"
+        "   OFFICE, EVIDENCE LOCKER, PRISON VISITING ROOM (как повторяющееся),\n"
+        "   POLICE STATION INTERROGATION ROOM (как климакс). Драма живёт в\n"
+        "   спальнях, кухнях, коридорах, отелях, машинах, на крышах, в\n"
+        "   больницах, в местах работы героев — НЕ в зданиях правосудия.\n"
+        "\n"
+        "D. САМОПРОВЕРКА КАЖДОЙ СЕРИИ перед выводом:\n"
+        "   1) Содержит ли строка «Кратко: …» хоть одно слово из списка A или\n"
+        "      B? → ДА = ПЕРЕПИШИ Кратко через устную конфронтацию.\n"
+        "   2) Двигается ли центральное событие серии через бумагу/экран/\n"
+        "      запись? → ДА = ПЕРЕПИШИ сцену через устное обвинение.\n"
+        "   3) Это судебная/следственная сцена или подготовка к ней?\n"
+        "      → ДА = ПЕРЕПИШИ через личное столкновение.\n"
+        "   4) Локация сцены — не суд/прокуратура/юр.фирма? → ДОЛЖНО быть НЕТ.\n"
+        "   Если хоть одна проверка провалена — НЕ ВЫВОДИ серию, перепиши.\n"
+        "════════════════════════════════════════════════════════════════════\n\n"
+    )
     system = (
-        f"Ты — сценарист короткой драмы для вертикального TikTok/Reels. Пишешь {mode_label} на N серий. "
+        hard_contract_block
+        + f"Ты — сценарист короткой драмы для вертикального TikTok/Reels. Пишешь {mode_label} на N серий. "
         f"{length_clause}Формат: "
         "имена ВЕРХНИМ регистром перед репликами, диалог короткий и накалённый, обязательный cliffhanger "
         "в конце КАЖДОЙ серии (открытый вопрос или новая угроза которая толкает к следующей).\n"
@@ -4135,17 +5554,18 @@ def generate_script_batch(sid):
            "5. Используй существующие сюжетные предметы (items) когда они уместны.\n"
            "6. Открытые линии из предыдущих серий — либо двигай их, либо логично откладывай.\n\n")
         + "ФОРМАТ ВЫХОДА — СТРОГО:\n"
-        + f"Episode {first_new_num}: <короткое название серии>\n"
-        + f"Кратко: <1-2 предложения о чём серия>\n"
-        + f"ИНТА. LOCATION NAME — ВРЕМЯ  ← ОБЯЗАТЕЛЬНО, первая строка до любого диалога/действия\n"
-        + f"<реплики и действия персонажей — диалог, action lines>\n"
+        + f"Episode {first_new_num}: <короткое название серии — БЕЗ слов 'Photo', 'File', 'Evidence', 'Investigator', 'Letter', 'Court', 'Trial', 'Hearing', 'Lawyer', 'Witness'>\n"
+        + f"Кратко: <1-2 предложения о чём серия — ОБЯЗАТЕЛЬНО через устную конфронтацию двух людей; БЕЗ упоминания фото/файла/конверта/визитки/папки/USB/SMS/экрана/записи/иска/суда/адвоката/прокурора/детектива-с-уликами>\n"
+        + f"ИНТА. LOCATION NAME — ВРЕМЯ  ← ОБЯЗАТЕЛЬНО, первая строка до любого диалога/действия. Не COURTROOM / LAW FIRM / DA'S OFFICE как основная локация.\n"
+        + f"<реплики и действия персонажей — диалог, action lines. Сюжет двигается только через устную речь и физическое действие, НЕ через бумагу/экран/запись>\n"
         + "\n"
-        + f"Episode {first_new_num + 1}: <название>\n"
-        + f"Кратко: <синопсис>\n"
+        + f"Episode {first_new_num + 1}: <название без запретных слов>\n"
+        + f"Кратко: <синопсис — устная конфронтация, без запретных носителей>\n"
         + f"ИНТА. LOCATION NAME — ВРЕМЯ  ← обязательно каждый раз\n"
         + f"<содержимое>\n"
         + "\n"
         + f"... и так далее до Episode {last_new_num}.\n\n"
+        + f"⏱ ХРОНОМЕТРАЖ — ЖЁСТКО: каждая серия = ровно ~{eff_duration}с экрана, не больше. Если на одну серию вышло >{eff_lines + 3} реплик/действий — режь до {eff_lines}±2. Не «полторы серии в одной». Не «расширенная сцена». РОВНО 1 минута на серию (если не указано иначе) — лишнее переноси в следующую серию или вырезай.\n"
         + "Каждая серия начинается с СТРОГО строки 'Episode N: <title>' — без других маркеров. "
         + "Никакой markdown, никаких '===', никаких '#'. Только plain text. "
         + ("Язык по контексту: если синопсис/направление на русском — пишем по-русски; "
@@ -4153,6 +5573,15 @@ def generate_script_batch(sid):
            "Язык — тот же что в предыдущих сериях (русский/английский/смесь — сохраняй стиль).\n\n")
         + "ВАЖНО: возвращай ТОЛЬКО сценарий, без преамбулы 'Вот сценарий:' и без post-комментариев."
     )
+    # Build narrative history + device history blocks for batch gen
+    try:
+        _batch_devices_block = _build_plot_device_history(sid, first_new_num)
+    except Exception:
+        _batch_devices_block = ''
+    try:
+        _batch_narrative_block = _build_narrative_state_block(sid, first_new_num)
+    except Exception:
+        _batch_narrative_block = ''
     user_msg = (
         f"СЕРИАЛ: «{s.get('title') or 'untitled'}»\n"
         f"Жанр: {s.get('genre') or '?'} · Тон: {s.get('tone') or '?'} · "
@@ -4165,10 +5594,25 @@ def generate_script_batch(sid):
         + (f"ПОСЛЕДНИЕ {len(verbatim_window)} СЕРИЙ (verbatim, для тонкой калибровки стиля и continuity):\n```\n{verbatim_block}\n```\n\n"
            if verbatim_block else '')
         + f"{direction_block}\n"
+        + (_batch_narrative_block if _batch_narrative_block else '')
+        + (_batch_devices_block if _batch_devices_block else '')
         + (f"НАПИШИ ПЕРВЫЕ {count} СЕРИЙ (Эп.{first_new_num}–{last_new_num}). "
             if from_scratch else
            f"НАПИШИ СЛЕДУЮЩИЕ {count} СЕРИЙ (Эп.{first_new_num}–{last_new_num}). ")
-        + f"Каждая ≈ {eff_duration}с экрана / {lines_range_word} реплик-действий, обязательно cliffhanger в конце."
+        + f"Каждая РОВНО ≈ {eff_duration}с экрана / {lines_range_word} реплик-действий (НЕ больше — переполнение = переписать), обязательно cliffhanger в конце.\n\n"
+        + "🚨 ПОСЛЕДНЯЯ ПРОВЕРКА ПЕРЕД ВЫВОДОМ — пройдись по КАЖДОЙ серии:\n"
+        + "  ✗ Если в строке «Кратко: …» есть слова: фото, фотограф, фотоснимок, файл, папка, конверт, "
+        + "записка, письмо, визитка, USB, флешка, диктофон, запись, камера наблюдения, телеобъектив, SMS, "
+        + "переписка, экран, документ, контракт, завещание, дневник, газета — ПЕРЕПИШИ Кратко с нуля через "
+        + "устную конфронтацию двух людей лицом к лицу.\n"
+        + "  ✗ Если в Кратко или в теле серии есть: иск, суд, адвокат, прокурор, детектив-с-уликами, "
+        + "слушание, заседание, депозиция, опека-через-суд, расследование-как-арка, ордер, рейд, evidence — "
+        + "ПЕРЕПИШИ через личное столкновение (конфронтация, шантаж в лицо, преследование, похищение, "
+        + "публичное унижение, физический удар, неожиданное появление человека).\n"
+        + "  ✗ Если локация сцены — COURTROOM / LAW FIRM / DA'S OFFICE / JUDGE'S CHAMBERS / DEPOSITION ROOM "
+        + "— ПЕРЕПИШИ сцену в спальне / кухне / отеле / коридоре / больнице / машине / на крыше.\n"
+        + f"  ✗ Если в одной серии больше {eff_lines + 3} реплик/строк — РЕЖЬ до {eff_lines}±2 или переноси лишнее в следующую.\n"
+        + "Эти проверки делай для КАЖДОЙ из серий перед выводом. Не выводи серию, которая хоть одну проверку провалила."
     )
     try:
         # Allow up to 24K output for 5+ episodes.
@@ -4250,6 +5694,22 @@ def append_from_script(sid):
             'created_at': datetime.datetime.utcnow().isoformat(),
         }
         save_episode(sid, num, ep_dict)
+        # Sync [BLOCKING] outfits on append too — same Margaret-prevention rule
+        # as the bulk import path. Idempotent & cheap.
+        try:
+            _sync_script_outfits(sid, e['body'])
+        except Exception as _oe:
+            _log_event('WARN', 'outfit_sync_after_append_failed',
+                       sid=sid, ep=num, err=str(_oe)[:200])
+        # Extract plot devices for anti-repetition tracking (best-effort, non-blocking)
+        try:
+            append_devices = _extract_devices_from_script(e['body'])
+            if append_devices:
+                ep_dict['plot_devices'] = append_devices
+                save_episode(sid, num, ep_dict)
+                _update_devices_index(sid, num, append_devices)
+        except Exception as _ade:
+            _log_event('WARN', 'device_extract_append_failed', ep=num, err=str(_ade)[:200])
         ep_records.append({'number': num})
 
     if do_extract and ep_records:
@@ -4262,6 +5722,39 @@ def append_from_script(sid):
         'episodes_appended': len(ep_records),
         'extraction_started': do_extract and bool(ep_records),
     }), 201
+
+
+@app.route('/api/series/<sid>/backfill-devices', methods=['POST'])
+def backfill_devices(sid):
+    """Extract plot_devices and narrative_state for all episodes that don't have them yet.
+    Useful for series created before the device/narrative registry was introduced.
+    """
+    s = load_series(sid)
+    if not s:
+        return jsonify({'error': 'series not found'}), 404
+    episodes = list_episodes(sid)
+    updated_devices = 0
+    updated_narrative = 0
+    for ep in sorted(episodes, key=lambda e: e.get('number', 0)):
+        ep_num = ep.get('number', 0)
+        script = ep.get('script', '')
+        if not script:
+            continue
+        if not ep.get('plot_devices'):
+            devices = _extract_devices_from_script(script)
+            ep['plot_devices'] = devices or []
+            save_episode(sid, ep_num, ep)
+            if devices:
+                _update_devices_index(sid, ep_num, devices)
+            updated_devices += 1
+        if not ep.get('narrative_state'):
+            narrative = _extract_narrative_state_from_script(script)
+            if narrative:
+                ep['narrative_state'] = narrative
+                save_episode(sid, ep_num, ep)
+                _update_narrative_index(sid, ep_num, narrative)
+                updated_narrative += 1
+    return jsonify({'updated_devices': updated_devices, 'updated_narrative': updated_narrative})
 
 
 @app.route('/api/series/<sid>/reextract', methods=['POST'])
@@ -4301,6 +5794,10 @@ def create_series():
     data = request.json
     slug = slugify(data.get('title', ''))
     sid = slug if slug and not (user_root() / slug).exists() else f"{slug}-{str(uuid.uuid4())[:6]}"
+    # Format mode controls generators across the board: 'short_drama' (default, TikTok/ReelShort
+    # addictive serial) or 'instagram_series' (standalone episodes, simpler titles, character-of-week).
+    _format_mode_raw = (data.get('format_mode') or 'short_drama').strip().lower()
+    _format_mode = _format_mode_raw if _format_mode_raw in ('short_drama', 'instagram_series') else 'short_drama'
     series_data = {
         'id': sid,
         'title': data['title'],
@@ -4309,6 +5806,7 @@ def create_series():
         'target_audience': data.get('target_audience', ''),
         'world_description': data.get('world_description', ''),
         'synopsis': data.get('synopsis', ''),
+        'format_mode': _format_mode,
         # Creative-writing model selector (ideas + episode scripts). Set at
         # creation time, can be overridden per-call from UI. Whitelist enforced
         # in _resolve_writer_model. Unknown / missing → default Claude.
@@ -4328,6 +5826,8 @@ def create_series():
         'characters': [],
         'locations': [],
         'items': [],                   # story-relevant props (handbag, gun, locket...)
+        'devices_index': {},           # plot-device anti-repetition registry
+        'cadence_policy': {'default_min_gap': 4, 'hard_limit': 3},
         'style': {
             'type': 'cinematic',
             'custom_description': '',
@@ -4752,6 +6252,171 @@ def _series_style_clause(s):
     return f"Visual style: {v}"
 
 
+# Period/era markers — looked up in series genre + synopsis to bias character
+# generation away from modern-default clothing. Without this, a series set in
+# Ancient Egypt produced characters in leather jackets because the prompt
+# fallback was «everyday casual attire».
+# Real prod bug 2026-05-25: colleague's Ancient Egypt series rendered modern
+# clothes for every character.
+_ERA_KEYWORDS = {
+    'ancient_egypt': ('egypt', 'pharaoh', 'pyramid', 'nile', 'фараон', 'египет', 'древнего египта', 'нил'),
+    'ancient_rome':  ('rome', 'roman', 'caesar', 'gladiator', 'рим', 'цезарь', 'гладиатор'),
+    'ancient_greece':('greece', 'greek', 'sparta', 'athen', 'грец', 'спарт', 'афин'),
+    'medieval':      ('medieval', 'middle ages', 'knight', 'castle', 'crusade', 'kingdom', 'средневек', 'рыцар', 'замок', 'королевство'),
+    'renaissance':   ('renaissance', 'tudor', 'elizabethan', 'florence', 'возрожден', 'тюдор'),
+    'victorian':     ('victorian', 'georgian', 'regency', 'edwardian', 'викториан', 'эдуардовск'),
+    'wild_west':     ('wild west', 'western', 'cowboy', 'gunslinger', 'frontier', 'вестерн', 'ковбой', 'дикий запад'),
+    'edwardian_20s': ('1920s', 'jazz age', 'prohibition', 'roaring twenties', '20-е', 'двадцатые'),
+    'wwii':          ('world war ii', 'wwii', 'second world war', '1940s', 'вторая мировая', '40-е'),
+    'cold_war_60s':  ('1960s', '60s', 'mod era', 'cold war', '60-е', 'шестидесятые'),
+    '70s':           ('1970s', '70s', 'disco era', '70-е', 'семидесятые'),
+    '80s':           ('1980s', '80s', 'reagan', '80-е', 'восьмидесятые'),
+    '90s':           ('1990s', '90s', '90-е', 'девяностые'),
+    'feudal_japan':  ('samurai', 'shogun', 'edo period', 'feudal japan', 'самурай', 'сёгун', 'феодальная япония'),
+    'victorian_steampunk': ('steampunk', 'стимпанк'),
+    'fantasy':       ('fantasy', 'dragon', 'elf', 'wizard', 'sorcery', 'фэнтези', 'дракон', 'эльф', 'маг', 'волшеб'),
+    'post_apocalyptic': ('post-apocalyptic', 'post apocalyptic', 'wasteland', 'постапокал'),
+    'sci_fi':        ('sci-fi', 'sci fi', 'science fiction', 'space opera', 'futuristic', 'фантастика', 'космич'),
+}
+
+def _char_name_in_text(char_name: str, text: str) -> bool:
+    """True if any component of char_name appears in text as a whole-word match.
+    Robust to names with punctuation (Mrs. Vale, Dr. Brown, Officer Jenkins).
+
+    Old buggy version used `\\b{first}\\b` directly — broke on «Mrs.» because
+    \\b after `.` requires word/non-word transition and `.` followed by space
+    is non-word→non-word (no boundary). Result: Mrs. Vale silently dropped
+    from refs by STRICT_CHAR_FILTER → composer's @ImageN slots got mis-
+    assigned → boy's role given to woman in «The Maid Who Raised the
+    Billionaire's Son» ep 17 chunk 1 (2026-05-25 prod incident).
+
+    Strategy: try each whitespace-separated component, stripping trailing
+    punctuation. Match if ANY component is in text. Skips very short
+    components (single letter / common particles) to avoid false positives.
+    """
+    if not char_name or not text:
+        return False
+    SKIP = {'mr', 'mrs', 'ms', 'dr', 'st', 'sir', 'lady', 'lord', 'г', 'мр', 'мс', 'г-н', 'г-жа'}
+    candidates = []
+    for part in char_name.split():
+        cleaned = part.strip(' .,;:!?"\'«»')
+        if not cleaned or len(cleaned) < 2:
+            continue
+        if cleaned.lower() in SKIP:
+            continue
+        candidates.append(cleaned)
+    # Always try the full name too (matches «Mrs. Vale» as a phrase if it
+    # appears verbatim).
+    if char_name.strip():
+        candidates.insert(0, char_name.strip())
+    for cand in candidates:
+        # Phrase-aware: match against whitespace-normalized text.
+        try:
+            pat = re.compile(rf'\b{re.escape(cand)}\b', re.IGNORECASE)
+        except re.error:
+            continue
+        if pat.search(text):
+            return True
+        # Fallback for trailing-dot names: pattern may fail on the trailing
+        # boundary. Try a looser match — name followed by space/punctuation/EOS.
+        if '.' in cand or "'" in cand:
+            loose = re.compile(rf'(^|\W){re.escape(cand)}(\W|$)', re.IGNORECASE)
+            if loose.search(text):
+                return True
+    return False
+
+
+def _series_era_hint(s):
+    """Detect a likely historical/genre era from the series' genre + synopsis +
+    tone. Returns either a short period-context string (e.g. «Ancient Egypt —
+    period-accurate Egyptian attire (linen kalasiris, gold collar, kohl eye
+    makeup); NO modern clothing.») or '' when no clear era detected.
+
+    Detection is conservative — only fires on explicit keyword matches in
+    `genre`/`synopsis`/`title`. Modern/contemporary settings stay default."""
+    hay = ' '.join([
+        (s.get('genre') or ''),
+        (s.get('synopsis') or '')[:500],
+        (s.get('title') or ''),
+        (s.get('tone') or ''),
+        (s.get('logline') or ''),
+    ]).lower()
+    if not hay.strip():
+        return ''
+    matched = None
+    for era, kws in _ERA_KEYWORDS.items():
+        if any(kw in hay for kw in kws):
+            matched = era
+            break
+    if not matched:
+        return ''
+    # Period-specific guidance per matched era — clothing, accessories,
+    # silhouette cues that Banana/Seedream need to render correctly.
+    guides = {
+        'ancient_egypt':
+            "ERA CONTEXT: Ancient Egypt — period-accurate attire (linen kalasiris/schenti, "
+            "gold collar (usekh), kohl eye makeup, sandals or barefoot, bronze/gold jewelry, "
+            "natural fabrics, traditional headdresses for nobility). NO modern clothing, NO jeans, "
+            "NO leather jackets, NO contemporary accessories.",
+        'ancient_rome':
+            "ERA CONTEXT: Ancient Rome — period-accurate attire (tunic, toga, palla, stola, "
+            "leather sandals/caligae, simple jewelry, period hairstyles). NO modern clothing.",
+        'ancient_greece':
+            "ERA CONTEXT: Ancient Greece — period-accurate attire (chiton, himation, peplos, "
+            "sandals, laurel wreaths for ceremonies). NO modern clothing.",
+        'medieval':
+            "ERA CONTEXT: Medieval European — period-accurate attire (tunics, gambeson, surcoats, "
+            "kirtle, hose, leather boots, hooded cloaks, period-appropriate armor for warriors). "
+            "NO modern clothing, NO synthetic fabrics, NO contemporary cuts.",
+        'renaissance':
+            "ERA CONTEXT: Renaissance — period-accurate attire (doublet, hose, ruff collars, "
+            "farthingale skirts, embroidered fabrics, leather boots). NO modern clothing.",
+        'victorian':
+            "ERA CONTEXT: Victorian/Edwardian — period-accurate attire (frock coats, waistcoats, "
+            "high collars, corseted bodices, bustled skirts, top hats, button boots). "
+            "NO modern clothing.",
+        'wild_west':
+            "ERA CONTEXT: American Wild West (1860s-1890s) — period-accurate attire (denim/canvas "
+            "trousers, vests, button shirts, dusters, cowboy hats, leather boots, gun belts). "
+            "NO modern jeans/jackets — vintage cuts only.",
+        'edwardian_20s':
+            "ERA CONTEXT: 1920s Jazz Age — period-accurate attire (flapper dresses, drop waists, "
+            "cloche hats, finger waves, three-piece suits, fedoras, oxford shoes). NO modern clothing.",
+        'wwii':
+            "ERA CONTEXT: WWII / 1940s — period-accurate attire (military uniforms of the era, "
+            "wide-shouldered suits, A-line skirts, victory rolls hair, utility wear). NO modern clothing.",
+        'cold_war_60s':
+            "ERA CONTEXT: 1960s — period-accurate attire (mod fashion, mini skirts, slim suits, "
+            "go-go boots, beehive hair, bouffant). NO modern clothing.",
+        '70s':
+            "ERA CONTEXT: 1970s — period-accurate attire (bell-bottoms, wide collars, polyester, "
+            "platform shoes, feathered hair). NO modern clothing cuts.",
+        '80s':
+            "ERA CONTEXT: 1980s — period-accurate attire (shoulder pads, neon, big hair, "
+            "high-waisted jeans, leg warmers, oversized blazers). NO 2020s cuts.",
+        '90s':
+            "ERA CONTEXT: 1990s — period-accurate attire (grunge, baggy jeans, plaid flannel, "
+            "slip dresses, choker necklaces). NO 2020s cuts.",
+        'feudal_japan':
+            "ERA CONTEXT: Feudal Japan — period-accurate attire (kimono, hakama, obi, samurai "
+            "armor for warriors, period hairstyles like chonmage). NO modern clothing.",
+        'victorian_steampunk':
+            "ERA CONTEXT: Victorian Steampunk — Victorian silhouette + brass/copper accessories, "
+            "goggles, mechanical details. No 21st-century clothing or tech.",
+        'fantasy':
+            "ERA CONTEXT: High fantasy — period-inspired attire (medieval/renaissance silhouettes "
+            "with fantasy elements; armor for warriors, robes for mages, leather for rogues). "
+            "NO modern clothing.",
+        'post_apocalyptic':
+            "ERA CONTEXT: Post-apocalyptic — improvised/salvaged attire (patched fabrics, layered "
+            "scavenged clothing, gas masks/goggles, weathered leather). No pristine modern clothes.",
+        'sci_fi':
+            "ERA CONTEXT: Sci-fi / futuristic — futuristic attire (sleek bodysuits, tech "
+            "accessories, smart fabrics, asymmetric cuts). NO contemporary 2020s casual wear.",
+    }
+    return guides.get(matched, '')
+
+
 # Keywords that indicate clothing is already described in appearance/description.
 _CLOTHING_WORDS = (
     'wearing', 'dressed', 'outfit', 'shirt', 'blouse', 'dress', 'skirt',
@@ -4764,13 +6429,20 @@ _CLOTHING_WORDS = (
     'халат', 'мантия', 'одежда', 'форма',
 )
 
-def _clothing_clause(appearance: str, description: str = '') -> str:
-    """Return 'Fully clothed in everyday casual attire. ' if neither
-    appearance nor description mentions any clothing. Prevents models
-    from defaulting to lingerie/swimwear on female full-body portraits."""
+def _clothing_clause(appearance: str, description: str = '', era_hint: str = '') -> str:
+    """Return a clothing-fallback clause when neither appearance nor description
+    mentions clothing. Prevents models from defaulting to lingerie/swimwear.
+
+    If `era_hint` is set (series is historical/non-modern), the fallback is
+    period-aware: «Fully clothed in period-appropriate attire matching the
+    series setting.» Without era_hint, defaults to «everyday casual» which
+    biases toward modern clothing — wrong for Ancient Egypt, Wild West, etc.
+    """
     combined = (appearance + ' ' + description).lower()
     if any(w in combined for w in _CLOTHING_WORDS):
         return ''
+    if era_hint:
+        return 'Fully clothed in period-appropriate attire matching the series setting. '
     return 'Fully clothed in everyday casual attire. '
 
 
@@ -4857,6 +6529,57 @@ def add_character(sid):
     s['characters'].append(char)
     save_series(sid, s)
     return jsonify(char), 201
+
+@app.route('/api/series/<sid>/fix-anthro-species', methods=['POST'])
+def fix_anthro_species(sid):
+    """Bulk-fix endpoint: scan every character, and when the series is an
+    anthro/furry world but a character lacks species in name/appearance, infer
+    the species via LLM and patch the appearance. Clears the character's
+    portrait so the UI can show "regenerate" prompts. Returns the list of
+    patched characters with old/new appearance for review.
+    Real bug: "The Landlord's Daughter" generated 3 human portraits in a furry
+    world because the cast extractor dropped species words. This endpoint lets
+    the user repair an existing series in one click."""
+    s = load_series(sid)
+    if not s:
+        return jsonify({'error': 'not found'}), 404
+    if not _is_anthro_world(s):
+        return jsonify({
+            'patched': [],
+            'message': 'Этот сериал не определяется как анthrо-мир — нечего чинить. Если это ошибка, добавь слово «furry» или «anthropomorphic» в synopsis / world_description.',
+        })
+    patched = []
+    for char in (s.get('characters') or []):
+        existing_species = _detect_animal_species(char.get('name'), char.get('appearance'))
+        if existing_species:
+            continue  # already species-coded — skip
+        inferred = _llm_infer_species_for_char(s, char)
+        if not inferred or inferred == 'human':
+            continue
+        old_appearance = char.get('appearance', '')
+        new_appearance = _patch_appearance_with_species(old_appearance, inferred, char.get('gender', ''))
+        if new_appearance == old_appearance:
+            continue
+        char['appearance'] = new_appearance
+        # Drop stale portrait so the UI shows "regenerate".
+        char['avai_base_url'] = ''
+        char['updated_at'] = int(time.time())
+        patched.append({
+            'id': char.get('id'),
+            'name': char.get('name'),
+            'inferred_species': inferred,
+            'old_appearance': old_appearance,
+            'new_appearance': new_appearance,
+        })
+    if patched:
+        save_series(sid, s)
+    return jsonify({
+        'patched': patched,
+        'count': len(patched),
+        'message': (f'Пропатчено персонажей: {len(patched)}. Теперь жми «Перегенерить» на каждом — портрет переснимется как {", ".join(p["inferred_species"] for p in patched)}.'
+                    if patched else 'Все персонажи уже имеют species в appearance — патчить нечего.')
+    })
+
 
 @app.route('/api/series/<sid>/characters/<char_id>', methods=['PUT'])
 def update_character(sid, char_id):
@@ -5208,8 +6931,8 @@ def generate_outfit_image(sid, char_id, outfit_id):
             f'Same face, same hair, same body — only the clothing changes. '
             f'Full body, front-facing, slight 3/4 angle. Neutral relaxed pose. '
             f'Arms hanging loosely at sides, hands open and empty — no objects held, no props, not in pockets. '
-            f'STRICT BACKGROUND: ONLY a flat featureless gray (#808080) studio cyclorama behind the character. ABSOLUTELY NO windows, doors, walls, room interiors, furniture, plants, objects, decor, outdoor scenes, or any environmental elements whatsoever. Character must be isolated against the gray field — no setting, no architecture, no context. No shadows or reflections on the background. '
-            f'Studio lighting, soft and even. Photorealistic, cinematic quality.'
+            f'STRICT BACKGROUND: ONLY a flat featureless solid gray (#808080) backdrop behind the character — a uniform color field, NOT a photo studio set. ABSOLUTELY NO windows, doors, walls, room interiors, furniture, plants, objects, decor, outdoor scenes, NO photography studio elements (NO lighting rigs, NO trusses, NO backdrop curtains with visible seams, NO floor-to-wall transition, NO studio equipment), or any environmental elements whatsoever. Character must be isolated against the flat gray field — no setting, no architecture, no context. No shadows or reflections on the background. '
+            f'Soft even diffused illumination on the character only (no visible lights or equipment), no harsh shadows. Photorealistic, cinematic quality.'
         )
     else:
         # No reference — generate from scratch with description
@@ -5219,10 +6942,16 @@ def generate_outfit_image(sid, char_id, outfit_id):
             f'Wearing: {outfit["label"]}. {outfit.get("description", "")}. '
             f'Standing facing camera, slight 3/4 angle. Neutral relaxed pose. '
             'Arms hanging loosely at sides, hands open and empty — no objects held, no props, not in pockets. '
-            f'STRICT BACKGROUND: ONLY a flat featureless gray (#808080) studio cyclorama behind the character. ABSOLUTELY NO windows, doors, walls, room interiors, furniture, plants, objects, decor, outdoor scenes, or any environmental elements whatsoever. Character must be isolated against the gray field — no setting, no architecture, no context. No shadows or reflections on the background. '
-            f'Studio lighting, soft and even. Photorealistic, cinematic quality.'
+            f'STRICT BACKGROUND: ONLY a flat featureless solid gray (#808080) backdrop behind the character — a uniform color field, NOT a photo studio set. ABSOLUTELY NO windows, doors, walls, room interiors, furniture, plants, objects, decor, outdoor scenes, NO photography studio elements (NO lighting rigs, NO trusses, NO backdrop curtains with visible seams, NO floor-to-wall transition, NO studio equipment), or any environmental elements whatsoever. Character must be isolated against the flat gray field — no setting, no architecture, no context. No shadows or reflections on the background. '
+            f'Soft even diffused illumination on the character only (no visible lights or equipment), no harsh shadows. Photorealistic, cinematic quality.'
         )
     prompt = re.sub(r'\s+', ' ', prompt).strip()
+    # Variation token — provider-level caching (Banana/Seedream deduplicate
+    # identical prompt strings) was returning the same image on every regen,
+    # so deleting + re-generating an outfit pulled back the cached old one.
+    # User-reported 2026-05-23. Same fix as `regenerate_character`.
+    variation_token = uuid.uuid4().hex[:8]
+    prompt = f"{prompt} [v{variation_token}]"
 
     char_slug = slugify(char['name'])
     out_dir = assets_dir(sid) / 'characters' / char_slug / 'outfits'
@@ -5234,12 +6963,17 @@ def generate_outfit_image(sid, char_id, outfit_id):
         # Remove old photo if exists
         if outfit.get('photo'):
             old = series_path(sid) / outfit['photo']
-            if old.exists():
+            if old.exists() and str(old) != str(out_path):
                 old.unlink()
         outfit['photo'] = rel_path
         outfit['avai_url'] = image_url  # store for future i2i variants
+        # Bump per-asset version so frontend cache-buster `?v=N` flips and the
+        # browser actually re-fetches. Without this, even after AVAI returns
+        # a new image, the local file path stays the same and browser shows
+        # the cached old image.
+        outfit['image_version'] = int(time.time())
         save_series(sid, s)
-        return jsonify({'ready': True, 'url': f'/assets/{sid}/{rel_path}', 'image_url': image_url})
+        return jsonify({'ready': True, 'url': f'/assets/{sid}/{rel_path}', 'image_url': image_url, 'image_version': outfit['image_version']})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -5414,14 +7148,171 @@ def _detect_animal_species(name, appearance=None):
         for c in candidates:
             if c in _ANIMAL_SPECIES:
                 return _ANIMAL_SPECIES[c]
-    # Secondary: appearance keywords (existing _gen_char_inline logic).
+    # Secondary: appearance text — first try EXACT species words (e.g. "panther"
+    # in "Elegant panther in a business suit"), then generic anthropomorphic
+    # markers as a last-ditch fallback.
     if appearance:
         low = appearance.lower()
+        # Scan for exact species name as a whole word.
+        for sp_name, sp_hint in _ANIMAL_SPECIES.items():
+            if re.search(rf'\b{re.escape(sp_name)}\b', low):
+                return sp_hint
         if any(w in low for w in ('fur', 'muzzle', 'snout', 'tail', 'paws',
                                    'claws', 'whiskers', 'mane', 'feathers',
                                    'beak', 'fang', 'fangs')):
             return 'anthropomorphic animal'
     return ''
+
+
+# ── Anthro-world detection (series-level) ──────────────────────────────────
+# Real bug: series "The Landlord's Daughter" — synopsis explicitly described
+# a furry world ("seamstress rabbit Sofia... panther property manager") but
+# genre was "Revenge Drama / Class Warfare" with no furry/anthro keyword.
+# Result: writer DID render Victoria as panther (caught the word) but
+# Sofia/Marcus/Anita got generic-human appearance with no species → portraits
+# rendered as humans. _detect_animal_species can't help — it only reads one
+# character's own name+appearance. We need a SERIES-level signal that says
+# "this world is anthropomorphic — every character must carry a species."
+
+_ANTHRO_WORLD_KEYWORDS = (
+    'furry', 'фури', 'фурри', 'anthropomorphic', 'anthro',
+    'zootopia', 'beastars', 'bojack', 'redwall', 'anthropomorph',
+)
+
+
+def _is_anthro_world(s) -> bool:
+    """Return True when the series clearly lives in an anthropomorphic-animal
+    world. Signals (any one is enough):
+      • explicit keyword (furry / anthropomorphic / Zootopia / Beastars / Bojack)
+      • ≥2 species words mentioned in title+genre+world+synopsis
+      • ≥2 characters with species in name or appearance
+      • ≥1 char-with-species AND ≥1 species mention in synopsis
+    """
+    if not isinstance(s, dict):
+        return False
+    text_blob = ' '.join(str(s.get(k) or '') for k in (
+        'title', 'genre', 'tone', 'world_description', 'synopsis',
+        'target_audience',
+    )).lower()
+    if any(kw in text_blob for kw in _ANTHRO_WORLD_KEYWORDS):
+        return True
+    char_species_count = 0
+    for c in (s.get('characters') or []):
+        if _detect_animal_species(c.get('name'), c.get('appearance')):
+            char_species_count += 1
+    blob_species_count = 0
+    for sp in _ANIMAL_SPECIES.keys():
+        if re.search(rf'\b{re.escape(sp)}\b', text_blob):
+            blob_species_count += 1
+            if blob_species_count >= 2:
+                break
+    if blob_species_count >= 2:
+        return True
+    if char_species_count >= 1 and blob_species_count >= 1:
+        return True
+    if char_species_count >= 2:
+        return True
+    return False
+
+
+def _anthro_world_block(s) -> str:
+    """Directive block for LLM prompts when the series is anthro. Empty for
+    human-world series — safe to concat unconditionally."""
+    if not _is_anthro_world(s):
+        return ''
+    known = []
+    for c in (s.get('characters') or []):
+        sp = _detect_animal_species(c.get('name'), c.get('appearance'))
+        if sp:
+            known.append(f"{c.get('name','')} = {sp}")
+    known_clause = (
+        f"Known character species (REUSE these exactly): {'; '.join(known)}.\n"
+        if known else ''
+    )
+    return (
+        "═══ WORLD CONVENTION — ANTHROPOMORPHIC ANIMAL UNIVERSE ═══\n"
+        "Every character in this series is an ANTHROPOMORPHIC ANIMAL — NOT a human. "
+        "Zootopia/Beastars/Bojack style: walks upright, talks, wears human clothing, "
+        "but has the head/face/fur/tail of their species.\n"
+        "MANDATORY for EVERY character description / appearance / LOOK field:\n"
+        "  • Start with the SPECIES (e.g. 'anthropomorphic rabbit female...', "
+        "    'anthropomorphic bear male...', 'female panther in business suit...').\n"
+        "  • Replace human anatomy words (hair, eyes, skin) with anatomy that "
+        "    matches the species — fur color and pattern, snout/muzzle, ears, tail, "
+        "    paws, claws, whiskers, mane, feathers, scales, etc.\n"
+        "  • Clothing stays human-style (suits, dresses, uniforms, hoodies).\n"
+        "  • Species choice should fit role/social position when not already specified.\n"
+        "FORBIDDEN: 'a man', 'a woman', 'human male/female', generic human facial "
+        "descriptors (skin tone, hair color without fur context). "
+        "If you write 'a young woman in a hoodie' for this world — STOP and rewrite "
+        "as 'an anthropomorphic <species> female in a hoodie'.\n"
+        + known_clause +
+        "═══════════════════════════════════════════════\n\n"
+    )
+
+
+def _llm_infer_species_for_char(s, char) -> str:
+    """When the series IS anthro but THIS char has no species in name/appearance,
+    ask LLM to infer species from synopsis + role. Returns species noun ('rabbit',
+    'fox') or '' on failure. Single short Haiku call per missing character."""
+    if not _is_anthro_world(s):
+        return ''
+    name = (char.get('name') or '').strip()
+    if not name:
+        return ''
+    if _detect_animal_species(name, char.get('appearance')):
+        return ''
+    known_lines = []
+    for c in (s.get('characters') or []):
+        sp = _detect_animal_species(c.get('name'), c.get('appearance'))
+        if sp:
+            known_lines.append(f"  - {c.get('name','')}: {sp}")
+    known_block = ('Already-assigned species in this world:\n' + '\n'.join(known_lines) + '\n\n') if known_lines else ''
+    species_menu = ', '.join(sorted(_ANIMAL_SPECIES.keys()))
+    prompt = (
+        f"Series title: {s.get('title','')}\n"
+        f"World: {s.get('world_description','')}\n"
+        f"Synopsis: {s.get('synopsis','')}\n\n"
+        f"{known_block}"
+        f"This series lives in an anthropomorphic-animal world (Zootopia/Beastars style). "
+        f"What ANIMAL SPECIES is the character named '{name}' (role: {(char.get('description') or '—')[:200]}; "
+        f"current appearance: {(char.get('appearance') or '—')[:200]})?\n\n"
+        f"Pick ONE word from this list (or propose another common-English animal noun if a clearer fit): "
+        f"{species_menu}\n\n"
+        "Rules:\n"
+        "- If the synopsis EXPLICITLY assigns this character a species, return that species verbatim.\n"
+        "- Otherwise pick a species that fits the character's role/temperament and avoids collision with already-assigned species above.\n"
+        "- Return STRICT JSON only: {\"species\": \"<one lowercase animal noun>\"}.\n"
+    )
+    try:
+        raw = claude_ask(prompt, system='You return one-word animal species in strict JSON.', model='claude-haiku-4-5', max_tokens=80)
+        data = loads_lenient(strip_json(raw))
+        sp = (data.get('species') or '').strip().lower()
+        sp = re.sub(r'[^a-z\- ]', '', sp).strip()
+        return sp
+    except Exception as e:
+        print(f'[anthro-infer] failed for {name}: {e}', flush=True)
+        return ''
+
+
+def _patch_appearance_with_species(appearance: str, species: str, gender: str = '') -> str:
+    """Rewrite a human-coded appearance so it starts with the species marker.
+    Idempotent — if species already present, returns unchanged."""
+    if not species:
+        return appearance or ''
+    base = (appearance or '').strip()
+    low = base.lower()
+    if species.lower() in low or 'anthropomorphic' in low:
+        return base
+    gword = 'female' if gender == 'female' else ('male' if gender == 'male' else '')
+    prefix = f"Anthropomorphic {species}"
+    if gword:
+        prefix += f" {gword}"
+    if not base:
+        return prefix
+    base = re.sub(r'^\s*(A|An)\s+(young\s+|middle-aged\s+|older\s+)?(man|woman|guy|girl|male|female|gentleman|lady)\b[,\.]?\s*',
+                  '', base, flags=re.IGNORECASE)
+    return f"{prefix}. {base}"
 
 
 # ── Script-pose extraction (Vision-override guard) ──────────────────────────
@@ -5652,10 +7543,27 @@ def generate_character_image(sid, char_id):
         return jsonify({'error': 'not found'}), 404
 
     style_clause = _series_style_clause(s)
+    era_clause = _series_era_hint(s)
     _appearance = char.get('appearance', '')
     _desc = char.get('description', '')
     # Species-aware framing — see _detect_animal_species docstring for context.
     species_hint = _detect_animal_species(char.get('name'), _appearance)
+    # Self-heal for anthro worlds: if the SERIES is anthropomorphic but THIS
+    # character has no species in name/appearance, infer the species from the
+    # series synopsis (one short LLM call) and patch the appearance so future
+    # generations stay consistent. Fixes the bug where Sofia/Marcus/Anita
+    # rendered as humans in a furry world because the cast extractor dropped
+    # species words from their appearance text.
+    if not species_hint and _is_anthro_world(s):
+        inferred = _llm_infer_species_for_char(s, char)
+        if inferred and inferred != 'human':
+            patched = _patch_appearance_with_species(_appearance, inferred, char.get('gender', ''))
+            if patched and patched != _appearance:
+                char['appearance'] = patched
+                _appearance = patched
+                save_series(sid, s)
+                print(f'[anthro-heal] char {char.get("name")} → species={inferred}; appearance patched', flush=True)
+            species_hint = _detect_animal_species(char.get('name'), _appearance)
     if species_hint:
         gender_word = 'female' if char.get('gender') == 'female' else 'male'
         kind_label = f', a {gender_word} {species_hint}'
@@ -5675,11 +7583,12 @@ def generate_character_image(sid, char_id):
     prompt = (
         f"Full body portrait of {char['name']}{kind_label}. "
         f"{_appearance}. {_desc}.{species_override} "
-        f"{_clothing_clause(_appearance, _desc)}"
+        f"{era_clause + ' ' if era_clause else ''}"
+        f"{_clothing_clause(_appearance, _desc, era_hint=era_clause)}"
         f"Standing facing camera, slight 3/4 angle. Neutral relaxed pose. "
         f"Arms hanging loosely at sides, hands open and empty — no objects held, no props, not in pockets. "
-        f"STRICT BACKGROUND: ONLY a flat featureless gray (#808080) studio cyclorama behind the character. ABSOLUTELY NO windows, doors, walls, room interiors, furniture, plants, objects, decor, outdoor scenes, or any environmental elements whatsoever. Character must be isolated against the gray field — no setting, no architecture, no context. No shadows or reflections on the background. "
-        f"Studio lighting, soft and even, no harsh shadows on face or body. "
+        f"STRICT BACKGROUND: ONLY a flat featureless solid gray (#808080) backdrop behind the character — a uniform color field, NOT a photo studio set. ABSOLUTELY NO windows, doors, walls, room interiors, furniture, plants, objects, decor, outdoor scenes, NO photography studio elements (NO lighting rigs, NO trusses, NO backdrop curtains with visible seams, NO floor-to-wall transition, NO studio equipment), or any environmental elements whatsoever. Character must be isolated against the flat gray field — no setting, no architecture, no context. No shadows or reflections on the background. "
+        f"Soft even diffused illumination on the character only (lighting source NOT visible in frame), no harsh shadows on face or body, no visible lights or equipment. "
         f"{style_clause}"
     )
     prompt = re.sub(r'\s+', ' ', prompt).strip()
@@ -5721,6 +7630,15 @@ def regenerate_character(sid, char_id):
     # When true: rewrite appearance via Claude before generating (breaks
     # out of the «same prompt → same result» loop when appearance is stale).
     rewrite_appearance = bool(body.get('rewrite_appearance', False))
+    # Per-call provider override (UI dropdown on the character lightbox).
+    # Empty → fall back to series-level preference. Accepts: '', 'banana',
+    # 'seedream', 'openai' (gpt-image-1 via AVAI). Used for BOTH base
+    # portrait and outfit regeneration on this call so the look stays
+    # consistent. Per-series default unchanged on this path.
+    provider_override = (body.get('provider') or '').strip().lower()
+    if provider_override not in ('', 'banana', 'seedream', 'openai'):
+        provider_override = ''
+    effective_provider = provider_override or _series_image_provider(s)
 
     # AUTO-rewrite when name implies an anthropomorphic animal AND appearance
     # text currently describes a plain human. Without this, the canonical
@@ -5729,6 +7647,18 @@ def regenerate_character(sid, char_id):
     # even when the ref portrait is now an anthropomorphic hyena. Bug case:
     # «The Fox CEO's Trap» — user clicked regenerate, got a Pixar man back.
     species_hint_pre = _detect_animal_species(char.get('name'), char.get('appearance'))
+    # Self-heal for anthro worlds: char has no species but series IS anthro.
+    # Infer species from synopsis, patch appearance, and proceed as if the
+    # species had been there all along. Without this the regenerate flow
+    # falls through to the human-rendering branch.
+    if not species_hint_pre and _is_anthro_world(s):
+        inferred = _llm_infer_species_for_char(s, char)
+        if inferred and inferred != 'human':
+            patched = _patch_appearance_with_species(char.get('appearance', ''), inferred, char.get('gender', ''))
+            if patched and patched != char.get('appearance'):
+                char['appearance'] = patched
+                print(f'[anthro-heal] regenerate: char {char.get("name")} → species={inferred}', flush=True)
+            species_hint_pre = _detect_animal_species(char.get('name'), char.get('appearance'))
     if species_hint_pre:
         appearance_raw_check = (char.get('appearance') or '').lower()
         species_word = species_hint_pre.split()[-1].lower()
@@ -5836,6 +7766,7 @@ def regenerate_character(sid, char_id):
 
     constraints_clause = f" IMPORTANT — strictly follow these constraints: {wishes}." if wishes else ""
     style_clause = _series_style_clause(s)
+    era_clause = _series_era_hint(s)
     _desc = char.get('description', '')
     # Species-aware framing — same logic as generate_character_image. Without
     # this, regenerate_character would re-render a Wolf/Hyena/Fox as a human
@@ -5858,15 +7789,16 @@ def regenerate_character(sid, char_id):
         gender = 'woman' if char.get('gender') == 'female' else 'man'
         kind_label = f', a {gender}'
         species_override = ''
-        clothing_fallback = _clothing_clause(appearance_for_prompt, _desc)
+        clothing_fallback = _clothing_clause(appearance_for_prompt, _desc, era_hint=era_clause)
     prompt = (
         f"Full body portrait of {char['name']}{kind_label}. "
         f"{appearance_for_prompt}. {_desc}.{constraints_clause}{species_override} "
+        f"{era_clause + ' ' if era_clause else ''}"
         f"{clothing_fallback}"
         f"Standing facing camera, slight 3/4 angle. Neutral relaxed pose. "
         f"Arms hanging loosely at sides, hands open and empty — no objects held, no props, not in pockets. "
-        f"STRICT BACKGROUND: ONLY a flat featureless gray (#808080) studio cyclorama behind the character. ABSOLUTELY NO windows, doors, walls, room interiors, furniture, plants, objects, decor, outdoor scenes, or any environmental elements whatsoever. Character must be isolated against the gray field — no setting, no architecture, no context. No shadows or reflections on the background. "
-        f"Studio lighting, soft and even, no harsh shadows on face or body. "
+        f"STRICT BACKGROUND: ONLY a flat featureless solid gray (#808080) backdrop behind the character — a uniform color field, NOT a photo studio set. ABSOLUTELY NO windows, doors, walls, room interiors, furniture, plants, objects, decor, outdoor scenes, NO photography studio elements (NO lighting rigs, NO trusses, NO backdrop curtains with visible seams, NO floor-to-wall transition, NO studio equipment), or any environmental elements whatsoever. Character must be isolated against the flat gray field — no setting, no architecture, no context. No shadows or reflections on the background. "
+        f"Soft even diffused illumination on the character only (lighting source NOT visible in frame), no harsh shadows on face or body, no visible lights or equipment. "
         f"{style_clause}"
     )
     prompt = re.sub(r'\s+', ' ', prompt).strip()
@@ -5889,7 +7821,7 @@ def regenerate_character(sid, char_id):
         # a vanished path. avai_generate will overwrite out_path anyway when
         # it succeeds. User-reported: "Подменил фотку, обновил страницу,
         # фото утеряно" was caused by this preemptive delete + AVAI failure.
-        image_url = avai_generate(prompt, out_path, preferred_provider=_series_image_provider(s))
+        image_url = avai_generate(prompt, out_path, preferred_provider=effective_provider)
     except Exception as e:
         _log_event('WARN', 'regenerate_character_failed', char_id=char_id,
                    name=char.get('name', ''), err=str(e)[:300])
@@ -5936,10 +7868,12 @@ def regenerate_character(sid, char_id):
                     f'{out_constraints}'
                     f'Full body, front-facing, slight 3/4 angle. Neutral relaxed pose. '
                     f'Arms hanging loosely at sides, hands open and empty — no objects held, no props, not in pockets. '
-                    f'STRICT BACKGROUND: ONLY a flat featureless gray (#808080) studio cyclorama behind the character. ABSOLUTELY NO windows, doors, walls, room interiors, furniture, plants, objects, decor, outdoor scenes, or any environmental elements whatsoever. Character must be isolated against the gray field — no setting, no architecture, no context. No shadows or reflections on the background. '
-                    f'Studio lighting, soft and even. Photorealistic, cinematic quality.'
+                    f'STRICT BACKGROUND: ONLY a flat featureless solid gray (#808080) backdrop behind the character — a uniform color field, NOT a photo studio set. ABSOLUTELY NO windows, doors, walls, room interiors, furniture, plants, objects, decor, outdoor scenes, NO photography studio elements (NO lighting rigs, NO trusses, NO backdrop curtains with visible seams, NO floor-to-wall transition, NO studio equipment), or any environmental elements whatsoever. Character must be isolated against the flat gray field — no setting, no architecture, no context. No shadows or reflections on the background. '
+                    f'Soft even diffused illumination on the character only (no visible lights or equipment), no harsh shadows. Photorealistic, cinematic quality.'
                 )
                 ref_prompt = re.sub(r'\s+', ' ', ref_prompt).strip()
+                # Provider-level cache buster (same fix as character base regen)
+                ref_prompt = f"{ref_prompt} [v{uuid.uuid4().hex[:8]}]"
                 outfit_dir = char_dir / 'outfits'
                 outfit_dir.mkdir(parents=True, exist_ok=True)
                 outfit_out = outfit_dir / f'{asset_name(char["name"], outfit["label"])}.jpg'
@@ -5952,9 +7886,10 @@ def regenerate_character(sid, char_id):
                 if outfit_out.exists():
                     try: outfit_out.unlink()
                     except Exception: pass
-                outfit_url = avai_generate(ref_prompt, outfit_out, reference_url=new_base_url, preferred_provider=_series_image_provider(s))
+                outfit_url = avai_generate(ref_prompt, outfit_out, reference_url=new_base_url, preferred_provider=effective_provider)
                 outfit['photo'] = str(outfit_out.relative_to(series_path(sid)))
                 outfit['avai_url'] = outfit_url
+                outfit['image_version'] = int(time.time())
                 regenerated.append(outfit.get('label') or outfit['id'])
                 save_series(sid, s)  # save progressively so partial work isn't lost
             except Exception as e:
@@ -6780,7 +8715,7 @@ def generate_item_image(sid, item_id):
     prompt = (
         f"{item['name']}. {item.get('description', '')}.{constraints_clause}{modern_doc_clause} "
         f"Product-style still-life photo of the object alone. No people, no hands, no characters. "
-        f"Centered composition, neutral seamless background (#dadada), soft even studio lighting, "
+        f"Centered composition, neutral seamless gray background (#dadada) — flat color field NOT a photo studio set (no lighting rigs, no trusses, no equipment visible), soft even diffused illumination on the subject only, "
         f"subtle shadow on ground, sharp focus on object texture and details. "
         f"Square 1:1 framing. Photorealistic, high detail. {style_clause}"
     )
@@ -6822,7 +8757,7 @@ def regenerate_item(sid, item_id):
     prompt = (
         f"{item['name']}. {item.get('description', '')}.{constraints_clause}{modern_doc_clause} "
         f"Product-style still-life photo of the object alone. No people, no hands, no characters. "
-        f"Centered composition, neutral seamless background (#dadada), soft even studio lighting, "
+        f"Centered composition, neutral seamless gray background (#dadada) — flat color field NOT a photo studio set (no lighting rigs, no trusses, no equipment visible), soft even diffused illumination on the subject only, "
         f"subtle shadow on ground, sharp focus on object texture and details. "
         f"Square 1:1 framing. Photorealistic, high detail. {style_clause}"
     )
@@ -7271,6 +9206,18 @@ def _gen_char_base_inline(s, sid, char):
     # worn-out clothes»), fall back to appearance keywords for human-named
     # chars described with fur/muzzle markers.
     species_hint = _detect_animal_species(char.get('name'), appearance)
+    # Self-heal for anthro worlds — same logic as generate_character_image.
+    # Catches the auto_generate_assets path where chars came from extractors
+    # without species in appearance.
+    if not species_hint and _is_anthro_world(s):
+        inferred = _llm_infer_species_for_char(s, char)
+        if inferred and inferred != 'human':
+            patched = _patch_appearance_with_species(appearance, inferred, char.get('gender', ''))
+            if patched and patched != appearance:
+                char['appearance'] = patched
+                appearance = patched
+                print(f'[anthro-heal] inline: char {char.get("name")} → species={inferred}', flush=True)
+            species_hint = _detect_animal_species(char.get('name'), appearance)
     is_animal = bool(species_hint)
     species_override = ''
     if is_animal:
@@ -7293,19 +9240,21 @@ def _gen_char_base_inline(s, sid, char):
     # otherwise model gets conflicting signals and renders human-looking realism.
     style_clause = _series_style_clause(s)
     visual_style = _series_visual_style(s)
+    era_clause = _series_era_hint(s)
     is_stylised = bool(style_clause and 'strict' in style_clause.lower())
     realism_suffix = '' if is_stylised else ' Photorealistic, cinematic quality, high detail on face and clothing.'
     style_prefix = (style_clause + ' ') if style_clause else ''
-    clothing_fallback = '' if is_animal else _clothing_clause(appearance, description)
+    clothing_fallback = '' if is_animal else _clothing_clause(appearance, description, era_hint=era_clause)
     prompt = (
         f"{style_prefix}"
         f"Full body portrait of {char['name']}{kind_label}. "
         f"{appearance}. {description}.{constraints_clause}{species_override} "
+        f"{era_clause + ' ' if era_clause else ''}"
         f"{clothing_fallback}"
         f"Standing facing camera, slight 3/4 angle. Neutral relaxed pose. "
         f"Arms hanging loosely at sides, hands open and empty — no objects held, no props, not in pockets. "
-        f"STRICT BACKGROUND: ONLY a flat featureless gray (#808080) studio cyclorama behind the character. ABSOLUTELY NO windows, doors, walls, room interiors, furniture, plants, objects, decor, outdoor scenes, or any environmental elements whatsoever. Character must be isolated against the gray field — no setting, no architecture, no context. No shadows or reflections on the background. "
-        f"Studio lighting, soft and even, no harsh shadows on face or body."
+        f"STRICT BACKGROUND: ONLY a flat featureless solid gray (#808080) backdrop behind the character — a uniform color field, NOT a photo studio set. ABSOLUTELY NO windows, doors, walls, room interiors, furniture, plants, objects, decor, outdoor scenes, NO photography studio elements (NO lighting rigs, NO trusses, NO backdrop curtains with visible seams, NO floor-to-wall transition, NO studio equipment), or any environmental elements whatsoever. Character must be isolated against the flat gray field — no setting, no architecture, no context. No shadows or reflections on the background. "
+        f"Soft even diffused illumination on the character only (lighting source NOT visible in frame), no harsh shadows on face or body, no visible lights or equipment."
         f"{realism_suffix}"
     )
     prompt = re.sub(r'\s+', ' ', prompt).strip()
@@ -7378,8 +9327,8 @@ def _gen_outfit_inline(s, sid, char, outfit):
         + constraints_clause
         + 'Full body, front-facing, slight 3/4 angle. Neutral relaxed pose. '
           'Arms hanging loosely at sides, hands open and empty — no objects held, no props, not in pockets. '
-          'STRICT BACKGROUND: ONLY a flat featureless gray (#808080) studio cyclorama behind the character. ABSOLUTELY NO windows, doors, walls, room interiors, furniture, plants, objects, decor, outdoor scenes, or any environmental elements whatsoever. Character must be isolated against the gray field — no setting, no architecture, no context. No shadows or reflections on the background. '
-          'Studio lighting, soft and even.'
+          'STRICT BACKGROUND: ONLY a flat featureless solid gray (#808080) backdrop behind the character — a uniform color field, NOT a photo studio set. ABSOLUTELY NO windows, doors, walls, room interiors, furniture, plants, objects, decor, outdoor scenes, NO photography studio elements (NO lighting rigs, NO trusses, NO backdrop curtains with visible seams, NO floor-to-wall transition, NO studio equipment), or any environmental elements whatsoever. Character must be isolated against the flat gray field — no setting, no architecture, no context. No shadows or reflections on the background. '
+          'Soft even diffused illumination on the character only (no visible lights or equipment).'
         + realism_suffix
     )
     prompt = re.sub(r'\s+', ' ', prompt).strip()
@@ -7431,7 +9380,7 @@ def _gen_item_inline(s, sid, item):
         f"{style_prefix}"
         f"{item['name']}. {item.get('description', '')}.{constraints_clause}{modern_doc_clause} "
         f"Product-style still-life of the object alone. No people, no hands, no characters. "
-        f"Centered composition, neutral seamless background (#dadada), soft even studio lighting, "
+        f"Centered composition, neutral seamless gray background (#dadada) — flat color field NOT a photo studio set (no lighting rigs, no trusses, no equipment visible), soft even diffused illumination on the subject only, "
         f"subtle shadow on ground, sharp focus on object texture and details. "
         f"Square 1:1 framing."
         f"{realism_suffix}"
@@ -7468,18 +9417,36 @@ def auto_generate_missing_assets(sid):
     st = _autogen_status(sid)
     st.update({'running': True, 'queue': 0, 'done': 0, 'errors': [], 'in_progress': []})
     try:
-        # ─── Pre-sweep: ensure every episode's cast block is reflected in series.json
+        # ─── Pre-sweep: ensure every episode's cast block AND [BLOCKING] outfits
+        # are reflected in series.json. This is the GUARANTEE that no outfit
+        # mentioned in any saved script gets missed — even if the path that
+        # saved the script (import worker, history restore, direct file edit,
+        # legacy versions before sync was hooked everywhere) forgot to call
+        # _sync_script_outfits. The autogen sweep runs whenever any asset
+        # generation is requested, so this acts as the final reconciliation
+        # layer. Idempotent: existing outfits match by label and are skipped.
         # Skip episodes where extraction hasn't been confirmed by the user yet.
         for ep in list_episodes(sid):
             if not (ep.get('script') or '').strip():
                 continue
             if ep.get('cast_extracted', True) is False:
                 continue
-            if True:
-                try:
-                    sync_episode_with_cast_block(sid, ep['number'])
-                except Exception as e:
-                    print(f'[autogen {sid}] sync ep{ep["number"]} failed: {e}')
+            try:
+                sync_episode_with_cast_block(sid, ep['number'])
+            except Exception as e:
+                print(f'[autogen {sid}] cast-block sync ep{ep["number"]} failed: {e}')
+            # ALSO sync [BLOCKING] outfits — separate from cast-block sync.
+            # This is the layer that catches scenarios like Margaret's missing
+            # Prison Jumpsuit in ep 21 (script had the OUTFIT line but no save
+            # path triggered the sync). Note: _sync_script_outfits internally
+            # tries to _spawn_with_keys(auto_generate_missing_assets, sid)
+            # again — that nested spawn is BLOCKED by _AUTOGEN_LOCKS lock,
+            # so no recursion; the newly-created outfits will be picked up
+            # by THIS sweep's task list (built right below after a reload).
+            try:
+                _sync_script_outfits(sid, ep.get('script') or '')
+            except Exception as e:
+                print(f'[autogen {sid}] blocking-outfit sync ep{ep["number"]} failed: {e}')
 
         s = load_series(sid)
         if not s: return
@@ -7794,6 +9761,105 @@ def trigger_autogen_sweep(sid):
     return jsonify({'started': True, 'status': _autogen_status(sid)})
 
 
+@app.route('/api/series/<sid>/reanalyze-outfits', methods=['POST'])
+def reanalyze_outfits(sid):
+    """Bulk-reparse [BLOCKING] outfits across selected episodes (or all
+    episodes with a script when `episode_numbers` is omitted). Fix for the
+    common case where an episode was generated under an older writer prompt
+    or before character-name matching was lenient — re-running the sync now
+    detects outfits the first pass missed and queues image generation.
+
+    Also back-fills WEAK descriptions on existing outfits — when the writer
+    only provided a label (e.g. `OUTFIT: Business Casual` with no OUTFIT_DESC),
+    the outfit was created with `description == label`, which is a useless
+    text anchor and makes Seedance reinvent the cloth on every chunk. We
+    detect these via `description == label` (case-insensitive) and expand them
+    via a single Claude call each, plus clear the outfit photo so the autogen
+    sweep regenerates the image with the new concrete description.
+
+    Body: {"episode_numbers": [int, ...]}  // optional. Omit/empty → all-with-script.
+    Returns: {episodes_processed, total_new_outfits, total_weak_descs_fixed,
+              by_episode: [{number, new_outfits: [...]}]}
+    """
+    s = load_series(sid)
+    if not s: return jsonify({'error': 'not found'}), 404
+    body = request.json or {}
+    requested = body.get('episode_numbers') or []
+    requested_set = set(int(n) for n in requested) if requested else None
+
+    all_eps = list_episodes(sid)
+    targets = [ep for ep in all_eps
+               if (ep.get('script') or '').strip()
+               and (requested_set is None or ep['number'] in requested_set)]
+
+    by_episode = []
+    total = 0
+    for ep in targets:
+        try:
+            new_outfits = _sync_script_outfits(sid, ep.get('script') or '')
+        except Exception as e:
+            _log_event('WARN', 'reanalyze_outfits_failed',
+                       sid=sid, ep=ep['number'], err=str(e)[:200])
+            new_outfits = []
+        by_episode.append({
+            'number': ep['number'],
+            'title': ep.get('title', ''),
+            'new_outfits': new_outfits,
+        })
+        total += len(new_outfits)
+
+    # ── Back-fill weak descriptions on existing outfits ─────────────────
+    # An outfit is "weak" when description is empty OR equals the label —
+    # legacy state from before _sync_script_outfits enforced expansion.
+    s = load_series(sid)  # reload — _sync_script_outfits may have written
+    weak_fixed = 0
+    weak_changed = False
+    for c in (s.get('characters') or []):
+        for o in (c.get('outfits') or []):
+            label = (o.get('label') or '').strip()
+            desc  = (o.get('description') or '').strip()
+            if not label:
+                continue
+            if desc and desc.lower() != label.lower():
+                continue  # already has a real description
+            # Expand via Claude
+            new_desc = _expand_outfit_label_to_desc(
+                label,
+                c.get('appearance', ''),
+                c.get('gender', ''),
+            )
+            if not new_desc or new_desc.strip().lower() == label.lower():
+                continue  # expansion failed or returned the same label
+            o['description'] = new_desc.strip()
+            # Clear the existing photo so the autogen sweep regenerates the
+            # outfit reference image with the concrete description — without
+            # this the old weakly-anchored ref keeps causing chunk-to-chunk drift.
+            o['photo'] = None
+            o['avai_url'] = ''
+            weak_fixed += 1
+            weak_changed = True
+            _log_event('INFO', 'outfit_weak_desc_expanded',
+                       sid=sid, char=c.get('name'), label=label,
+                       new_desc=new_desc[:120])
+    if weak_changed:
+        save_series(sid, s)
+
+    # Fire one consolidated autogen sweep — covers both newly-created outfits
+    # AND the photo-cleared ones from back-fill above.
+    if total > 0 or weak_fixed > 0:
+        try:
+            _spawn_with_keys(auto_generate_missing_assets, sid)
+        except Exception as e:
+            print(f'[reanalyze-outfits] autogen spawn failed for {sid}: {e}')
+
+    return jsonify({
+        'episodes_processed': len(targets),
+        'total_new_outfits': total,
+        'total_weak_descs_fixed': weak_fixed,
+        'by_episode': by_episode,
+    })
+
+
 # ── Series Canon endpoints ──────────────────────────────────────────────────
 @app.route('/api/series/<sid>/canon', methods=['GET'])
 def get_canon(sid):
@@ -7846,7 +9912,7 @@ def generate_asset_prompt(sid):
             f"{appearance}. {description}. "
             f"Full body, front-facing neutral pose, arms relaxed at sides. "
             f"Isolated on solid uniform light gray background (#E0E0E0). "
-            f"Soft even studio lighting, no harsh shadows. Sharp focus. "
+            f"Soft even diffused illumination on the character only (no visible lights or studio equipment), no harsh shadows. Sharp focus. "
             f"Photorealistic, professional character design reference. "
             f"No background objects or gradients. Clean, simple, reference-quality."
         )
@@ -7867,7 +9933,7 @@ def generate_asset_prompt(sid):
             f"Now wearing/posed: {outfit_desc}. "
             f"Full body, front-facing neutral pose unless the outfit description specifies otherwise. "
             f"Isolated on solid uniform light gray background (#E0E0E0). "
-            f"Soft even studio lighting, no harsh shadows. Sharp focus. "
+            f"Soft even diffused illumination on the character only (no visible lights or studio equipment), no harsh shadows. Sharp focus. "
             f"Photorealistic, professional character reference. "
             f"Identical face and body to the base reference — change ONLY the clothing/pose described above. "
             f"No background objects or gradients. Clean, simple, reference-quality."
@@ -7944,7 +10010,7 @@ Title templates that work — VARIETY IS REQUIRED. Among any 5 generated ideas, 
   • "[Question Demanding Answer]"
   • "[Pronoun] [Did Something]. [Pronoun] Didn't Know [Twist]."
 
-  Situational-shock templates (great for mystery, found-family, courtroom):
+  Situational-shock templates (great for mystery, found-family, hidden-identity shocks):
   • "[Shocking Premise in One Line]"
   • "[Character] [Does Extreme Thing] at [Setting]"
   • "[Profession/Role] for [Powerful Other]'s [Secret Need]"
@@ -8078,10 +10144,17 @@ Audience must instantly grasp who/what/why. If reader needs to re-read to follow
 
 DIALOGUE-FIRST RULE — HARD BAN ON PAPERWORK & SCREENS:
 Reveals come from spoken confrontations between people on screen, never from documents or screens.
-BANNED as plot devices in synopses: letters, notes, documents, contracts, files, dossiers, "folder of photos", text messages, SMS, chat bubbles, emails, phone screens, laptop screens, computer UIs, surveillance camera footage being watched, audio recordings being played, diary entries, voiceover, news headlines, radio reports, silent flashback montages.
-Never write phrases like: "finds a folder of photos", "discovers documents proving", "receives a text", "sees on the screen", "watches the security footage". Rewrite as: character A confronts character B and accuses/admits/threatens out loud.
-NARROW exception: a physical object (ring, pregnancy test, key, single photo) may appear ONCE in a synopsis only if a character immediately verbalizes its meaning aloud to another character in the same beat.
-Same rule applies to synopsis_ru: запрещены «папка с фото», «SMS», «на экране телефона», «запись с камеры», «находит письмо/файл/документ» — переписывай через прямую устную конфронтацию.
+BANNED as plot devices in synopses: letters, notes, envelopes, business cards, sealed packages, documents, contracts, wills, files, folders, dossiers, evidence binders, "folder of photos", any photographs being shown/handed over/discovered, text messages, SMS, chat bubbles, emails, phone screens, laptop screens, computer UIs, USB drives / flash cards / memory cards as plot carriers, dictaphones / voice memos / hidden audio recordings, surveillance camera footage being watched, telephoto/long-lens spy photos, audio recordings being played, diary entries, voiceover, news headlines, radio reports, silent flashback montages.
+Never write phrases like: "finds a folder of photos", "discovers documents proving", "receives a text", "sees on the screen", "watches the security footage", "hands her a business card", "an envelope arrives", "plays the recording", "shows him a file of evidence". Rewrite as: character A confronts character B and accuses/admits/threatens out loud.
+NARROW exception: a physical object (ring, pregnancy test, key, single photo) may appear ONCE in the ENTIRE SERIES (not per synopsis, not per episode) only if a character immediately verbalizes its meaning aloud to another character in the same beat.
+Same rule applies to synopsis_ru: запрещены «папка с фото», «SMS», «на экране телефона», «запись с камеры», «находит письмо/файл/документ», «вручает визитку», «приносит конверт», «играет диктофонную запись», «детектив показывает файл с доказательствами», «инвестигатор приносит улики» — переписывай через прямую устную конфронтацию.
+
+HARD BAN ON LEGAL / COURTROOM / EVIDENCE-GATHERING PLOT ENGINES:
+The series concept MUST NOT be driven by lawsuits, court cases, trials, depositions, hearings, plea negotiations, indictments, custody hearings, eviction proceedings, settlement talks, evidence-gathering arcs, "we need proof to win in court", lawyer-strategy sessions, prosecutor briefings, police-investigation procedural arcs, or private-investigator-collects-the-file storylines. Courtroom and procedural is the slowest, most static, most exposition-heavy mode possible — the OPPOSITE of short-form drama. Audiences scroll past trials.
+BANNED phrases in synopses: "she sues", "takes them to court", "the case goes to trial", "the judge rules", "she files for custody", "demands a hearing", "the lawyer reveals", "a private investigator brings proof", "the DA prepares charges", "evidence will destroy him", "выходим в суд", "подаёт иск", "пересмотр опеки в суде", "адвокатская фирма", "прокурор", "детектив с уликами", "инвестигатор приносит файл", "сбор доказательств".
+NARROW law-as-atmosphere exception (max 1 line of one synopsis in the whole series): a lawyer/cop is mentioned for atmosphere, never as the engine.
+Replace legal escalation with PERSONAL escalation: face-to-face accusation, blackmail spoken aloud, kidnapping, chase, physical clash, betrayal by someone close, secret child / pregnancy exposed in conversation, public humiliation at wedding/gala/dinner, unexpected arrival, someone walks out, violence on screen.
+The same rule applies to synopsis_ru: переписывай любые «иск», «суд», «адвокат», «прокурор», «свидетели», «улики», «расследование», «слушание», «опека через суд», «передача дела» как двигатели сюжета — через личную конфронтацию.
 
 LOGIC CHECK — MANDATORY before finalizing any synopsis:
 - TIMELINE CONSISTENCY: if years passed since an encounter, a pregnancy cannot be from that encounter. A 3-year gap → she has a child aged ~3, NOT a current pregnancy. Fix: use "secret child" / "toddler son" / "3-year-old daughter" — not "pregnant".
@@ -8242,7 +10315,7 @@ _IDEA_TWISTS = [
     'a soldier comes home to find their spouse remarried to their commander',
     'a buried time capsule contradicts everyone\'s memory of that night',
     'protagonist\'s «dead» parent is alive under witness protection',
-    'a courtroom-translator is hiding native fluency to gather intel',
+    'a private nurse is hiding native fluency in the family\'s language to gather intel',
     'a charity\'s mission statement is a money-laundering script',
     'the personal trainer is an undercover detective',
     'a paternity test was forged in the lab decades ago',
@@ -8480,10 +10553,26 @@ def generate_series_ideas():
     data_in = request.json or {}
     writer_model = _resolve_writer_model(data_in)
     genres = data_in.get('genres') or []
+    idea_hint = (data_in.get('idea') or '').strip()  # optional free-text from the idea input field
+    # Format mode: 'short_drama' (TikTok addictive serial) or 'instagram_series' (sitcom-style standalone).
+    format_mode = (data_in.get('format_mode') or 'short_drama').strip().lower()
+    if format_mode not in _FORMAT_MODE_RULES:
+        format_mode = 'short_drama'
+    format_block = _format_mode_block(format_mode)
+    format_ideas_directive = _FORMAT_MODE_RULES[format_mode]['ideas_directive']
     # Free-text avoid-list: user-curated tropes/words that must NOT appear in
     # any of the 5 ideas (titles, synopses, character roles). Comma-separated
     # or newline-separated. E.g. «близнецы, пастор, billionaire CEO».
     avoid_raw = (data_in.get('avoid') or '').strip()
+
+    # Detect non-standard format from the idea hint to avoid injecting human-drama seeds
+    _idea_lower = idea_hint.lower()
+    _nonstandard_format = idea_hint and any(w in _idea_lower for w in [
+        'мультик', 'мульт', 'анимац', 'cartoon', 'animated', 'anime', 'аниме',
+        'pixar', 'пиксар', 'furry', 'фури', 'фурри', 'fantasy', 'фэнтези',
+        'sci-fi', 'science fiction', 'космос', 'space', 'horror', 'хоррор',
+        'superhero', 'супергерой', 'игра', 'game', 'видеоигр',
+    ])
 
     if genres:
         genre_rule = (
@@ -8530,14 +10619,36 @@ def generate_series_ideas():
         f'   Mood: {seed_tones[i][0]}'
         for i in range(5)
     )
+    format_convention = _get_format_convention(idea_hint)
+    # For non-standard formats (animation, furry, sci-fi, etc.) the human-drama seeds
+    # are irrelevant — replace them with just mood seeds to avoid archetype contamination.
+    if _nonstandard_format:
+        mood_seeds = '\n'.join(f'{i+1}. Mood: {seed_tones[i][0]}' for i in range(5))
+        seeds_section = (
+            f"USER FORMAT BRIEF (PRIMARY — все 5 идей ОБЯЗАНЫ соответствовать этому формату): \"{idea_hint}\"\n\n"
+            + (format_convention if format_convention else
+               "ВАЖНО: формат пользователя определяет всё — жанр, сеттинг, архетипы персонажей. "
+               "НЕ используй человеческие drama-архетипы (CEO, горничная, мачеха, миллиардер) если только "
+               "идея пользователя явно не включает людей. Придумывай архетипы исходя из заданного формата.\n")
+            + "\nMOOD SEEDS (один на идею):\n"
+            f"{mood_seeds}\n\n"
+        )
+    else:
+        seeds_section = (
+            (f"USER IDEA HINT (учти при генерации): \"{idea_hint}\"\n\n" if idea_hint else "")
+            + "INSPIRATION SEEDS (one per idea — these are LIGHT prompts, pick what's useful, "
+            "ignore what overcomplicates):\n"
+            f"{constraints}\n\n"
+        )
+
     prompt = (
-        "Generate exactly 5 SHORT DRAMA series concepts for TikTok/Reels.\n\n"
+        "Generate exactly 5 series concepts for short-form vertical video.\n\n"
+        + format_block
+        + f"FORMAT-SPECIFIC DIRECTIVE: {format_ideas_directive}\n\n"
         + genre_rule
         + avoid_rule
-        + "INSPIRATION SEEDS (one per idea — these are LIGHT prompts, pick what's useful, "
-        "ignore what overcomplicates):\n"
-        f"{constraints}\n\n"
-        "How to use the seeds:\n"
+        + seeds_section
+        + "How to use the seeds:\n"
         "- Treat each row as 6 OPTIONAL ingredients. Pick 2-3 that combine cleanly into ONE simple premise.\n"
         "- IGNORE seeds that would force complexity. Better a clean «setting + protagonist + 1 twist» than\n"
         "  a Frankenstein with every seed jammed in.\n"
@@ -8600,6 +10711,264 @@ _FROM_IDEA_ANGLES = [
     'Use a documentary-style framing — the protagonist is being interviewed throughout, looking back from after the events.',
 ]
 
+# Genre convention notes — injected when idea implies a specific format.
+# Tells the model what the genre ACTUALLY means so it doesn't default to
+# stereotyped assumptions (furry ≠ farm animals, fantasy ≠ medieval, etc.).
+_FORMAT_CONVENTIONS = {
+    'furry': (
+        "FURRY GENRE CONVENTIONS — MANDATORY:\n"
+        "Furry = anthropomorphic animals living in a fully modern human-like civilization. "
+        "They walk upright, talk, drive cars, use smartphones, have office jobs, live in apartments. "
+        "The world looks like a modern city (skyscrapers, subway, cafes, corporate offices, nightclubs) — "
+        "NOT a forest, farm, or nature setting. Species may inform personality/social dynamics "
+        "(predator vs prey hierarchies, size differences, instincts as character flaws) but characters "
+        "are NOT wild animals. Think: Zootopia, Beastars, Bojack Horseman. "
+        "FORBIDDEN settings: meadow, barn, forest clearing, animal den, wildlife reserve (unless ironic). "
+        "REQUIRED: urban setting — downtown apartment, corporate HQ, university campus, subway car, "
+        "rooftop bar, police precinct, hospital, high school, nightclub, food court.\n"
+    ),
+    'pixar': (
+        "PIXAR / ANIMATION STYLE CONVENTIONS:\n"
+        "Pixar-style = emotionally grounded animated story with universal themes, "
+        "unexpected but logical internal world rules, and a protagonist with a clear emotional wound. "
+        "The world has a conceptual hook ('what if toys were alive', 'what if emotions had emotions'). "
+        "Tone: warm but not saccharine — real stakes, real loss, real growth. "
+        "Character design should be distinct and readable as silhouettes. "
+        "The antagonist is usually the protagonist's own flaw externalized, or a well-meaning character with wrong values.\n"
+    ),
+    'anime': (
+        "ANIME GENRE CONVENTIONS:\n"
+        "Anime = Japanese animation style with genre-specific tropes. "
+        "Common settings: Japanese high school, urban Tokyo backdrop, fantasy academy, tournament arc. "
+        "Emotional beats are more heightened than Western drama — "
+        "internal monologue, power-up moments, rivals-to-allies arcs. "
+        "Character archetypes: tsundere, kuudere, genki girl, stoic rival, mentor figure. "
+        "Visual storytelling relies on reaction shots, dramatic pauses, expressive eyes.\n"
+    ),
+    'fantasy': (
+        "FANTASY GENRE CONVENTIONS:\n"
+        "Fantasy world = magic system with clear rules and costs. "
+        "Do NOT default to generic medieval European — pick a specific cultural base "
+        "(East Asian, African, Middle Eastern, Central American) or a fully invented world. "
+        "Power structures: noble houses, guilds, academies, criminal magic syndicates, divine orders. "
+        "The drama comes from the magic system having consequences — not just being a cool effect.\n"
+    ),
+    'sci-fi': (
+        "SCI-FI GENRE CONVENTIONS:\n"
+        "Science fiction = one core speculative premise ('what if X technology existed'). "
+        "The drama is a HUMAN drama happening inside that technological context — "
+        "the tech is not the story, it's the pressure cooker. "
+        "Settings: space station, generation ship, corporate colony, near-future megacity, "
+        "biotech lab, neural interface facility. "
+        "Avoid generic 'robots attack' — focus on social/ethical consequences of the tech.\n"
+    ),
+}
+
+def _get_format_convention(idea_text: str) -> str:
+    """Return genre convention note for the idea, or empty string."""
+    t = idea_text.lower()
+    if 'furry' in t or 'фури' in t or 'фурри' in t:
+        return _FORMAT_CONVENTIONS['furry']
+    if 'pixar' in t or 'пиксар' in t:
+        return _FORMAT_CONVENTIONS['pixar']
+    if 'anime' in t or 'аниме' in t:
+        return _FORMAT_CONVENTIONS['anime']
+    if 'fantasy' in t or 'фэнтези' in t or 'фентези' in t:
+        return _FORMAT_CONVENTIONS['fantasy']
+    if 'sci-fi' in t or 'science fiction' in t or 'космос' in t or 'space' in t:
+        return _FORMAT_CONVENTIONS['sci-fi']
+    return ''
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FORMAT MODE — short_drama vs instagram_series.
+#
+# Different distribution channels demand different storytelling. Short drama
+# (TikTok / ReelShort / DramaBox) lives on hard cliffhangers and serialised
+# binge-watching. Instagram series — closer to sitcoms or "slice of life"
+# vignettes that any new follower can drop into mid-season — needs every
+# episode to land as a complete unit AND still serve binge viewers.
+#
+# These rule blocks are injected into every generator (ideas / synopses /
+# scripts / checkpoints / finale) so the whole pipeline writes in the chosen
+# mode end-to-end.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_FORMAT_MODE_RULES = {
+    'short_drama': {
+        'one_liner': 'TikTok/Reels short drama — addictive serialized format (ReelShort / DramaBox style).',
+        'title_rule': (
+            'Title style — LONG, hook-loaded first-person sentence (8-14 words). '
+            'Examples: "My Stepmother Made Me a Servant in My Own House", '
+            '"I Got Pregnant by My Commander\'s Twin". '
+            'The title alone must spell out the central betrayal / scandal / inversion.'
+        ),
+        'synopsis_rule': (
+            'Synopsis: 3-5 punchy sentences. Open IN the conflict — something is already on fire. '
+            'Midpoint reversal mandatory ("but then...", "until..."). '
+            'End on the biggest cliffhanger the synopsis can sustain.'
+        ),
+        'episode_rule': (
+            'Each episode = ~60s, ends on a HARD CLIFFHANGER that forces ep+1. '
+            'Continuous serialized arc — viewer MUST watch ep1→ep2→ep3 in order. '
+            'No recap, no resolution within episode — every episode is a chunk of one larger scene.'
+        ),
+        'pace_rule': (
+            'Pace: relentless. Shock open in 5 seconds. Mid-episode flip. End on a fresh question. '
+            'Tone: over-the-top, high emotion, betrayal-of-the-week energy.'
+        ),
+        'ideas_directive': (
+            'These are SHORT DRAMA concepts (TikTok/Reels addictive serials). '
+            'Long titles, big premises, central betrayal / power-inversion engine, '
+            'continuous serialized arc with hard cliffhangers.'
+        ),
+    },
+    'instagram_series': {
+        # Instagram series = compact serialized mini-series (6-10 episodes).
+        # Difference from short_drama: shorter overall run, clearer arc-per-episode,
+        # tighter dialogue. SAME engine: sharp hook + clear conflict + cliffhanger.
+        # NOT a sitcom, NOT an anthology, NOT "every Tuesday they meet in the café".
+        # NOT a legal procedural — no lawsuits, no courts, no paperwork as plot.
+        'one_liner': (
+            'Instagram series — compact 6-10 episode serialized mini-drama. EVERY episode opens '
+            'with a SHARP HOOK and ends on a CLIFFHANGER — no exceptions. Drop-in friendly: a '
+            'viewer landing on ep 3 or ep 5 must be hooked within 10 seconds. Action and emotion, '
+            'NOT lawsuits / courts / paperwork. Varied locations.'
+        ),
+        'title_rule': (
+            'Title style — SHORT and intriguing (2-5 words). Must imply a CONFLICT, a SECRET, or '
+            'a hook — NOT a recurring setting or weekly meetup. '
+            'Good: "Wrong Bride", "The Replacement", "Three Days Left", "Her Other Husband", '
+            '"Lights Out at 7", "Inheritance Lie", "The Missing Sister", "Don\'t Open the Door". '
+            'Bad (BANNED — anthology / sitcom shapes): "Coffee with Mira", "Lunch Stories", '
+            '"The Late Shift", "Party of Two", "After Hours", any "<verb>ing with <name>". '
+            'Bad (BANNED — legal-procedural): "The Trial of X", "Case File N", "The Lawsuit", '
+            '"Court Order" — IG series is NOT a legal drama. '
+            'NEVER use long ReelShort-style sentences ("My X Did Y In Z"). '
+            'Episode titles: «Series Name — Эп N: <2-4 слова про сцену>». Must describe the '
+            'specific turn in THIS episode, not a recurring ritual. Example: '
+            '"Wrong Bride — Эп 3: Звонок из больницы".'
+        ),
+        'synopsis_rule': (
+            'Synopsis: 2-3 short, punchy sentences. '
+            'Sentence 1 = the CENTRAL CONFLICT or hidden truth that launches the story '
+            '(a lie, a switch, a reveal, a deadline, a missing person, a confrontation, a chase, '
+            'a discovered secret). Open IN the situation, not in setup. '
+            'Sentence 2 = what escalates ("but then...", "until...", "когда..."). One clean turn. '
+            'Sentence 3 (optional) = the personal-emotional stakes ("если она не успеет — потеряет '
+            'ребёнка"). NOT legal stakes ("she will sue the building" — BANNED). '
+            'BANNED phrases: "каждую неделю", "каждый вторник", "regular meetup", '
+            '"recurring hangout", "slice of life", "vignettes", "warm comedy". '
+            'BANNED engines: lawsuit, court case, trial, legal filing, district attorney, judge, '
+            'paralegal, contract dispute, depositions, hearings, eviction proceedings, '
+            'forensic accountant. The drama lives in PEOPLE and ACTION, not in paperwork. '
+            'If your synopsis ends with "files a lawsuit" or "takes them to court" — REWRITE. '
+            'Replace legal escalation with personal confrontation, betrayal, chase, or reveal.\n'
+            'NO sitcom framing. NO "they discuss a new story every episode". '
+            'Locations vary across the season — story drives where we are, not the other way around.'
+        ),
+        'episode_rule': (
+            'ABSOLUTE RULE — EVERY EPISODE WITHOUT EXCEPTION must have all three:\n'
+            '  (1) SHARP COLD-OPEN HOOK in the FIRST 3-5 SECONDS. A line of dialogue, an action '
+            '      mid-motion, a sound, a face, a confrontation already underway. NEVER an '
+            '      establishing shot of a building, NEVER a slow zoom into a face, NEVER '
+            '      "и вот, на следующее утро...". The viewer must lean in before second 6.\n'
+            '  (2) ESCALATION — one clear conflict or intrigue pushed forward by clipped dialogue. '
+            '      No filler scenes. No "checking in on the family". Every line either reveals, '
+            '      flips, or raises stakes.\n'
+            '  (3) CLIFFHANGER on the LAST LINE / LAST FRAME. A reveal, an arrival, a phone call, '
+            '      a slap, a door opening, a name spoken, a body falling. Something that makes '
+            '      the viewer immediately tap to ep+1. NO resolution, NO "satisfying close", '
+            '      NO "warm-hug ending". If the ending feels comfortable, you failed.\n'
+            'DROP-IN FRIENDLY: a viewer landing on ep 3 / ep 5 / ep 7 cold must catch the situation '
+            'in the first 10 seconds through context (a line, a reaction shot, a prop). No '
+            'narrator catch-up, no "previously on" — context is woven into the action.\n'
+            'Self-contained means: this episode delivers a complete HOOK→ESCALATION→CLIFFHANGER '
+            'arc — it does NOT mean the conflict resolves. The bigger story keeps escalating across '
+            'the season.\n'
+            'Dialogue: short, clipped, 2-phrase clarity. One line states the situation, the next '
+            'flips it. No monologues, no banter padding, no slice-of-life small talk.\n'
+            'Episode length 45-90 seconds. Total episode count per season: 6-10.\n'
+            'BANNED endings: "soft hook", "punchline close", "satisfying self-contained beat", '
+            '"quiet growth", "small realisation", "see-you-Tuesday", character looking at sunset, '
+            'character writing in diary, character finally smiling.\n'
+            'BANNED plot engines: court hearings, lawsuit filings, legal evidence-gathering, '
+            'meeting with a lawyer, signing documents, signing a contract as climax, filing '
+            'paperwork at city hall. Drama is FACE-TO-FACE, not in a courtroom.\n'
+            'Locations vary — do NOT lock the whole series to one kitchen / café / office. '
+            'Each episode goes where the plot demands.'
+        ),
+        'pace_rule': (
+            'Pace: relentless, propulsive, dialogue-driven. Every line either reveals, escalates, '
+            'or sets up a turn. Conflict readable in two exchanges. '
+            'Tone: grounded drama / thriller / mystery / romance with TEETH — NOT sitcom, NOT '
+            'slice-of-life, NOT melodrama caricature, NOT legal procedural. Think a 6-episode '
+            'prestige mini-series compressed into 60-second chapters where every chapter ends on '
+            'a knife.\n'
+            'Hook density is MAXIMUM:\n'
+            '  • Seconds 0-5: cold-open hook (action mid-motion / line mid-conflict)\n'
+            '  • Mid-episode: at least one TURN (a reveal, a contradiction, a new info-drop)\n'
+            '  • Final 5 seconds: cliffhanger\n'
+            'Three beats MINIMUM per episode. No exceptions, no "slow episode" excuses.\n'
+            'Engineer every episode-ending so the viewer says "wait, what?" / "OH NO" / "PIZDETS" '
+            '— never "aww that was sweet" or "interesting interaction".\n'
+            'Share-ability comes from the HOOK and the TURN, not from quotable banter.'
+        ),
+        'ideas_directive': (
+            'These are INSTAGRAM SERIES concepts — compact serialized mini-dramas (6-10 episodes, '
+            '45-90s each). EVERY episode without exception = SHARP HOOK + clear conflict + '
+            'CLIFFHANGER. Concept-driven, plot-driven, NOT setting-driven.\n'
+            'Short intriguing title (2-5 words) that telegraphs CONFLICT, SECRET, or HOOK.\n'
+            'Punchy 2-3 sentence synopsis that opens inside the conflict.\n'
+            'Drop-in friendly: every episode plays solo. Ep 5 should hook a fresh viewer in 10s.\n'
+            'BANNED setups: "every Tuesday at the café", "weekly hangout", "recurring ritual", '
+            '"anthology of stories", "slice-of-life", "sitcom", "branded micro-drama", '
+            '"Party of Two", "Mokai", "Mumbai flatmates".\n'
+            'BANNED engines: lawsuit, court trial, legal filing, paperwork-as-climax, '
+            'eviction proceedings, "she files suit and wins", "the court rules in her favour". '
+            'Drama lives in PEOPLE confronting people, not in paperwork. If the natural '
+            'resolution would be a courtroom — pivot to direct personal confrontation, escape, '
+            'betrayal, blackmail, or reveal instead.\n'
+            'BANNED tropes: billionaire-CEO-stepmother, "she\'s secretly the heiress", '
+            'TikTok melodrama shock-bait — but the ENGINE (hook + conflict + cliffhanger) stays.\n'
+            'Think compressed prestige mini-series: a domestic mystery, a deception that unravels, '
+            'a 6-day countdown, a relationship with a hidden truth, a stolen identity, a chase, '
+            'a missing person. Locations vary as the story moves.'
+        ),
+    },
+}
+
+
+def _format_mode_of(s) -> str:
+    """Return the format mode for a series, defaulting to 'short_drama'."""
+    if not s:
+        return 'short_drama'
+    m = (s.get('format_mode') or 'short_drama').strip().lower()
+    return m if m in _FORMAT_MODE_RULES else 'short_drama'
+
+
+def _format_mode_block(s, sections=None) -> str:
+    """Build a compact format-mode directive block for injection into a prompt.
+
+    sections — optional list of rule keys to include (default = all). Common
+    subsets: ['title_rule','synopsis_rule'] for idea/synopsis prompts;
+    ['episode_rule','pace_rule'] for script-writing prompts.
+    """
+    mode = _format_mode_of(s) if isinstance(s, dict) else (s if isinstance(s, str) else 'short_drama')
+    if mode not in _FORMAT_MODE_RULES:
+        mode = 'short_drama'
+    rules = _FORMAT_MODE_RULES[mode]
+    keys = sections or ['title_rule', 'synopsis_rule', 'episode_rule', 'pace_rule']
+    lines = [f'═══ FORMAT MODE: {mode.replace("_", " ").upper()} ═══']
+    lines.append(rules['one_liner'])
+    for k in keys:
+        v = rules.get(k)
+        if v:
+            lines.append(f'• {v}')
+    lines.append('═══════════════════════════════════════════════')
+    return '\n'.join(lines) + '\n\n'
+
+
 @app.route('/api/generate-series-from-idea', methods=['POST'])
 def generate_series_from_idea():
     data_in = request.json or {}
@@ -8608,6 +10977,12 @@ def generate_series_from_idea():
     genres = data_in.get('genres') or []
     if not idea:
         return jsonify({'error': 'Опиши идею'}), 400
+    # Format mode: 'short_drama' (default) or 'instagram_series'
+    format_mode = (data_in.get('format_mode') or 'short_drama').strip().lower()
+    if format_mode not in _FORMAT_MODE_RULES:
+        format_mode = 'short_drama'
+    format_block = _format_mode_block(format_mode)
+    format_ideas_directive = _FORMAT_MODE_RULES[format_mode]['ideas_directive']
     angle    = random.choice(_FROM_IDEA_ANGLES)
     setting  = random.choice(_IDEA_SETTINGS)
     twist    = random.choice(_IDEA_TWISTS)
@@ -8619,25 +10994,63 @@ def generate_series_from_idea():
         f"The series MUST be a blend of these genres: {', '.join(genres)}. "
         "Every element of the concept should feel like it belongs in all of them simultaneously. "
     ) if genres else ""
+    # Detect if the idea specifies a non-standard format (animation, anime, furry, etc.)
+    # so we know whether the human-drama seeds are relevant or should be skipped.
+    _idea_lower = idea.lower()
+    _nonstandard_format = any(w in _idea_lower for w in [
+        'мультик', 'мульт', 'анимац', 'cartoon', 'animated', 'anime', 'аниме',
+        'pixar', 'пиксар', 'furry', 'фури', 'фурри', 'fantasy', 'фэнтези',
+        'sci-fi', 'science fiction', 'космос', 'space', 'horror', 'хоррор',
+        'superhero', 'супергерой', 'игра', 'game', 'видеоигр',
+    ])
+    format_convention = _get_format_convention(idea)
+
+    if _nonstandard_format:
+        # Seeds are for human drama archetypes — skip them entirely when format is non-standard.
+        # Let the idea brief + genre convention dominate completely.
+        seeds_block = (
+            f"Creative angle to explore: {angle}\n"
+            f"Mood / emotional register: {tone}\n\n"
+            + (format_convention if format_convention else
+               "NOTE: The user's idea defines a specific format (animation, fantasy, sci-fi, etc.). "
+               "Do NOT force human-drama archetypes (CEO, billionaire, maid, stepmother, etc.) into this concept. "
+               "Character archetypes, setting, and premise must match the user's stated format.\n")
+            + "\n"
+        )
+    else:
+        seeds_block = (
+            f"Creative angle to explore: {angle}\n\n"
+            f"Optional inspiration seeds — use 2-3 that fit cleanly, discard the rest:\n"
+            f"  • Setting: {setting}\n"
+            f"  • Premise structure: {premise}\n"
+            f"  • Twist element: {twist}\n"
+            f"  • Protagonist archetype: {protag}\n"
+            f"  • Antagonist archetype: {antag}\n"
+            f"  • Mood: {tone}\n\n"
+        )
+
+    # Adjust synopsis length per format
+    _synopsis_len_rule = (
+        "synopsis should be 2-3 plain-language sentences (Instagram series format — see rules above)."
+        if format_mode == 'instagram_series' else
+        "synopsis should be 3-5 sentences summarizing the full series arc."
+    )
     prompt = (
-        f"Based on this idea: \"{idea}\"\n\n"
+        format_block
+        + f"FORMAT-SPECIFIC DIRECTIVE: {format_ideas_directive}\n\n"
+        + f"USER'S IDEA (PRIMARY BRIEF — honor this above everything else): \"{idea}\"\n\n"
         + genre_rule
-        + f"Creative angle to explore: {angle}\n\n"
-        f"Use this 6-axis combo as the spine of the concept (each axis must be visibly present in the synopsis):\n"
-        f"  • Setting: {setting}\n"
-        f"  • Premise structure: {premise}\n"
-        f"  • Twist element: {twist}\n"
-        f"  • Protagonist archetype: {protag}\n"
-        f"  • Antagonist archetype: {antag}\n"
-        f"  • Mood: {tone}\n\n"
-        "Important: if the user's idea already implies one of these axes (e.g. a setting), HONOR the user's idea — "
-        "use the suggested combo only as creative pressure to avoid generic clichés, not to override what the user said. "
-        "Pick a TITLE TEMPLATE from the system prompt that fits the mood — don't default to 'My X Is A Y' if the mood is procedural or revenge-tour.\n\n"
-        "Create a UNIQUE short drama series concept for TikTok/Reels that feels fresh and specific — "
-        "avoid generic plots. Give it a title that sets a clear visual expectation. "
+        + seeds_block
+        + "RULES:\n"
+        "- The user's idea is the brief. Seeds and genre tags are SECONDARY creative pressure — "
+        "discard any seed that conflicts with what the user described.\n"
+        "- The format (animation vs live-action drama vs thriller vs fantasy) must match the user's idea.\n"
+        "- TITLE must follow the format-mode title rule above (long ReelShort sentence vs short Instagram-style).\n"
+        "- Avoid generic plots. Give it a title that sets a clear visual expectation.\n\n"
+        "Create a UNIQUE series concept for short-form vertical video that feels fresh and specific. "
         "Return JSON with exactly these fields: "
         "title, genre, tone, target_audience, world_description, synopsis. "
-        "synopsis should be 3-5 sentences summarizing the full series arc."
+        f"{_synopsis_len_rule}"
     )
     try:
         data = json.loads(strip_json(llm_ask(writer_model, prompt, system=_IDEAS_SYSTEM)))
@@ -8680,9 +11093,17 @@ _WRITER_SYSTEM = (
     "немые флэшбеки, монтажи без диалога. "
     "НЕ ПИШИ фразы вида: «обнаруживает на ноутбуке папку с фото», «получает SMS с угрозой», «на экране телефона видна запись», «находит письмо», «открывает досье», «слышит запись». "
     "ВМЕСТО ЭТОГО пиши: персонаж А сталкивается с персонажем Б и говорит/обвиняет/признаётся вслух. Например: вместо «находит фото James с врагом» — «James сам признаётся ей в лицо, что встречался с тем человеком — но не за тем, что она думает». "
-    "УЗКОЕ ИСКЛЮЧЕНИЕ — максимум ОДИН раз на эпизод (НЕ на синопсис серии — на одну серию из 70): "
+    "УЗКОЕ ИСКЛЮЧЕНИЕ — максимум ОДИН раз НА ВЕСЬ СЕРИАЛ (не на эпизод — на 70 серий целиком): "
     "коротко показать физический предмет (кольцо, тест на беременность, ключ, одно фото), но в том же предложении персонаж проговаривает смысл вслух другому персонажу. "
-    "Если в синопсисе появилось слово «папка», «файл», «документ», «экран», «запись», «SMS», «сообщение», «ноутбук с …», «телефон с …», «фото на …» — ПЕРЕПИШИ через диалог. "
+    "Если этот лимит уже израсходован раньше — НИКАКИХ предметов-носителей сюжета. Только устные конфронтации. "
+    "Если в синопсисе появилось слово «папка», «файл», «документ», «экран», «запись», «SMS», «сообщение», «ноутбук с …», «телефон с …», «фото на …», «конверт», «записка», «диктофон», «улики», «доказательства» — ПЕРЕПИШИ через диалог. "
+    "HARD BAN — LEGAL/COURTROOM PLOT ENGINES (ЖЁСТКИЙ ЗАПРЕТ НА ЮРИДИЧЕСКИЕ ДВИЖКИ): "
+    "Сериал НЕ должен сводиться к суду, юридическому процессу, сбору улик, заседаниям, прокурору, адвокату, судье, иску, обвинительному акту, daw enforcement, депозиции, слушанию, экспертизе, юридическому разбирательству. "
+    "ЗАПРЕЩЕНЫ как двигатели сюжета: lawsuit, court case, trial, hearing, deposition, motion, prosecutor, attorney, paralegal, judge, jury, courtroom, indictment, plea, settlement, eviction proceedings, custody hearing, restraining order filing, forensic accountant, evidence-gathering arc, «she sues them», «он подаёт иск», «суд решит», «доказательства против него», «давать показания», «допрос в суде», police investigation arc, FBI raid as climax, prosecutor briefing scene. "
+    "Если синопсис серии или арки естественно идёт к суду — ПЕРЕПИСЫВАЙ. "
+    "Замена: прямая личная конфронтация / преследование / шантаж / побег / физическое столкновение / разоблачение лицом к лицу / предательство со стороны близкого / угроза похищения / угроза ребёнку / выбор «уйти или остаться» / семейная тайна выходит наружу. Люди — людям, не бумагам и не судьям. "
+    "Закон может СУЩЕСТВОВАТЬ в мире сериала как фон или угроза (полицейский звонит в дверь, юрист звонит по телефону — на 5 секунд), но НЕ должен становиться двигателем серии или арки. Максимум на весь сериал: 1 короткая сцена с legal-фоном (≤30 секунд экрана, нерешающая) — если без неё никак. Никаких длинных сцен в зале суда, никаких подготовок к процессу, никаких сборов доказательств как самостоятельной линии. "
+    "Если в синопсисе появилось «иск», «суд», «судится», «прокурор», «адвокат», «свидетель», «улики», «доказательства», «расследование», «приговор», «слушание», «истец», «ответчик» как двигатель сюжета — ПЕРЕПИШИ через личную конфронтацию или физическое действие. "
     "ПРОВЕРКА ЛОГИКИ — ОБЯЗАТЕЛЬНО: перед финализацией любого синопсиса проверь временную линию. "
     "ПРОВЕРКА ЛОГИКИ — ОБЯЗАТЕЛЬНО: перед финализацией любого синопсиса проверь временную линию. "
     "Если прошли годы с момента секса — персонаж НЕ беременная сейчас от того эпизода. У неё есть РЕБЁНОК N лет. "
@@ -8714,7 +11135,14 @@ _AUDIT_SYSTEM = (
     "You are a strict continuity editor for short-drama scripts. "
     "Compare the SCRIPT against the CANON and the LOGIC BRIEF. "
     "Find every contradiction, timeline impossibility, knowledge leak (character knows "
-    "something they couldn't know), biology/physics violation, or unresolved required setup. "
+    "something they couldn't know), biology/physics violation, unresolved required setup, "
+    "or IMPOSSIBLE NARRATOR PERSPECTIVE. "
+    "IMPOSSIBLE NARRATOR PERSPECTIVE: flag as type='knowledge', severity='critical' when a character "
+    "in a letter/diary/note refers to their OWN DEATH in past tense while the text was written BEFORE "
+    "they died (e.g. 'Three weeks before I died...' in a letter written by the deceased — impossible, "
+    "they could not know they would die). Correct form: 'before what I fear will be my end', "
+    "'should something happen to me', or simply present-tense 'three weeks ago'. "
+    "Also flag when any character demonstrates knowledge of future events they could not have known. "
     "Be ruthless but precise — only flag REAL contradictions backed by canon, not stylistic notes. "
     "ALSO flag SCENE TELEPORTATION as type='scene_teleport', severity='critical': "
     "if the PREVIOUS EPISODE script ended mid-scene (a character had just arrived / a question was hanging / "
@@ -8726,14 +11154,26 @@ _AUDIT_SYSTEM = (
     "Exception: scene change is fine only if the previous episode genuinely closed its scene (private decision, "
     "character walked out, explicit time-jump cliffhanger). When in doubt, flag it. "
     "ALSO flag any DIALOGUE-FIRST RULE violations as type='paperwork', severity='critical': "
-    "any reveal carried by a letter, note, document, file, contract, dossier, text message, "
-    "SMS, chat bubble, email, on-screen UI, computer/phone screen, photograph handed over, "
+    "any reveal carried by a letter, note, document, file, contract, dossier, envelope, evidence binder, "
+    "text message, SMS, chat bubble, email, on-screen UI, computer/phone screen, photograph handed over, "
+    "USB drive / flash card / hidden recording being played, surveillance/CCTV being watched, "
     "diary, voiceover, news headline, radio report, or silent flashback montage. "
     "Reveals MUST come through spoken dialogue (accusations, taunts, confessions). "
-    "A short physical object (ring, test, key, photo) may appear silently for 1–2s ONCE per "
-    "episode IF a character immediately verbalizes its meaning aloud. "
+    "A short physical object (ring, test, key, photo) may appear silently for 1–2s only ONCE in the "
+    "entire series IF a character immediately verbalizes its meaning aloud — not once per episode. "
     "A single note ≤6 words is allowed only if the punch hinges on those exact words and there "
     "is no spoken alternative. Otherwise → flag as critical paperwork violation. "
+    "ALSO flag any LEGAL/COURTROOM PLOT ENGINE as type='legal_engine', severity='critical': "
+    "the episode is driven by a lawsuit, court case, trial, deposition, hearing, plea, settlement, "
+    "indictment, evidence-gathering arc, lawyer strategy session, prosecutor briefing, courtroom scene "
+    "(cross-examination / verdict / judge / jury), 'we need proof to win in court', 'see you in court', "
+    "'I'm filing tomorrow', 'the case goes to trial', police-investigation procedural arc as the "
+    "primary engine, raid as climax, or scene set in COURTROOM / LAW FIRM / JUDGE'S CHAMBERS / "
+    "DEPOSITION ROOM / PROSECUTOR'S OFFICE / EVIDENCE LOCKER / DA'S OFFICE as the scene that delivers "
+    "the episode's main turn. Law may exist as one-line atmosphere (a detective calls, a lawyer is "
+    "mentioned in passing) but never as the engine. Fix: rewrite the beat as face-to-face personal "
+    "confrontation — accusation, blackmail, ultimatum, chase, betrayal, physical clash, exposure in "
+    "front of a third party. People against people, not people against the legal system. "
     "Severity: 'critical' = breaks the story logic OR violates dialogue-first rule; 'minor' = "
     "inconsistency but watchable. "
     "LANGUAGE RULES FOR THE OUTPUT — STRICT: "
@@ -8743,7 +11183,7 @@ _AUDIT_SYSTEM = (
     "action-line replacements in RUSSIAN. Inside one 'fix' value you may mix both if it spans both. "
     "Do NOT translate dialogue replacements into Russian — those must stay English so the writer can paste them in. "
     "Respond ONLY with valid JSON: "
-    '{"passes": bool, "violations": [{"type":"timeline|fact|knowledge|biology|setup|paperwork|scene_teleport", '
+    '{"passes": bool, "violations": [{"type":"timeline|fact|knowledge|biology|setup|paperwork|legal_engine|scene_teleport", '
     '"severity":"critical|minor", "where":"описание места по-русски", "explanation":"что не так — по-русски", "fix":"replacement (English dialogue / Russian action)"}]} '
     "passes=true ONLY if zero critical violations."
 )
@@ -8789,7 +11229,44 @@ _LOGIC_HOLE_AUDIT_SYSTEM = (
     "Cliffhanger should imply a clear next move (release the file, publish, expose, leave) even if "
     "the resolution is held back. Suggest a sharper alternative.\n"
     "\n"
-    "Severity rules: 'critical' = breaks viewer's suspension of disbelief (can't follow the story); "
+    "7. PLOT REPETITION (type='plot_repetition'): the script uses a narrative delivery mechanism "
+    "(written_message, overheard_dialogue, phone_call_stranger, dream_flashback, confession_direct, "
+    "discovery_object, confrontation_domestic, confrontation_public, betrayal_reveal, rescue_escape, "
+    "legal_threat, ally_arrives, surveillance_caught, blackmail, accident_staged) that was already "
+    "used 3+ times in this series according to the PLOT DEVICES context provided. "
+    "Severity: 'minor'. Fix: suggest a concrete alternative mechanism from the available list.\n"
+    "\n"
+    "8. PROTAGONIST STAGNATION (type='protagonist_stagnation'): the protagonist ends this episode "
+    "in the same or worse position AND has not made any concrete progress toward their goal. "
+    "Flag ONLY when the NARRATIVE MOMENTUM context shows 4+ consecutive 'antagonist_wins' episodes. "
+    "Severity: 'minor'. Fix: suggest one concrete thing the protagonist achieves or changes by episode end.\n"
+    "\n"
+    "9. EMOTIONAL MONOTONY (type='emotional_monotony'): the episode's closing emotional beat is "
+    "identical to the previous 3+ episodes (same closing_emotion pattern from NARRATIVE MOMENTUM). "
+    "Flag ONLY when the pattern is clear from the context provided. "
+    "Severity: 'minor'. Fix: suggest a different emotional resolution that still fits the story logic.\n"
+    "\n"
+    "10. SCENE OVERCROWDING (type='scene_overcrowding'): a scene has more speaking characters than the "
+    "series limit specified in the LOGIC CONSTRAINTS brief under 'ЛИМИТ ПЕРСОНАЖЕЙ В СЦЕНЕ'. "
+    "Count ONLY characters who speak at least one line or perform a named action — not background crowd/extras. "
+    "Flag ONLY when the LOGIC CONSTRAINTS brief explicitly states a limit AND the script violates it. "
+    "Severity: 'critical'. Fix: specify which character(s) to remove from the scene and how to restructure it "
+    "(e.g. split into two consecutive scenes, or cut secondary characters to single-line cameos).\n"
+    "\n"
+    "11. FINALE DRIFT (type='finale_drift'): the script CONTRADICTS or makes impossible the user-pinned "
+    "STORY TRAJECTORY (finale / checkpoints) that appears at the top of the LOGIC CONSTRAINTS brief. "
+    "Trigger when the script: (a) kills, exposes, jails, or otherwise neutralizes a character the finale "
+    "or an upcoming checkpoint needs in a specific state; (b) resolves a conflict the finale needs "
+    "unresolved; (c) introduces a competing climax that steals the finale's moment; (d) when this IS "
+    "the finale episode (distance = 0) — fails to execute the finale's specified events with the "
+    "specified characters; (e) introduces a NEW major villain / culprit / love interest that the user "
+    "finale or checkpoints never reference. "
+    "Severity: 'critical'. Fix: identify which finale/checkpoint constraint is violated and propose "
+    "a rewrite (specific lines / actions to change) that keeps the trajectory intact. "
+    "If no STORY TRAJECTORY block is present in the brief — DO NOT flag this type.\n"
+    "\n"
+    "Severity rules: 'critical' = breaks viewer's suspension of disbelief (can't follow the story) "
+    "OR contradicts the user-pinned trajectory; "
     "'minor' = noticeable on rewatch but doesn't break first-viewing.\n"
     "\n"
     "LANGUAGE RULES FOR THE OUTPUT — STRICT:\n"
@@ -8802,7 +11279,7 @@ _LOGIC_HOLE_AUDIT_SYSTEM = (
     "Be PRECISE in 'where', be SPECIFIC in 'fix' — write the exact replacement line, not a vague suggestion.\n"
     "\n"
     "Output ONLY valid JSON: "
-    '{"passes": bool, "violations": [{"type":"status|hidden_position|enabling_condition|legal_term|unmotivated_delay|ambiguous_cliffhanger", '
+    '{"passes": bool, "violations": [{"type":"status|hidden_position|enabling_condition|legal_term|unmotivated_delay|ambiguous_cliffhanger|plot_repetition|protagonist_stagnation|emotional_monotony|scene_overcrowding|finale_drift", '
     '"severity":"critical|minor", "where":"описание места по-русски", "explanation":"что не так и почему зритель заметит — по-русски", '
     '"fix":"replacement (English dialogue / Russian action)"}]} '
     "passes=true ONLY if zero critical violations."
@@ -8840,13 +11317,20 @@ def audit_logic_holes(sid, num, script):
                 'it as missing — treat it as already justified.\n\n'
             )
 
+    # Build plot-device history for repetition auditing
+    try:
+        audit_devices_block = _build_plot_device_history(sid, num)
+    except Exception:
+        audit_devices_block = ''
+
     context = (
         f'Series: "{s.get("title") or ""}" | Genre: {s.get("genre") or ""}\n'
         f'Series arc: {(s.get("arc") or "")[:600]}\n'
         f'Episode {num} synopsis: {ep.get("synopsis") or ""}\n\n'
+        + (audit_devices_block if audit_devices_block else '')
         + prev_block
         + f'=== SCRIPT TO AUDIT (episode {num}) ===\n{script}\n\n'
-        'Find every STORY LOGIC HOLE per the schema. Be ruthless about the 6 categories. '
+        'Find every STORY LOGIC HOLE per the schema. Be ruthless about the 7 categories. '
         'Reminder: only flag issues in the EPISODE-TO-AUDIT script. Use the previous-episode '
         'context purely to avoid false positives on things already established.'
     )
@@ -8961,6 +11445,656 @@ def _format_canon_for_prompt(canon, max_facts=40, max_timeline=10):
     return '\n'.join(parts)
 
 
+def _extract_devices_from_script(script: str) -> list:
+    """Lightweight Haiku call: detect which DEVICE_TAXONOMY entries this script uses.
+    Returns list of {"id": device_id, "fn": device_function} dicts (max 4).
+    On any failure returns [].
+    """
+    if not script or not script.strip():
+        return []
+    taxonomy_str = ', '.join(DEVICE_TAXONOMY)
+    functions_str = ', '.join(DEVICE_FUNCTIONS)
+    prompt = (
+        f'Analyze this short-drama script and identify the narrative delivery mechanisms used.\n\n'
+        f'TAXONOMY (pick ONLY from this list): {taxonomy_str}\n'
+        f'FUNCTIONS (pick ONLY from this list): {functions_str}\n\n'
+        f'Return JSON array of up to 4 objects, each: {{"id": "<taxonomy_item>", "fn": "<function_item>"}}.\n'
+        f'Only include mechanisms that are clearly present. If none match, return [].\n'
+        f'Return ONLY the JSON array, no explanation.\n\n'
+        f'SCRIPT:\n{script[:6000]}'
+    )
+    try:
+        raw = claude_ask(prompt, system='', model='claude-haiku-4-5', max_tokens=300)
+        raw = strip_json(raw)
+        data = json.loads(raw)
+        if not isinstance(data, list):
+            return []
+        result = []
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            dev_id = item.get('id', '')
+            dev_fn = item.get('fn', '')
+            if dev_id in DEVICE_TAXONOMY and dev_fn in DEVICE_FUNCTIONS:
+                result.append({'id': dev_id, 'fn': dev_fn})
+        return result[:4]
+    except Exception as e:
+        print(f'[devices] extract failed: {e}', flush=True)
+        return []
+
+
+def _extract_narrative_state_from_script(script: str) -> dict:
+    """Haiku call: extract narrative state from script.
+    Returns {"archetype": str, "power_delta": str, "closing_emotion": str, "antagonist_momentum": str}
+    or {} on failure.
+    """
+    if not script or not script.strip():
+        return {}
+    archetypes_str   = ', '.join(NARRATIVE_ARCHETYPES)
+    power_str        = ', '.join(NARRATIVE_POWER_DELTA)
+    emotions_str     = ', '.join(NARRATIVE_EMOTIONS)
+    ant_str          = ', '.join(NARRATIVE_ANT_MOMENTUM)
+    prompt = (
+        f'Analyze this short-drama episode script and classify its narrative state.\n\n'
+        f'archetype — ONE of: {archetypes_str}\n'
+        f'power_delta — who ends the episode with more power: ONE of: {power_str}\n'
+        f'closing_emotion — dominant viewer emotion at episode end: ONE of: {emotions_str}\n'
+        f'antagonist_momentum — how is the antagonist\'s trajectory: ONE of: {ant_str}\n\n'
+        f'Return ONLY valid JSON, no explanation:\n'
+        f'{{"archetype":"...","power_delta":"...","closing_emotion":"...","antagonist_momentum":"..."}}\n\n'
+        f'SCRIPT:\n{script[:6000]}'
+    )
+    try:
+        raw = claude_ask(prompt, system='', model='claude-haiku-4-5', max_tokens=120, timeout=30)
+        raw = strip_json(raw)
+        data = json.loads(raw)
+        result = {}
+        if data.get('archetype') in NARRATIVE_ARCHETYPES:
+            result['archetype'] = data['archetype']
+        if data.get('power_delta') in NARRATIVE_POWER_DELTA:
+            result['power_delta'] = data['power_delta']
+        if data.get('closing_emotion') in NARRATIVE_EMOTIONS:
+            result['closing_emotion'] = data['closing_emotion']
+        if data.get('antagonist_momentum') in NARRATIVE_ANT_MOMENTUM:
+            result['antagonist_momentum'] = data['antagonist_momentum']
+        return result
+    except Exception as e:
+        print(f'[narrative] state extract failed: {e}', flush=True)
+        return {}
+
+
+def _update_devices_index(sid: str, num: int, devices: list):
+    """Update series devices_index with extracted devices from episode num.
+    Idempotent: skips if ep already registered for that device.
+    Validates device_id against DEVICE_TAXONOMY — unknown ids are skipped.
+    """
+    if not devices:
+        return
+    s = load_series(sid)
+    if s is None:
+        return
+    s.setdefault('devices_index', {})
+    s.setdefault('cadence_policy', {'default_min_gap': 4, 'hard_limit': 3})
+
+    ep = load_episode(sid, num)
+    if ep is not None and not ep.get('plot_devices'):
+        ep['plot_devices'] = devices
+        save_episode(sid, num, ep)
+
+    changed = False
+    for d in devices:
+        dev_id = d.get('id', '')
+        dev_fn = d.get('fn', '')
+        if dev_id not in DEVICE_TAXONOMY:
+            print(f'[devices] WARN: unknown device_id "{dev_id}" — skipping', flush=True)
+            continue
+        entries = s['devices_index'].setdefault(dev_id, [])
+        # Idempotent: skip if this ep is already recorded
+        if any(e.get('ep') == num for e in entries):
+            continue
+        entries.append({'ep': num, 'fn': dev_fn})
+        changed = True
+
+    if changed:
+        save_series(sid, s)
+
+
+def _update_narrative_index(sid: str, num: int, state: dict):
+    """Update series narrative_index with extracted state from episode num.
+    narrative_index is a list of {"ep": int, "archetype": str, "power_delta": str,
+    "closing_emotion": str, "antagonist_momentum": str} entries, sorted by ep.
+    Idempotent: replaces existing entry for same ep num.
+    """
+    if not state:
+        return
+    s = load_series(sid)
+    if s is None:
+        return
+    s.setdefault('narrative_index', [])
+    # Remove old entry for this ep (if any) then append new
+    s['narrative_index'] = [e for e in s['narrative_index'] if e.get('ep') != num]
+    entry = {'ep': num, **state}
+    s['narrative_index'].append(entry)
+    s['narrative_index'].sort(key=lambda e: e.get('ep', 0))
+    # Also store on episode itself
+    ep = load_episode(sid, num)
+    if ep is not None:
+        ep['narrative_state'] = state
+        save_episode(sid, num, ep)
+    save_series(sid, s)
+
+
+def _build_plot_device_history(sid: str, num: int) -> str:
+    """Build the plot-device constraint block for episode num's generation prompt.
+    Returns empty string if no history exists (zero regression).
+    """
+    s = load_series(sid)
+    if s is None:
+        return ''
+    index = s.get('devices_index') or {}
+    if not index:
+        return ''
+
+    policy = s.get('cadence_policy') or {}
+    min_gap = int(policy.get('default_min_gap', 4))
+    hard_limit = int(policy.get('hard_limit', 3))
+
+    lines = []
+    for dev_id in DEVICE_TAXONOMY:
+        entries = index.get(dev_id)
+        if not entries:
+            continue
+        count = len(entries)
+        last_ep = max(e.get('ep', 0) for e in entries)
+        gap = num - last_ep  # episodes since last use
+
+        if count >= hard_limit:
+            status = f'🚫 {dev_id} × {count} (last: ep{last_ep}) — FORBIDDEN (used {count}+ times)'
+        elif gap < min_gap:
+            status = f'⚠️  {dev_id} × {count} (last: ep{last_ep}) — caution (used recently)'
+        else:
+            status = f'✓  {dev_id} × {count} (ep{last_ep}) — available'
+        lines.append(status)
+
+    if not lines:
+        return ''
+
+    return (
+        '═══ PLOT DEVICES ALREADY USED — VARIETY REQUIRED ═══\n'
+        + '\n'.join(lines)
+        + '\n\nRULE: 🚫 devices are FORBIDDEN this episode. ⚠️ devices: avoid unless completely transformed.\n'
+        'Use a mechanism not in this list, or pick from ✓ column.\n'
+        '═══════════════════════════════════════════════════\n\n'
+    )
+
+
+def _build_crowd_constraint_block(s) -> str:
+    """Build a hard scene character-count constraint block from the series settings.
+    Returns empty string when max_main_chars_per_scene is not configured.
+    """
+    try:
+        n = int(s.get('max_main_chars_per_scene') or 0)
+    except (TypeError, ValueError):
+        return ''
+    if n < 1 or n > 6:
+        return ''
+    if n == 1:
+        rule = (
+            'ОДИНОЧНЫЕ СЦЕНЫ: ровно 1 главный персонаж на сцену. '
+            'Второй может зайти максимум на 1-2 реплики (вошёл → сказал → ушёл). '
+            'Сцены с двумя полноценными участниками — запрещены.'
+        )
+    elif n == 2:
+        rule = (
+            '2 ГЛАВНЫХ ПЕРСОНАЖА В СЦЕНЕ — строгий максимум. '
+            'Третий персонаж может появиться только чтобы произнести ровно одну реплику-объявление и уйти. '
+            'НИКАКИХ сцен где 3+ именованных персонажа одновременно участвуют в диалоге или конфликте.'
+        )
+    else:
+        rule = (
+            f'МАКСИМУМ {n} ГЛАВНЫХ ПЕРСОНАЖА в одной сцене. '
+            f'В большинстве сцен — 2. До {n} — только для финальной кульминационной конфронтации, '
+            f'не чаще одного раза за серию. '
+            f'Сцены с {n+1}+ именованными участниками — категорически запрещены.'
+        )
+    return (
+        f'═══ HARD RULE: ЛИМИТ ПЕРСОНАЖЕЙ В СЦЕНЕ ═══\n'
+        f'НАСТРОЙКА СЕРИАЛА: не более {n} главных персонажей одновременно в одной сцене.\n'
+        f'{rule}\n'
+        f'НЕ считается: массовка, гости, прохожие, охрана без реплик — лимит ТОЛЬКО на тех, '
+        f'кто говорит или выполняет действие в сцене.\n'
+        f'НАРУШЕНИЕ = сцена переписывается. Это жёсткое ограничение продакшна.\n'
+        f'Если для сюжета нужно собрать больше {n} персонажей — РАЗБЕЙ на несколько '
+        f'последовательных сцен (один уходит → другой заходит) ИЛИ дай большинству молчать '
+        f'в кадре (только {n} реально говорящих/действующих, остальные — фон).\n'
+        f'═══════════════════════════════════════════════\n\n'
+    )
+
+
+def _count_speaking_characters_per_scene(script: str, cast_names: list[str]) -> list[dict]:
+    """Programmatic scan of a generated script to count NAMED-CAST characters with speaking
+    lines or named actions in each scene. Returns one dict per scene:
+        {scene_idx, location, characters: [names], count}
+
+    Scenes are delimited by INT./EXT./ИНТ./ЭКСТ. headers OR by [BLOCKING] open/close fences.
+    A character "speaks" when a line matches `NAME:` at the start (allowing English/Cyrillic).
+    A character is "named in action" when their cast name appears as a word in an action-line.
+    """
+    if not script or not cast_names:
+        return []
+    cast_set = {n.strip() for n in cast_names if n and n.strip()}
+    # Split into scenes — primary delimiter: INT./EXT./ИНТ./ЭКСТ. headers.
+    scene_header_re = re.compile(
+        r'^\s*(?:INT\.|EXT\.|ИНТ\.|ЭКСТ\.|INT/EXT\.)\s+(.+?)(?:\s+—|\s+–|\s+-|\s+/|\s*$)',
+        re.IGNORECASE | re.MULTILINE,
+    )
+    # Cut-marker break too (for batch chunks)
+    cut_marker_re = re.compile(r'═══\s*END\s+EPISODE\s+\d+', re.IGNORECASE)
+
+    # Find all scene start positions
+    starts = []
+    for m in scene_header_re.finditer(script):
+        starts.append((m.start(), m.group(1).strip()))
+    for m in cut_marker_re.finditer(script):
+        starts.append((m.start(), '<cut>'))
+    starts.sort(key=lambda x: x[0])
+
+    if not starts:
+        # No scene headers — treat whole script as one scene
+        starts = [(0, 'whole script')]
+
+    # Build scene chunks
+    scenes = []
+    for i, (pos, loc) in enumerate(starts):
+        end = starts[i + 1][0] if i + 1 < len(starts) else len(script)
+        chunk = script[pos:end]
+        scenes.append({'idx': i + 1, 'location': loc, 'text': chunk})
+
+    # Dialogue line pattern: "NAME: ..." (case-insensitive matching against cast)
+    # Capture token before colon at line start (allow leading whitespace).
+    dialogue_line_re = re.compile(r'^\s*([A-ZА-ЯЁ][A-ZA-Zа-яёА-ЯЁ\.\-\' ]{1,40})\s*:', re.MULTILINE)
+
+    result = []
+    for sc in scenes:
+        text = sc['text']
+        # Skip the trailing BLOCKING_END payload — it sometimes lists all 6 figs as a stage diagram
+        # which inflates the count. We want only spoken/active beats in the actual scene body.
+        body = text
+        # Drop [BLOCKING_END] ... fence content from the count (it's prod blocking, not dialogue)
+        body = re.sub(r'\[BLOCKING_END\].*?(?=\n\s*\n|\Z)', '', body, flags=re.DOTALL)
+        # Also drop [BLOCKING] ... fence (only initial stage notes — but actually these DO list
+        # characters who will be in the scene with actions. So we count them too, but ONLY
+        # those who also have a dialogue or an action elsewhere in the body OR are listed in BLOCKING.)
+        speakers = set()
+        for m in dialogue_line_re.finditer(body):
+            name = m.group(1).strip().rstrip('.').strip()
+            # Match against canonical cast — exact or case-insensitive
+            for cn in cast_set:
+                if cn.lower() == name.lower():
+                    speakers.add(cn)
+                    break
+                # Also handle "DR. FINCH" matching "Dr. Harold Finch" — prefix match on lowercase
+                if cn.lower().startswith(name.lower()) and len(name) >= 4:
+                    speakers.add(cn)
+                    break
+        # Also pick up characters mentioned in BLOCKING with explicit actions (sits / stands / etc.)
+        blocking_re = re.compile(r'\[BLOCKING\](.*?)\[/BLOCKING\]', re.DOTALL | re.IGNORECASE)
+        for bm in blocking_re.finditer(text):
+            block_text = bm.group(1)
+            # Each line: NAME: action :: OUTFIT: ...
+            for line in block_text.splitlines():
+                ml = re.match(r'\s*([A-ZА-ЯЁ][A-ZA-Zа-яёА-ЯЁ\.\-\' ]{1,40})\s*:', line)
+                if ml:
+                    name = ml.group(1).strip().rstrip('.').strip()
+                    if name.lower() in ('location', 'outfit', 'outfit_desc'):
+                        continue
+                    for cn in cast_set:
+                        if cn.lower() == name.lower():
+                            speakers.add(cn)
+                            break
+                        if cn.lower().startswith(name.lower()) and len(name) >= 4:
+                            speakers.add(cn)
+                            break
+
+        result.append({
+            'idx': sc['idx'],
+            'location': sc['location'],
+            'characters': sorted(speakers),
+            'count': len(speakers),
+        })
+    return result
+
+
+def detect_scene_overcrowding(s, script: str) -> list[dict]:
+    """Return list of scene-overcrowding violations relative to series' max_main_chars_per_scene.
+    Each violation: {scene_idx, location, count, limit, characters}.
+    Empty list = no violations or no limit configured.
+    """
+    try:
+        limit = int(s.get('max_main_chars_per_scene') or 0)
+    except (TypeError, ValueError):
+        return []
+    if limit < 1 or limit > 6:
+        return []
+    cast_names = [(c.get('name') or '').strip() for c in (s.get('characters') or [])
+                  if (c.get('name') or '').strip()]
+    if not cast_names:
+        return []
+    scenes = _count_speaking_characters_per_scene(script, cast_names)
+    violations = []
+    for sc in scenes:
+        if sc['count'] > limit:
+            violations.append({
+                'scene_idx': sc['idx'],
+                'location': sc['location'],
+                'count': sc['count'],
+                'limit': limit,
+                'characters': sc['characters'],
+            })
+    return violations
+
+
+def _script_runtime_metrics(script: str) -> dict:
+    """Programmatic length scan — counts dialogue lines + spoken words + action lines
+    + estimated runtime.
+
+    Returns:
+        dialogue_lines, dialogue_words, action_lines, longest_line_words, avg_line_words,
+        est_runtime_sec.
+
+    Heuristic (calibrated against real TikTok/Reels short drama timings):
+      - Spoken delivery: ~150 wpm for plain rapid dialogue, dropping to ~120 wpm for
+        long emotional beats. We use 135 wpm midpoint.
+      - Each dialogue beat: +1.2s baseline for the actor's "settle" + reaction
+        (longer beats need more visual support, so we add another +0.8s per beat
+        with >8 words).
+      - Each action line (non-dialogue narrative outside [BLOCKING]): +2.0s — actions
+        like "She picks up the phone" or "He walks across the room" take real screen
+        time even with no words spoken.
+      - Looks for explicit time markers in action lines ("две минуты молча", "for ten
+        seconds") and adds them — writers sometimes script multi-minute beats in a
+        single sentence.
+    """
+    if not script:
+        return {
+            'dialogue_lines': 0, 'dialogue_words': 0, 'action_lines': 0,
+            'longest_line_words': 0, 'avg_line_words': 0, 'est_runtime_sec': 0,
+        }
+    dialogue_re = re.compile(r'^\s*[A-ZА-ЯЁ][A-ZA-Zа-яёА-ЯЁ\.\-\' ]{1,40}:\s*(.*)$')
+    # Skip lines inside [BLOCKING]/[BLOCKING_END] / scene headers / cut-markers
+    scene_header_re = re.compile(r'^\s*(?:INT\.|EXT\.|ИНТ\.|ЭКСТ\.|INT/EXT\.)', re.IGNORECASE)
+    cut_marker_re   = re.compile(r'═══\s*END\s+EPISODE', re.IGNORECASE)
+    # Time markers in narrative — "две минуты молча", "for 30 seconds", "10 секунд"
+    minute_re = re.compile(r'\b(\d+|одну?|две|три|четыре|пять|десять|fifteen|twenty|thirty)\s*(?:минут|minutes|min)\b', re.IGNORECASE)
+    second_re = re.compile(r'\b(\d+|десять|fifteen|twenty|thirty)\s*(?:секунд|seconds|sec)\b', re.IGNORECASE)
+    _word_to_num = {'one':1,'two':2,'three':3,'four':4,'five':5,'ten':10,'fifteen':15,'twenty':20,'thirty':30,
+                    'одну':1,'один':1,'две':2,'два':2,'три':3,'четыре':4,'пять':5,'десять':10}
+
+    in_blocking = False
+    in_dialogue_continuation = False  # for multi-line dialogue (NAME:\n"line")
+    current_speaker = None
+    dialogue_lines = 0
+    dialogue_words = 0
+    action_lines = 0
+    longest_line_words = 0
+    explicit_time_sec = 0
+    line_word_counts = []
+
+    lines = script.splitlines()
+    for i, raw in enumerate(lines):
+        line = raw.strip()
+        # Toggle BLOCKING fences
+        if '[BLOCKING]' in raw.upper() and '[/BLOCKING]' not in raw.upper():
+            in_blocking = True
+            continue
+        if '[/BLOCKING]' in raw.upper() or '[BLOCKING_END]' in raw.upper():
+            in_blocking = False
+            continue
+        if in_blocking:
+            continue
+        if not line:
+            in_dialogue_continuation = False
+            continue
+        if scene_header_re.match(raw) or cut_marker_re.search(raw):
+            in_dialogue_continuation = False
+            continue
+        if line.startswith('Кратко:') or line.startswith('Episode '):
+            continue
+        # Dialogue header (NAME:)
+        m = dialogue_re.match(raw)
+        if m:
+            current_speaker = True
+            tail = m.group(1).strip()
+            if tail:
+                # Inline dialogue: NAME: text
+                wc = len(tail.split())
+                dialogue_lines += 1
+                dialogue_words += wc
+                line_word_counts.append(wc)
+                if wc > longest_line_words:
+                    longest_line_words = wc
+                in_dialogue_continuation = False
+            else:
+                # Header on its own — next non-empty line is the actual dialogue
+                in_dialogue_continuation = True
+            continue
+        # Continuation of a dialogue header (multi-line: NAME:\n"text")
+        if in_dialogue_continuation:
+            # Strip surrounding quotes
+            tail = line.strip('"').strip("'").strip('«»').strip()
+            if tail:
+                wc = len(tail.split())
+                dialogue_lines += 1
+                dialogue_words += wc
+                line_word_counts.append(wc)
+                if wc > longest_line_words:
+                    longest_line_words = wc
+            in_dialogue_continuation = False
+            continue
+        # Otherwise — action / narrative line
+        action_lines += 1
+        # Scan for explicit time markers
+        for mm in minute_re.finditer(line):
+            raw_v = mm.group(1).lower()
+            n = int(raw_v) if raw_v.isdigit() else _word_to_num.get(raw_v, 0)
+            explicit_time_sec += n * 60
+        for mm in second_re.finditer(line):
+            raw_v = mm.group(1).lower()
+            n = int(raw_v) if raw_v.isdigit() else _word_to_num.get(raw_v, 0)
+            explicit_time_sec += n
+
+    avg_line = round(dialogue_words / dialogue_lines, 1) if dialogue_lines else 0
+
+    # Runtime estimate:
+    spoken_sec = dialogue_words / 135 * 60
+    # Per-beat overhead — short beats 1.2s, long beats +0.8s extra
+    beat_overhead = 0.0
+    for wc in line_word_counts:
+        beat_overhead += 1.2 + (0.8 if wc > 8 else 0)
+    action_sec = action_lines * 2.0
+    # Cap explicit_time_sec at 120s to avoid runaway from typos like "100 минут"
+    explicit_time_sec = min(explicit_time_sec, 120)
+
+    est_runtime = round(spoken_sec + beat_overhead + action_sec + explicit_time_sec)
+
+    return {
+        'dialogue_lines': dialogue_lines,
+        'dialogue_words': dialogue_words,
+        'action_lines': action_lines,
+        'longest_line_words': longest_line_words,
+        'avg_line_words': avg_line,
+        'est_runtime_sec': est_runtime,
+        'explicit_time_sec': explicit_time_sec,
+    }
+
+
+def detect_script_overlength(s, script: str) -> dict:
+    """Programmatic over-length detector. Returns either {} (within budget) or a violation dict.
+
+    Target episode duration comes from series setting `target_duration_sec` (falls back to 60s).
+    Triggers when ANY of:
+      • estimated runtime >130% of target
+      • any single dialogue line >12 words (long monologues kill short-drama pacing)
+      • avg dialogue line >9 words (too talky overall)
+      • action line count >6 (too much narrative business)
+    """
+    try:
+        target_sec = int((s or {}).get('target_duration_sec') or 60)
+    except (TypeError, ValueError):
+        target_sec = 60
+    # Speech budget: ~135 wpm spoken → ~100 words / 60s with pauses
+    target_words = round(target_sec / 60 * 100)
+    target_lines = max(3, min(40, round(target_sec / 4.5)))
+    m = _script_runtime_metrics(script)
+    est_sec = m['est_runtime_sec']
+    dialogue_lines = m['dialogue_lines']
+    dialogue_words = m['dialogue_words']
+    longest_line = m['longest_line_words']
+    avg_line = m['avg_line_words']
+    action_lines = m['action_lines']
+
+    reasons = []
+    if est_sec > target_sec * 1.3:
+        reasons.append(f"runtime ~{est_sec}с ({round(est_sec/target_sec, 1)}× от {target_sec}с лимита)")
+    if longest_line > 12:
+        reasons.append(f"самая длинная реплика {longest_line} слов (лимит 10, идеал 3-7)")
+    if avg_line > 9:
+        reasons.append(f"средняя длина реплики {avg_line} слов (лимит 7, идеал 5)")
+    # Action lines budget proportional to target duration
+    action_budget = max(3, round(target_sec / 12))
+    if action_lines > action_budget * 1.5:
+        reasons.append(f"action-строк {action_lines} (лимит ~{action_budget})")
+
+    if not reasons:
+        return {}
+    return {
+        'target_sec': target_sec,
+        'target_lines': target_lines,
+        'target_words': target_words,
+        'est_sec': est_sec,
+        'dialogue_lines': dialogue_lines,
+        'dialogue_words': dialogue_words,
+        'longest_line_words': longest_line,
+        'avg_line_words': avg_line,
+        'action_lines': action_lines,
+        'ratio': round(est_sec / target_sec, 1),
+        'reasons': reasons,
+    }
+
+
+def _build_narrative_state_block(sid: str, num: int) -> str:
+    """Build the narrative momentum context block for episode num's generation prompt.
+    Returns a POSITIVE DIRECTIVE block (not a prohibition list) showing the story trajectory
+    and what this episode must achieve. Empty string if insufficient data.
+    """
+    s = load_series(sid)
+    if s is None:
+        return ''
+    index = s.get('narrative_index') or []
+    # Only use episodes before current num
+    prior = [e for e in index if e.get('ep', 0) < num]
+    if len(prior) < 2:
+        return ''  # Not enough history yet
+
+    window = prior[-8:]  # Last 8 episodes
+
+    # Build history lines
+    history_lines = []
+    for e in window:
+        ep_num = e.get('ep', '?')
+        arch   = e.get('archetype', '?')
+        pd     = e.get('power_delta', '?')
+        em     = e.get('closing_emotion', '?')
+        am     = e.get('antagonist_momentum', '?')
+        history_lines.append(f"  Ep{ep_num}: {arch} → power: {pd} → mood: {em} | antagonist: {am}")
+
+    # Detect patterns in last 6 episodes
+    last6 = prior[-6:]
+    arch_counts     = Counter(e.get('archetype') for e in last6 if e.get('archetype'))
+    power_counts    = Counter(e.get('power_delta') for e in last6 if e.get('power_delta'))
+    emotion_counts  = Counter(e.get('closing_emotion') for e in last6 if e.get('closing_emotion'))
+    ant_counts      = Counter(e.get('antagonist_momentum') for e in last6 if e.get('antagonist_momentum'))
+
+    # Device history — keep as secondary signal
+    dev_index = s.get('devices_index') or {}
+    device_warnings = []
+    for dev_id in DEVICE_TAXONOMY:
+        entries = dev_index.get(dev_id, [])
+        if len(entries) >= 3:
+            last_ep = max(e.get('ep', 0) for e in entries)
+            device_warnings.append(f"  • {dev_id} — использован {len(entries)} раз (последний: ep{last_ep}) — ИСЧЕРПАН нарративно")
+
+    # Build pattern warnings
+    pattern_alerts = []
+    overused_archs = [a for a, n in arch_counts.items() if n >= 3]
+    if overused_archs:
+        pattern_alerts.append(f"⚠️  Archetype '{overused_archs[0]}' — {arch_counts[overused_archs[0]]} из последних 6 серий")
+
+    ant_losing_streak = power_counts.get('antagonist_wins', 0)
+    if ant_losing_streak >= 4:
+        pattern_alerts.append(f"⚠️  Протагонист проигрывает {ant_losing_streak} из последних 6 серий — зритель потерял веру")
+
+    prot_winning_streak = power_counts.get('protagonist_wins', 0)
+    if prot_winning_streak >= 4:
+        pattern_alerts.append(f"⚠️  Протагонист побеждает {prot_winning_streak} из последних 6 — нужен серьёзный setback")
+
+    dominant_emotion = emotion_counts.most_common(1)
+    if dominant_emotion and dominant_emotion[0][1] >= 4:
+        pattern_alerts.append(f"⚠️  Финальная эмоция '{dominant_emotion[0][0]}' повторяется {dominant_emotion[0][1]} раз — зритель привыкает")
+
+    # Build REQUIRED directives
+    directives = []
+    if overused_archs:
+        forbidden_arch_str = ', '.join(overused_archs)
+        allowed_archs = [a for a in NARRATIVE_ARCHETYPES if a not in overused_archs]
+        directives.append(f"→ archetype: НЕ '{forbidden_arch_str}' — выбери из: {', '.join(allowed_archs[:4])}")
+    if ant_losing_streak >= 4:
+        directives.append(f"→ power_delta: ДОЛЖЕН БЫТЬ protagonist_wins — протагонист добивается РЕАЛЬНОЙ победы, не просто 'узнаёт что-то'")
+    if dominant_emotion and dominant_emotion[0][1] >= 4:
+        bad_em = dominant_emotion[0][0]
+        other_ems = [e for e in NARRATIVE_EMOTIONS if e != bad_em]
+        directives.append(f"→ closing_emotion: НЕ '{bad_em}' снова — целься в: {', '.join(other_ems[:3])}")
+    if ant_counts.get('escalating', 0) >= 4:
+        directives.append(f"→ antagonist: должен впервые столкнуться с серьёзным препятствием, ошибкой или неожиданным осложнением")
+    if device_warnings:
+        directives.append(f"→ info-delivery: НЕ использовать исчерпанные механизмы (см. список ниже)")
+
+    if not pattern_alerts and not directives:
+        # Story has good variety — just show history as context, no hard directives
+        block = (
+            '═══ NARRATIVE MOMENTUM (последние серии) ═══\n'
+            + '\n'.join(history_lines)
+            + '\n✓ Хорошее разнообразие — продолжай варьировать archetype и emotional close.\n'
+            '═══════════════════════════════════════════════════\n\n'
+        )
+        return block
+
+    # Build the full block
+    lines = ['═══ NARRATIVE MOMENTUM — ИСТОРИЯ КАК ЕЁ ВИДИТ ЗРИТЕЛЬ ═══']
+    lines.append('Последние серии:')
+    lines.extend(history_lines)
+    if pattern_alerts:
+        lines.append('')
+        lines.extend(pattern_alerts)
+    lines.append('')
+    lines.append('════ ЭТОТ ЭПИЗОД ДОЛЖЕН ════')
+    if directives:
+        lines.extend(directives)
+    else:
+        lines.append('→ Поддержи хорошее разнообразие — не повторяй ни archetype, ни emotional close прошлой серии')
+    if device_warnings:
+        lines.append('')
+        lines.append('Исчерпанные info-delivery механизмы (не использовать):')
+        lines.extend(device_warnings)
+    lines.append('')
+    lines.append('ГЛАВНОЕ: каждый эпизод должен заканчиваться в ДРУГОМ эмоциональном состоянии, чем предыдущий.')
+    lines.append('Разнообразие — это не смена декораций, это смена того, кто побеждает и что зритель чувствует.')
+    lines.append('═══════════════════════════════════════════════════')
+    lines.append('')
+
+    return '\n'.join(lines)
+
+
 def build_logic_brief(sid, num):
     """Pre-write: produce a constraints brief for episode `num` from canon + recent context."""
     s = load_series(sid)
@@ -9001,9 +12135,47 @@ def build_logic_brief(sid, num):
         'Будь предельно конкретным. Если поле пустое — напиши "—". Не больше 25 строк всего.'
     )
     try:
-        return claude_ask_fast(prompt, system=_BRIEF_SYSTEM).strip()
+        brief = claude_ask_fast(prompt, system=_BRIEF_SYSTEM).strip()
     except Exception as e:
-        return f'(logic brief generation failed: {e})'
+        brief = f'(logic brief generation failed: {e})'
+    # Append format-mode block (short_drama vs instagram_series) — top of brief
+    try:
+        fmt_block = _format_mode_block(s, sections=['episode_rule', 'pace_rule'])
+        if fmt_block:
+            brief = f'## FORMAT MODE\n{fmt_block}\n' + brief
+    except Exception:
+        pass
+    # Prepend user-pinned story trajectory (finale + checkpoints) — this is the
+    # signal that the auditor and the writer both need to honor. Without it
+    # surfaced at the top of the brief, the auditor cannot flag finale drift.
+    try:
+        traj = build_trajectory_block(s, num)
+        if traj:
+            brief = f'## STORY TRAJECTORY (USER-PINNED LANDMARKS)\n{traj}\n' + brief
+    except Exception:
+        pass
+    # Append scene character cap rule (hard production constraint)
+    try:
+        crowd_rule = _build_crowd_constraint_block(s)
+        if crowd_rule:
+            brief += f'\n\n## ЛИМИТ ПЕРСОНАЖЕЙ В СЦЕНЕ (HARD RULE)\n{crowd_rule}'
+    except Exception:
+        pass
+    # Append narrative momentum context to brief
+    try:
+        narrative_block = _build_narrative_state_block(sid, num)
+        if narrative_block:
+            brief += f'\n\n## NARRATIVE MOMENTUM — VARIETY REQUIRED\n{narrative_block}'
+    except Exception:
+        pass
+    # Append plot-device forbidden list if present (secondary signal)
+    try:
+        devices_block = _build_plot_device_history(sid, num)
+        if devices_block:
+            brief += f'\n\n## ИСЧЕРПАННЫЕ INFO-DELIVERY МЕХАНИЗМЫ\n{devices_block}'
+    except Exception:
+        pass
+    return brief
 
 
 def audit_script(sid, num, script, brief):
@@ -9155,11 +12327,63 @@ Wrong (FORBIDDEN — this is a generation failure):
     Sophie открывает коробку.            ← starts with action, NO SCENE HEADING = FAIL
 
 Rules for the scene heading:
-- Location name MUST be in ENGLISH (e.g. FATHER'S STUDY, DETECTIVE'S OFFICE, STORAGE UNIT, COURTROOM)
-- FORBIDDEN Russian location names: КАБИНЕТ, СКЛАД, ЗАЛ СУДА, ОФИС, ГОСТИНАЯ, etc. — always translate to English
+- Location name MUST be in ENGLISH (e.g. FATHER'S STUDY, HOTEL SUITE, STORAGE UNIT, ROOFTOP, HOSPITAL CORRIDOR)
+- FORBIDDEN Russian location names: КАБИНЕТ, СКЛАД, ОФИС, ГОСТИНАЯ, etc. — always translate to English
+- AVOID legal/courtroom locations as primary scene (COURTROOM, LAW FIRM, JUDGE'S CHAMBERS, DEPOSITION ROOM, EVIDENCE LOCKER, PROSECUTOR'S OFFICE, PRISON VISITING ROOM as repeat setting) — drama lives in homes, bedrooms, kitchens, hallways, hotel rooms, cars, rooftops, hospitals, NOT in courthouses
 - Format: ИНТА. ENGLISH LOCATION NAME — ВРЕМЯ
 - Even if the scene CONTINUES from the same location as the previous episode — write the heading again
 - Every new scene within the episode also gets its own heading
+
+═══════════════════════════════════════
+POSITION BLOCKS — MANDATORY IN EVERY EPISODE
+═══════════════════════════════════════
+Every episode MUST contain position blocks that anchor character positions for the video generator.
+
+[BLOCKING] — place immediately after EVERY scene heading (both the first heading in the episode AND every new scene within the episode):
+  [BLOCKING]
+  LOCATION: <English location name>
+  CHARACTER_NAME: <position in Russian> :: OUTFIT: <Outfit Name>
+  ... (one line per character PRESENT AT THE START of this scene)
+  [/BLOCKING]
+
+[BLOCKING_END] — place at the very end of the episode (absolute last thing before nothing):
+  [BLOCKING_END]
+  LOCATION: <English location name>
+  CHARACTER_NAME: <final position at episode cut — in Russian>
+  ... (only characters present at episode end)
+  [/BLOCKING_END]
+
+Rules:
+- [BLOCKING] lists ONLY characters present at scene START (not those who enter during the scene)
+- OUTFIT = a short Title Case NAME of the outfit asset, NOT a clothing description. Examples: `Business Suit`, `Casual`, `Pajamas`, `Red Dress`, `School Uniform`, `Hospital Gown`, `Swimsuit`, `Wedding Dress`, `Lab Coat`. The system reuses the same outfit asset every time the same name is used for the same character.
+- When the OUTFIT name is NEW for this character (no previous scene used it) append description with a pipe: `OUTFIT: Pajamas | OUTFIT_DESC: light blue cotton pajamas, bare feet`. For names already introduced in a previous scene of this or any earlier episode, OMIT `| OUTFIT_DESC:`.
+- DEDUP: avoid inventing 10 near-identical labels. If the character is in their default everyday clothes use `Base` (or whatever existing label they have). A new label = a real wardrobe change (uniform / sleepwear / formal / swim / patient / etc).
+- WHO WEARS WHAT — context-driven, per character:
+    • THIS character lying in bed / sleeping / going to sleep → `Pajamas` / `Nightgown` / `Sleepwear`
+    • THIS character at beach / pool → `Swimsuit`
+    • THIS character at funeral / wedding / court / formal event → `Formal Black` / `Wedding Dress` / `Business Suit`
+    • THIS character as hospital PATIENT → `Hospital Gown` (staff who work there stay in their base/uniform)
+    • A character VISITING/SITTING NEXT TO another character's bedroom scene KEEPS their base outfit — bedroom location alone does not auto-pajama everyone.
+- [BLOCKING_END] lists only characters present at the moment of the cut (no OUTFIT field needed — same outfit as scene start)
+- If a PREV_END_POSITION block is provided in the context AND this episode opens in the same scene/location — the [BLOCKING] MUST exactly match that PREV_END_POSITION (same characters, same positions). If starting a new scene, create a fresh [BLOCKING].
+- ⛔ FORBIDDEN: do NOT write [SCENE_OPEN], [/SCENE_OPEN], [EPISODE_END], [/EPISODE_END] — these are OLD deprecated tags. Only [BLOCKING]/[/BLOCKING] and [BLOCKING_END]/[/BLOCKING_END] are valid.
+
+Example (Adrian already has `Business Suit` from a previous scene; Noah's `Pajamas` is new):
+  ИНТА. NOAH'S BEDROOM — НОЧЬ
+
+  [BLOCKING]
+  LOCATION: Noah's Bedroom
+  NOAH: лежит в кровати под одеялом, голова на подушке :: OUTFIT: Pajamas | OUTFIT_DESC: light blue cotton pajamas, bare feet, hair tousled
+  CLARA: сидит на краю кровати, лицом к Noah, рука на одеяле :: OUTFIT: Maid Uniform
+  [/BLOCKING]
+
+  ... lullaby scene ...
+
+  [BLOCKING_END]
+  LOCATION: Noah's Bedroom
+  NOAH: лежит в кровати, глаза закрыты, ровное дыхание
+  CLARA: стоит у двери, оглядывается на Noah
+  [/BLOCKING_END]
 
 LANGUAGE RULES — NON-NEGOTIABLE:
 - DIALOGUE: English only — all spoken lines must be in English
@@ -9442,23 +12666,55 @@ Physical beat rules:
 This is short drama for vertical video. EVERYTHING must be revealed through SPOKEN DIALOGUE between living people on screen.
 
 HARD-BANNED devices (do NOT use them at all):
-  ✗ letters, hand-written notes, printed pages
-  ✗ documents, contracts, files, folders, dossiers being read on screen
+  ✗ letters, hand-written notes, printed pages, envelopes, sealed documents
+  ✗ documents, contracts, files, folders, dossiers, evidence binders being read on screen
   ✗ text messages / SMS / WhatsApp / chat bubbles displayed to the camera
   ✗ emails, on-screen UI, computer screens being read aloud
   ✗ photographs handed over silently as the "reveal"
   ✗ diary entries, journals, voiceover narration
   ✗ newspaper headlines, TV news chyrons, radio reports
   ✗ flashbacks shown as silent montage
+  ✗ audio recordings (dictaphone, voice memos, hidden mic) played in scene
+  ✗ surveillance / CCTV footage being watched on screen
+  ✗ USB drives, flash cards, "the recording is on this", "open this when I'm gone"
   ✗ any "character reads X aloud while alone" moment
 
 If a fact must surface, a CHARACTER says it OUT LOUD to another character — preferably as an accusation, threat, taunt, or confession in conflict.
 
-NARROW exception (use at most ONCE per episode, and only if it is the ONLY way):
+NARROW exception (use at most ONCE across the ENTIRE SERIES — not per episode):
   • A short physical object (e.g. a single ring, a pregnancy test, a key, a photo) can be SHOWN for 1–2 seconds as a silent shock — but a character must immediately react and verbalize the meaning ("That's HER ring." / "You knew. You always knew.").
-  • A single short note ≤ 6 words is permissible only if the entire dramatic punch hinges on those exact words (e.g. "I know what you did."). One per episode max. Never use when dialogue could carry the same beat.
+  • A single short note ≤ 6 words is permissible only if the entire dramatic punch hinges on those exact words (e.g. "I know what you did."). Once per series total, never as a recurring device.
 
-If you catch yourself writing "[X reads the letter]" or "[Y opens the file]" — DELETE it and replace with a face-to-face confrontation where the same information lands as spoken accusation.
+If you catch yourself writing "[X reads the letter]" or "[Y opens the file]" or "[Y receives an envelope]" or "[Y hands him a flash drive]" — DELETE it and replace with a face-to-face confrontation where the same information lands as spoken accusation.
+
+━━━ HARD BAN — LEGAL / COURTROOM / EVIDENCE-GATHERING PLOT ENGINES ━━━
+This is short drama. The story MUST NOT be driven by lawsuits, court cases, trials, depositions, hearings, prosecutor briefings, attorney strategy sessions, evidence-gathering arcs, "we need proof to win in court", police-investigation procedural arcs.
+
+HARD-BANNED as plot engines:
+  ✗ courtroom scenes (cross-examination, verdict, judge ruling, jury deliberation)
+  ✗ depositions, hearings, plea negotiations, settlement talks as the climax
+  ✗ "they take it to court" / "she'll sue them" / "the case goes to trial" / "выйдем в суд"
+  ✗ evidence-gathering arcs: building a file against someone, collecting witnesses, dossier prep
+  ✗ lawyer-strategy scenes ("you can't testify because…", "we need a witness who…")
+  ✗ raids, indictments, arrest warrants as the episode's central engine
+  ✗ "if I have enough proof, the law will finish him" — this is dead screen-time
+  ✗ DA / prosecutor / detective monologues laying out the legal path
+
+Reason: courtroom and legal procedural is the slowest, most static, most exposition-heavy mode possible. It is the OPPOSITE of short-form drama. Vertical-video audience does not watch trials.
+
+Replace legal-escalation beats with PERSONAL ESCALATION:
+  ✓ direct face-to-face confrontation (accusation, slap, ultimatum)
+  ✓ blackmail spoken aloud between two people
+  ✓ kidnapping / chase / physical clash
+  ✓ betrayal by someone close (ally turns, family member reveals truth)
+  ✓ secret child / pregnancy / identity exposed in conversation
+  ✓ public humiliation at a wedding / gala / dinner
+  ✓ a character walks away / disappears / shows up unexpectedly
+  ✓ violence on screen (a fight, a push, a weapon raised)
+
+Law can EXIST in the world as one-line atmosphere ("a detective called", "my lawyer is on his way") but never as the engine of a scene. A police officer arriving at the door is allowed once per series as a cliffhanger SHOCK — never as setup for a procedural arc.
+
+If you catch yourself writing "[X testifies]", "[opens evidence file]", "[the judge enters]", "[deposition begins]", "court hearing", "DA's office", "prosecutor briefing" — DELETE the scene and rewrite the same plot point as a face-to-face personal confrontation.
 
 FORMAT RULES:
 - Scene headings: INT./EXT. LOCATION — DAY/NIGHT (max 3 words)
@@ -9515,9 +12771,36 @@ Total speaking characters: 3–6.
 ═══════════════════════════════════════
 THE VERY FIRST LINE OF EVERY SUB-EPISODE AND EVERY NEW SCENE = SCENE HEADING. NOT dialogue. NOT action.
 Format: ИНТА. ENGLISH LOCATION NAME — ВРЕМЯ
-Location name MUST be in English (e.g. STORAGE UNIT, FATHER'S STUDY, COURTROOM, DETECTIVE'S OFFICE).
-Russian location names (КАБИНЕТ, СКЛАД, ЗАЛ СУДА etc.) are FORBIDDEN in headings.
+Location name MUST be in English (e.g. STORAGE UNIT, FATHER'S STUDY, HOTEL SUITE, ROOFTOP, HOSPITAL CORRIDOR).
+Russian location names (КАБИНЕТ, СКЛАД, ОФИС etc.) are FORBIDDEN in headings.
+AVOID legal/courtroom locations as primary scene (COURTROOM, LAW FIRM, JUDGE'S CHAMBERS, DEPOSITION ROOM, PROSECUTOR'S OFFICE, PRISON VISITING ROOM, EVIDENCE LOCKER as recurring setting) — drama lives in living rooms, bedrooms, kitchens, hallways, hotel rooms, cars, rooftops, hospitals, NOT in courthouses.
 Starting with dialogue or action WITHOUT a scene heading = GENERATION FAILURE.
+
+═══════════════════════════════════════
+📍 POSITION BLOCKS — MANDATORY IN EVERY SUB-EPISODE
+═══════════════════════════════════════
+Every sub-episode MUST contain position blocks.
+
+[BLOCKING] — place immediately after EVERY scene heading:
+  [BLOCKING]
+  LOCATION: <English location name>
+  CHARACTER_NAME: <position in Russian> :: OUTFIT: <Outfit Name>
+  [/BLOCKING]
+
+[BLOCKING_END] — place at the very end of each sub-episode (right before the cut marker):
+  [BLOCKING_END]
+  LOCATION: <English location name>
+  CHARACTER_NAME: <final position at cut — in Russian>
+  [/BLOCKING_END]
+
+Rules:
+- [BLOCKING] lists ONLY characters present at scene START
+- OUTFIT = short Title Case NAME of the outfit asset (NOT a description). Examples: `Business Suit`, `Casual`, `Pajamas`, `Red Dress`, `School Uniform`, `Hospital Gown`, `Swimsuit`. The system reuses the same asset every time the same name appears for the same character.
+- New label for this character → append description: `OUTFIT: Pajamas | OUTFIT_DESC: light blue cotton pajamas, bare feet`. Already-introduced label → omit `| OUTFIT_DESC:`.
+- DEDUP: do NOT invent 10 nearly-identical names. Default everyday clothes → `Base`. New label = real wardrobe change.
+- Context-driven per character (not per scene): THIS character in bed → `Pajamas`; THIS character at beach → `Swimsuit`; visitor sitting next to a bedded character keeps their normal outfit.
+- [BLOCKING_END] lists only characters present at the moment of the cut (OUTFIT not required)
+- If a PREV_END_POSITION block is in the context AND this sub-episode opens in the same location — [BLOCKING] MUST exactly match it
 
 ═══════════════════════════════════════
 LANGUAGE RULES — NON-NEGOTIABLE
@@ -9595,22 +12878,55 @@ DIALOGUE-FIRST RULE — HARD BAN ON PAPERWORK
 EVERYTHING must be revealed through SPOKEN DIALOGUE between living people on screen.
 
 HARD-BANNED devices across the WHOLE chunk:
-  ✗ letters, notes, documents, contracts, files, dossiers being read on screen
+  ✗ letters, notes, documents, contracts, files, dossiers, envelopes, sealed papers, evidence binders
   ✗ text messages / SMS / WhatsApp / chat bubbles displayed to the camera
   ✗ emails, on-screen UI, computer screens, phone screens being read aloud
   ✗ photographs handed over silently as a "reveal"
   ✗ diary entries, voiceover, narration
   ✗ newspaper headlines, news chyrons, radio reports
   ✗ flashbacks as silent montage
+  ✗ audio recordings (dictaphone, voice memos, hidden mic) played in scene
+  ✗ surveillance / CCTV footage being watched on screen
+  ✗ USB drives, flash cards, "the recording is on this", "this will destroy him"
   ✗ any "character reads X aloud while alone" beat
 
 Reveals = spoken confrontations. A fact surfaces because someone ACCUSES, THREATENS, TAUNTS, or CONFESSES it out loud in front of another character.
 
-NARROW exception (max ONCE per chunk, not per sub-episode):
+NARROW exception (max ONCE across the ENTIRE SERIES, not per chunk, not per sub-episode):
   • A physical object (ring, pregnancy test, key, photo) can be shown silently for 1–2s only if a character immediately reacts and verbalizes the meaning.
-  • A single short note ≤ 6 words is permissible only if the entire punch hinges on those exact words. Never when dialogue could carry the same beat.
+  • A single short note ≤ 6 words is permissible only if the entire punch hinges on those exact words. Once per series total — never as a recurring device.
 
-If you find yourself writing "[reads the letter]" / "[opens the file]" / "[texts back]" — DELETE it and rewrite as a face-to-face confrontation.
+If you find yourself writing "[reads the letter]" / "[opens the file]" / "[texts back]" / "[hands him a flash drive]" / "[plays the recording]" — DELETE it and rewrite as a face-to-face confrontation.
+
+═══════════════════════════════════════
+HARD BAN — LEGAL / COURTROOM / EVIDENCE-GATHERING PLOT ENGINES
+═══════════════════════════════════════
+This is short drama for vertical video. The chunk and the series as a whole MUST NOT be driven by lawsuits, court cases, trials, depositions, hearings, prosecutor briefings, attorney strategy, evidence-gathering arcs, or "we need to win in court". Courtroom and procedural is the slowest, most static, most exposition-heavy mode possible — the OPPOSITE of short-form drama.
+
+HARD-BANNED as plot engines:
+  ✗ courtroom scenes (cross-examination, verdict, judge ruling, jury deliberation)
+  ✗ depositions, hearings, plea negotiations, settlement talks as climax
+  ✗ "they take it to court" / "she'll sue them" / "the case goes to trial" / "выйдем в суд"
+  ✗ evidence-gathering arcs: building a file against someone, collecting witnesses, dossier prep
+  ✗ lawyer-strategy scenes ("you can't testify because…", "we need a witness who…")
+  ✗ raids, indictments, arrest warrants as the chunk's central engine
+  ✗ "if I have enough proof, the law will finish him" — dead screen-time
+  ✗ DA / prosecutor / detective monologues laying out the legal path
+  ✗ sub-episode cliffhangers that resolve in "I'm filing tomorrow" or "see you in court"
+
+Replace legal escalation with PERSONAL escalation:
+  ✓ direct face-to-face confrontation (accusation, slap, ultimatum)
+  ✓ blackmail spoken aloud between two people
+  ✓ kidnapping / chase / physical clash
+  ✓ betrayal by someone close
+  ✓ secret child / pregnancy / identity exposed in conversation
+  ✓ public humiliation at a wedding / gala / dinner
+  ✓ a character walks away / disappears / returns unexpectedly
+  ✓ violence on screen (fight, push, weapon raised)
+
+Law may EXIST in the world as one-line atmosphere ("my lawyer is on his way", a detective at the door for 10 seconds) — never as the engine of a sub-episode or the chunk.
+
+If you catch yourself writing "[X testifies]", "[opens evidence file]", "[the judge enters]", "[deposition begins]", "court hearing", "DA's office", "prosecutor briefing", "evidence locker" — DELETE the scene and rewrite as a face-to-face personal confrontation.
 
 ═══════════════════════════════════════
 FORMAT RULES
@@ -9707,10 +13023,44 @@ def generate_milestones(sid):
     bs = batch_size(s)
     a1, a2, a3 = anchor_chunks(s) if batch else (1, 10, TOTAL_SUB_EPS)
     cast_pin = _canonical_cast_block(s)
-    if batch:
+    series_format_mode = _format_mode_of(s)
+    fmt_block = _format_mode_block(s, sections=['title_rule', 'synopsis_rule', 'episode_rule', 'pace_rule'])
+    if series_format_mode == 'instagram_series':
+        # 6-10 episodes total. Anchors: 1 / mid (3-4) / finale (6 or 7).
+        ig_a1, ig_a2, ig_a3 = 1, 3, 6
         prompt = (
             f'Series: "{s["title"]}"\nGenre: {s.get("genre","")} | Tone: {s.get("tone","")}\n'
             f'Synopsis: "{synopsis}"\nArc: "{arc}".\n\n'
+            + fmt_block
+            + cast_pin +
+            f'This is an INSTAGRAM SERIES — 6-10 episodes total, compact serialized mini-drama. '
+            f'Each episode is a self-contained chapter with SHARP HOOK + clear conflict + CLIFFHANGER.\n'
+            f'Write synopsis (2-3 punchy sentences) for THREE anchor episodes: {ig_a1}, {ig_a2}, {ig_a3}.\n'
+            f'Ep {ig_a1} — pilot: drops the viewer into the central conflict / secret / hook in the first '
+            f'5 seconds. Establishes who is at stake and what the lie/intrigue is. Ends on a cliffhanger '
+            f'that locks the viewer into the season.\n'
+            f'Ep {ig_a2} — midseason reversal: the situation viewers thought they understood gets flipped. '
+            f'A secret breaks, an ally turns, a deadline closes in. The arc accelerates. New location is '
+            f'fine — the plot moves wherever it needs to. Ends on a sharper cliffhanger than ep {ig_a1}.\n'
+            f'Ep {ig_a3} — season finale: all threads converge. The central conflict resolves (or '
+            f'deliberately fractures into a season-2 promise). Earn the ending — no anticlimax, no '
+            f'"warm hug" close.\n'
+            'FORBIDDEN: "introduces the recurring cast / weekly hook", "soft opening hook", "satisfying '
+            'beat — no cliffhanger", "slice-of-life", "sitcom", "warm earned arc", "see-you-next-week", '
+            'anthology framing, location-locked premises (kitchen-only / café-only). '
+            'FORBIDDEN plot engines: lawsuits, court hearings, trials, depositions, legal filings, '
+            'tenant union files suit, "she takes them to court", "the judge rules". Drama lives in '
+            'face-to-face confrontation / chase / betrayal / reveal / blackmail / escape — NOT in '
+            'courtrooms. If the synopsis above leans on legal escalation, REPLACE the anchor beats '
+            'with personal confrontations and direct action.\n'
+            'Locations vary across the three anchors as the story demands.\n'
+            f'Return JSON: {{"milestones": {{"{ig_a1}": "...", "{ig_a2}": "...", "{ig_a3}": "..."}}}}'
+        )
+    elif batch:
+        prompt = (
+            f'Series: "{s["title"]}"\nGenre: {s.get("genre","")} | Tone: {s.get("tone","")}\n'
+            f'Synopsis: "{synopsis}"\nArc: "{arc}".\n\n'
+            + fmt_block
             + cast_pin +
             f'BATCH MODE: each storage chunk = {bs} consecutive ~1-min sub-episodes (~{bs*60}s total = ~{bs} min). '
             f'Total chunks = {chunk_count(s)}. There are NO standalone episodes in the UI — only chunks.\n'
@@ -9727,6 +13077,7 @@ def generate_milestones(sid):
         prompt = (
             f'Series: "{s["title"]}"\nGenre: {s.get("genre","")} | Tone: {s.get("tone","")}\n'
             f'Synopsis: "{synopsis}"\nArc: "{arc}".\n\n'
+            + fmt_block
             + cast_pin +
             "Write a synopsis (2-4 sentences) for exactly THREE anchor episodes: 1, 10, and 70.\n"
             "Ep 1 — series premiere: hooks with immediate stakes, establishes the central conflict and main character, ends on a cliffhanger that locks the viewer in.\n"
@@ -9765,17 +13116,31 @@ def regenerate_milestone(sid, ep_num):
     prev = '\n'.join(f'{unit(k)}: {v}' for k, v in sorted(ms.items(), key=lambda x: int(x[0])) if int(k) < ep_num)
     nxt  = '\n'.join(f'{unit(k)}: {v}' for k, v in sorted(ms.items(), key=lambda x: int(x[0])) if int(k) > ep_num)
     target_label = unit(ep_num)
+    series_format_mode = _format_mode_of(s)
     extra = (
         f' This is a CHUNK of {bs} consecutive ~1-min sub-episodes — outline the {bs} mini-cliffhangers + midpoint reversal + chunk-end cliffhanger.'
+        if batch and series_format_mode == 'short_drama' else
+        f' This is a CHUNK of {bs} consecutive ~1-min self-contained chapters — each ends on its own cliffhanger, plus a chunk-end turn that escalates into the next chunk.'
         if batch else ''
+    )
+    format_tail = (
+        'INSTAGRAM SERIES FORMAT: self-contained chapter of a serialized story. Sharp cold-open hook, '
+        'one clear conflict, CLIFFHANGER ending that pulls into the next episode. Dialogue clipped — '
+        'conflict readable in two exchanges. NO sitcom / slice-of-life / "satisfying close" energy. '
+        'FORBIDDEN plot engines: lawsuits, courts, trials, legal filings, "she sues them", '
+        '"the case goes to court". Drama lives in face-to-face confrontation / chase / betrayal / '
+        'reveal / blackmail — NOT in courtrooms or paperwork.'
+        if series_format_mode == 'instagram_series' else
+        'SHORT DRAMA FORMAT: open in conflict (not setup), include a mid-point reversal, end on a cliffhanger.'
     )
     prompt = (
         f'Series: "{s["title"]}" | Arc: "{s.get("arc","")}".\n'
+        + _format_mode_block(s, sections=['synopsis_rule', 'episode_rule'])
         + _canonical_cast_block(s) +
         f'Previous milestones:\n{prev or "—"}\n'
         f'Next milestones:\n{nxt or "—"}\n\n'
         f'Write a new synopsis (4-6 sentences for chunks, 2-4 for episodes) for {target_label} that fits logically between the above.{extra} '
-        'SHORT DRAMA FORMAT: open in conflict (not setup), include a mid-point reversal, end on a cliffhanger. '
+        f'{format_tail} '
         'Return JSON: {"synopsis": "..."}'
     )
     try:
@@ -9931,12 +13296,21 @@ def restore_script_version(sid, num, idx):
     ep['script'] = chosen.get('script', '')
     ep['script_history'] = history[-10:]
     save_episode(sid, num, ep)
+    # Re-sync outfits — restored script may reference labels that never made
+    # it into series.json (e.g. restoring a version generated before
+    # outfit-sync code was working).
+    new_outfits = []
+    try:
+        new_outfits = _sync_script_outfits(sid, ep['script'])
+    except Exception as _oe:
+        _log_event('WARN', 'outfit_sync_after_restore_failed', err=str(_oe)[:200])
     return jsonify({
         'restored_from': {
             'ts': chosen.get('ts'),
             'reason': chosen.get('reason'),
         },
         'script': ep['script'],
+        '_new_outfits': new_outfits,
     })
 
 
@@ -10012,6 +13386,9 @@ def doctor_episode_script(sid, num):
     })
     ep['script_history'] = ep['script_history'][-10:]
     ep['script'] = fixed
+    end_pos = _extract_end_position(fixed)
+    if end_pos:
+        ep['end_position'] = end_pos
     ep['last_doctor_run'] = {
         'ts': time.time(),
         'violations_fixed': len(violations),
@@ -10019,11 +13396,21 @@ def doctor_episode_script(sid, num):
     }
     save_episode(sid, num, ep)
 
+    # Re-sync outfits — doctor may have rewritten [BLOCKING] (adding/changing
+    # OUTFIT labels) and we want any new outfit objects auto-queued for image
+    # generation just like the manual save/accept path.
+    new_outfits = []
+    try:
+        new_outfits = _sync_script_outfits(sid, fixed)
+    except Exception as _oe:
+        _log_event('WARN', 'outfit_sync_after_doctor_failed', err=str(_oe)[:200])
+
     return jsonify({
         'changed': True,
         'script': fixed,
         'violations_fixed': len(violations),
         'violations': violations,
+        '_new_outfits': new_outfits,
     })
 
 
@@ -10059,9 +13446,13 @@ def extract_characters_from_script(sid, num):
         if director_notes else ''
     )
 
+    anthro_block = _anthro_world_block(s)
     prompt = (
-        f'Series: "{s["title"]}" | Genre: {s.get("genre","")} | Tone: {s.get("tone","")}\n\n'
-        f'ALREADY KNOWN CHARACTERS in this series:\n{existing_char_lines}\n\n'
+        f'Series: "{s["title"]}" | Genre: {s.get("genre","")} | Tone: {s.get("tone","")}\n'
+        f'Series world: {(s.get("world_description") or "")[:600]}\n'
+        f'Series synopsis: {(s.get("synopsis") or "")[:600]}\n\n'
+        + anthro_block
+        + f'ALREADY KNOWN CHARACTERS in this series:\n{existing_char_lines}\n\n'
         f'ALREADY KNOWN LOCATIONS in this series:\n{existing_loc_lines}\n\n'
         f'{notes_block}'
         f'EPISODE {num} SCRIPT:\n{script}\n\n'
@@ -10103,9 +13494,15 @@ def extract_characters_from_script(sid, num):
         '  - name: exact label as it appears in the script (English / Latin letters)\n'
         '  - gender: "male" or "female"\n'
         '  - description: 1 sentence in RUSSIAN about their role in the story\n'
-        '  - appearance: 1 detailed sentence in RUSSIAN describing physical look (age, hair, eyes, build, '
-        'style of dress) suitable as a prompt for AI image generation. Be specific.\n\n'
-        'For each NEW LOCATION infer:\n'
+        + ('  - appearance: 1 detailed sentence in RUSSIAN describing physical look. '
+           'MANDATORY first word: the ANTHROPOMORPHIC SPECIES of this character '
+           '(e.g. "Антропоморфный кролик-самка..." / "Anthropomorphic rabbit female..."). '
+           'Then fur color/pattern, ears, snout, tail, build, and style of dress. '
+           'No human anatomy (no skin tone, no human hair, no human eyes) — replace with species-appropriate features.\n\n'
+           if _is_anthro_world(s) else
+           '  - appearance: 1 detailed sentence in RUSSIAN describing physical look (age, hair, eyes, build, '
+           'style of dress) suitable as a prompt for AI image generation. Be specific.\n\n')
+        + 'For each NEW LOCATION infer:\n'
         '  - name: short ENGLISH label as it appears in scene heading (e.g. "Hotel Suite", "Boardroom", "Hospital Corridor")\n'
         '  - description: 1 sentence in RUSSIAN about the place + atmosphere relevant to the scene\n\n'
         'Return JSON only:\n'
@@ -10386,6 +13783,89 @@ def generate_next_episode_synopsis(sid):
             f'Do NOT contradict or skip over its events.\n'
         )
 
+    # ─── CRITICAL: user-pinned trajectory (checkpoints + finale) ───
+    # The static MILESTONE_EPS above are setup-time anchors. The REAL steering
+    # signal is user-defined: s['checkpoints'] (story landmarks at specific eps)
+    # and s['finale'] (the planned ending). Without injecting these, the
+    # synopsis generator drifts and ignores the finale entirely.
+    trajectory_block = build_trajectory_block(s, next_num)
+    # Concrete per-episode bridge plan from current state to finale.
+    try:
+        _bridge_data = build_finale_bridge_plan(s, next_num) or {}
+    except Exception:
+        _bridge_data = {}
+    _bridge_block_txt = _bridge_data.get('block', '')
+    _bridge_this_beat = (_bridge_data.get('this_beat') or '').strip()
+    if _bridge_block_txt:
+        trajectory_block = trajectory_block + _bridge_block_txt
+    if _bridge_this_beat:
+        trajectory_block = (
+            trajectory_block
+            + f'\n🎯 ЭТА СЕРИЯ (Ep {next_num}) — конкретный beat из плана-моста: {_bridge_this_beat}\n'
+            f'Синопсис ниже ОБЯЗАН отражать этот beat. Если ранее запланированные подсюжеты '
+            f'не вписываются в beat — сверни или адаптируй их.\n\n'
+        )
+    # Build a sharp "must lead toward X" steering instruction tied to the
+    # NEAREST landmark (next checkpoint OR finale, whichever is closer).
+    steering_instruction = ''
+    cps_all = s.get('checkpoints') or []
+    fin = s.get('finale') or None
+    upcoming_cps = sorted(
+        [c for c in cps_all if int(c.get('episode', 0) or 0) >= next_num and (c.get('description') or '').strip()],
+        key=lambda c: int(c.get('episode', 0) or 0),
+    )
+    nearest_landmark = None
+    if upcoming_cps:
+        # nearest checkpoint wins if it's before or equal to the finale episode
+        nc = upcoming_cps[0]
+        nc_ep = int(nc['episode'])
+        fin_ep = int(fin['episode']) if fin and fin.get('description') else None
+        if fin_ep is None or nc_ep <= fin_ep:
+            nearest_landmark = ('checkpoint', nc_ep, nc.get('description', '').strip())
+        else:
+            nearest_landmark = ('finale', fin_ep, fin.get('description', '').strip())
+    elif fin and fin.get('description', '').strip() and int(fin.get('episode', 0) or 0) >= next_num:
+        nearest_landmark = ('finale', int(fin['episode']), fin['description'].strip())
+
+    if nearest_landmark:
+        kind, land_ep, land_desc = nearest_landmark
+        dist = land_ep - next_num
+        when = 'in THIS episode' if dist == 0 else f'in {dist} episode(s)'
+        steering_instruction = (
+            f'\n═══ TRAJECTORY STEERING — MANDATORY ═══\n'
+            f'NEAREST USER-PINNED LANDMARK: {kind.upper()} at Ep {land_ep} ({when}).\n'
+            f'Landmark description:\n{land_desc}\n\n'
+            f'HARD RULE — the Ep {next_num} synopsis MUST advance the plot toward this landmark. '
+            f'Plant a SEED for it (a clue / a confrontation setup / a character moving into position / '
+            f'an unresolved tension that the landmark will resolve). '
+        )
+        if dist == 0:
+            steering_instruction += (
+                f'\nTHIS IS THE LANDMARK EPISODE — the events in the landmark description MUST happen in this synopsis. '
+                f'Do NOT delay them, do NOT substitute them with similar-but-different events. '
+                f'Use the exact characters and the exact actions from the description.\n'
+            )
+        elif dist <= 3:
+            steering_instruction += (
+                f'\nLandmark is CLOSE ({dist} ep(s) away) — this synopsis is the FINAL setup. '
+                f'Every character the landmark needs must already be in position by end of this episode. '
+                f'Do NOT introduce a new subplot that delays the landmark.\n'
+            )
+        else:
+            steering_instruction += (
+                f'\nLandmark is {dist} ep(s) away — plant subtle setup without firing the landmark prematurely. '
+                f'Move pieces into place, do not pre-resolve any condition the landmark relies on.\n'
+            )
+        # If a finale exists at a LATER episode than the nearest checkpoint, also surface it.
+        if kind == 'checkpoint' and fin and fin.get('description', '').strip() and int(fin.get('episode', 0) or 0) >= next_num:
+            fin_ep = int(fin['episode'])
+            steering_instruction += (
+                f'\nSERIES FINALE (Ep {fin_ep}, {fin_ep - next_num} ep(s) away): {fin["description"].strip()}\n'
+                f'Whatever character / power-state / secret the finale relies on MUST remain achievable '
+                f'from this episode onward — do NOT kill, expose, or permanently remove anyone the finale needs.\n'
+            )
+        steering_instruction += '═══════════════════════════════════════════════\n'
+
     unit_word = 'CHUNK' if batch else 'EPISODE'
     chunk_range_str = (lambda n: f'{chunk_range(s,n)[0]}–{chunk_range(s,n)[1]}')(next_num) if batch else str(next_num)
 
@@ -10396,6 +13876,8 @@ def generate_next_episode_synopsis(sid):
                 f'Series: "{s["title"]}"\nGenre: {s.get("genre","")} | Tone: {s.get("tone","")}\n'
                 f'Series synopsis: "{s.get("synopsis","")}" | Arc: "{s.get("arc","")}".\n'
                 + _canonical_cast_block(s) +
+                trajectory_block +
+                steering_instruction +
                 f'{milestone_block}\n'
                 f'BATCH MODE: write the synopsis for CHUNK 1 — sub-episodes {a}–{b} (~{bs*60} sec total).\n'
                 f'4–6 sentences outlining: (1) the chunk hook, (2) all {bs} mini-cliffhangers in order, (3) the chunk midpoint reversal, (4) the chunk-end cliffhanger.\n'
@@ -10406,6 +13888,8 @@ def generate_next_episode_synopsis(sid):
                 f'Series: "{s["title"]}"\nGenre: {s.get("genre","")} | Tone: {s.get("tone","")}\n'
                 f'Series synopsis: "{s.get("synopsis","")}" | Arc: "{s.get("arc","")}".\n'
                 + _canonical_cast_block(s) +
+                trajectory_block +
+                steering_instruction +
                 f'{milestone_block}\n'
                 f'Write a synopsis (2-3 sentences) for EPISODE 1 — the series premiere.\n'
                 f'This is the FIRST episode: establish the world and main character while immediately grabbing the viewer. '
@@ -10429,6 +13913,8 @@ def generate_next_episode_synopsis(sid):
                 f'Series: "{s["title"]}"\nGenre: {s.get("genre","")} | Tone: {s.get("tone","")}\n'
                 f'Series synopsis: "{s.get("synopsis","")}" | Arc: "{s.get("arc","")}".\n'
                 + _canonical_cast_block(s) + '\n'
+                + trajectory_block
+                + steering_instruction +
                 f'Previous {prev_label} synopsis:\n{prev_synopsis}\n'
                 f'{script_block}'
                 f'{milestone_block}\n'
@@ -10436,6 +13922,7 @@ def generate_next_episode_synopsis(sid):
                 f'Pick up FROM THE NEXT BEAT after the previous chunk\'s cliffhanger, NOT from the cliffhanger itself. NO PLOT-RECAP: events already shown in CHUNK {prev_ep["number"]} are DONE — describe what happens NEXT, do NOT have characters re-issue the same ultimatums / re-state the same threats / re-deliver the same revelations from the previous chunk. '
                 f'4–6 sentences outlining: (1) chunk hook, (2) all {bs} mini-cliffhangers in order, (3) chunk midpoint reversal, (4) chunk-end cliffhanger.\n'
                 f'TIMELINE — also output `days_since_previous` (integer in-world days from prev chunk\'s end). 0 = same-day continuation.\n'
+                f'TRAJECTORY: the chunk MUST move pieces toward the nearest pinned landmark above. Re-read the TRAJECTORY STEERING block before finalizing.\n'
                 'Return JSON: {"synopsis": "...", "days_since_previous": int}'
             )
         else:
@@ -10443,6 +13930,8 @@ def generate_next_episode_synopsis(sid):
                 f'Series: "{s["title"]}"\nGenre: {s.get("genre","")} | Tone: {s.get("tone","")}\n'
                 f'Series synopsis: "{s.get("synopsis","")}" | Arc: "{s.get("arc","")}".\n'
                 + _canonical_cast_block(s) + '\n'
+                + trajectory_block
+                + steering_instruction +
                 f'Previous episode ({prev_label}) synopsis:\n{prev_synopsis}\n'
                 f'{script_block}'
                 f'{milestone_block}\n'
@@ -10452,6 +13941,7 @@ def generate_next_episode_synopsis(sid):
                 f'Include: an immediate-stakes opening (no warm-up), a mid-episode reversal, and end on a new cliffhanger. '
                 f'TIMELINE — also output `days_since_previous` (integer): in-world days between Ep {prev_ep["number"]} and Ep {next_num}. '
                 f'Use real-world biology (pregnancy test 10+ days post conception, undercover ops 30+ days setup). 0 = same-day continuation. '
+                f'TRAJECTORY: this episode MUST move pieces toward the nearest pinned landmark above. Re-read the TRAJECTORY STEERING block before finalizing the synopsis.\n'
                 'Return JSON: {"synopsis": "...", "days_since_previous": int}'
             )
 
@@ -10672,6 +14162,270 @@ def _build_cast_block(s, ep):
     return '\n\n'.join(filter(None, [cast_block, loc_block]))
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Generate-to-landmark — convergence-mode generation
+# ─────────────────────────────────────────────────────────────────────────────
+# When the user clicks "До финала" / "До чекпоинта", we run a sequential pass:
+# for each episode in [current_unwritten .. target_episode]:
+#   1. Generate / refresh the bridge plan (cached after first call).
+#   2. OVERWRITE the episode's synopsis with the bridge beat — this kills the
+#      "stale-synopsis vs new-bridge-plan" disconnect that caused the model to
+#      keep writing in the old subplot direction.
+#   3. Generate the script via the existing pipeline — now the synopsis itself
+#      describes the bridge beat, so prev_script pressure can't pull the writer
+#      back into the divergent thread.
+#
+# This is the "max-weight landmark steering" mode the user requested.
+
+# In-memory progress tracker for generate-to-landmark.
+# Keyed by sid → {state, start, target, current_ep, completed, total, results, error, started_at, finished_at}
+_LANDMARK_PROGRESS = {}
+_LANDMARK_LOCK = threading.Lock()
+
+
+def _landmark_progress_set(sid, **fields):
+    with _LANDMARK_LOCK:
+        cur = _LANDMARK_PROGRESS.get(sid, {})
+        cur.update(fields)
+        _LANDMARK_PROGRESS[sid] = cur
+
+
+def _landmark_progress_get(sid):
+    with _LANDMARK_LOCK:
+        return dict(_LANDMARK_PROGRESS.get(sid) or {})
+
+
+def _run_generate_to_landmark_bg(sid, landmark_type, target_ep, start_ep, model):
+    """Background worker — does the per-episode generation loop. Mirrors the logic
+    that used to run inline in the request handler, but writes progress to
+    _LANDMARK_PROGRESS so the UI can poll status.
+    """
+    try:
+        _landmark_progress_set(
+            sid,
+            state='running',
+            landmark_type=landmark_type,
+            target_episode=target_ep,
+            start_episode=start_ep,
+            current_ep=start_ep,
+            completed=0,
+            total=target_ep - start_ep + 1,
+            results=[],
+            error=None,
+        )
+        for n in range(start_ep, target_ep + 1):
+            _landmark_progress_set(sid, current_ep=n)
+            s_fresh = load_series(sid)
+            if not s_fresh:
+                _landmark_progress_set(sid, error='series not found mid-run', state='failed',
+                                       finished_at=time.time())
+                return
+            ep = load_episode(sid, n)
+            if ep is None:
+                ep = {'number': n, 'title': f'Episode {n}', 'synopsis': '', 'script': '', 'status': 'draft'}
+                save_episode(sid, n, ep)
+            # Bridge plan + synopsis overwrite
+            try:
+                bridge = build_finale_bridge_plan(s_fresh, n) or {}
+            except Exception as be:
+                print(f'[generate-to-landmark/bg] ep{n}: bridge_plan FAILED: {be}', flush=True)
+                bridge = {}
+            this_beat = (bridge.get('this_beat') or '').strip()
+            state_before = (bridge.get('this_state_before') or '').strip()
+            if this_beat:
+                parts = []
+                if state_before:
+                    parts.append(f'[Состояние мира на старте серии: {state_before}]')
+                parts.append(this_beat)
+                new_synopsis = ' '.join(parts)
+                old_synopsis = (ep.get('synopsis') or '').strip()
+                if old_synopsis != new_synopsis:
+                    ep.setdefault('synopsis_history', []).append({
+                        'ts': time.time(),
+                        'reason': f'overwritten by generate-to-landmark ({landmark_type})',
+                        'synopsis': old_synopsis[:2000],
+                    })
+                    ep['synopsis_history'] = ep['synopsis_history'][-10:]
+                    ep['synopsis'] = new_synopsis
+                    save_episode(sid, n, ep)
+                    print(f'[generate-to-landmark/bg] ep{n}: synopsis overwritten from bridge beat', flush=True)
+            # Generate script via existing endpoint logic
+            try:
+                with app.test_request_context(
+                    f'/api/series/{sid}/episodes/{n}/generate-script',
+                    method='POST',
+                    json={'model': model},
+                ):
+                    resp = generate_episode_script(sid, n)
+                payload = resp.json if hasattr(resp, 'json') else {}
+                status_code = getattr(resp, 'status_code', 200)
+                if status_code >= 400:
+                    err_msg = (payload or {}).get('error') or f'HTTP {status_code}'
+                    with _LANDMARK_LOCK:
+                        cur = _LANDMARK_PROGRESS.get(sid) or {}
+                        cur.setdefault('results', []).append({'episode': n, 'ok': False, 'error': err_msg})
+                        cur['error'] = err_msg
+                        cur['state'] = 'failed'
+                        cur['finished_at'] = time.time()
+                        _LANDMARK_PROGRESS[sid] = cur
+                    print(f'[generate-to-landmark/bg] ep{n}: FAILED — {err_msg}', flush=True)
+                    return
+                with _LANDMARK_LOCK:
+                    cur = _LANDMARK_PROGRESS.get(sid) or {}
+                    cur.setdefault('results', []).append({
+                        'episode': n,
+                        'ok': True,
+                        'retries': ((payload or {}).get('audit_report') or {}).get('retries'),
+                    })
+                    cur['completed'] = cur.get('completed', 0) + 1
+                    _LANDMARK_PROGRESS[sid] = cur
+                print(f'[generate-to-landmark/bg] ep{n}: OK', flush=True)
+            except Exception as e:
+                with _LANDMARK_LOCK:
+                    cur = _LANDMARK_PROGRESS.get(sid) or {}
+                    cur.setdefault('results', []).append({'episode': n, 'ok': False, 'error': str(e)[:300]})
+                    cur['error'] = str(e)[:300]
+                    cur['state'] = 'failed'
+                    cur['finished_at'] = time.time()
+                    _LANDMARK_PROGRESS[sid] = cur
+                print(f'[generate-to-landmark/bg] ep{n}: EXCEPTION — {e}', flush=True)
+                return
+        _landmark_progress_set(sid, state='done', current_ep=None, finished_at=time.time())
+        print(f'[generate-to-landmark/bg] sid={sid} DONE', flush=True)
+    except Exception as outer:
+        _landmark_progress_set(sid, state='failed', error=str(outer)[:300], finished_at=time.time())
+        print(f'[generate-to-landmark/bg] sid={sid} OUTER EXCEPTION — {outer}', flush=True)
+
+
+@app.route('/api/series/<sid>/generate-to-landmark/status', methods=['GET'])
+def generate_to_landmark_status(sid):
+    return jsonify(_landmark_progress_get(sid) or {'state': 'idle'})
+
+
+@app.route('/api/series/<sid>/generate-to-landmark', methods=['POST'])
+def generate_to_landmark(sid):
+    s = load_series(sid)
+    if not s:
+        return jsonify({'error': 'not found'}), 404
+    body = request.json or {}
+    landmark_type = (body.get('landmark_type') or '').strip().lower()
+    if landmark_type not in ('finale', 'checkpoint'):
+        return jsonify({'error': 'landmark_type must be "finale" or "checkpoint"'}), 400
+
+    # Resolve target episode
+    if landmark_type == 'finale':
+        fin = s.get('finale') or None
+        if not fin or not (fin.get('description') or '').strip():
+            return jsonify({'error': 'no finale pinned for this series'}), 400
+        try:
+            target_ep = int(fin.get('episode', 0))
+        except (TypeError, ValueError):
+            return jsonify({'error': 'finale has invalid episode number'}), 400
+    else:
+        # checkpoint — caller may specify which one; otherwise the NEAREST upcoming.
+        cps = sorted(
+            [c for c in (s.get('checkpoints') or []) if (c.get('description') or '').strip()],
+            key=lambda c: int(c.get('episode', 0) or 0),
+        )
+        if not cps:
+            return jsonify({'error': 'no checkpoints pinned for this series'}), 400
+        requested_cp = body.get('landmark_episode')
+        if requested_cp:
+            try:
+                target_ep = int(requested_cp)
+                if not any(int(c.get('episode', 0) or 0) == target_ep for c in cps):
+                    return jsonify({'error': f'no checkpoint at episode {target_ep}'}), 400
+            except (TypeError, ValueError):
+                return jsonify({'error': 'landmark_episode must be an integer'}), 400
+        else:
+            # Pick nearest upcoming checkpoint relative to first unwritten episode
+            episodes = sorted(list_episodes(sid), key=lambda e: int(e.get('number', 0) or 0))
+            first_unwritten = next((e['number'] for e in episodes if not (e.get('script') or '').strip()),
+                                   (episodes[-1]['number'] + 1) if episodes else 1)
+            upcoming = [c for c in cps if int(c.get('episode', 0) or 0) >= first_unwritten]
+            if not upcoming:
+                return jsonify({'error': 'all checkpoints are already past the current episode'}), 400
+            target_ep = int(upcoming[0]['episode'])
+
+    # Resolve start episode:
+    #   1. If caller passed explicit start_episode → use it (supports overwrite mode)
+    #   2. Else: first episode without a script
+    #   3. Else: error — there's nothing to do
+    episodes = sorted(list_episodes(sid), key=lambda e: int(e.get('number', 0) or 0))
+    explicit_start = body.get('start_episode')
+    if explicit_start is not None and str(explicit_start).strip() != '':
+        try:
+            start_ep = int(explicit_start)
+            if start_ep < 1:
+                return jsonify({'error': 'start_episode must be >= 1'}), 400
+        except (TypeError, ValueError):
+            return jsonify({'error': 'start_episode must be an integer'}), 400
+    else:
+        start_ep = None
+        for e in episodes:
+            if not (e.get('script') or '').strip():
+                start_ep = int(e.get('number', 0))
+                break
+        if start_ep is None:
+            return jsonify({
+                'error': 'no unwritten episodes — pass start_episode to overwrite from a specific point'
+            }), 400
+
+    if target_ep < start_ep:
+        return jsonify({'error': f'target ep {target_ep} is before start ep {start_ep}'}), 400
+    span = target_ep - start_ep + 1
+    MAX_SPAN = 8
+    if span > MAX_SPAN:
+        return jsonify({
+            'error': f'span too large ({span} episodes) — max {MAX_SPAN} per call. '
+                     f'Run multiple times, or move the landmark closer.'
+        }), 400
+
+    print(f'[generate-to-landmark] sid={sid} type={landmark_type} target=Ep{target_ep} start=Ep{start_ep} span={span}', flush=True)
+
+    # Refuse if a previous run for this sid is still active
+    prev = _landmark_progress_get(sid)
+    if prev.get('state') == 'running':
+        return jsonify({
+            'error': 'a landmark generation is already running for this series',
+            'progress': prev,
+        }), 409
+
+    # Initialize fresh progress
+    _landmark_progress_set(
+        sid,
+        state='starting',
+        landmark_type=landmark_type,
+        target_episode=target_ep,
+        start_episode=start_ep,
+        current_ep=start_ep,
+        completed=0,
+        total=span,
+        results=[],
+        error=None,
+        started_at=time.time(),
+        finished_at=None,
+    )
+
+    model = body.get('model') or s.get('writer_model')
+    t = threading.Thread(
+        target=_run_generate_to_landmark_bg,
+        args=(sid, landmark_type, target_ep, start_ep, model),
+        name=f'gen-to-landmark-{sid}',
+        daemon=True,
+    )
+    t.start()
+
+    return jsonify({
+        'started': True,
+        'landmark_type': landmark_type,
+        'target_episode': target_ep,
+        'start_episode': start_ep,
+        'span': span,
+        'poll_url': f'/api/series/{sid}/generate-to-landmark/status',
+    }), 202
+
+
 @app.route('/api/series/<sid>/episodes/<int:num>/generate-script', methods=['POST'])
 def generate_episode_script(sid, num):
     s = load_series(sid)
@@ -10769,34 +14523,186 @@ def generate_episode_script(sid, num):
     except Exception as e:
         brief = f'(brief unavailable: {e})'
     brief_block = f'═══ LOGIC CONSTRAINTS — MUST RESPECT ALL OF THESE ═══\n{brief}\n═══════════════════════════════════════════════════\n\n'
+    try:
+        devices_block = _build_plot_device_history(sid, num)
+    except Exception:
+        devices_block = ''
+    try:
+        narrative_block = _build_narrative_state_block(sid, num)
+    except Exception:
+        narrative_block = ''
+    try:
+        crowd_block = _build_crowd_constraint_block(s)
+    except Exception:
+        crowd_block = ''
     trajectory_block = build_trajectory_block(s, num)
+    # Concrete plot bridge from THIS episode to the finale — generated by a quick Haiku
+    # planning call. This is the load-bearing fix for "writer ignores the finale":
+    # prev_script tends to dominate, so we explicitly tell the writer what THIS episode
+    # must do to converge to the finale.
+    try:
+        bridge_data = build_finale_bridge_plan(s, num) or {}
+    except Exception as _be:
+        _log_event('WARN', 'bridge_plan_skip', err=str(_be)[:200])
+        bridge_data = {}
+    bridge_block = bridge_data.get('block', '')
+    bridge_this_beat = (bridge_data.get('this_beat') or '').strip()
+    bridge_state_before = (bridge_data.get('this_state_before') or '').strip()
+    bridge_finale_ep = bridge_data.get('finale_ep')
+    # Format-mode block (short_drama vs instagram_series) — drives ending style,
+    # cliffhanger requirement, standalone-ness, pacing.
+    series_format_mode = _format_mode_of(s)
+    format_block = _format_mode_block(s, sections=['episode_rule', 'pace_rule'])
+
+    # Hard mandatory block for IG-series — every episode of every series MUST
+    # open on a hook and close on a cliffhanger, no exceptions, regardless of
+    # how soft the synopsis reads. Plus explicit ban on legal-procedural plot
+    # engines (lawsuit / court / paperwork) that kill the pace of a 60s show.
+    ig_hard_block = (
+        '\n╔══════════════════════════════════════════════════════════════════════╗\n'
+        '║ INSTAGRAM SERIES — HARD CONTRACT FOR THIS SCRIPT — VIOLATING = FAIL  ║\n'
+        '╚══════════════════════════════════════════════════════════════════════╝\n'
+        '1. COLD-OPEN HOOK (seconds 0-5) — MANDATORY. Drop the viewer into action / '
+        '   conflict / question already in motion. Examples of valid opens:\n'
+        '     • Mid-shout / mid-slap / mid-grab\n'
+        '     • A line of dialogue that contains a reveal or accusation\n'
+        '     • A door slamming open / a phone ringing repeatedly / a body on floor\n'
+        '     • A character running mid-stride\n'
+        '   FORBIDDEN opens: establishing shot of a building, slow zoom, narration, '
+        '   "next morning", "two days later", small-talk warm-up, character making '
+        '   coffee / sewing / journaling.\n'
+        '2. ESCALATION — every dialogue exchange must reveal, flip, or raise stakes. '
+        '   No filler. No "checking in" scenes. No tea-time chat. If a scene does not '
+        '   move the plot, delete it.\n'
+        '3. CLIFFHANGER on the LAST LINE / LAST FRAME — MANDATORY. Examples of valid '
+        '   closes:\n'
+        '     • A reveal / name spoken / face seen\n'
+        '     • An arrival (door opens, car pulls up, knock)\n'
+        '     • A phone showing a message / a photograph\n'
+        '     • A weapon raised, a shot fired offscreen\n'
+        '     • A line of dialogue that flips everything ("That\'s not my daughter.")\n'
+        '   FORBIDDEN closes: character looking at sunset, journaling, smiling, '
+        '   resolved hug, "everything will be okay", "and so they...", any wrap-up.\n'
+        '4. DROP-IN FRIENDLY — assume the viewer never saw earlier episodes. Within '
+        '   the first 10 seconds they must understand WHO this is and WHAT is at '
+        '   stake through context (a costume cue, a line, a reaction). No exposition '
+        '   dump, no "previously on", no narrator.\n'
+        '5. BANNED PLOT ENGINES (none of these may drive the episode):\n'
+        '     • lawsuits, court hearings, trials, depositions, judges, lawyers, '
+        '       paralegals, legal motions, evidence binders\n'
+        '     • eviction filings, paperwork submissions, signing contracts as climax\n'
+        '     • tenant unions filing complaints, building inspectors arriving with forms\n'
+        '   If the synopsis above leans on any of these — REWRITE the beat into a '
+        '   FACE-TO-FACE confrontation, chase, betrayal, reveal, blackmail, escape, '
+        '   or physical clash. People doing things to people. Not paperwork.\n'
+        '6. DIALOGUE — short and clipped. Two-line clarity: one line states, the next '
+        '   flips. No monologues. No "let me explain" speeches. No banter padding.\n'
+        '7. LOCATIONS — vary as the plot demands. Do NOT lock the whole episode (or '
+        '   the season) to one room. Move where the action goes.\n'
+        '═══════════════════════════════════════════════════════════════════════\n\n'
+    )
 
     if batch:
         a, b = chunk_range(s, num)
-        instruction = (
-            f'Write the complete script for {unit_label}. '
-            f'It must contain {bs} sub-episodes (sub-eps {a} through {b}), each ending with the EXACT cut marker '
-            f'`═══ END EPISODE X/{bs} — CLIFFHANGER: <type> ═══` on its own line. '
-            f'The chunk overall has its own midpoint REVERSAL and a final cliffhanger that leads into chunk {num+1}. '
-        )
+        if series_format_mode == 'instagram_series':
+            # Self-contained chapters of a serialized mini-drama — each sub-ep ends
+            # on its own cliffhanger; the chunk overall escalates into chunk+1.
+            instruction = (
+                ig_hard_block +
+                f'Write the complete script for {unit_label}. '
+                f'It must contain {bs} self-contained chapters (sub-eps {a} through {b}), each ending with the EXACT cut marker '
+                f'`═══ END EPISODE X/{bs} — CLIFFHANGER: <type> ═══` on its own line. '
+                f'Each sub-episode = SHARP cold-open hook (first 3-5s) → escalating conflict → cliffhanger turn at the end. '
+                f'Apply ALL 7 rules of the HARD CONTRACT to every single sub-episode in this chunk. '
+                f'The chunk overall ends on the sharpest cliffhanger pulling into chunk {num+1}. '
+            )
+        else:
+            instruction = (
+                f'Write the complete script for {unit_label}. '
+                f'It must contain {bs} sub-episodes (sub-eps {a} through {b}), each ending with the EXACT cut marker '
+                f'`═══ END EPISODE X/{bs} — CLIFFHANGER: <type> ═══` on its own line. '
+                f'The chunk overall has its own midpoint REVERSAL and a final cliffhanger that leads into chunk {num+1}. '
+            )
     else:
-        instruction = (
-            f'Write the complete script for Episode {num}. '
-            + ('Continue naturally from where Episode {prev} ended.'.format(prev=num-1) if prev_script else 'Hook the viewer immediately.')
-            + ' End on a cliffhanger.'
-        )
+        if series_format_mode == 'instagram_series':
+            instruction = (
+                ig_hard_block +
+                f'Write the complete script for Episode {num}. '
+                + ('Open on a SHARP COLD-OPEN HOOK in the first 3-5 seconds — drop us into action / conflict / line-mid-confrontation. NO setup, NO establishing shot. ' if not prev_script else
+                   'Open on a SHARP COLD-OPEN HOOK tied to where the story left off — drop us back in mid-action. A fresh viewer must catch up in 10 seconds through context, NOT exposition. ')
+                + 'Escalate through clipped dialogue — every line reveals, flips, or raises stakes. '
+                + 'End on a HARD CLIFFHANGER on the final line / frame. '
+                + 'Apply ALL 7 rules of the HARD CONTRACT above.'
+            )
+        else:
+            # Hard length cap — series-level target_duration_sec (default 60s).
+            try:
+                _target_sec = int(s.get('target_duration_sec') or 60)
+            except (TypeError, ValueError):
+                _target_sec = 60
+            _target_words = round(_target_sec / 60 * 100)
+            _target_lines = max(3, min(40, round(_target_sec / 4.5)))
+            instruction = (
+                f'Write the complete script for Episode {num}. '
+                + ('Continue naturally from where Episode {prev} ended.'.format(prev=num-1) if prev_script else 'Hook the viewer immediately.')
+                + ' End on a cliffhanger. '
+                + f'\n\n⚠ HARD LENGTH LIMIT — серия = {_target_sec} секунд экрана. ЖЁСТКИЕ ПРАВИЛА:\n'
+                + f'• ВСЕГО ~{_target_lines} ± 2 диалоговых/action строк (НЕ больше {_target_lines + 3}).\n'
+                + f'• ВСЕГО ~{_target_words} спикерских слов МАКСИМУМ (НИКОГДА не превышай {int(_target_words * 1.1)}).\n'
+                + f'• КАЖДАЯ реплика: 3-7 слов. МАКСИМУМ 10 слов. >10 — РАЗРЕЖЬ на две короткие.\n'
+                + f'• МОНОЛОГИ ЗАПРЕЩЕНЫ. Никаких "Your Honor, I would like to explain..." речей. Короткие рваные удары.\n'
+                + f'• ACTION-СТРОК максимум ~{max(3, round(_target_sec/12))}. Не описывай каждое движение.\n'
+                + f'• НИКАКИХ time-markers в action-lines: запрещены фразы "слушает две минуты молча", '
+                + f'"молчит десять секунд", "проходит минута". Это раздувает хронометраж в кадре.\n'
+                + f'• Если на черновике насчитал >{_target_words} слов или >{_target_lines + 3} строк — '
+                + f'РЕЖЬ беспощадно перед выводом, не отдавай длинный драфт.\n'
+                + f'• Это короткая драма для TikTok/Reels, НЕ полнометражный сценарий.\n'
+                + f'• Программный детектор проверит длину + длину каждой реплики; нарушения = автоматическая перезапись.'
+            )
 
     base_prompt = (
         f'Series: "{s["title"]}" | Genre: {s.get("genre","")} | Tone: {s.get("tone","")}\n'
         f'Series arc: {s.get("arc","")}\n\n'
+        + _anthro_world_block(s)  # ← furry/anthro world directive (empty for human worlds)
+        + trajectory_block        # ← user-pinned finale + checkpoints, FIRST so it's impossible to miss
+        + bridge_block            # ← concrete per-episode plan from current state to finale
+        + crowd_block             # ← HARD limit on characters per scene, lifted up front
+        + format_block
         + (cast_block + '\n\n' if cast_block else '')
         + brief_block
-        + trajectory_block
+        + devices_block
         + prev_block
-        + f'{unit_label} SYNOPSIS:\n{ep.get("synopsis","")}\n\n'
+        + f'{unit_label} SYNOPSIS (may be stale — see THIS EPISODE\'S BEAT below):\n{ep.get("synopsis","")}\n\n'
+        + (
+            (
+                f'╔══════════════════════════════════════════════════════════════════╗\n'
+                f'║ 🎯 THIS EPISODE\'S BEAT — execute exactly this, override synopsis ║\n'
+                f'╚══════════════════════════════════════════════════════════════════╝\n'
+                + (f'СОСТОЯНИЕ МИРА В НАЧАЛЕ ЭТОЙ СЕРИИ (Ep {num}):\n  {bridge_state_before}\n\n'
+                   if bridge_state_before else '')
+                + (f'TEMPORAL ANCHOR: финальные события (Ep {bridge_finale_ep or "—"}) ЕЩЁ НЕ ПРОИЗОШЛИ. '
+                   f'Не пиши сцены так будто кто-то уже арестован/осуждён/мёртв, если по плану это случится позже.\n\n'
+                   if bridge_finale_ep else '')
+                + f'Эта серия (Ep {num}) ОБЯЗАНА выполнить следующий beat из плана-моста к финалу:\n\n'
+                f'  ▶▶▶ {bridge_this_beat}\n\n'
+                f'IF THE SYNOPSIS ABOVE CONTRADICTS THIS BEAT — THE BEAT WINS. The synopsis may have\n'
+                f'been generated before the finale was pinned and is now stale. The beat above is\n'
+                f'the authoritative instruction. Write the script to deliver THIS BEAT.\n'
+                f'Do NOT invent new named characters not in the cast.\n'
+                f'Do NOT introduce a subplot that the bridge plan does not include.\n'
+                f'Do NOT depict characters in their FINALE-state (arrested, sentenced, exposed) — '
+                f'use their CURRENT state from the СОСТОЯНИЕ МИРА block above.\n'
+                f'═══════════════════════════════════════════════════════════════════\n\n'
+            ) if bridge_this_beat else ''
+        )
         + next_block
+        + narrative_block
         + instruction
-        + ' EVERY constraint in the LOGIC CONSTRAINTS block above is mandatory — violating canon is a hard fail.'
+        + ' EVERY constraint in the LOGIC CONSTRAINTS block above is mandatory — violating canon is a hard fail. '
+        + 'And EVERY landmark in the NARRATIVE TRAJECTORY block at the top is mandatory — drift from the finale is a hard fail. '
+        + ('The THIS EPISODE\'S BEAT above is the authoritative scene direction — execute it. '
+           'If the synopsis or prev_script set up a different subplot, fold it into the beat or park it; '
+           'NEVER continue a subplot the bridge plan does not include.' if bridge_this_beat else '')
     )
 
     script_system = _build_batch_script_system(s) if batch else _SCRIPT_SYSTEM
@@ -10812,7 +14718,68 @@ def generate_episode_script(sid, num):
             report = audit_script(sid, num, script, brief)
             # Run logic-hole auditor in parallel with continuity auditor — different concerns.
             logic_report = audit_logic_holes(sid, num, script)
-            all_violations = list(report.get('violations', [])) + list(logic_report.get('violations', []))
+            # Programmatic check for scene overcrowding — reliable signal that Claude-based
+            # auditor sometimes misses. We count NAMED-CAST speakers per scene and flag any
+            # scene that exceeds the user's max_main_chars_per_scene setting.
+            crowd_violations = detect_scene_overcrowding(s, script)
+            crowd_critical = []
+            for cv in crowd_violations:
+                names_str = ', '.join(cv['characters'])
+                crowd_critical.append({
+                    'type': 'scene_overcrowding',
+                    'severity': 'critical',
+                    'where': f"сцена {cv['scene_idx']} ({cv['location']})",
+                    'explanation': (
+                        f"в сцене {cv['count']} именованных персонажа из каста "
+                        f"({names_str}), а лимит сериала = {cv['limit']}. "
+                        f"Программный детектор посчитал диалоговые реплики и BLOCKING-разметку."
+                    ),
+                    'fix': (
+                        f"Перепиши сцену так чтобы говорящих/действующих именованных персонажей "
+                        f"было НЕ БОЛЕЕ {cv['limit']}. Варианты: (a) убери из сцены лишних персонажей "
+                        f"(они могут появиться в ОТДЕЛЬНОЙ последовательной сцене); "
+                        f"(b) разбей сцену на две — сначала одна группа, потом другая входит после ухода первой; "
+                        f"(c) оставь лишних только в фоне без реплик и без [BLOCKING] упоминания."
+                    ),
+                })
+            if crowd_critical:
+                print(f'[scene-crowd] ep {num} attempt {attempt+1}: {len(crowd_critical)} overcrowded scene(s) detected programmatically', flush=True)
+                for cv in crowd_violations:
+                    print(f'[scene-crowd]   scene {cv["scene_idx"]} ({cv["location"]}): {cv["count"]}>{cv["limit"]} — {", ".join(cv["characters"])}', flush=True)
+            # ── Programmatic over-length detector — count dialogue lines and spoken words,
+            # estimate runtime, fail if >30% over the target duration.
+            length_critical = []
+            length_violation = detect_script_overlength(s, script)
+            if length_violation:
+                lv = length_violation
+                reasons_str = '; '.join(lv.get('reasons') or [])
+                length_critical.append({
+                    'type': 'script_overlength',
+                    'severity': 'critical',
+                    'where': 'весь сценарий серии',
+                    'explanation': (
+                        f"сценарий нарушает бюджет длины: {reasons_str}. "
+                        f"Метрики: {lv['dialogue_lines']} реплик · {lv['dialogue_words']} слов · "
+                        f"{lv['action_lines']} action-строк · самая длинная реплика {lv['longest_line_words']} слов · "
+                        f"средняя {lv['avg_line_words']} слов · оценка ~{lv['est_sec']}с экрана. "
+                        f"Лимит сериала: {lv['target_sec']}с, ~{lv['target_words']} слов, ~{lv['target_lines']} строк."
+                    ),
+                    'fix': (
+                        f"СОКРАТИ беспощадно. Конкретно: "
+                        f"(a) каждая реплика МАКСИМУМ 7 слов, идеал 3-5 (короткие рваные удары); "
+                        f"(b) если есть монолог >10 слов — разрежь на короткие реплики ИЛИ удали лишнее; "
+                        f"(c) action-строк не больше {max(3, round(lv['target_sec']/12))} — убери все 'смотрит / встаёт / делает паузу' если они не двигают сцену; "
+                        f"(d) общий лимит: ~{lv['target_words']} спикерских слов, ~{lv['target_lines']} диалоговых строк суммарно; "
+                        f"(e) НИКАКИХ time-markers вроде 'в течение двух минут' / 'десять секунд молча' — это раздувает хронометраж; "
+                        f"(f) удали экспозицию и повторы — только живые удары + cliffhanger. "
+                        f"Это короткая драма для TikTok ({lv['target_sec']}с), не полнометражный сценарий."
+                    ),
+                })
+                print(f'[script-length] ep {num} attempt {attempt+1}: {lv["est_sec"]}s ({lv["ratio"]}×), '
+                      f'lines={lv["dialogue_lines"]} words={lv["dialogue_words"]} '
+                      f'longest={lv["longest_line_words"]} avg={lv["avg_line_words"]} actions={lv["action_lines"]} '
+                      f'reasons=[{reasons_str}]', flush=True)
+            all_violations = list(report.get('violations', [])) + list(logic_report.get('violations', [])) + crowd_critical + length_critical
             critical = [v for v in all_violations if v.get('severity') == 'critical']
             audit_report = {
                 'passes': not critical,
@@ -10821,12 +14788,13 @@ def generate_episode_script(sid, num):
                 'audit_error': report.get('audit_error') or logic_report.get('audit_error'),
                 'logic_passes': logic_report.get('passes', True),
                 'continuity_passes': report.get('passes', True),
+                'crowd_violations': crowd_violations,
             }
             if not critical:
                 break
             # Build a fix-it prompt and retry — group violations by source for clarity
             cont_fixes = [v for v in critical if v.get('type') in ('timeline','fact','knowledge','biology','setup','paperwork','scene_teleport')]
-            logic_fixes = [v for v in critical if v.get('type') in ('status','hidden_position','enabling_condition','legal_term','unmotivated_delay','ambiguous_cliffhanger')]
+            logic_fixes = [v for v in critical if v.get('type') in ('status','hidden_position','enabling_condition','legal_term','unmotivated_delay','ambiguous_cliffhanger','protagonist_stagnation','emotional_monotony','scene_overcrowding','finale_drift','script_overlength')]
             fixes_parts = []
             if cont_fixes:
                 fixes_parts.append('CONTINUITY/CANON ISSUES:\n' + '\n'.join(
@@ -10853,11 +14821,38 @@ def generate_episode_script(sid, num):
                 'script': prev_script_text[:80000],
             })
             ep['script_history'] = ep['script_history'][-10:]
-        ep['script'] = script
+        ep['script'] = _normalize_blocking_tags(script)
+        script = ep['script']   # use normalized version downstream
         ep['status'] = 'draft'
         ep['logic_brief'] = brief
         ep['audit_report'] = audit_report
+        # Store end_position for continuity context (used by _prev_episode_ending_context)
+        end_pos = _extract_end_position(script)
+        if end_pos:
+            ep['end_position'] = end_pos
         save_episode(sid, num, ep)
+        # Extract and register plot devices + narrative state for anti-repetition tracking
+        try:
+            gen_devices = _extract_devices_from_script(script)
+            if gen_devices:
+                ep['plot_devices'] = gen_devices
+                save_episode(sid, num, ep)
+                _update_devices_index(sid, num, gen_devices)
+        except Exception as _de:
+            _log_event('WARN', 'device_extract_after_gen_failed', err=str(_de)[:200])
+        try:
+            gen_narrative = _extract_narrative_state_from_script(script)
+            if gen_narrative:
+                ep['narrative_state'] = gen_narrative
+                save_episode(sid, num, ep)
+                _update_narrative_index(sid, num, gen_narrative)
+        except Exception as _ne:
+            _log_event('WARN', 'narrative_extract_after_gen_failed', err=str(_ne)[:200])
+        # Sync outfits from SCENE_OPEN blocks (non-blocking — failures are logged)
+        try:
+            _sync_script_outfits(sid, script)
+        except Exception as _oe:
+            _log_event('WARN', 'outfit_sync_after_gen_failed', err=str(_oe)[:200])
 
         # NOTE: cast-block sync is INTENTIONALLY NOT run after script-gen.
         # User wants explicit control — they'll click "🤖 Извлечь персонажей и локации"
@@ -11890,11 +15885,47 @@ def update_episode(sid, num):
     if not ep:
         return jsonify({'error': 'not found'}), 404
     data = request.json
+    prev_script = (ep.get('script') or '').strip()
     if 'reteller' in data:
         ep['reteller'].update(data.pop('reteller'))
+    # Normalize legacy [SCENE_OPEN]/[EPISODE_END] tags to [BLOCKING]/[BLOCKING_END] on save
+    if 'script' in data and data['script']:
+        data['script'] = _normalize_blocking_tags(data['script'])
     ep.update(data)
     save_episode(sid, num, ep)
-    return jsonify(ep)
+    # If script was updated, sync outfits and extract plot devices
+    new_outfits = []
+    new_script = (ep.get('script') or '').strip()
+    if 'script' in data and new_script and new_script != prev_script:
+        try:
+            new_outfits = _sync_script_outfits(sid, data['script'])
+        except Exception as _e:
+            _log_event('WARN', 'outfit_sync_failed', err=str(_e)[:200])
+        try:
+            upd_devices = _extract_devices_from_script(new_script)
+            if upd_devices:
+                ep['plot_devices'] = upd_devices
+                save_episode(sid, num, ep)
+                _update_devices_index(sid, num, upd_devices)
+        except Exception as _de:
+            _log_event('WARN', 'device_extract_on_update_failed', err=str(_de)[:200])
+        try:
+            upd_narrative = _extract_narrative_state_from_script(new_script)
+            if upd_narrative:
+                ep['narrative_state'] = upd_narrative
+                save_episode(sid, num, ep)
+                _update_narrative_index(sid, num, upd_narrative)
+        except Exception as _ne:
+            _log_event('WARN', 'narrative_extract_on_update_failed', err=str(_ne)[:200])
+    elif 'script' in data:
+        try:
+            new_outfits = _sync_script_outfits(sid, data['script'])
+        except Exception as _e:
+            _log_event('WARN', 'outfit_sync_failed', err=str(_e)[:200])
+    resp = dict(ep)
+    if new_outfits:
+        resp['_new_outfits'] = new_outfits
+    return jsonify(resp)
 
 @app.route('/api/series/<sid>/episodes/<int:num>/segment-auto-skips', methods=['PUT'])
 def update_segment_auto_skips(sid, num):
@@ -12888,6 +16919,233 @@ def _extract_keyframes_at_cuts(sid, video_relpath, cut_timestamps, max_frames=3,
             continue
     return out_paths
 
+# ── AVAI Submit Circuit Breaker ───────────────────────────────────────────
+# Hard physical limit on AVAI submits. Lives inside _avai_seedance_start so
+# EVERY path that sends money to AVAI must pass through these checks. No
+# caller can bypass — if any future bug causes a loop, the breaker trips and
+# refuses further submits.
+#
+# Real production incident 2026-05-19: a stuck escalation flag fired one new
+# AVAI submit every 8 seconds for hours, costing ~$230 before user noticed.
+# This breaker would have stopped at submit #3 (per-fingerprint cap).
+_AVAI_AUDIT_LOG = DATA_ROOT / 'avai_submit_audit.jsonl'
+_AVAI_KILL_SWITCH = DATA_ROOT / 'AVAI_KILL_SWITCH'
+_avai_rate_lock = threading.Lock()
+_avai_recent_submits = []   # list[(epoch_sec, fingerprint)]
+
+# Tunable limits — calibrated against real user flows
+_AVAI_MAX_PER_FP_10MIN = 3   # same prompt+refs can't fire 4×+ in 10 min
+_AVAI_MAX_PER_MINUTE   = 15  # global cap per 60s — bulk-gen of 10 = OK; loop = blocked
+_AVAI_KILLSWITCH_5MIN  = 20  # 20+ submits in 5 min auto-trips permanent kill switch
+                              # (tightened from 60 by user after $600 incident — max $12 damage)
+
+class AVAICircuitBreakerError(RuntimeError):
+    """Raised when a submit is refused by the circuit breaker. Indicates a
+    runaway loop bug or pricing risk — refuse to spend money."""
+    pass
+
+
+# ── Seedance Moderation Pre-Flight Checker ─────────────────────────────────
+# Calibrated against the ONLY official ByteDance moderation source we could
+# verify (docs.byteplus.com/en/docs/ModelArk/Content_Pre-filter):
+#   - Nudity, sexual, and graphic content (pornography, abuse, violence, self-harm)
+#   - Misinformation
+#   - Hate speech (racial, nationality, ethnic, sexual orientation, physical disability)
+# Everything else (specific keywords, before/after substitutions, dialogue
+# scanning) is community lore — NOT used here. The checker uses Haiku to
+# evaluate prompts against these categories and returns a verdict the user
+# can act on. Cost: ~$0.0004 per check.
+_SEEDANCE_MODERATION_CHECKER_SYS = (
+    "You are a content-moderation pre-flight checker for ByteDance Seedance 2.0 "
+    "video generation. Your sole job: read a Seedance motion prompt and decide "
+    "whether it will likely be REJECTED by Seedance's documented Content Pre-filter.\n\n"
+    "OFFICIAL ByteDance Content Pre-filter categories (from "
+    "docs.byteplus.com/en/docs/ModelArk/Content_Pre-filter — the ONLY documented "
+    "source). These are the ONLY things you evaluate:\n"
+    "  1. SEXUAL — pornography, explicit sexual acts, nudity, post-clothed states, "
+    "     erotic situations after a kiss. NOT blocked: kissing, embracing, romantic "
+    "     tension, dancing close, undressing implied off-screen.\n"
+    "  2. VIOLENCE_GRAPHIC — extreme graphic violence with visible gore, dismemberment, "
+    "     extensive blood spray on-screen. NOT blocked: action scenes, fights, "
+    "     gunshots without visible wounds, punches landing, falling, dramatic "
+    "     confrontations, threats, slaps. (Crime drama is allowed; gore is not.)\n"
+    "  3. SELF_HARM — explicit self-injury depicted on screen (slashing wrists shown, "
+    "     overdose acts depicted, etc.). NOT blocked: emotional despair, character "
+    "     contemplating, dialogue about pain.\n"
+    "  4. HATE_SPEECH — slurs, dehumanization of protected groups, racial/ethnic/"
+    "     national/sexual-orientation/disability targeting in dialogue or text.\n"
+    "  5. MISINFORMATION — visually depicting real public figures in fabricated events "
+    "     (real politicians/celebrities by name doing things they didn't).\n\n"
+    "CRITICAL RULES — read carefully:\n"
+    "  • Crime drama with violence, gunshots, threats, slaps, action, confrontations, "
+    "    chase scenes, intimidation, fights = ALLOWED. Do NOT flag these.\n"
+    "  • Romantic scenes with kissing, embracing, attraction, passion = ALLOWED.\n"
+    "  • Visible weapons (guns, knives) as props or in action = ALLOWED unless "
+    "    paired with explicit gore (cut-off limbs, exposed organs, gushing blood).\n"
+    "  • Dialogue lines (text inside quotes spoken by characters) — DO NOT MODERATE. "
+    "    Dialogue is delivered as lip-synced audio. Threats in dialogue ('you'll "
+    "    pay for this', 'I'll kill you') are NOT a moderation problem.\n"
+    "  • Mention of blood/wounds is fine; visible explicit gore is the line.\n"
+    "  • Style of the prompt (cartoon/cel-shaded/anime/photoreal) does NOT change "
+    "    your judgment — Seedance applies the same rules.\n"
+    "  • You are NOT a censor. You only flag what Seedance's documented filter "
+    "    will REJECT. If it's just 'edgy', mark PASS.\n\n"
+    "Return ONLY valid JSON, no markdown fences, no commentary:\n"
+    "{\n"
+    '  "verdict": "pass" | "warn" | "reject",\n'
+    '  "categories": ["sexual" | "violence_graphic" | "self_harm" | "hate_speech" | "misinformation"],\n'
+    '  "reasoning": "one short sentence Russian — why this verdict",\n'
+    '  "problem_snippets": ["exact substring from the prompt that triggered each category"],\n'
+    '  "suggestion": "one short Russian sentence — how to rewrite minimally if reject. Empty if pass."\n'
+    "}\n\n"
+    "VERDICT GUIDE:\n"
+    "  - 'pass' = nothing problematic, full submit recommended.\n"
+    "  - 'warn' = grey area, might pass but flagged for user awareness. Submit proceeds.\n"
+    "  - 'reject' = clear violation, Seedance will block. Refuse submit.\n\n"
+    "Default to 'pass' when uncertain. False rejects are MORE costly than false passes."
+)
+
+
+def _seedance_moderation_precheck(prompt_text):
+    """Pre-flight moderation check via Haiku. Returns dict with verdict +
+    reasoning. Safe to call inline — Haiku is fast (~2s) and cheap (~$0.0004).
+    Returns {'verdict': 'pass', ...} on any error (fail-open — don't block
+    legitimate submits on infrastructure issues)."""
+    if not prompt_text or len(prompt_text.strip()) < 20:
+        return {'verdict': 'pass', 'reasoning': '(prompt empty or too short to evaluate)',
+                'categories': [], 'problem_snippets': [], 'suggestion': ''}
+    try:
+        raw = claude_ask_fast(
+            f"Промпт для проверки (между маркерами):\n=== PROMPT ===\n{prompt_text[:8000]}\n=== END PROMPT ===\n\n"
+            f"Верни strict JSON по схеме.",
+            system=_SEEDANCE_MODERATION_CHECKER_SYS,
+        )
+        data = json.loads(strip_json(raw))
+        # Normalize required fields
+        return {
+            'verdict': data.get('verdict') or 'pass',
+            'categories': data.get('categories') or [],
+            'reasoning': data.get('reasoning') or '',
+            'problem_snippets': data.get('problem_snippets') or [],
+            'suggestion': data.get('suggestion') or '',
+            'checked_at': int(time.time()),
+        }
+    except Exception as e:
+        # Fail-open. Never block on infra errors.
+        print(f'[moderation-precheck] check failed (fail-open): {e}', flush=True)
+        return {
+            'verdict': 'pass',
+            'reasoning': f'(checker error: {type(e).__name__})',
+            'categories': [],
+            'problem_snippets': [],
+            'suggestion': '',
+            'checked_at': int(time.time()),
+            'error': str(e)[:200],
+        }
+
+
+def _avai_kill_switch_status():
+    """Returns dict {active, since, reason, file_path} for UI display.
+    Always safe to call — handles missing file / parse errors gracefully."""
+    if not _AVAI_KILL_SWITCH.exists():
+        return {'active': False, 'reason': '', 'since': None, 'file_path': str(_AVAI_KILL_SWITCH)}
+    try:
+        reason = _AVAI_KILL_SWITCH.read_text()[:800]
+        since = int(_AVAI_KILL_SWITCH.stat().st_mtime)
+    except Exception as e:
+        reason = f'(read failed: {e})'
+        since = None
+    return {
+        'active': True,
+        'reason': reason,
+        'since': since,
+        'file_path': str(_AVAI_KILL_SWITCH),
+    }
+
+def _avai_fingerprint(prompt, ref_urls, duration, moderation_bypass):
+    """Stable 16-char hash of submit content. Same fingerprint = duplicate
+    submit. Identical prompt+refs+duration+bypass → blocked at the breaker."""
+    payload = '\n'.join([
+        (prompt or '')[:5000],
+        '|'.join(sorted(ref_urls or [])),
+        str(duration),
+        str(moderation_bypass or ''),
+    ])
+    return hashlib.sha256(payload.encode('utf-8', errors='ignore')).hexdigest()[:16]
+
+def _avai_circuit_breaker_check(prompt, ref_urls, duration, moderation_bypass):
+    """Hard-block submits exceeding rate limits. Raises AVAICircuitBreakerError
+    on block. Records to audit log on pass. MUST be called before every AVAI
+    submit — already wired into _avai_seedance_start as the first line."""
+    # Permanent kill switch first (cheapest check)
+    if _AVAI_KILL_SWITCH.exists():
+        raise AVAICircuitBreakerError(
+            f'AVAI submits DISABLED — kill switch active at {_AVAI_KILL_SWITCH}. '
+            f'Investigate, then delete the file to re-enable.'
+        )
+    fp = _avai_fingerprint(prompt, ref_urls, duration, moderation_bypass)
+    now = time.time()
+    with _avai_rate_lock:
+        # Prune entries older than 10 min
+        cutoff = now - 600
+        _avai_recent_submits[:] = [(t, f) for (t, f) in _avai_recent_submits if t > cutoff]
+        # 1) Per-fingerprint duplicate cap in last 10 min
+        fp_count = sum(1 for (t, f) in _avai_recent_submits if f == fp)
+        if fp_count >= _AVAI_MAX_PER_FP_10MIN:
+            err = (
+                f'AVAI circuit breaker: identical content (fp={fp}) submitted '
+                f'{fp_count}× in last 10 min — refusing duplicate. Looks like '
+                f'a retry loop. Investigate before manually retrying.'
+            )
+            print(f'[avai-cb] BLOCKED fp={fp}: {err}', flush=True)
+            raise AVAICircuitBreakerError(err)
+        # 2) Global per-minute cap
+        per_min = sum(1 for (t, f) in _avai_recent_submits if t > now - 60)
+        if per_min >= _AVAI_MAX_PER_MINUTE:
+            err = (
+                f'AVAI circuit breaker: {per_min} submits in last 60 sec '
+                f'(cap {_AVAI_MAX_PER_MINUTE}). Refusing — runaway loop suspected.'
+            )
+            print(f'[avai-cb] BLOCKED rate: {err}', flush=True)
+            raise AVAICircuitBreakerError(err)
+        # 3) 5-min escalation → permanent kill switch
+        per_5min = sum(1 for (t, f) in _avai_recent_submits if t > now - 300)
+        if per_5min >= _AVAI_KILLSWITCH_5MIN:
+            try:
+                _AVAI_KILL_SWITCH.parent.mkdir(parents=True, exist_ok=True)
+                _AVAI_KILL_SWITCH.write_text(
+                    f'Auto-tripped at {datetime.datetime.now().isoformat()}\n'
+                    f'{per_5min} AVAI submits in 5 minutes (limit {_AVAI_KILLSWITCH_5MIN}).\n'
+                    f'Recent fingerprints: {set(f for (t, f) in _avai_recent_submits if t > now - 300)}\n'
+                    f'Investigate root cause, then delete this file to re-enable submits.'
+                )
+            except Exception as e:
+                print(f'[avai-cb] kill-switch write failed: {e}', flush=True)
+            err = (
+                f'AVAI KILL SWITCH AUTO-TRIPPED: {per_5min} submits in 5 min. '
+                f'All AVAI submits BLOCKED until {_AVAI_KILL_SWITCH} is removed.'
+            )
+            print(f'[avai-cb] {err}', flush=True)
+            raise AVAICircuitBreakerError(err)
+        # OK — record this submit
+        _avai_recent_submits.append((now, fp))
+    # Audit log — append-only is atomic on POSIX
+    try:
+        _AVAI_AUDIT_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with open(_AVAI_AUDIT_LOG, 'a') as f:
+            f.write(json.dumps({
+                'ts': int(now),
+                'iso': datetime.datetime.fromtimestamp(now).isoformat(),
+                'fp': fp,
+                'prompt_prefix': (prompt or '')[:80],
+                'ref_count': len(ref_urls or []),
+                'duration': duration,
+                'moderation_bypass': moderation_bypass,
+            }) + '\n')
+    except Exception as e:
+        print(f'[avai-cb] audit log write failed: {e}', flush=True)
+
+
 def _avai_seedance_start(prompt, ref_urls, duration, resolution, moderation_bypass,
                           aspect_ratio='9:16', generate_audio=True,
                           moderation_bypass_prompt=None, avai_key=None,
@@ -12904,6 +17162,10 @@ def _avai_seedance_start(prompt, ref_urls, duration, resolution, moderation_bypa
     context). Caller must resolve it via _get_user_avai_key() inside the request
     handler and pass it explicitly. Falls back to _get_user_avai_key() only when
     called inline from a request handler (image-style sync calls)."""
+    # Hard rate-limit / circuit-breaker — fires BEFORE any AVAI network call
+    # so cost is bounded regardless of caller bugs. Raises AVAICircuitBreakerError
+    # if limits exceeded; caller must catch + show user-friendly error.
+    _avai_circuit_breaker_check(prompt, ref_urls, duration, moderation_bypass)
     if model not in ('reference-pro', 'reference-fast'):
         model = 'reference-fast'
     payload = {
@@ -13204,15 +17466,33 @@ def _qc_vision_grid_and_subs(frame_urls, frame_labels):
 
 
 def _qc_check_prompt_english(prompt):
-    """Scan the composer-built prompt for non-English dialogue. We only care
-    about content INSIDE quoted spoken lines («"..."»), not the surrounding
-    Russian/English narration. Returns dict with list of offending lines."""
+    """Scan the composer-built prompt for non-English **DIALOGUE** specifically.
+    A dialogue line in the composer's output looks like:
+        Adrian (@Image1), with cold rage, says: "Get out of my house."
+    The quoted span follows «says: » / «replies: » / «whispers: » / similar.
+    We scope the non-English check to THOSE quoted spans only — generic
+    narrative quotes in scene description (e.g. «По-крупному, шёпотом»)
+    are NOT dialogue and must not trigger a QC fail.
+
+    Real production bug: chunk QC every retry flagged `prompt_non_english`
+    because the composer's Russian narrative («Adrian набирает...») got
+    picked up. We restrict to lines that look like actual spoken delivery."""
     if not prompt:
         return {'ok': True, 'non_english_lines': []}
     offending = []
-    # Find quoted text spans. We use a non-greedy regex tolerating both
-    # ASCII " and curly-quote variants used by Claude.
-    for m in re.finditer(r'[\"«„]([^\"»“]{2,200}?)[\"»“]', prompt):
+    # Match: <speaking verb> : "<dialogue content>"
+    # Speaking verbs broad enough for English+Russian composer outputs.
+    speak_verbs = (
+        r'(?:says?|asks?|replies|whispers?|shouts?|yells?|murmurs?|breathes?|'
+        r'mutters?|growls?|hisses?|barks?|spits?|sneers?|snaps?|'
+        r'требует|спрашива[еют]+|отвеча[еют]+|шепч[ёе]т|кричит|произносит|говорит|'
+        r'бросает|роняет|выпаливает|выкрикивает)'
+    )
+    dialogue_re = re.compile(
+        speak_verbs + r'[^"«„]{0,40}?[:,]\s*[\"«„]([^\"»"]{2,200}?)[\"»"]',
+        re.IGNORECASE | re.UNICODE,
+    )
+    for m in dialogue_re.finditer(prompt):
         text = m.group(1).strip()
         if not text:
             continue
@@ -13237,8 +17517,32 @@ def _qc_run_chunk(sid, num, idx):
     video_relpath = chunk.get('video_path')
     if not video_relpath:
         return None
+    # ── Cross-chunk attempt counter ────────────────────────────────────
+    # Real production bug: auto-retry creates a NEW chunk (new idx) instead
+    # of replacing the failed one. Each new chunk starts fresh with
+    # qc.attempts=1 → the «>= QC_MAX_RETRIES» cap NEVER fires → infinite
+    # duplicate-chunk explosion (12+ copies of the same segment observed
+    # on «My Stepmother Made Me a Servant», ep 44).
+    # Count ALL completed chunks for the same chunk_text (or same
+    # script_order if available) — that's the real retry budget for this
+    # segment. Then this chunk's «attempts» = chunks_so_far + 1.
+    cur_text = (chunk.get('chunk_text') or '').strip()
+    cur_so = chunk.get('script_order')
+    sibling_count = 0
+    for c in chunks:
+        if c.get('idx') == idx:
+            continue   # don't count self
+        # Match by script_order when both have one (most reliable), else by chunk_text
+        if (isinstance(cur_so, int) and isinstance(c.get('script_order'), int)
+                and c.get('script_order') == cur_so):
+            sibling_count += 1
+        elif cur_text and (c.get('chunk_text') or '').strip() == cur_text:
+            sibling_count += 1
     prev_qc = chunk.get('qc') or {}
-    attempts = int(prev_qc.get('attempts') or 0)
+    # Per-chunk attempts: how many times QC ran on THIS chunk (always >=1 by end).
+    own_attempts = int(prev_qc.get('attempts') or 0) + 1
+    # Global attempts: includes failed siblings. This is what the cap uses.
+    attempts = own_attempts + sibling_count
 
     details = {}
     fails = []
@@ -13294,21 +17598,29 @@ def _qc_run_chunk(sid, num, idx):
     if audio:
         l_res = _qc_whisper_detect(audio)
         details['lang'] = l_res
-        # Speech detected AND language not English AND confident enough → fail
-        if (l_res.get('lang') and l_res.get('lang') != 'en'
+        # Whisper returns either ISO code ('en') OR full English name
+        # ('english') depending on response_format. Be permissive: accept
+        # any English marker. Real production bug: every chunk was failing
+        # `lang:english` because Whisper sent 'english' and we required 'en'.
+        ENGLISH_MARKERS = {'en', 'eng', 'english'}
+        detected_lang = (l_res.get('lang') or '').lower().strip()
+        if (detected_lang and detected_lang not in ENGLISH_MARKERS
                 and (l_res.get('confidence') or 0) >= 0.5):
-            fails.append(f'lang:{l_res["lang"]}')
+            fails.append(f'lang:{detected_lang}')
     else:
         details['lang'] = {'skipped': 'no_audio'}
 
-    new_attempts = attempts + 1
+    # `attempts` already includes self (own_attempts >= 1) + siblings, so we
+    # compare directly to the cap. No further +1.
     status = 'pass' if not fails else (
-        'retry_exhausted' if new_attempts >= QC_MAX_RETRIES else 'fail'
+        'retry_exhausted' if attempts >= QC_MAX_RETRIES else 'fail'
     )
 
     qc_entry = {
         'status': status,
-        'attempts': new_attempts,
+        'attempts': attempts,        # global count (this chunk + failed siblings)
+        'own_attempts': own_attempts,  # how many times QC ran on THIS chunk
+        'sibling_count': sibling_count,  # debug visibility
         'fails': fails,
         'details': details,
         'last_check_at': int(time.time()),
@@ -13323,7 +17635,7 @@ def _qc_run_chunk(sid, num, idx):
             chunk_f['qc'] = qc_entry
             save_episode(sid, num, ep_fresh)
 
-    print(f'[qc] chunk {idx} → {status} (attempts={new_attempts}, fails={fails})', flush=True)
+    print(f'[qc] chunk {idx} → {status} (own={own_attempts}, siblings={sibling_count}, global={attempts}, fails={fails})', flush=True)
     return qc_entry
 
 
@@ -13357,6 +17669,26 @@ def _qc_can_pass(chunk):
         return url
     except Exception as e:
         print(f'[seedance] loc upload failed for {loc.get("name")}: {e}')
+        return None
+
+def _ensure_loc_avai_url(sid, loc):
+    """Lazy-upload the location's first local ref_image to AVAI when
+    avai_url is missing. Persists the URL on the loc dict in-memory
+    (caller must save_series). Returns the URL or None."""
+    if loc.get('avai_url'):
+        return loc['avai_url']
+    refs = loc.get('ref_images') or []
+    if not refs:
+        return None
+    local = series_path(sid) / refs[0]
+    if not local.exists():
+        return None
+    try:
+        url = _avai_upload_local_image(local)
+        loc['avai_url'] = url
+        return url
+    except Exception as e:
+        print(f'[seedance] loc avai upload failed for {loc.get("name")}: {e}')
         return None
 
 def _ensure_char_avai_base_url(sid, char):
@@ -13623,9 +17955,67 @@ def auto_assemble_episode(sid, num):
                 by_order[so] = c
         else:
             truly_orphan.append(c)
-    chunks = [by_order[k] for k in sorted(by_order.keys())] + sorted(
-        truly_orphan, key=lambda c: c.get('idx') or 0
-    )
+    # Interleave orphans (chunks lacking script_order AND not matched to any
+    # existing slot by chunk_text) BY idx instead of dumping them at the end.
+    # idx is monotonically increasing per /seedance/start, so it preserves
+    # the user's creation order. We insert each orphan AFTER the latest
+    # ordered chunk whose idx is below the orphan's idx — that keeps
+    # manually-regenerated chunks visually near their original siblings
+    # instead of appearing at the tail of the final cut.
+    ordered_list = [by_order[k] for k in sorted(by_order.keys())]
+    truly_orphan_sorted = sorted(truly_orphan, key=lambda c: c.get('idx') or 0)
+
+    # Orphan placement — scene-heading-based grouping.
+    # Real prod bug 2026-05-25 «My Stepmother» ep 54: orphan chunks (chunks
+    # without script_order — typically manual recomposes) were placed by
+    # raw idx, which scattered them away from their scene siblings. An
+    # orphan from scene 1 with idx=6 ended up after scene 5's chunk because
+    # idx=6 > idx of all other chunks of scene 1.
+    #
+    # Fix: extract the first meaningful line (the slug «INT. CAR — MORNING»
+    # or «LOCATION: ...») as a scene-key, then insert each orphan immediately
+    # after the LAST ordered chunk sharing the same scene-key. Falls back to
+    # idx-based insertion for orphans whose scene heading doesn't match any
+    # ordered chunk (truly novel scenes).
+    def _scene_key(text):
+        for line in (text or '').split('\n'):
+            line = line.strip()
+            if line:
+                # Normalize whitespace + uppercase so minor differences don't
+                # break the match («INT. Car — Morning» == «INT.  CAR — MORNING»).
+                return ' '.join(line.upper().split())
+        return ''
+    chunks = list(ordered_list)
+    # Map scene-key → last position of that scene in the current chunks list
+    def _rebuild_heading_index(lst):
+        idx_map = {}
+        for i, c in enumerate(lst):
+            k = _scene_key(c.get('chunk_text'))
+            if k:
+                idx_map[k] = i
+        return idx_map
+    heading_last_pos = _rebuild_heading_index(chunks)
+    fallback_orphans = []
+    for orph in truly_orphan_sorted:
+        k = _scene_key(orph.get('chunk_text'))
+        pos = heading_last_pos.get(k) if k else None
+        if pos is not None:
+            # Insert right after the last chunk of this scene
+            chunks.insert(pos + 1, orph)
+            heading_last_pos = _rebuild_heading_index(chunks)
+        else:
+            fallback_orphans.append(orph)
+    # Truly novel scenes (no heading match) — fall back to old idx-based
+    # interleaving to keep them in creation order.
+    for orph in fallback_orphans:
+        oi = orph.get('idx') or 0
+        insert_at = len(chunks)
+        for j, ch in enumerate(chunks):
+            ci = ch.get('idx') or 0
+            if ci > oi:
+                insert_at = j
+                break
+        chunks.insert(insert_at, orph)
 
     if require_all and isinstance(expected_segments, int) and expected_segments > 0:
         if len(chunks) < expected_segments:
@@ -13721,10 +18111,13 @@ def auto_assemble_episode(sid, num):
 
     seg_meta = [_probe_audio_and_duration(p) for p in seg_paths]
     audio_uniform = all(ha for ha, _ in seg_meta)
-    # Concat-copy is only safe when all inputs share codec/dims/fps AND every
-    # segment has an audio track. Facades typically violate both → skip the
-    # fast path entirely once we know audio coverage isn't uniform.
-    can_try_copy = audio_uniform and (facades_inserted == 0)
+    # Concat-copy (-c copy via concat demuxer) is disabled. Seedance chunks
+    # have non-aligned B-frame pyramids + non-zero PTS offsets, so bitstream
+    # append showed 2-4 reordered buffer frames across each seam (looked like
+    # last/first frame flickering back and forth several times). Filter-complex
+    # re-encode with per-segment setpts=PTS-STARTPTS rewrites the timeline
+    # cleanly. Costs ~30-90s CPU per episode — worth it for clean cuts.
+    can_try_copy = False
 
     out_dir = base / 'OUT'
     out_dir.mkdir(exist_ok=True)
@@ -13796,8 +18189,24 @@ def auto_assemble_episode(sid, num):
             inputs = []
             filt = []
             n = len(seg_paths)
+            # Seam-flicker root cause (after empirical testing): libx264 with
+            # default B-frame settings reorders frames around seam boundaries
+            # during re-encode. Combined with `aresample=async=1` stretching
+            # audio, the concat filter pads video with held frames → the visible
+            # "last frame + first frame alternating" flash at every seam.
+            #
+            # Fix (no content trimming, audio preserved bit-for-bit):
+            #   1. `-bf 0` disables B-frames → no reorder possible.
+            #   2. `-force_key_frames` at every seam timestamp → encoder treats
+            #      each segment as an independent GOP; no inter-seam references.
+            #   3. Drop `async=1` from aresample → no audio stretch, no concat
+            #      video padding to compensate.
+            #   4. `-fps_mode cfr` → strict constant frame rate, ffmpeg will
+            #      not duplicate frames at any point.
+            FPS = 24
             for i, p in enumerate(seg_paths):
                 inputs += ['-i', p]
+                has_audio, dur = seg_meta[i]
                 # Scale to target resolution with padding to avoid AR distortion.
                 # force_original_aspect_ratio=decrease → fit within box,
                 # pad → letterbox/pillarbox to fill exact target dims.
@@ -13805,12 +18214,15 @@ def auto_assemble_episode(sid, num):
                     f"[{i}:v]setpts=PTS-STARTPTS,"
                     f"scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,"
                     f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2,"
-                    f"setsar=1,fps=24[v{i}]"
+                    f"setsar=1,fps={FPS}[v{i}]"
                 )
-                has_audio, dur = seg_meta[i]
                 if has_audio:
+                    # No `async=1` — that allowed ffmpeg to stretch/pad audio,
+                    # which made the concat filter pad video with held frames
+                    # at seams. Plain resample to 48k stereo, preserve original
+                    # timing exactly.
                     filt.append(
-                        f"[{i}:a]aresample=async=1:first_pts=0,"
+                        f"[{i}:a]aresample=48000,"
                         f"aformat=channel_layouts=stereo:sample_rates=48000,"
                         f"asetpts=PTS-STARTPTS[a{i}]"
                     )
@@ -13823,12 +18235,28 @@ def auto_assemble_episode(sid, num):
                     )
             cat = ''.join(f"[v{i}][a{i}]" for i in range(n))
             filt.append(f"{cat}concat=n={n}:v=1:a=1[v][a]")
+
+            # Cumulative seam timestamps in the OUTPUT timeline. We pass these
+            # to `-force_key_frames` so libx264 starts a fresh IDR exactly at
+            # each segment boundary — no cross-seam motion estimation, no
+            # reorder artifacts.
+            seam_times = []
+            acc = 0.0
+            for i in range(n):
+                if i > 0:
+                    seam_times.append(acc)
+                acc += seg_meta[i][1] or 0.0
+            kf_arg = ','.join(f'{t:.3f}' for t in seam_times) if seam_times else '0'
+
             cmd_re = [
                 ffmpeg_bin, '-y', *inputs,
                 '-filter_complex', ';'.join(filt),
                 '-map', '[v]', '-map', '[a]',
                 '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20',
                 '-pix_fmt', 'yuv420p',
+                '-bf', '0',                          # no B-frames → no reorder at seams
+                '-force_key_frames', kf_arg,         # IDR at every seam
+                '-fps_mode', 'cfr',                  # strict CFR, no auto-duplication
                 '-c:a', 'aac', '-b:a', '128k', '-ar', '48000', '-ac', '2',
                 '-movflags', '+faststart',
                 str(out_path),
@@ -14147,7 +18575,10 @@ def _generate_scene_music_worker(sid, num, scene_idx, user_hint, force, attempts
                 with RENDER_SEMAPHORE:
                     _music_post.mp3_to_wav(ffmpeg_bin, raw_mp3, raw_wav)
                     _music_post.silence_trim(ffmpeg_bin, raw_wav, trimmed)
-                    activity = _music_post.analyze_activity(ffmpeg_bin, trimmed, target_sec)
+                    # Use the CLAMPED target (≤110s) — ElevenLabs physically cannot
+                    # exceed ~110s regardless of what we ask. Comparing against the
+                    # raw scene duration (e.g. 189s from 13 chunks) would always fail.
+                    activity = _music_post.analyze_activity(ffmpeg_bin, trimmed, target_ms / 1000.0)
                     if not activity['ok']:
                         last_error = f'attempt {attempt+1} failed quality check: {activity["reason"]}'
                         print(f'[music] {sid}/ep{num}/sc{scene_idx} {last_error}', flush=True)
@@ -14332,11 +18763,15 @@ def music_regenerate(sid, num):
     return jsonify({'ok': True, 'scenes': started})
 
 
+_MUSIC_STALE_TIMEOUT_S = 15 * 60  # 15 min — worker likely crashed
+
+
 @app.route('/api/series/<sid>/episodes/<int:num>/music/poll', methods=['GET'])
 def music_poll(sid, num):
     ep = load_episode(sid, num)
     if not ep:
         return jsonify({'error': 'not found'}), 404
+
     # Backfill scene metadata if missing so the UI sees legacy episodes too.
     if _backfill_scene_meta_from_batch_prompts(ep):
         with _episode_lock(sid, num):
@@ -14344,7 +18779,44 @@ def music_poll(sid, num):
             if _backfill_scene_meta_from_batch_prompts(ep_fresh):
                 save_episode(sid, num, ep_fresh)
                 ep = ep_fresh
+
+    now = int(time.time())
+
+    # 1) Reset stale 'generating' records (worker crashed).
+    stale = [r for r in _music_scenes(ep)
+             if r.get('status') == 'generating'
+             and now - int(r.get('started_at') or 0) > _MUSIC_STALE_TIMEOUT_S]
+    if stale:
+        with _episode_lock(sid, num):
+            ep2 = load_episode(sid, num) or ep
+            changed = False
+            for r in _music_scenes(ep2):
+                if (r.get('status') == 'generating'
+                        and now - int(r.get('started_at') or 0) > _MUSIC_STALE_TIMEOUT_S):
+                    r['status'] = 'failed'
+                    r['error'] = 'timeout — worker crashed, click ↻ to retry'
+                    changed = True
+            if changed:
+                save_episode(sid, num, ep2)
+                ep = ep2
+
     groups = _group_chunks_by_scene(_seedance_chunks(ep))
+
+    # 2) Auto-kick: episode has completed chunks but zero music_scenes → missed trigger.
+    if (groups and not _music_scenes(ep)
+            and (ep.get('script') or '').strip() and ELEVENLABS_KEY):
+        _kick_music_generation(sid, num, [g['sceneIdx'] for g in groups], '', force=False)
+        with _episode_lock(sid, num):
+            ep = load_episode(sid, num) or ep
+
+    # 3) Re-spawn workers for 'pending' scenes that have no active worker
+    #    (server restarted after a manual reset, or early-fire wrote pending but crashed).
+    pending = [r for r in _music_scenes(ep) if r.get('status') == 'pending']
+    if pending and ELEVENLABS_KEY:
+        _kick_music_generation(sid, num, [int(r['sceneIdx']) for r in pending], '', force=False)
+        with _episode_lock(sid, num):
+            ep = load_episode(sid, num) or ep
+
     scenes_meta = [{'sceneIdx': g['sceneIdx'], 'total_sec': g['total_sec'],
                     'chunks': len(g['chunks'])} for g in groups]
     return jsonify({
@@ -14741,6 +19213,209 @@ Constraints: use <Name1> as @Image1, use <Name2> as @Image2, keep exact facial i
 Return ONLY valid JSON. No markdown fences. No commentary.
 """
 
+# ─────────────────────────────────────────────────────────────────────────────
+# TURBO-mode auto-revise: one Claude call rewrites ALL main promptEns of one
+# episode according to a single Russian instruction (from per-user settings).
+# Mirrors colleague's REVISE_EPISODE_RULES in
+# /tmp/shadow-founder/src/main/services/chunk-builder.ts (ShadowFounder reference).
+# Used by the Turbo auto-pipeline after batch-compose, and by the manual
+# «✨ Применить правку» button on the episode page. Sequential mode never
+# touches this.
+# ─────────────────────────────────────────────────────────────────────────────
+_SD_REVISE_BATCH_RULES = """
+Ты редактируешь набор готовых Seedance-промптов всех main-чанков ОДНОЙ серии. Серия идёт непрерывно: это последовательность 5-15-секундных клипов в одной (или нескольких) локации с теми же персонажами. Между чанками действует общий episodeBlocking (расстановка персонажей).
+
+ЦЕЛЬ ПРАВКИ — задана пользователем на русском. Применяй её ко ВСЕМ чанкам СОГЛАСОВАННО. Если правка про continuity между чанками («кадры скачут», «свет меняется», «персонаж дёргается», «телепортируется») — синхронизируй описания всех чанков. Если правка про конкретный аспект во всей серии («больше статичных кадров», «убери handheld», «следи за длинной реплик») — примени везде.
+
+ОБЯЗАТЕЛЬНО СОХРАНИТЬ В КАЖДОМ ЧАНКЕ:
+1. Структура из 6 блоков ровно в порядке: Location / Characters in this segment / Action timeline / Lighting and atmosphere / Style / Constraints.
+2. Реплики в кавычках («{Name} says: "..."») — ДОСЛОВНО, если пользователь явно не просит их менять. Если правка просит укоротить реплики — укороти, сохранив смысл и эмоции.
+3. Тайминги шотов (0-5s, 5-10s и т.п.) и общая длительность чанка в секундах не меняй.
+4. ЗАПРЕЩЕНО в финальном тексте: "same", "still", "as before", "as previous", "continues", "previous chunk", "прежний", "тот же" — каждый чанк автономен.
+5. Не добавляй одежду/аксессуары которых нет в активном outfit персонажа.
+
+ДОБАВЛЕНИЕ / ИЗМЕНЕНИЕ ПЕРСОНАЖЕЙ И ТЕГОВ В ЧАНКЕ:
+Если пользователь явно просит добавить нового персонажа в кадр («покажи Ethan», «Victoria тоже в кадре», «cross-cutting на спикеров», «покажи говорящих» и т.п.) — ты МОЖЕШЬ изменить состав @ImageN тегов в чанке. Правила:
+- Используй ТОЛЬКО @ImageN теги из EPISODE TAG MAPPING (он передан выше). Не выдумывай новых тегов и slug-ов.
+- Если добавил/убрал персонажа — в выходном JSON для этого чанка верни ПОЛНЫЙ обновлённый `charactersInSegment` И `tagsUsed`.
+- Если состав не меняется — НЕ возвращай эти поля, оставь только `promptEn`.
+
+ЕСЛИ ПРАВКА ЯВНО КАСАЕТСЯ continuity:
+- Сделай позы и расположение персонажей в начале чанка N+1 совпадающими с концом чанка N.
+- Убедись что свет/атмосфера/наряд не «прыгают» между чанками.
+- Описывай состояние внешнего вида явно в каждом чанке (наушники, кепка, что в руках) если это есть в outfit/blocking.
+
+ВЫХОДНОЙ ФОРМАТ (СТРОГО ЭТОТ JSON, без markdown). Поля `charactersInSegment` и `tagsUsed` ОПЦИОНАЛЬНЫЕ — включай только если состав реально изменился:
+{
+  "chunks": [
+    {
+      "anchor": "<COPY EXACTLY from input — это ID чанка>",
+      "promptEn": "<полный новый promptEn для этого чанка, 6 блоков, английский>",
+      "charactersInSegment": [{"tag":"@Image1","name":"Victoria","slug":"victoria","variantId":"base"}],
+      "tagsUsed": ["@Image1", "@Image3"]
+    }
+  ]
+}
+
+Никаких пояснений ДО или ПОСЛЕ JSON. Только JSON.
+"""
+
+
+@app.route('/api/series/<sid>/episodes/<int:num>/seedance/revise-batch', methods=['POST'])
+def seedance_revise_batch(sid, num):
+    """ONE Claude call rewrites ALL batch_prompts of one episode according to a
+    Russian instruction. Mirrors colleague's `reviseEpisodePrompts()`.
+
+    Body: { instruction?: str }  — empty/missing falls back to per-user setting.
+    Response: { updated: [{anchor, promptEn}], warnings: [...] }
+    """
+    s = load_series(sid)
+    ep = load_episode(sid, num)
+    if not s or not ep:
+        return jsonify({'error': 'not found'}), 404
+    body = request.json or {}
+    # Resolve the instruction: explicit body > per-user setting > default constant.
+    instr = (body.get('instruction') or '').strip()
+    if not instr:
+        try:
+            email = current_user_email() or ''
+            us = _load_user_settings(email) if email else {}
+            instr = (us.get('auto_revise_instruction') or '').strip()
+        except Exception:
+            instr = ''
+    if not instr:
+        instr = DEFAULT_AUTO_REVISE_INSTRUCTION
+    batch = ep.get('batch_prompts') or {}
+    if not batch:
+        return jsonify({'error': 'no batch_prompts — сначала запусти batch-compose'}), 400
+    tag_mapping = ep.get('batch_tag_mapping') or []
+    episode_blocking = (ep.get('batch_episode_blocking') or ep.get('scene_blocking') or '').strip()
+    valid_tags = {t['tag'] for t in tag_mapping if t.get('tag')}
+
+    # Snapshot original promptEns so we can build the LLM input AND keep a
+    # backup on disk (allows per-chunk «↺ Оригинал» rollback later if needed).
+    source = []
+    for anchor, entry in batch.items():
+        prompt_en = (entry.get('prompt') or '').strip()
+        if not prompt_en:
+            continue
+        source.append({
+            'anchor': anchor,
+            'promptEn': prompt_en,
+            'plan': entry.get('plan') or {},
+            'tagsUsed': entry.get('tagsUsed') or [],
+            'sceneIdx': entry.get('sceneIdx'),
+            'segIdx': entry.get('segIdx'),
+        })
+    if not source:
+        return jsonify({'error': 'no usable promptEns in batch_prompts'}), 400
+
+    # Build the AI input. Pack each chunk in its own delimited block — anchor +
+    # plan summary + tagsUsed + the full promptEn — so Claude can edit in place.
+    blocks = []
+    for p in source:
+        blocks.append('\n────── CHUNK ' + str(p['anchor']) + ' ──────')
+        plan = p['plan']
+        chars = plan.get('charactersInSegment') or []
+        blocks.append('// duration: ' + str(plan.get('durationSec', '')))
+        blocks.append('// charactersInSegment: ' + json.dumps(chars, ensure_ascii=False))
+        blocks.append('// tagsUsed: ' + json.dumps(p['tagsUsed'], ensure_ascii=False))
+        blocks.append(p['promptEn'])
+
+    ai_input = '\n'.join([
+        _SD_REVISE_BATCH_RULES.strip(),
+        '',
+        '═══════════ EPISODE TAG MAPPING ═══════════',
+        '(все @ImageN которые можно использовать в этой серии — refs уже загружены под этими тегами)',
+        json.dumps(tag_mapping, ensure_ascii=False, indent=2),
+        '',
+        '═══════════ EPISODE BLOCKING ═══════════',
+        episode_blocking or '(не задан)',
+        '',
+        '═══════════ ОРИГИНАЛЬНЫЕ ' + str(len(source)) + ' MAIN-ПРОМПТА ═══════════',
+        *blocks,
+        '',
+        '═══════════ ПРАВКА ОТ ПОЛЬЗОВАТЕЛЯ ═══════════',
+        instr,
+        '',
+        'Верни JSON с переписанными ' + str(len(source)) + ' промптами. Используй ТОЛЬКО теги из EPISODE TAG MAPPING выше.',
+    ])
+
+    try:
+        raw = claude_ask(ai_input, system='You are a JSON-only response API. Output strict JSON, no markdown fences, no commentary.')
+        data = json.loads(strip_json(raw))
+    except Exception as e:
+        return jsonify({'error': f'AI не вернул валидный JSON: {e}'}), 500
+    chunks_out = (data or {}).get('chunks') or []
+    if not isinstance(chunks_out, list) or not chunks_out:
+        return jsonify({'error': 'AI вернул пустой chunks[]'}), 500
+
+    by_anchor = {}
+    for c in chunks_out:
+        a = c.get('anchor')
+        pe = (c.get('promptEn') or '').strip()
+        if not isinstance(a, str) or not pe:
+            continue
+        # Strip a stray markdown fence if Claude wrapped the value.
+        m = re.match(r'^```(?:[a-z]*)?\s*\n([\s\S]*?)\n```\s*$', pe)
+        if m:
+            pe = m.group(1).strip()
+        tags_used = c.get('tagsUsed')
+        if isinstance(tags_used, list):
+            tags_used = [t for t in tags_used if isinstance(t, str) and t in valid_tags]
+        else:
+            tags_used = None
+        chars_in_seg = c.get('charactersInSegment')
+        if isinstance(chars_in_seg, list):
+            chars_in_seg = [x for x in chars_in_seg if isinstance(x, dict) and x.get('tag') in valid_tags]
+        else:
+            chars_in_seg = None
+        by_anchor[a] = {'promptEn': pe, 'tagsUsed': tags_used, 'charactersInSegment': chars_in_seg}
+
+    updated = []
+    warnings = []
+    with _episode_lock(sid, num):
+        ep_fresh = load_episode(sid, num) or ep
+        batch_fresh = ep_fresh.get('batch_prompts') or {}
+        for anchor, new in by_anchor.items():
+            entry = batch_fresh.get(anchor)
+            if not entry:
+                warnings.append({'code': 'unknown-anchor', 'anchor': anchor, 'message': 'AI вернул чанк которого нет в batch_prompts'})
+                continue
+            # Inject blocking and ban-list pass on the rewritten promptEn —
+            # mirrors compose-time post-processing so revise output is
+            # immediately ready for Seedance without an extra round.
+            tags_for_inject = new.get('tagsUsed') or entry.get('tagsUsed') or []
+            with_block = _seedance_inject_blocking(new['promptEn'], episode_blocking, tags_for_inject)
+            finalized, applied = _seedance_apply_banlist(with_block)
+            # Preserve a one-shot backup of the pre-revise text so a future
+            # «↺ Оригинал» UI button can roll a single chunk back.
+            if not entry.get('prompt_original'):
+                entry['prompt_original'] = entry.get('prompt') or ''
+            entry['prompt'] = finalized
+            if new.get('tagsUsed'):
+                entry['tagsUsed'] = new['tagsUsed']
+            if new.get('charactersInSegment'):
+                entry.setdefault('plan', {})['charactersInSegment'] = new['charactersInSegment']
+            if applied:
+                entry['appliedReplacements'] = applied
+            batch_fresh[anchor] = entry
+            updated.append({'anchor': anchor, 'promptEn': finalized})
+        ep_fresh['batch_prompts'] = batch_fresh
+        ep_fresh['batch_revised_at'] = datetime.datetime.utcnow().isoformat()
+        ep_fresh['batch_revised_instruction'] = instr
+        save_episode(sid, num, ep_fresh)
+
+    return jsonify({
+        'ok': True,
+        'updated': updated,
+        'count': len(updated),
+        'expected': len(source),
+        'warnings': warnings,
+        'instruction_used': instr,
+    })
+
+
 @app.route('/api/series/<sid>/episodes/<int:num>/seedance/batch-compose', methods=['POST'])
 def seedance_batch_compose(sid, num):
     """Reference-style episode plan builder. ONE Claude call produces a strict
@@ -14771,6 +19446,21 @@ def seedance_batch_compose(sid, num):
     script = (ep.get('script') or '').strip()
     if not script:
         return jsonify({'error': 'script empty'}), 400
+
+    # ─── SAFETY NET: re-sync [BLOCKING] outfits before composing. If for
+    # any reason the script was saved through a path that skipped sync
+    # (legacy import, direct edit, history restore from before sync
+    # existed), missing outfit objects get created here so Claude sees
+    # them in `outfit_options` and can pick the right variantId. The
+    # corresponding images may not be ready THIS run if just created —
+    # the spawned autogen worker handles them in the background.
+    try:
+        _sync_script_outfits(sid, script)
+        # reload after sync — character.outfits may have grown
+        s = load_series(sid)
+    except Exception as _e:
+        _log_event('WARN', 'pre_compose_outfit_sync_failed',
+                   sid=sid, ep=num, err=str(_e)[:200])
 
     active_char_ids = set(ep.get('characters_used') or [])
     active_loc_ids  = set(ep.get('locations_used') or [])
@@ -15608,7 +20298,7 @@ def seedance_compose(sid, num):
         "  1) SUBJECT — кто в кадре. После биндинга используй ИМЕНА: 'Ethan и Maya в лобби'.\n"
         "  2) ACTION — что они делают, ИМЕНАМИ: 'Ethan ставит чашку на стол, Maya садится напротив'.\n"
         "  3) SCENE — где, ИМЕНЕМ локации: 'Действие в Lobby — стеклянное холодное лобби, утренний свет'.\n"
-        "  4) CAMERA — конкретно: 'medium close-up' (по умолчанию), 'over-the-shoulder', 'medium shot', "
+        "  4) CAMERA — используй канонические Seedance-keyword'ы: 'close-up' (дефолт — face filling ~50-60% of frame), 'macro close-up' (extreme emotion — face filling >70%), 'over-the-shoulder', 'medium close-up' (chest-up), 'medium shot' (waist-up), "
         "'tracking shot' / 'slow dolly in' (на эмоции), 'wide shot' / 'establishing wide' (ТОЛЬКО для границ сцены).\n"
         "  4a) FRAMING REFERENCE — ЖЁСТКИЙ ЗАПРЕТ И ЭТАЛОНЫ:\n"
         "     ❌ КАТЕГОРИЧЕСКИ НЕЛЬЗЯ: ставить одного персонажа размытым/расфокусированным силуэтом "
@@ -15638,9 +20328,9 @@ def seedance_compose(sid, num):
         "       • Если по тексту реально нужен один в фокусе — выкидывай второго из refs и пиши medium close-up / close-up одного спикера, в CAMERA: 'остальные за пределами кадра / off-screen'.\n"
         "  5) DIALOGUE — ИСКЛЮЧЕНИЕ из правила биндинга. Для КАЖДОЙ реплики — формат из ДВУХ частей "
         "ОБЯЗАТЕЛЬНО с @ImageN (для lipsync-привязки):\n"
-        "     (a) ШОТ-БИТ перед репликой, имя + @ImageN. По умолчанию используй MEDIUM CLOSE-UP (по грудь портрет), "
-        "не tight close-up на одно лицо. Варианты ракурса: 'medium close-up Maya (@Image2) до груди', "
-        "'over-the-shoulder Ethan на Maya (@Image2)', 'медиум Maya (@Image2) с лёгкого наклона'.\n"
+        "     (a) ШОТ-БИТ перед репликой, имя + @ImageN. По умолчанию используй CLOSE-UP (face filling ~50-60% of frame — это канонический Seedance-keyword, не 'tight CU'). "
+        "Варианты ракурса: 'close-up Maya (@Image2), face filling frame, shoulders barely visible', "
+        "'over-the-shoulder Ethan на Maya (@Image2)', 'close-up Maya (@Image2), slight low angle'.\n"
         "         Wide / two-shot ИЗБЕГАЙ во время реплик — модель плохо удерживает мимику и lipsync на дистанции.\n"
         "     (b) Сама реплика: 'Maya (@Image2), <эмоция/тон на русском>, говорит: \"<точная реплика как в сценарии>\"'\n"
         "     Полный пример (две реплики двух разных персов):\n"
@@ -15827,7 +20517,16 @@ def seedance_compose(sid, num):
         "    пока я не нашёл явный «hangs up» между ними.\n"
         "  – В ACTION есть «телефон у уха» / «mobile in hand»? Должен быть, если звонок.\n"
         "  – Я случайно не поставил обоих собеседников в одну комнату? Это запрещено.\n"
-        "  – Тип телефона тот же что в PREVIOUS? Не «мобильный → стационарный».\n\n"
+        "  – Тип телефона тот же что в PREVIOUS? Не «мобильный → стационарный».\n"
+        "  – VOICE-ONLY ПЕРСОНАЖИ: Если в AVAILABLE CHARACTERS у персонажа appearance начинается "
+        "    с «Voice on phone» / «Off-screen voice» / «голос по телефону» / «голос за кадром» — "
+        "    это персонаж НА ДРУГОМ КОНЦЕ звонка. Его @ImageN ref нужен для голосовой консистентности, "
+        "    но визуально В КАДРЕ ОН НЕ ПОЯВЛЯЕТСЯ. Сцена показывает только тех кто в комнате слушает "
+        "    звонок (на громкой связи) или говорит в трубку. Реплику voice-only персонажа оформляй "
+        "    как '(V.O.) from phone speaker' или 'off-screen voice through phone'. НЕ описывай его "
+        "    физическое присутствие в SUBJECT/ACTION/SCENE. Прод-инцидент 2026-05-19 'My Stepmother' "
+        "    ep 43: Detective Morris (voice-on-phone) был поставлен в SUITE 12 с папками в руках, "
+        "    хотя должен был быть только голосом в speakerphone.\n\n"
         "OUTFIT CONSISTENCY — КРИТИЧНО ДЛЯ КОНСИСТЕНТНОСТИ ОДЕЖДЫ:\n"
         "Это самая частая причина дрейфа костюмов между чанками. Жёсткие правила:\n"
         "  1. Поле \"outfit\" в каждом char-ref'е выбирай ТОЛЬКО из списка значений, явно перечисленного "
@@ -15879,19 +20578,20 @@ def seedance_compose(sid, num):
         "  5. SAME-SCENE LOCK всё ещё работает ВНУТРИ одной event-сцены — если перс уже в чёрном на похоронах "
         "в чанке N, в чанке N+1 (тех же похоронах) он всё ещё в чёрном.\n\n"
         "FRAMING / РАКУРС — КРИТИЧНО (частая проблема «герои телепортируются на широких планах»):\n"
-        "Дефолт: ВСЯ серия должна выглядеть как series of medium close-ups (по грудь портрет), потому что:\n"
+        "Дефолт: ВСЯ серия должна выглядеть как series of close-ups (face filling ~50-60% of frame — канонический Seedance keyword 'close-up'), потому что:\n"
+        "  • Mobile vertical retention: лицо занимает большую часть экрана — зритель не отрывается. "
+        "    TikTok/Reels-grammar: tight CU = первые 3 секунды hook.\n"
         "  • Wide-планы между чанками показывают конкретные позы тел, и Seedance не помнит точное положение "
         "    рук/ног/корпуса из предыдущего чанка → герой «перепрыгивает» с места на место.\n"
-        "  • Medium close-up (chest-up) обрезает половину тела, lipsync чище, мимика читается, "
-        "    перепрыгивание неощутимо (модель додумывает совместимый кусок тела ниже кадра).\n"
+        "  • Tight close-up обрезает почти всё тело, lipsync чище, мимика читается крупно, "
+        "    перепрыгивание неощутимо (тела под кадром нет вообще).\n"
         "\nПРАВИЛА:\n"
-        "1. По умолчанию ВСЕ shot-биты в DIALOGUE — это medium close-up (по грудь, не до пояса, не tight на одно лицо). "
-        "Глаза + всё лицо + плечи + верх груди в кадре. Без рук, без обстановки на заднем плане в фокусе.\n"
-        "2. OTS (over-the-shoulder) — отличная альтернатива, не пиши их меньше чем medium-close-up. Чередуй "
-        "OTS и medium close-up по сменам говорящих чтобы было разнообразие, но оба остаются «близкими».\n"
-        "3. Tight close-up на одно лицо (только лицо в кадре, нос-подбородок-щёки) ИСПОЛЬЗУЙ ТОЛЬКО когда "
-        "сюжет требует эмоционального акцента: герой плачет крупным планом, узнаёт страшное, шок, ужас. "
-        "Обычная реплика — НЕ tight close-up, иначе всё видео душное.\n"
+        "1. По умолчанию ВСЕ shot-биты в DIALOGUE — это close-up (face filling ~50-60% of frame, плечи едва видны, "
+        "без обстановки в фокусе). Medium close-up (по грудь) — только когда явно нужен жест руки.\n"
+        "2. OTS (over-the-shoulder) — отличная альтернатива для смены ракурса. Чередуй tight CU и OTS "
+        "по сменам говорящих чтобы было разнообразие, но оба остаются «близкими».\n"
+        "3. Extreme close-up на одно лицо (только глаза или только губы) — ТОЛЬКО для эмоциональных акцентов "
+        "(шок, ужас, слёзы). Обычная реплика — обычный tight CU.\n"
         "4. Wide shot / establishing wide / two-shot во весь рост ИСКЛЮЧИТЕЛЬНО в двух случаях:\n"
         "   (a) ПЕРВЫЙ chunk ПОСЛЕ scene heading (новая сцена) — establishing wide на 2 секунды, "
         "       показать пространство и расстановку, дальше медленный наезд на medium close-up первого спикера.\n"
@@ -15907,8 +20607,19 @@ def seedance_compose(sid, num):
         "   делай wide, но в SCENE/ACTION пропиши КОНКРЕТНЫЕ позиции каждого ИМЕНАМИ ('Maya справа от стола, "
         "   Ethan слева, Liam на заднем плане у двери') чтобы Seedance не теряла геометрию.\n"
         "6. Establishing-wide в начале сцены — ОТДЕЛЬНЫЙ tag в CAMERA: 'establishing wide shot of Lobby — 2с, "
-        "   потом slow dolly in на medium close-up Maya для первой реплики'. Это сообщает модели «сначала "
+        "   потом slow dolly in на close-up Maya для первой реплики'. Это сообщает модели «сначала "
         "   мир, потом крупно». Не пиши «wide shot of everyone» — потеряешь lipsync.\n"
+        "7. ОДНО ДВИЖЕНИЕ КАМЕРЫ НА ШОТ-БИТ (Seedance hard rule per ByteDance docs): "
+        "   'slow dolly in', 'pan left', 'tracking shot', 'rack focus' — выбирай ОДНО. "
+        "   Комбо вида 'slow dolly in with rack focus' или 'tracking shot + handheld jitter' "
+        "   гарантированно вызывает jitter и потерю композиции. Если нужны два движения — "
+        "   это два отдельных shot-bit'а со склейкой между ними.\n"
+        "8. CAP НА NAMED ПЕРСОНАЖЕЙ В КАДРЕ — 2 (Seedance hard limit per community benchmark). "
+        "   Больше 2 named characters одновременно в одном shot-bit'е → identity blend / feature averaging. "
+        "   Если в чанке 3+ named — оставляй в фокусе кадра МАКСИМУМ 2, остальных явно убирай: "
+        "   'Liam off-screen / out of frame' или 'Liam silhouette in deep background, blurred'. "
+        "   Сцены массовки (court, restaurant) — extras с размытыми лицами не считаются — лимит 2 на NAMED.\n"
+
         "ПРОВЕРКА перед выводом: если в твоём prompt-е больше одного wide/two-shot ракурса вне scene-edges — "
         "пересмотри и замени средние/крупные на medium close-up. Это улучшит continuity видеогенерации.\n\n"
         "ВАРИАТИВНОСТЬ РАКУРСОВ МЕЖДУ SHOT-BIT'АМИ ВНУТРИ ОДНОГО ЧАНКА — КРИТИЧНО (баг «склейки есть, "
@@ -16020,13 +20731,11 @@ def seedance_compose(sid, num):
         "('Maya видит себя в отражении', 'два разных временных Maya'). В этом случае пиши явно: "
         "'@Image1 — настоящая Maya у окна, отражение в зеркале справа дублирует её' — и это всё равно "
         "ОДИН char-ref.\n"
-        "  6. ОБЯЗАТЕЛЬНАЯ ДЕКЛАРАЦИЯ CAST в первой строке SUBJECT каждого compose:\n"
-        "     'CAST IN FRAME: ровно N — [имя1] (@ImageX), [имя2] (@ImageY), [unnamed extra: краткое описание]'.\n"
-        "     Это форсит модель посчитать персонажей и не плодить копии. Если в кадре только Maya — пиши "
-        "     'CAST IN FRAME: ровно 1 — Maya (@Image1)'. Если Maya+Ethan — 'ровно 2 — "
-        "     Maya (@Image1), Ethan (@Image2)'. БЕЗ ЭТОЙ СТРОКИ модель часто дорисовывает лишних. "
-        "     НЕ пиши слова «человек / people / men / women» — персонажи могут быть НЕ людьми (звери, "
-        "     антропоморфные существа, мультяшки). Используй только число и имена.\n"
+        "  6. (УДАЛЕНО) Раньше здесь было обязательное «CAST IN FRAME: ровно N — …». "
+        "     Правило снято: не давало обещанной защиты от дублей лиц И мешало legitimate "
+        "     extras (пустые залы суда / рестораны), И принуждало модель буквально рендерить "
+        "     N статичных фигур в кадре — иногда вторая фигура появлялась за спиной первого "
+        "     в моменты когда композитор хотел close-up одного. НЕ декларируй headcount в SUBJECT.\n"
         "  7. UNNAMED EXTRAS / БЕЗЫМЯННЫЕ ПЕРСОНАЖИ (адвокат, охранник, прохожий, официант) — "
         "     САМЫЙ ЧАСТЫЙ источник бага 'два одинаковых лица в кадре'. У них НЕТ char-ref'а, поэтому "
         "     Seedance копирует лицо ближайшего ref-перса (главгероя). Правила:\n"
@@ -16049,30 +20758,32 @@ def seedance_compose(sid, num):
         "     – 'на фоне толпы похожих людей' — НЕТ. Толпа клонирует ref-лицо.\n"
         "     – Зеркальное расположение двух людей по бокам от третьего — НЕТ если в refs не два разных перса.\n"
         "     Используй ассиметрию: один человек на foreground + локация на background, без фигур-двойников.\n"
-        "  9. САМОПРОВЕРКА CAST перед выводом:\n"
-        "     – Посчитай персонажей, которые ПОДРАЗУМЕВАЮТСЯ в prompt-е (по SUBJECT/ACTION/SCENE).\n"
-        "     – Сверь с CAST IN FRAME строкой и количеством char-ref'ов.\n"
-        "     – Если есть extras без ref'ов — у каждого должна быть отличающая фраза в SUBJECT.\n"
+        "  9. САМОПРОВЕРКА перед выводом:\n"
+        "     – Если в SUBJECT/ACTION/SCENE упомянуты несколько персонажей — у каждого NAMED перса должен быть свой char-ref. "
+        "       Безымянных extras прописывай только с отличающей фразой (см. п.7).\n"
+        "     – КРИТИЧНО: Проверь chunk_text на ВСЕ named characters. Если персонаж совершает любое visible action "
+        "       (бежит, исчезает, оборачивается, смотрит, тянется, кричит, исчезает за углом) — он ДОЛЖЕН быть в refs[]. "
+        "       Единственное исключение — когда персонаж УПОМИНАЕТСЯ только в диалоге («где Leo?») без visible action: "
+        "       тогда его в refs НЕ кладёшь. Если хотя бы один глагол действия привязан к имени — ref ОБЯЗАТЕЛЕН. "
+        "       Прод-инцидент 2026-05-19: Leo в chunk_text 'Leo исчезает в другой стороне' / 'Rex замечает что Leo "
+        "       нет рядом' — composer выбросил Leo из refs → Seedance нарисовал галлюцинацию вместо канонического Leo.\n"
+        "     – При CLOSE-UP / MEDIUM CLOSE-UP одного спикера — формулировка должна явно убирать остальных из кадра: "
+        "       «close-up Adrian, остальные out-of-frame». БЕЗ этой фразы Seedance часто всунет вторую фигуру на задний план.\n"
         "     – Если число персонажей в SUBJECT > 1 и char-ref только один — это красный флаг, либо убери "
         "       extras, либо дай им жёсткую визуальную дифференциацию.\n\n"
-        "ОПИСАНИЕ ПЕРСОНАЖА И ОДЕЖДЫ — ТОЛЬКО В BINDING, БОЛЬШЕ НИГДЕ:\n"
-        "Сервер автоматически вставит в BINDING-строку каноническое описание каждого персонажа, "
-        "вшитое в его карточку (то же самое, по которому генерилось ref-изображение). Это appearance "
-        "+ описание текущего outfit'а. Текст совпадает с тем что Seedance видит на @Image — поэтому "
-        "он УСИЛИВАЕТ ref, а не конфликтует.\n"
-        "  • BINDING после серверной обработки выглядит так:\n"
-        "    'В refs: @Image1=Ethan (charcoal three-piece suit, white shirt, slicked-back hair), "
-        "@Image2=Maya (navy medical scrubs, hospital ID badge on chest, hair in messy bun), @Image3=Lobby.'\n"
-        "    ТЕБЕ его писать с одеждой не нужно — пиши '@Image1=Ethan, @Image2=Maya, @Image3=Lobby', "
-        "сервер дополнит. Главное оставь корректные '=' разделители и реальные имена.\n"
-        "  • В SUBJECT/ACTION/SCENE одежду НЕ описывай. Никаких 'в красном платье', 'in suit', "
-        "'медицинская форма', цветов, тканей, типов — иначе ты дашь альтернативное описание которое "
-        "противоречит тому что вшил в BINDING сервер. Описывай только лицо/поза/действие/эмоция.\n"
-        "  • ИЗМЕНЁННОЕ СОСТОЯНИЕ одежды (порвана, мокрая, в крови, потеряна пуговица) — "
-        "можно и нужно ('разорванная блузка'), но БЕЗ исходного описания ('разорванная белая блузка' — нет, "
-        "цвет уже в BINDING). Используй родовое слово: 'блузка', 'рубашка', 'пиджак'.\n"
-        "  • Hair/makeup: описывай только если меняется состояние (растрёпанные волосы, "
-        "размазанная помада). Базовый стиль причёски уже в BINDING."
+        # BINDING-format/appearance section REMOVED 2026-05-18 per council debate
+        # finding: server auto-injects canonical char descriptions into BINDING
+        # AFTER composer output (see _canonical_char_description + injection at
+        # ~line 16527), so instructing composer about clothing/appearance rules
+        # was dead weight (~2k tokens, behaviorally inert). Composer just needs
+        # to emit '@Image1=Ethan, @Image2=Maya, @Image3=Lobby' — server fills rest.
+        "ОПИСАНИЕ ПЕРСОНАЖА — короткая инструкция:\n"
+        "  • В BINDING-строке пиши только имя: '@Image1=Ethan, @Image2=Maya, @Image3=Lobby'. "
+        "Сервер сам допишет одежду/внешность из карточки персонажа.\n"
+        "  • В SUBJECT/ACTION одежду/внешность НЕ описывай — это сделает сервер. "
+        "Описывай только лицо/поза/действие/эмоция.\n"
+        "  • ИЗМЕНЁННОЕ СОСТОЯНИЕ одежды (порвана, мокрая, в крови) — упоминай родовым словом без цвета: "
+        "'разорванная блузка', 'мокрая рубашка'. Цвет уже в карточке."
     )
     # Active episode cast & locations (already checked off in sidebar)
     active_char_ids = set(ep.get('characters_used') or [])
@@ -16080,10 +20791,43 @@ def seedance_compose(sid, num):
     active_chars = [c for c in (s.get('characters') or []) if c['id'] in active_char_ids]
     active_locs  = [l for l in (s.get('locations') or []) if l['id'] in active_loc_ids]
 
+    # Voice-only marker — composer must SEE this character is off-screen voice
+    # only. Without an explicit «🔊 VOICE-ONLY» tag in the roster, composer
+    # treats them as regular present characters and places them in the room.
+    _VOICE_ONLY_LINE_RE = re.compile(
+        r'^\s*(?:voice\s+(?:on|via|through|over)\s+phone|voice-?on-?phone'
+        r'|off[\s\-]?screen\s+voice|voiceover|voice[\s\-]?only|via\s+phone'
+        r'|on\s+the\s+phone\s+(?:from|in)|phone\s+voice|голос\s+по\s+телефону'
+        r'|голос\s+за\s+кадром|закадровый\s+голос)\b',
+        re.IGNORECASE,
+    )
+
     def _active_char_line(c):
-        line = f"- {c['name']} (id={c['id']}): {c.get('appearance','')[:120]}"
+        app_raw = (c.get('appearance') or '')
+        is_voice_only = bool(_VOICE_ONLY_LINE_RE.match(app_raw.strip()))
+        if is_voice_only:
+            # Loud marker — voice-only character. Two-part directive:
+            # (1) INCLUDE @ImageN ref so Seedance has voice/lipsync anchor
+            # (2) DON'T render them visually in the frame
+            # Real prod bug 2026-05-25 «My Stepmother» ep 53 chunk 5: composer
+            # interpreted «НЕ В КАДРЕ» as «исключи из refs» → Detective Morris
+            # говорил реплику без ref → Seedance hallucinated his voice.
+            # Server-side cast_restriction code already splits voice-only chars
+            # into a separate «VOICE-ONLY off-screen» group, so the composer
+            # SHOULD include them in refs whenever they speak.
+            line = (
+                f"- 🔊 VOICE-ONLY {c['name']} (id={c['id']}): голос через телефон/интерком/V.O.\n"
+                f"  ВКЛЮЧАЙ его @ImageN в refs если он ГОВОРИТ в этом чанке "
+                f"(нужно для голосовой консистентности lipsync). "
+                f"НО в SUBJECT/ACTION/SCENE физически НЕ описывай — он не в кадре. "
+                f"Реплики оформляй как «{c['name']} (V.O.) from phone speaker: \"...\"» "
+                f"или «off-screen voice through phone». "
+                f"Original appearance: «{app_raw[:80]}»."
+            )
+        else:
+            line = f"- {c['name']} (id={c['id']}): {app_raw[:120]}"
         labels = [o.get('label') for o in (c.get('outfits') or []) if o.get('avai_url') and o.get('label')]
-        if labels:
+        if labels and not is_voice_only:
             line += "\n  outfit-варианты: " + ", ".join(f'"{l}"' for l in labels) + ", null"
         return line
     active_chars_block = '\n'.join(_active_char_line(c) for c in active_chars) or '(не отмечены)'
@@ -16259,8 +21003,8 @@ def seedance_compose(sid, num):
             "но НЕ в этом кадре. Не добавляй их в refs.\n"
             "  3. Continuity-кадры (lastframe / cutframes) тоже могут принести лица других персов в кадр. "
             "Они всё ещё прицепятся как композиционные референсы, НО в тексте промпта явно скажи: "
-            "'tight close-up на лицо <Имя>, остальные вне кадра, размытый/тёмный фон'.\n"
-            "  4. В CAMERA блоке промпта: 'tight close-up', 'extreme close-up' или 'medium close-up' — "
+            "'close-up на лицо <Имя> (face filling frame), остальные вне кадра, размытый/тёмный фон'.\n"
+            "  4. В CAMERA блоке промпта: 'close-up' (дефолт), 'macro close-up' (extreme emotion) или 'medium close-up' — "
             "не 'wide', не 'two-shot', не 'group'.\n"
             "  5. SCENE: упомяни локацию через @Image, но добавь 'фон вне фокуса / приглушён' "
             "чтобы Seedance не пытался прорисовать остальных людей в задних планах.\n"
@@ -16303,6 +21047,36 @@ def seedance_compose(sid, num):
         if it.get('id') in active_item_ids and it.get('avai_url')
     ) or '  (none)'
 
+    # Pull [BLOCKING] / [BLOCKING_OUT] fences out of the script for the scene
+    # this chunk belongs to. Author-written setup (outfits, positions, lighting,
+    # props) is 0-chrono in the segmenter but BECOMES authoritative context here.
+    # episode_blocks = constants for the whole episode; scene_blocks_for_chunk =
+    # opening setup of THIS chunk's scene + closing setup of the prior scene
+    # (for cross-scene continuity).
+    try:
+        episode_blocks, scene_blocks_for_chunk = _extract_script_blocking(
+            full_script_block or (ep.get('script') or ''),
+            chunk_text,
+        )
+    except Exception as _e:
+        episode_blocks, scene_blocks_for_chunk = '', ''
+        print(f'[seedance_compose] blocking extract failed: {_e}', flush=True)
+
+    blocking_block = ''
+    if episode_blocks or scene_blocks_for_chunk:
+        parts = []
+        if episode_blocks:
+            parts.append(f"EPISODE-WIDE CONSTANTS (одежда, базовая палитра, общие пропсы):\n{episode_blocks}")
+        if scene_blocks_for_chunk:
+            parts.append(f"SCENE OPENING SETUP (где стоят, что держат, освещение, состояние — для ЭТОЙ сцены):\n{scene_blocks_for_chunk}")
+        blocking_block = (
+            "AUTHOR BLOCKING — постановка из [BLOCKING]…[/BLOCKING] блоков сценария. "
+            "Это АВТОРИТАТИВНАЯ постановка: позы, наряды, освещение, реквизит, мизансцена. "
+            "Используй ИМЕННО эти позиции / outfits / атрибуты в prompt-е; если что-то в CHUNK не описано — бери из блокинга.\n"
+            + "\n\n".join(parts)
+            + "\n\n"
+        )
+
     userprompt = (
         f"AVAILABLE CHARACTERS (весь roster серии):\n{chr(10).join(chars_lines) or '(none)'}\n\n"
         f"AVAILABLE LOCATIONS (весь roster серии):\n{chr(10).join(locs_lines) or '(none)'}\n\n"
@@ -16317,6 +21091,7 @@ def seedance_compose(sid, num):
         f"{locked_refs_block}"
         f"{style_block}"
         f"{prev_block}\n"
+        f"{blocking_block}"
         f"FULL EPISODE SCRIPT (читай ВЕСЬ — тут scene headings, ремарки, кто где находится):\n"
         f"```\n{full_script_block}\n```\n\n"
         f"CHUNK — выделенный кусок для генерации (его репликам сохраняй verbatim):\n"
@@ -16369,6 +21144,54 @@ def seedance_compose(sid, num):
         return jsonify({'error': f'compose failed: {e}'}), 500
 
     refs = data.get('refs') or []
+    # Filter voice-only characters that composer added without justification.
+    # Real prod bug 2026-05-20 «My Stepmother» ep 52: composer auto-pulled
+    # Detective Morris (appearance="Voice on phone...") into refs of every
+    # chunk even when his name appears NOWHERE in chunk_text. Server-side
+    # voice-only handling (BINDING rewrite + cast_restriction) couldn't
+    # prevent Seedance from getting his @ImageN reference image and
+    # potentially using it. Solution: drop voice-only chars from refs[]
+    # unless their name is actually mentioned in chunk_text.
+    _voice_only_pattern = re.compile(
+        r'^\s*(?:voice\s+(?:on|via|through|over)\s+phone|voice-?on-?phone'
+        r'|off[\s\-]?screen\s+voice|voiceover|voice[\s\-]?only|via\s+phone'
+        r'|on\s+the\s+phone\s+(?:from|in)|phone\s+voice|голос\s+по\s+телефону'
+        r'|голос\s+за\s+кадром|закадровый\s+голос)\b',
+        re.IGNORECASE,
+    )
+    dropped_voice_only = []
+    dropped_strict = []   # only populated when STRICT_CHAR_FILTER is on
+    if refs and chunk_text:
+        ct_lower = chunk_text.lower()
+        filtered = []
+        for r in refs:
+            if r.get('kind') == 'char':
+                ch = next((c for c in (s.get('characters') or []) if c['id'] == r.get('id')), None)
+                if ch:
+                    name = (ch.get('name') or '').strip()
+                    name_in_text = _char_name_in_text(name, chunk_text)
+                    app_field = (ch.get('appearance') or '').strip()
+                    # Voice-only filter: drop voice-only chars whose name
+                    # not in chunk_text (always on — known-bad pattern).
+                    if _voice_only_pattern.match(app_field):
+                        if not name_in_text:
+                            dropped_voice_only.append({'name': name, 'id': r.get('id')})
+                            continue
+                    # Strict filter (experimental — STRICT_CHAR_FILTER flag):
+                    # drop ANY char whose name isn't in chunk_text. Catches
+                    # composer over-attaching from episode roster (e.g. Sophie
+                    # «sits in the chair» when chunk only has Emma+Adrian).
+                    # Risk: false-positive on physically-present but unnamed
+                    # chars («her hand visible at edge»). Dropped chars are
+                    # surfaced in compose_warnings so regression is visible.
+                    # Rollback: STRICT_CHAR_FILTER=0 env var, or flip default.
+                    elif STRICT_CHAR_FILTER and not name_in_text:
+                        dropped_strict.append({'name': name, 'id': r.get('id')})
+                        continue
+            filtered.append(r)
+        if dropped_voice_only or dropped_strict:
+            refs = filtered
+            data['refs'] = refs
     # If base-only flag is on, strip outfit selection from every char ref
     if base_outfits_only:
         for r in refs:
@@ -16590,9 +21413,19 @@ def seedance_compose(sid, num):
                 # Cache uploaded urls per-cut on the chunk to avoid re-uploading.
                 cf_urls = list(prev_neighbour.get('cutframes_avai_urls') or [])
                 budget = 9 - len(ref_urls)
-                # Up to 3 extra cut frames — gives the model full continuity for
-                # 3-shot prev chunks (most common in our pacing). Refs hard cap
-                # is 9 so we leave 6 slots for chars + locations + lastframe.
+                # Cap restored to 3 (was 1 from 2026-05-19) — user-reported
+                # 2026-05-23 «The Landlord's Daughter» ep 1 chunk 2: prev
+                # chunk had multiple internal cuts but only 1 cutframe was
+                # attached, losing mise-en-scène context for the new chunk.
+                #
+                # My earlier 1-cap was based on a misapplied WaveSpeed
+                # finding: «2-3 refs > 6-9 refs for identity stability» —
+                # that's about different ANGLES of the SAME character (more
+                # refs = feature averaging). Cutframes serve a different
+                # role (scene/blocking continuity, not identity). They don't
+                # cause feature averaging the way duplicate character refs do.
+                #
+                # 9-ref AVAI hard cap is still respected via `budget`.
                 max_attach = min(3, budget)
                 wanted_cuts = cuts[:max_attach]
                 # Need to extract any frames not yet uploaded
@@ -16691,6 +21524,12 @@ def seedance_compose(sid, num):
                 "1) Видимые персонажи (имя из roster + краткое 'кто это', если roster короткий — просто имя).\n"
                 "2) Для каждого СТРОГО по этим полям:\n"
                 "   • Поза: ровно одно из — стоит / сидит / на коленях / лежит / приседает / опирается / наклоняется.\n"
+                "   • Blocking (КРИТИЧНО для continuity): сторона кадра + куда обращён.\n"
+                "     Формат: '<сторона кадра>, обращён <куда>'. Стороны: левая часть / правая часть / центр / "
+                "     передний план / задний план. Обращённость: лицом к [имя другого перса] / лицом к камере / "
+                "     спиной к камере / профилем влево / профилем вправо / спиной к [имя] / лицом в окно.\n"
+                "     Пример: 'левая часть, обращён лицом к Ethan (который справа)' или 'правая часть, профилем влево, "
+                "     лицом к Maya'. БЕЗ этого поля следующий чанк теряет геометрию и персонажи разворачиваются.\n"
                 "   • Где именно в комнате: у двери / у окна / в центре / в углу / за столом / перед камином / "
                 "     рядом с [имя другого перса] / на заднем плане.\n"
                 "   • Что в руках: телефон / бокал / документ / нож / чашка / ничего. Если в одной руке одно — пиши какой.\n"
@@ -16706,8 +21545,8 @@ def seedance_compose(sid, num):
                 "- ПО-РУССКИ.\n\n"
                 "Формат строго (поля через | в одной строке на персонажа):\n"
                 "Кадр 1 (lastframe):\n"
-                "  • <Имя>: поза=стоит | где=у книжного шкафа справа | в руках=бокал виски | контакт=нет | эмоция=напряжён | повреждения=нет\n"
-                "  • <Имя>: поза=сидит | где=за столом по центру | в руках=ничего, ладони на документах | контакт=нет | эмоция=шок | повреждения=нет\n"
+                "  • <Имя>: поза=стоит | blocking=правая часть кадра, обращён лицом к <Имя2> (слева) | где=у книжного шкафа справа | в руках=бокал виски | контакт=нет | эмоция=напряжён | повреждения=нет\n"
+                "  • <Имя2>: поза=сидит | blocking=левая часть кадра, профилем вправо, лицом к <Имя> | где=за столом слева | в руках=ничего, ладони на документах | контакт=нет | эмоция=шок | повреждения=нет\n"
                 "  • Сцена: <мизансцена одной строкой — локация, свет, ключевые объекты фона>\n"
                 "Кадр 2 (cutframe #1):\n"
                 "  • ..."
@@ -16763,8 +21602,12 @@ def seedance_compose(sid, num):
                 "  • НЕ повторяй неправильную позу из анализа в первой строке ACTION.\n"
                 "Если в CHUNK явный глагол смены позы (садится, встаёт, выходит) — это нормальный переход, "
                 "выполняй сценарий.\n"
-                "ОБЯЗАТЕЛЬНАЯ первая строка ACTION: «Продолжая с прошлого чанка: [имя1] [поза по сценарию] "
-                "[где] [с чем]; [имя2] [поза по сценарию] [где] [с чем]»."
+                "ОБЯЗАТЕЛЬНАЯ первая строка ACTION (с blocking из анализа — это ЕДИНСТВЕННЫЙ способ сохранить "
+                "пространственную геометрию между чанками, Seedance не выводит её из lastframe-картинки сам): "
+                "«Продолжая с прошлого чанка: [имя1] [сторона кадра, обращён лицом к/спиной/профилем] [поза] "
+                "[где] [с чем]; [имя2] [сторона кадра, обращён лицом к/спиной/профилем] [поза] [где] [с чем]». "
+                "Если в текущем чанке смена ракурса (например cut to reverse shot) — отрази что [имя1] теперь "
+                "видим с другой стороны, но направление взгляда персонажа в пространстве сцены сохраняется."
             )
             data['prompt'] = (data.get('prompt') or '').rstrip() + state_extra
             state_analysis_attached = True
@@ -16846,18 +21689,62 @@ def seedance_compose(sid, num):
     # character — without this Seedance invents a third figure for the
     # foreground shoulder («over X's shoulder» → model generates someone
     # whose shoulder THIS is, even when X is one of the existing refs).
-    char_names_by_slot = {}   # 1-based slot index → canonical name
+    char_names_by_slot = {}     # 1-based slot index → canonical name (IN-FRAME chars)
+    voice_only_by_slot = {}     # 1-based slot index → name (off-screen voice chars)
+    # Detect characters whose `appearance` field describes them as voice-only
+    # (someone on the other end of a phone call, voiceover, off-screen). Real
+    # prod bug 2026-05-19 «My Stepmother» ep 43 — Detective Morris has
+    # appearance="Voice on phone delivering urgent summons..." (script-writer
+    # LLM put role description into the appearance field instead of physical
+    # description). Composer dutifully placed him IN frame with the room cast,
+    # contradicting the phone-call narrative. Detection: appearance starts
+    # with "voice", "off-screen", "voiceover", "phone voice", "via phone".
+    _VOICE_ONLY_RE = re.compile(
+        r'^\s*(?:voice\s+(?:on|via|through|over)\s+phone|voice-?on-?phone'
+        r'|off[\s\-]?screen\s+voice|voiceover|voice[\s\-]?only|via\s+phone'
+        r'|on\s+the\s+phone\s+(?:from|in)|phone\s+voice|голос\s+по\s+телефону'
+        r'|голос\s+за\s+кадром|закадровый\s+голос)\b',
+        re.IGNORECASE,
+    )
     for i, r in enumerate(char_refs_ordered):
         ch = next((c for c in (s.get('characters') or []) if c.get('id') == r.get('id')), None)
-        if ch and ch.get('name'):
-            char_names_by_slot[i + 1] = ch['name']
+        if not (ch and ch.get('name')):
+            continue
+        slot = i + 1
+        app = (ch.get('appearance') or '').strip()
+        if _VOICE_ONLY_RE.match(app):
+            voice_only_by_slot[slot] = ch['name']
+        else:
+            char_names_by_slot[slot] = ch['name']
     cast_list = ', '.join(f'@Image{idx}={nm}' for idx, nm in char_names_by_slot.items())
-    cast_restriction = (
-        f" В кадре ТОЛЬКО эти персонажи: {cast_list}. "
-        "НЕ добавляй НИКАКИХ других людей — ни массовки, ни статистов, ни «случайной фигуры», "
-        "ни безымянных силуэтов на фоне или переднем плане. Если рамка кадра требует чьё-то плечо/затылок/руку "
-        "на переднем плане — это плечо/затылок/рука ОДНОГО ИЗ УЖЕ ЗАЯВЛЕННЫХ персонажей выше, НЕ нового."
-    ) if char_names_by_slot else ''
+    voice_list = ', '.join(f'@Image{idx}={nm}' for idx, nm in voice_only_by_slot.items())
+    # Soft-restrict: ban INVENTED ref-look-alikes (anti-phantom-3rd-character
+    # pattern) but allow legitimate background massovka in public spaces like
+    # courtrooms/restaurants/streets. User feedback 2026-05-18: jeлзкое
+    # «ровно эти персонажи, никаких других» давало пустые залы суда.
+    parts = []
+    if char_names_by_slot:
+        parts.append(
+            f" Named характеры в кадре — только эти: {cast_list}. "
+            "Если рамка кадра требует чьё-то плечо/затылок/руку на переднем плане (OTS shot) — "
+            "это часть тела ОДНОГО ИЗ УЖЕ ЗАЯВЛЕННЫХ персонажей выше (того кого ты указал в "
+            "`framing_anchor`), НЕ новой выдуманной фигуры. Силуэты на дальнем фоне в публичных "
+            "местах (залы суда, рестораны, улицы) допустимы как extras с РАЗМЫТЫМИ лицами — "
+            "они НЕ должны иметь черты ни одного из ref-персонажей."
+        )
+    if voice_only_by_slot:
+        parts.append(
+            f" VOICE-ONLY off-screen (НЕ В КАДРЕ, только голос): {voice_list}. "
+            "Эти персонажи находятся НА ДРУГОМ КОНЦЕ телефонного звонка / интеркома / рации. "
+            "Их голос слышен в кадре (через динамик телефона на громкой связи, либо через "
+            "трубку у уха другого персонажа), но САМИ ОНИ В КАДРЕ НЕ ПОЯВЛЯЮТСЯ. "
+            "НЕ помещай их в комнату с другими персонажами. НЕ рисуй их фигуру. "
+            "В DIALOGUE-блоках их реплики оформляй как (V.O.) / voiceover from phone speaker / "
+            "off-screen voice through phone — но НЕ как visible character speaking. "
+            "Сами @ImageN рефы этих персонажей нужны Seedance для голосовой консистентности (lipsync "
+            "поверх audio), но визуально на frame они отсутствуют."
+        )
+    cast_restriction = ''.join(parts)
     # Find @ImageN slot for the OTS anchor (matched by canonical name, case-insensitive).
     anchor_slot = None
     if framing_anchor:
@@ -17029,6 +21916,29 @@ def seedance_compose(sid, num):
                       'nor ending_state nor chunk_text regex produced a pose-lock block. '
                       'Pose drift likely.',
         })
+    # 0a) voice-only chars dropped (always-on filter)
+    if dropped_voice_only:
+        compose_warnings.append({
+            'kind': 'voice_only_chars_dropped',
+            'detail': (
+                f'Voice-only character(s) dropped from refs because their name'
+                f' is not in chunk_text: {", ".join(c["name"] for c in dropped_voice_only)}.'
+            ),
+            'dropped_chars': dropped_voice_only,
+        })
+    # 0b) strict-filter chars dropped (experimental — STRICT_CHAR_FILTER)
+    if dropped_strict:
+        compose_warnings.append({
+            'kind': 'strict_filter_chars_dropped',
+            'detail': (
+                f'STRICT_CHAR_FILTER (экспериментальный) удалил из refs персонажей '
+                f'которых composer положил, но их имя не упомянуто в chunk_text: '
+                f'{", ".join(c["name"] for c in dropped_strict)}. '
+                f'Если они должны быть в кадре физически (например «her hand visible»), '
+                f'отключи фильтр: env STRICT_CHAR_FILTER=0.'
+            ),
+            'dropped_chars': dropped_strict,
+        })
     # 2) prev_neighbour from a different scene than current chunk.
     if debug_prev and debug_prev.get('same_scene') is False:
         compose_warnings.append({
@@ -17043,6 +21953,110 @@ def seedance_compose(sid, num):
             'detail': f"{char_ref_count} character refs but composer did not return a `framing` "
                       "field. Server-side OTS/two-shot injection skipped.",
         })
+    # 4) Named character VISIBLE in chunk_text but NOT in refs[]: AUTO-ADD.
+    #    Composer-LLM repeatedly forgets to include characters doing visible
+    #    actions even with explicit sysprompt rules (real prod: «Vice Beasts»
+    #    ep 1 chunks 6, 8, 9 — Leo dropped despite «Leo disappears in another
+    #    direction»). Switched from warn-only to auto-fix on 2026-05-20.
+    #
+    #    Heuristic: character is VISIBLE if their name appears in chunk_text
+    #    OUTSIDE dialogue lines (i.e. in action/scene description). Mention
+    #    inside a quoted dialogue («Rex: "Leo?"») does NOT count — that's
+    #    just calling the name. Mention as a speaker cue («LEO:» on a line
+    #    by itself before a dialogue) DOES count — that means Leo speaks,
+    #    which means he's somewhere (visible or voice-over; either way he
+    #    needs his lipsync ref).
+    chunk_text_for_check = body.get('chunk_text') or ''
+    auto_added_chars = []
+    if chunk_text_for_check and s.get('characters'):
+        ref_char_ids = {r.get('id') for r in (data.get('refs') or [])
+                        if r.get('kind') == 'char'}
+        active_char_ids = set(ep.get('characters_used') or [])
+        candidates = [
+            c for c in (s.get('characters') or [])
+            if c.get('id') in active_char_ids and c.get('id') not in ref_char_ids
+        ]
+        # Strip dialogue content from chunk_text — we only check names
+        # appearing in action/scene description. Two flavours of dialogue:
+        #   (a) Quoted: `Adrian says: "Leo?"` → strip the quoted part
+        #   (b) Screenplay format: `EMMA: Vivian.` (name + colon + unquoted
+        #       dialogue text) → strip the whole line. Real prod bug
+        #       2026-05-20 «My Stepmother» ep 52: chunk_text had
+        #       `EMMA: Vivian.` — Emma SPEAKS Vivian's name. Old strip
+        #       only handled quotes, so «Vivian» landed in action_only and
+        #       got auto-added to refs incorrectly.
+        action_only = re.sub(r'[\"«„][^"»“\n]{1,500}[\"»“]', '', chunk_text_for_check)
+        # Screenplay-format dialogue: lines starting with NAME (1-3 words,
+        # leading letter) + colon. Strip the entire line including content.
+        action_only = re.sub(
+            r'^[A-Za-zА-Яа-яЁё][^:\n]{0,40}:.*$',
+            '', action_only, flags=re.MULTILINE,
+        )
+        for c in candidates:
+            name = (c.get('name') or '').strip()
+            if not name:
+                continue
+            # Use _char_name_in_text for punctuation-safe matching (handles
+            # «Mrs.», «Dr.», «Officer» etc that the old simple regex missed).
+            if _char_name_in_text(name, action_only):
+                auto_added_chars.append({'name': name, 'id': c.get('id')})
+        # Auto-add to refs[] + ref_urls + ref_meta. Skip voice-only chars
+        # (those handled separately by the voice-only marker, must not appear
+        # in frame). Resolve URL inline so the returned compose response is
+        # complete and the next /seedance/start has them.
+        if auto_added_chars:
+            data['refs'] = data.get('refs') or []
+            actually_added = []
+            for added in auto_added_chars:
+                # Skip voice-only chars — they're handled by the voice-only
+                # mechanism and must NOT be added as visible refs.
+                ch = next((c for c in (s.get('characters') or []) if c['id'] == added['id']), None)
+                app_field = (ch.get('appearance') or '').strip() if ch else ''
+                if _VOICE_ONLY_RE.match(app_field):
+                    continue
+                ref_entry = {
+                    'kind': 'char',
+                    'id': added['id'],
+                    'outfit': None,
+                    '_auto_added': True,
+                }
+                url = _resolve_ref_url(s, ref_entry, sid=sid)
+                if not url:
+                    continue  # no avai_base_url available, can't add
+                data['refs'].append(ref_entry)
+                # Append to ref_urls + ref_meta so the returned response is
+                # complete. New slot index is len(ref_urls)+1 (1-based).
+                slot_idx = len(ref_urls) + 1
+                ref_urls.append(url)
+                clean = {k: v for k, v in ref_entry.items() if not k.startswith('_')}
+                ref_meta.append({**clean, 'url': url, '_auto_added': True})
+                actually_added.append({**added, 'slot': slot_idx})
+            if actually_added:
+                # Tell Seedance about the auto-added characters — server-side
+                # appended note. Without this the prompt text body still won't
+                # mention them, so even with the image in refs Seedance might
+                # not visualize. The note specifically says «include them in
+                # visual per chunk_text actions».
+                names_str = ', '.join(
+                    f'{c["name"]} (@Image{c["slot"]})' for c in actually_added
+                )
+                data['prompt'] = (data.get('prompt') or '').rstrip() + (
+                    f"\n\nДОБАВЛЕННЫЕ СЕРВЕРОМ ПЕРСОНАЖИ: {names_str} — composer "
+                    f"пропустил их, но они УПОМЯНУТЫ в chunk_text сценарии вне диалога "
+                    f"(совершают visible action). Включи их в визуал согласно сценарию. "
+                    f"Если в действии написано «{actually_added[0]['name']} disappears in another direction» — "
+                    f"покажи это движение, не игнорируй персонажа."
+                )
+                compose_warnings.append({
+                    'kind': 'named_char_auto_added_to_refs',
+                    'detail': (
+                        f'Сервер автоматически добавил в refs персонажей которых composer пропустил, '
+                        f'хотя они упомянуты в chunk_text вне диалога: '
+                        f'{", ".join(c["name"] for c in actually_added)}. '
+                        f'Если это были voice-only/off-screen — удали их вручную.'
+                    ),
+                    'auto_added': actually_added,
+                })
     if compose_warnings:
         _log_event('INFO', 'compose_warnings', sid=sid, ep_num=num,
                    warnings=compose_warnings)
@@ -17052,11 +22066,12 @@ def seedance_compose(sid, num):
     # high-priority directive. Even if the composer forgot the STYLE-block
     # accent hint, this short caps line locks American-English narration
     # for every spoken line (regular dialogue + voiceover).
+    # Positive-phrased per ByteDance docs (Seedance does not support negative
+    # prompts; "No British/European..." rewritten as positive constraint).
     data['prompt'] = (data.get('prompt') or '').rstrip() + (
         "\n\nVOICE: every spoken line — regular dialogue AND voiceover — is "
-        "performed in clear standard American English (General American accent). "
-        "No British / European / Australian / Indian / regional or exotic accents. "
-        "Natural conversational American delivery throughout."
+        "performed in clear standard American English (General American accent), "
+        "natural conversational American delivery throughout."
     )
 
     return jsonify({
@@ -17103,7 +22118,7 @@ def seedance_start(sid, num):
     resolution = body.get('resolution') or '720p'
     if resolution not in ('720p', '480p'):
         resolution = '720p'
-    mod = body.get('moderation_bypass') or 'collage_grid'
+    mod = body.get('moderation_bypass') or 'off'
     if mod not in ('off', 'grid', 'collage_grid', 'cartoon'):
         mod = 'collage_grid'
     model_tier = body.get('model') or 'reference-fast'
@@ -17132,6 +22147,32 @@ def seedance_start(sid, num):
     # the chunk so the UI can show a yellow «⚠ континьюити сброшен» badge
     # explaining why a pose/position discontinuity occurred relative to prev chunk.
     continuity_reset_reason = (body.get('continuity_reset_reason') or '').strip()[:500]
+
+    # ── PRE-FLIGHT MODERATION CHECK ─────────────────────────────────────────
+    # Run BEFORE creating a chunk or hitting AVAI. Saves ~$0.10-0.30 per
+    # rejected submit + the post-moderation billing. Calibrated only against
+    # OFFICIAL ByteDance Content Pre-filter categories (sexual/violence_graphic/
+    # self_harm/hate_speech/misinformation). No community-lore substitutions.
+    #
+    # Honors body['skip_precheck']=true escape hatch for cases where user
+    # explicitly wants to bypass (e.g. retry after manual review).
+    precheck_result = None
+    if not body.get('skip_precheck'):
+        precheck_result = _seedance_moderation_precheck(prompt)
+        if precheck_result.get('verdict') == 'reject':
+            print(f'[precheck] REJECTED prompt for sid={sid} ep={num}: '
+                  f'{precheck_result.get("reasoning", "")[:200]}', flush=True)
+            return jsonify({
+                'error': 'moderation_precheck_reject',
+                'message': (
+                    f'Промпт почти наверняка зарубит модерация Seedance: '
+                    f'{precheck_result.get("reasoning", "")}. '
+                    f'Подсказка: {precheck_result.get("suggestion", "")}. '
+                    f'Если уверен что это false positive — добавь '
+                    f'"skip_precheck": true в body запроса.'
+                ),
+                'precheck': precheck_result,
+            }), 400
 
     # Per-episode lock — serializes the read-load-mutate-save cycle so parallel
     # /start calls don't race and erase each other's chunks (Flask threaded=True
@@ -17165,6 +22206,8 @@ def seedance_start(sid, num):
             'segIdx': seg_idx_val,
             'durationSec': duration_sec_val,
             'continuity_reset_reason': continuity_reset_reason or None,
+            # Persist precheck result on chunk so UI shows it. None if skipped.
+            'precheck': precheck_result,
         }
         chunks.append(chunk)
         save_episode(sid, num, ep)
@@ -17197,6 +22240,69 @@ def seedance_start(sid, num):
             "grid used internally for moderation bypass must be fully removed "
             "from the rendered output."
         )
+
+    # ── Subtitle prevention — three-layer fix ──────────────────────────────
+    # Real prod bug: «My Stepmother» ep 43-44 chunks had burned-in subtitles.
+    # Root cause: ANY straight/curly quotes in the prompt get interpreted by
+    # reference-fast as «render this text in-frame». Sources of unwanted quotes:
+    #   (1) Dialogue with speech verb: `говорит: "line"` — Layer A
+    #   (2) Screenplay format: `NAME: "line"` (no verb) — Layer A2 (NEW)
+    #   (3) Metaphor quotes ("клетке"), server-injected example phrases
+    #       («Fox Woman lies under the car») — Layer C (NEW)
+    def _strip_dialogue_quotes_for_video(text):
+        if not text:
+            return text
+        # Layer A — speech-verb-led dialogue → em-dash (preserves spoken text)
+        speak_verbs = (
+            r'(?:says?|asks?|replies|whispers?|shouts?|yells?|murmurs?|breathes?|'
+            r'mutters?|growls?|hisses?|barks?|spits?|sneers?|snaps?|delivers?|states?|'
+            r'требует|спрашива[еют]+|отвеча[еют]+|шепч[ёе]т|кричит|произносит|говорит|'
+            r'бросает|роняет|выпаливает|выкрикивает|зов[её]т|восклица[еют]+)'
+        )
+        pat_a = re.compile(
+            r'(' + speak_verbs + r'[^"«„]{0,40}?[:,]\s*)[\"«„]([^"»“]{2,400}?)[\"»“]',
+            re.IGNORECASE | re.UNICODE,
+        )
+        text = pat_a.sub(lambda m: f'{m.group(1)}— {m.group(2)}', text)
+        # Layer A2 — screenplay name+colon form (optional «голос/voice of»
+        # prefix for voiceovers). E.g. `голос Detective Morris: "47 Hawthorne..."`
+        pat_a2 = re.compile(
+            r'(\b(?:голос|voice\s+(?:of|on|via|through|over))?\s*'
+            r'(?:[A-ZА-ЯЁ][A-Za-zА-Яа-яЁё\-]{1,30}(?:\s+[A-ZА-ЯЁ][A-Za-zА-Яа-яЁё\-]{1,30}){0,3})'
+            r'\s*[:：]\s*)[\"«„]([^"»“]{2,400}?)[\"»“]',
+            re.UNICODE,
+        )
+        text = pat_a2.sub(lambda m: f'{m.group(1)}— {m.group(2)}', text)
+        # Layer C — aggressive final pass: drop ALL remaining quote PAIRS
+        # around 3-400 chars. Nothing in a Seedance prompt legitimately needs
+        # visible quote chars. Apostrophes inside words (what's) survive
+        # because they're not closing quotes for any opener.
+        pat_c = re.compile(
+            r'[\"«„]([^"»“\n]{3,400}?)[\"»“]',
+            re.UNICODE,
+        )
+        text = pat_c.sub(lambda m: m.group(1), text)
+        return text
+
+    prompt = _strip_dialogue_quotes_for_video(prompt)
+
+    # Layer B (anti_subs_clause) REMOVED 2026-05-18 per council debate finding:
+    # explicit "NO subtitles..." text in the tail of the prompt acted as a
+    # mention=render paradox — naming the artifact reinforced it. Layer A
+    # (em-dash dialogue sanitization above) is the root-cause fix; tail
+    # negation was redundant and harmful. A/B watch on next 50 chunks.
+
+    # Quality tail — ByteDance's officially recommended quality string per
+    # BytePlus ModelArk docs. Positive-phrased only (Seedance does NOT support
+    # negative prompts — they're recommended against by ByteDance). Goes on
+    # every generation as the last line so the model sees it strongest.
+    # Cheap (~15 tokens) free quality bump.
+    quality_tail = (
+        "\n\n4K, ultra HD, rich details, sharp clarity, cinematic texture, "
+        "natural colors, stable picture, audio voice only delivers dialogue, "
+        "frame contains visual action only."
+    )
+    prompt = (prompt or '').rstrip() + quality_tail
 
     def _submit():
         try:
@@ -17293,12 +22399,45 @@ def seedance_poll(sid, num):
                     or not (vurl_lower.endswith('.mp4') or '.mp4?' in vurl_lower or '/video' in vurl_lower)
                 )
                 if is_moderation:
+                    # Auto-escalation: AVAI returned moderation rejection.
+                    # Behaviour (revised 2026-05-19 after $600 incident):
+                    #   1. Mark chunk visibly as 'moderation_blocked' so user
+                    #      SEES it was rejected BEFORE we attempt anything.
+                    #   2. ONCE per chunk — heal the prompt via Claude (rewrite
+                    #      softer) and re-submit with collage_grid bypass.
+                    #   3. If THAT also hits moderation → final fail, surface
+                    #      explicit message to user. Never escalate twice.
+                    #
+                    # Hard cap is enforced by `mod_escalated` flag (single use)
+                    # AND by global circuit breaker (3 same-fp per 10 min) so
+                    # any future bug can't loop more than 3× ($1).
+                    already_escalated = bool(c.get('mod_escalated'))
+                    cur_mod = (c.get('moderation_bypass') or 'off').lower()
+                    if not already_escalated and cur_mod in ('off', 'cartoon'):
+                        # Mark mod_escalated FIRST and save BEFORE setting
+                        # _pending flag. Idempotent — even if subsequent steps
+                        # crash, mod_escalated=True prevents re-attempt.
+                        c['mod_escalated'] = True
+                        c['moderation_bypass'] = 'collage_grid'
+                        c['status'] = 'moderation_blocked'   # visible intermediate state
+                        c['progress'] = 0
+                        c['error'] = (
+                            f'Заблокировано модерацией Seedance ({vurl[:60]}). '
+                            f'Лечу промпт и пробую ещё раз с collage_grid bypass...'
+                        )
+                        c.pop('job_id', None)
+                        c.pop('status_url', None)
+                        c['_pending_mod_escalation'] = True
+                        changed = True
+                        print(f'[seedance_poll] chunk {c.get("idx")} hit moderation with bypass={cur_mod} → marking moderation_blocked + queueing heal+escalate', flush=True)
+                        continue
+                    # Already escalated — give up, surface to user.
                     c['status'] = 'failed'
                     c['error'] = (
-                        f'Заблокировано модерацией Seedance (вернул "{vurl[:60]}"). '
-                        'Перепиши промпт мягче — убери: царапины/раны/кровь, удары в лицо, '
-                        'обнажение, оружие, явное насилие. Попробуй collage_grid bypass или '
-                        'переформулируй действие через эмоцию вместо физического урона.'
+                        f'Заблокировано модерацией Seedance даже после heal+collage_grid '
+                        f'(вернул "{vurl[:60]}"). Перепиши промпт мягче руками — убери: '
+                        f'царапины/раны/кровь, удары в лицо, обнажение, оружие, явное '
+                        f'насилие. Переформулируй действие через эмоцию вместо физического урона.'
                     )
                     changed = True
                     continue
@@ -17341,6 +22480,107 @@ def seedance_poll(sid, num):
         for c in chunks:
             if c.get('status') == 'completed' and c.get('video_path') and not c.get('qc'):
                 qc_targets.append(c.get('idx'))
+        # Snapshot moderation-escalation candidates: chunks where we just
+        # bumped bypass to collage_grid and wiped job_id. Need to spawn a
+        # fresh AVAI submit out-of-lock — the second attempt at the same
+        # chunk slot (not a new idx, so QC retry-counter doesn't see them
+        # as siblings).
+        mod_escalations = []
+        for c in chunks:
+            if c.pop('_pending_mod_escalation', False):
+                mod_escalations.append({
+                    'idx': c.get('idx'),
+                    'prompt': c.get('prompt') or '',
+                    'chunk_text': c.get('chunk_text') or '',
+                    'ref_urls': list(c.get('ref_urls') or []),
+                    'duration': int(c.get('duration') or 15),
+                    'resolution': c.get('resolution') or '720p',
+                    'aspect_ratio': c.get('aspect_ratio') or '9:16',
+                    'model': c.get('model') or 'reference-fast',
+                })
+        # CRITICAL: persist the popped flags. Without this, the prior save at
+        # `if changed: save_episode` ran BEFORE this pop, so the disk still
+        # holds `_pending_mod_escalation=True` → next poll re-fires escalation
+        # → infinite escalation submits every 8s (real prod bug
+        # «Vice Beasts» ep 1, 2026-05-19). One-line fix: re-save after popping.
+        if mod_escalations:
+            save_episode(sid, num, ep)
+
+    # ── Out of lock — dispatch heal+escalation per chunk (one-shot per chunk)
+    if mod_escalations:
+        for esc in mod_escalations:
+            def _esc_runner(esc=esc):
+                try:
+                    # 1. Heal the prompt via Claude (rewrite softer)
+                    print(f'[seedance_poll] chunk {esc["idx"]} heal+escalate: calling heal-prompt...', flush=True)
+                    healed = _heal_chunk_via_claude({
+                        'prompt': esc['prompt'],
+                        'chunk_text': esc.get('chunk_text', ''),
+                        'error': 'Заблокировано модерацией Seedance — переписать без насилия/крови/оружия',
+                    })
+                    healed_prompt = healed.get('prompt') or esc['prompt']
+                    healed_chunk_text = healed.get('chunk_text') or esc.get('chunk_text', '')
+                    # 2. Persist healed prompt to chunk BEFORE submit so the UI
+                    #    can show it. Also increment heal_count.
+                    with _episode_lock(sid, num):
+                        ep_h = load_episode(sid, num)
+                        for cc in _seedance_chunks(ep_h):
+                            if cc.get('idx') == esc['idx']:
+                                cc['prompt'] = healed_prompt
+                                cc['chunk_text'] = healed_chunk_text
+                                cc['heal_count'] = int(cc.get('heal_count') or 0) + 1
+                                cc['error'] = (
+                                    f'Заблокировано модерацией → промпт вылечен, пересабмит с collage_grid. '
+                                    f'Изменения: {"; ".join((healed.get("changes") or [])[:3])}'
+                                )
+                                break
+                        save_episode(sid, num, ep_h)
+                    # 3. Submit healed prompt with collage_grid bypass
+                    print(f'[seedance_poll] chunk {esc["idx"]} submitting healed prompt with collage_grid', flush=True)
+                    job = _avai_seedance_start(
+                        prompt=healed_prompt, ref_urls=esc['ref_urls'],
+                        duration=esc['duration'], resolution=esc['resolution'],
+                        moderation_bypass='collage_grid',
+                        aspect_ratio=esc['aspect_ratio'],
+                        generate_audio=True,
+                        moderation_bypass_prompt=(
+                            "Final output MUST be a single continuous full-frame composition. "
+                            "NO visible grid lines, NO cell borders, NO tiling artifacts, NO "
+                            "panel separators, NO visible seams. Any grid used internally for "
+                            "moderation bypass must be fully removed from the rendered output."
+                        ),
+                        model=esc['model'],
+                    )
+                    with _episode_lock(sid, num):
+                        ep_e = load_episode(sid, num)
+                        for cc in _seedance_chunks(ep_e):
+                            if cc.get('idx') == esc['idx']:
+                                cc['job_id'] = job['job_id']
+                                cc['status_url'] = job['status_url']
+                                cc['status'] = 'pending'   # flip from moderation_blocked → pending now that new job exists
+                                break
+                        save_episode(sid, num, ep_e)
+                except AVAICircuitBreakerError as cbe:
+                    print(f'[seedance_poll] escalation BLOCKED by circuit breaker for chunk {esc["idx"]}: {cbe}', flush=True)
+                    with _episode_lock(sid, num):
+                        ep_e = load_episode(sid, num)
+                        for cc in _seedance_chunks(ep_e):
+                            if cc.get('idx') == esc['idx']:
+                                cc['status'] = 'failed'
+                                cc['error'] = f'auto-escalation отказано circuit breaker\'ом: {cbe}'
+                                break
+                        save_episode(sid, num, ep_e)
+                except Exception as e:
+                    print(f'[seedance_poll] heal+escalation FAILED for chunk {esc["idx"]}: {e}', flush=True)
+                    with _episode_lock(sid, num):
+                        ep_e = load_episode(sid, num)
+                        for cc in _seedance_chunks(ep_e):
+                            if cc.get('idx') == esc['idx']:
+                                cc['status'] = 'failed'
+                                cc['error'] = f'heal+escalation submit failed: {e}'
+                                break
+                        save_episode(sid, num, ep_e)
+            _spawn_with_keys(_esc_runner)
 
     # ── Out of lock — dispatch QC threads
     if qc_targets:
@@ -17356,7 +22596,34 @@ def seedance_poll(sid, num):
                 print(f'[qc] background runner for chunk {target_idx} crashed: {e}', flush=True)
         for tidx in qc_targets:
             _spawn_with_keys(_qc_runner, tidx)
-    return jsonify({'chunks': chunks})
+    # Include kill-switch state in EVERY poll response so frontend can show
+    # full-screen warning the moment it trips. Cheap (single file existence
+    # check). Frontend renders a fixed-top red banner when active=True.
+    return jsonify({
+        'chunks': chunks,
+        'avai_kill_switch': _avai_kill_switch_status(),
+    })
+
+
+@app.route('/api/avai/kill-switch', methods=['GET'])
+def avai_kill_switch_get():
+    """Public endpoint to check kill switch state. Used by frontend to render
+    a global full-screen banner regardless of which page user is on."""
+    return jsonify(_avai_kill_switch_status())
+
+
+@app.route('/api/avai/kill-switch', methods=['DELETE'])
+def avai_kill_switch_clear():
+    """Manually clear the kill switch (admin / operator action). Removes the
+    file. Use only after investigating the root cause."""
+    if _AVAI_KILL_SWITCH.exists():
+        try:
+            _AVAI_KILL_SWITCH.unlink()
+            print('[avai-cb] kill switch manually cleared via API', flush=True)
+            return jsonify({'cleared': True})
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+    return jsonify({'cleared': False, 'note': 'kill switch was not active'})
 
 
 @app.route('/api/series/<sid>/episodes/<int:num>/seedance/<int:idx>/qc', methods=['POST'])
@@ -17392,51 +22659,14 @@ def seedance_delete(sid, num, idx):
         save_episode(sid, num, ep)
         return jsonify({'ok': True})
 
-@app.route('/api/series/<sid>/episodes/<int:num>/seedance/<int:idx>/heal-prompt', methods=['POST'])
-def seedance_heal_prompt(sid, num, idx):
-    """Rewrite a chunk's prompt + chunk_text to pass Seedance moderation.
-    Returns {prompt, chunk_text, changes:[...], reasoning}."""
-    s = load_series(sid)
-    ep = load_episode(sid, num)
-    if not s or not ep:
-        return jsonify({'error': 'not found'}), 404
-    chunk = next((c for c in _seedance_chunks(ep) if c.get('idx') == idx), None)
-    if not chunk:
-        return jsonify({'error': 'chunk not found'}), 404
+def _heal_chunk_via_claude(chunk):
+    """Heal a chunk's prompt + chunk_text via Claude to pass Seedance moderation.
+    Returns dict {prompt, chunk_text, changes, reasoning} or raises.
 
-    sysprompt = (
-        "Ты — редактор промптов для ByteDance Seedance 2.0. Твоя задача — переписать "
-        "промпт и фрагмент сценария так, чтобы они прошли модерацию Seedance, СОХРАНИВ "
-        "драматический эффект сцены.\n\n"
-        "ЧТО БЛОКИРУЕТ МОДЕРАЦИЯ (заменяй на эмоциональные эквиваленты):\n"
-        "  • Кровь, раны, царапины, порезы, синяки → убрать видимые повреждения. "
-        "Замена: «звонкий шлепок отпечатывается на щеке», «след от удара», «дрожь от боли».\n"
-        "  • Удары в лицо, кулаком, по голове → заменить на: пощёчина (слабая), толчок в плечо, "
-        "грубое схватывание за воротник, рывок руки. Без видимого урона.\n"
-        "  • Удушение, держать за горло → заменить: «схватил за плечи и трясёт», «прижал к стене за плечо».\n"
-        "  • Оружие (нож, пистолет, бита) → убрать или заменить безоружным жестом / угрожающим взглядом.\n"
-        "  • Кровь на одежде/полу/руках → убрать.\n"
-        "  • Явное насилие, побои, пытки → заменить психологическим давлением, "
-        "крик в лицо, нависание, унижающий жест.\n"
-        "  • Обнажение, эротика → одежда, сцена в публичном месте.\n"
-        "  • Самоубийство, явная смерть → потеря сознания, обморок, шок.\n\n"
-        "ЧТО ОБЯЗАТЕЛЬНО СОХРАНИТЬ:\n"
-        "  • ВСЕ реплики персонажей в кавычках — VERBATIM (не переводи, не меняй).\n"
-        "  • Все ссылки @Image1, @Image2... и их количество/порядок.\n"
-        "  • Структуру шотов и склеек, эмоции перед репликами.\n"
-        "  • Локацию и общий смысл сцены.\n"
-        "  • Язык: описания на русском, реплики как были (обычно англ).\n\n"
-        "Верни СТРОГО JSON и ничего кроме него:\n"
-        "{\n"
-        '  "prompt": "переписанный motion prompt",\n'
-        '  "chunk_text": "переписанный фрагмент сценария (если в нём были запрещённые элементы — иначе верни как было)",\n'
-        '  "changes": ["изменение 1 коротким предложением", "изменение 2", ...],\n'
-        '  "reasoning": "одно предложение — что было критичного и как обошёл"\n'
-        "}\n"
-        "Каждое изменение в 'changes' пиши ясно, например: "
-        '«Убрана царапина на щеке Selena — заменена на красный след от удара картой (без повреждения кожи)».'
-    )
-
+    Shared between the user-facing /heal-prompt endpoint and the server-side
+    auto-escalation runner (post-moderation single-shot heal). Single source
+    of truth for the heal sysprompt + Claude call."""
+    sysprompt = _HEAL_PROMPT_SYSPROMPT
     error_hint = (chunk.get('error') or '').strip()[:300]
     user = (
         f"ОРИГИНАЛЬНЫЙ ПРОМПТ:\n```\n{(chunk.get('prompt') or '')}\n```\n\n"
@@ -17444,24 +22674,135 @@ def seedance_heal_prompt(sid, num, idx):
         f"ОШИБКА МОДЕРАЦИИ (что не пропустило): {error_hint or '(не указано — обработай оба текста на любые потенциально блокируемые элементы)'}\n\n"
         "Найди и замени блокирующие элементы. Дай список изменений на русском."
     )
+    raw = claude_ask(user, system=sysprompt)
+    data = json.loads(strip_json(raw))
+    return {
+        'prompt':     data.get('prompt') or chunk.get('prompt') or '',
+        'chunk_text': data.get('chunk_text') or chunk.get('chunk_text') or '',
+        'changes':    data.get('changes') or [],
+        'reasoning':  data.get('reasoning') or '',
+    }
+
+
+_HEAL_PROMPT_SYSPROMPT = (
+    # Calibrated from a sibling production pipeline (colleague's Seedance/AVAI
+    # project) — empirically proven substitution list that passes Seedance
+    # classifier without losing drama. Replaces our earlier guideline-based
+    # version which was less precise. Key insight from their prod data:
+    # classifier scans BOTH action descriptions AND dialogue lines, hits on
+    # keyword regardless of context (metaphorical or literal).
+    "Перепиши этот Seedance-промпт чанка ЦЕЛИКОМ, чтобы он гарантированно прошёл "
+    "классификатор модерации Seedance/fal.ai. Замени все слова и фразы высокой "
+    "эмоциональной или физической интенсивности на квалитативные эквиваленты, но "
+    "СОХРАНИ драматургию сцены, кадровую композицию и реплики.\n\n"
+    "⚠️ ГЛАВНЫЙ ПРИНЦИП: НЕ ТЕРЯТЬ ЭМОЦИОНАЛЬНУЮ ЭНЕРГИЮ.\n"
+    "Триггерные слова заменяй НЕ ослабляющими синонимами ('furious' → 'calm' — "
+    "❌ запрещено), а ПЕРЕНОСИ интенсивность в физические/визуальные детали "
+    "(глаза, челюсть, дыхание, поза, тон, поза рук). Зритель должен увидеть ту же "
+    "ярость / шок / угрозу, но через то, что персонаж ДЕЛАЕТ телом.\n\n"
+    "КОНКРЕТНЫЕ ЗАМЕНЫ (триггер слева → равнозначные по силе описания справа):\n"
+    "• shocked / stunned → frozen mid-breath, eyes blown wide, lips parted, all colour drained from face\n"
+    "• frozen (как замороженный) → rigid, breath caught in throat, hands locked at sides\n"
+    "• shattered / devastated → eyes hollow, shoulders collapsed, breathing shallow, jaw slack\n"
+    "• furious / raging / fury / rage → eyes blazing, jaw clenched hard, breath sharp through nostrils, knuckles white\n"
+    "• screaming / shouting → voice raised to a roar, throat cords visible, jaw thrown wide, words hammered out\n"
+    "• yelling → voice carrying across the room, sharp and cutting, jaw tight\n"
+    "• terrified / horrified → eyes white-rimmed, hand trembling visibly, breath shallow and rapid\n"
+    "• violent / brutal / savage / extreme → ferocious, unflinching, surging with force\n"
+    "• slap / strike across face → sharp open-palm contact at the cheek (медленнее, описательнее, но не теряет силы)\n"
+    "• punch / hit → fist driven forward, full weight behind it\n"
+    "• blood / bleeding → dark stain spreading, slick mark\n"
+    "• gun / weapon (если не сюжетно критично) → small dark object in hand\n"
+    "• dies / killed / death → falls still, eyes glazing, body gone slack\n"
+    "• crying / weeping → tears streaming, breath ragged, shoulders shaking\n"
+    "• intimate / sensual / bare / nude — убирать или менять на нейтральное (контекст одежды/позы)\n"
+    "• hate (как чувство) → loathing in the eyes, lip curling\n\n"
+    "ПРИНЦИП: если триггер был 'furious', и ты заменил на 'with controlled restraint' "
+    "— это ХУЖЕ оригинала и **запрещено**. Правильно — 'eyes blazing, jaw clenched, "
+    "knuckles white' — это РАВНО по силе или СИЛЬНЕЕ.\n\n"
+    "Если в действии было 'screams' — итог должен по-прежнему передавать крик через "
+    "тон, мимику и язык тела, а не превращаться в спокойную речь.\n\n"
+    "РЕПЛИКИ В КАВЫЧКАХ ({Name} says: \"...\"):\n\n"
+    "⚠️ ОБЯЗАТЕЛЬНО ПРОЙДИСЬ ПО КАЖДОЙ РЕПЛИКЕ И ПРОВЕРЬ НА СПИСОК ТРИГГЕРОВ НИЖЕ. "
+    "Если хоть одно слово из списка есть в реплике — ЗАМЕНИ его. Не оставляй 'как есть' "
+    "с мыслью 'ну это же мягко'. Классификатор Seedance не различает контекст — он бьёт "
+    "по словарю (empirically verified on colleague's production pipeline).\n\n"
+    "ОБЯЗАТЕЛЬНЫЕ ЗАМЕНЫ В РЕПЛИКАХ (если встречается слева — поменяй на правое):\n"
+    "• 'ass' (в любом контексте: your ass, my ass, kick ass) → 'skin' / 'neck' / убрать слово.\n"
+    "  Примеры: 'saved your ass' → 'saved your skin'; 'kick your ass' → 'wreck you'; 'my ass!' → 'the hell I will!'\n"
+    "• 'Shut up' / 'Shut your mouth' → 'Enough!' / 'Quiet now!' / 'Stop right there!'\n"
+    "• 'fuck' / 'fucking' / 'fucked' → 'hell' / 'bloody' / 'twisted' / убрать.\n"
+    "  Примеры: 'fucking idiot' → 'bloody fool'; 'fuck you' → 'to hell with you'\n"
+    "• 'damn' / 'goddamn' → 'bloody' / 'cursed' / убрать\n"
+    "• 'bastard' → 'snake' / 'worm' / 'rat'\n"
+    "• 'bitch' → 'snake' / 'viper' / убрать\n"
+    "• 'kill' / 'I'll kill you' → 'end' / 'I'll end you' / 'You're finished'\n"
+    "• 'die' / 'dead' → 'fall' / 'gone' / 'won't be back'\n"
+    "• 'blood' / 'bleeding' → 'marks' / 'stained'\n"
+    "• 'smash' / 'beat' / 'punch' → 'wreck' / 'break' / 'shatter (метафорически)'\n"
+    "• 'hate' → 'despise' / 'loathe'\n"
+    "• 'stupid' / 'idiot' / 'moron' — обычно проходит, не трогай если контекст подходит\n\n"
+    "Сохраняй при замене:\n"
+    "- Смысл и драматургическую функцию (угроза остаётся угрозой)\n"
+    "- Примерную длину (плюс-минус 1-2 слова — КРИТИЧНО для lip-sync)\n"
+    "- Адресата и эмоциональный регистр\n\n"
+    "Если реплика после прохода по списку чистая — оставь дословно.\n\n"
+    "ОБЯЗАТЕЛЬНО СОХРАНИТЬ:\n"
+    "- Структуру блоков промпта (BINDING/SUBJECT/ACTION/SCENE/CAMERA/DIALOGUE/...)\n"
+    "- Все @ImageN теги на тех же персонажах в том же порядке\n"
+    "- Тайминги шотов\n"
+    "- Описания одежды, причёски, позы, расположения\n"
+    "- Camera framing, ракурсы, движение камеры\n"
+    "- Освещение, атмосферу, стиль\n\n"
+    "═══ ⚠️ КРИТИЧНО — ВНЕШНОСТЬ ПЕРСОНАЖЕЙ НЕ ТРОГАТЬ ═══\n\n"
+    "ЗАПРЕЩЕНО изменять, добавлять или удалять ЛЮБЫЕ описания внешности персонажей. К внешности относятся:\n"
+    "- ЛИЦО: цвет/форма глаз, ресницы, брови, нос, скулы, челюсть, губы, кожа, морщины, веснушки, шрамы, родинки, борода, усы\n"
+    "- ВОЛОСЫ: цвет, длина, причёска, оттенок, фактура\n"
+    "- ТЕЛО: рост, телосложение, татуировки\n\n"
+    "Если в оригинале было 'pale skin and dark hair' — оставь дословно.\n"
+    "Если оригинал НЕ описывал глаза персонажа — НЕ ВЫДУМЫВАЙ ('eyes blazing' можно ТОЛЬКО как реакцию, не как «icy blue eyes blazing»).\n\n"
+    "Эмоции через лицо описывай ТОЛЬКО через действие, не через цвет/форму:\n"
+    "- ✅ 'jaw clenched', 'lips parted', 'brows drawn together', 'tear tracks on the cheeks'\n"
+    "- ❌ 'icy blue eyes blazing' — меняет цвет глаз, ломает консистентность лица с reference image.\n\n"
+    "ПОЧЕМУ ВАЖНО: Seedance берёт лицо персонажа из reference-картинки @ImageN. Если в тексте появляется "
+    "новое описание лица/глаз/волос, не совпадающее с картинкой — модель усредняет, и лицо 'плывёт'.\n\n"
+    "ПРАВИЛО: если в исходном промпте про внешность сказано «X», в финальном должно быть РОВНО «X». "
+    "Если ничего не сказано — ничего и не добавляй.\n\n"
+    "═══════════════════════════════════════════════\n\n"
+    "Если в исходнике слов высокой интенсивности нет — верни промпт практически без изменений.\n\n"
+    "Верни СТРОГО JSON и ничего кроме него:\n"
+    "{\n"
+    '  "prompt": "переписанный motion prompt (английский, та же структура)",\n'
+    '  "chunk_text": "переписанный фрагмент сценария (если были запрещённые элементы)",\n'
+    '  "changes": ["изменение 1", "изменение 2", ...],\n'
+    '  "reasoning": "одно предложение — что было критичного и как обошёл"\n'
+    "}"
+)
+
+
+@app.route('/api/series/<sid>/episodes/<int:num>/seedance/<int:idx>/heal-prompt', methods=['POST'])
+def seedance_heal_prompt(sid, num, idx):
+    """User-facing endpoint: heal a chunk's prompt + chunk_text to pass moderation.
+    Delegates to _heal_chunk_via_claude. Returns the healed prompt for the
+    frontend to display/re-submit. Increments heal_count for UI gating."""
+    s = load_series(sid)
+    ep = load_episode(sid, num)
+    if not s or not ep:
+        return jsonify({'error': 'not found'}), 404
+    chunk = next((c for c in _seedance_chunks(ep) if c.get('idx') == idx), None)
+    if not chunk:
+        return jsonify({'error': 'chunk not found'}), 404
     try:
-        raw = claude_ask(user, system=sysprompt)
-        data = json.loads(strip_json(raw))
+        result = _heal_chunk_via_claude(chunk)
     except Exception as e:
         return jsonify({'error': f'heal failed: {e}'}), 500
-    # Track how many times this chunk was healed — used to show "Переписать сцену" button
     with _episode_lock(sid, num):
         ep2 = load_episode(sid, num)
         chunk2 = next((c for c in _seedance_chunks(ep2) if c.get('idx') == idx), None)
         if chunk2 is not None:
             chunk2['heal_count'] = int(chunk2.get('heal_count') or 0) + 1
             save_episode(sid, num, ep2)
-    return jsonify({
-        'prompt':     data.get('prompt') or chunk.get('prompt') or '',
-        'chunk_text': data.get('chunk_text') or chunk.get('chunk_text') or '',
-        'changes':    data.get('changes') or [],
-        'reasoning':  data.get('reasoning') or '',
-    })
+    return jsonify(result)
 
 
 @app.route('/api/series/<sid>/episodes/<int:num>/seedance/<int:idx>/rewrite-chunk', methods=['POST'])

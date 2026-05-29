@@ -196,6 +196,7 @@
           <button class="btn-secondary reteller-only" onclick="openReteller()">🎬 Отправить в Reteller</button>
           <button class="btn-ghost" onclick="renameOutFiles()" title="Переименовать файлы в папке OUT по студийным требованиям" style="display:none">📁 Переименовать OUT</button>
           <button class="btn-secondary" onclick="openAppendScript()" title="Вставить готовый сценарий — он автоматически разобьётся на серии, добавится в этот сериал, и в фоне извлекутся персонажи/локации/предметы из каждой серии">📜 Добавить сценарий</button>
+          <button class="btn-ghost" onclick="backfillDevices()" title="Проанализировать все серии и заполнить реестр сюжетных приёмов (нужно для анти-повторения)">🔄 Устройства</button>
           <button class="btn-primary" onclick="openCreateEpisode()" data-mlg-action="gunshot">+ Эпизод</button>
         </div>
       </div>
@@ -212,6 +213,7 @@
           <button class="btn-ghost btn-sm" onclick="clearEpisodeSelection()" title="Снять все галочки">✕ Снять</button>
           <button class="btn-ghost btn-sm" onclick="resetStuckGenStatuses()" title="Если какие-то серии застряли в статусе «🎬 Генерится…» (упал range-gen, потеряна сеть, и т.п.) — это сбросит их в нормальное состояние. Чанки которые реально генерятся НЕ трогает.">🔄 Сбросить зависшие</button>
           <button class="btn-ghost btn-sm" onclick="checkLogicOnSelected()" title="Прогнать Claude по сценариям выделенных серий — найдёт противоречия, плот-холы, забытые сюжетные линии. Можно сразу же применить правки — Claude перепишет соответствующие серии с минимальными изменениями.">🧠 Проверить логику выделенных</button>
+          <button class="btn-ghost btn-sm" onclick="reanalyzeOutfitsForSelected()" title="Перепарсить [BLOCKING] во всех (или выделенных) эпизодах: найти новые образы у персонажей, создать outfit-объекты и сразу запустить генерацию картинок. Если ничего не выделено — пройдёт по всем эпизодам со сценарием.">🔁 Перепроанализировать образы</button>
           <span id="range-gen-selected-count" style="font-size:0.82rem;color:#10b981;font-weight:600"></span>
           <label style="display:flex;align-items:center;gap:6px;margin-left:auto" title="Сколько серий генерить одновременно. 1 = последовательно (безопасно, поштучно). 2-3 = параллельно (≈2× быстрее, но Seedance получает больше одновременных джоб). Внутри каждой серии всё равно сцены идут параллельно по локациям.">
             <span style="color:var(--muted);font-size:0.82rem">⚡ параллельно:</span>
@@ -432,9 +434,13 @@
           </div>
           <div class="char-counter" style="display:flex;justify-content:space-between;align-items:center;gap:8px">
             <span id="ep-script-gen-status" style="font-size:0.78rem;color:var(--warning);flex:1"></span>
+            <button class="btn-ghost btn-sm" id="ep-phrase-btn" onclick="epCheckPhrases(this)" title="Проверить диалоги на фразы которые могут не пройти модерацию Seedance">🚨 Фразы</button>
+            <button class="btn-ghost btn-sm" id="ep-adapt-btn" onclick="epAdaptToStandard(this)" title="Добавить позиционные блоки, перевести не-английские реплики и проверить на модерацию Seedance">🔧 Под стандарт</button>
             <button class="btn-ghost btn-sm" id="ep-script-apply-btn" onclick="applyScriptChanges()" title="Сохранить ручные правки сценария на диск" style="display:none">💾 Применить изменения</button>
             <span><span id="script-char-count">0</span> символов</span>
           </div>
+          <div id="ep-postgen-checks"></div>
+          <div id="ep-adapt-result"></div>
         </div>
 
         <div class="field-group">
@@ -448,6 +454,7 @@
               <div style="display:flex;gap:6px;align-items:center">
                 <button class="btn-ghost btn-sm" id="ep-gen-blocking-btn" onclick="generateSceneBlocking()" title="Claude прочитает сценарий + roster и заполнит blocking 60-120 слов английского текста">✨ Сгенерить</button>
                 <button class="btn-ghost btn-sm" onclick="openBatchJsonViewer()" title="Просмотр единого JSON-промпта эпизода (batch-compose). Содержит episodeBlocking + per-segment prompts которые Auto-mode турбо шлёт в Seedance.">📋 batch JSON</button>
+                <button class="btn-ghost btn-sm" onclick="applyAutoRevise(this)" title="Применить «🎬 Автоматическую правку» из настроек ко всем main-промптам этого эпизода. Один Claude-вызов переписывает все promptEn чтобы персонажи не прыгали, диалоги читались, чанки склеивались монтажно. Эту же правку Turbo Auto-mode применяет автоматически после batch-compose.">✨ Авто-правка</button>
                 <span id="ep-blocking-status" style="font-size:0.76rem;color:var(--muted)"></span>
               </div>
             </div>
@@ -503,9 +510,9 @@
                 <input type="checkbox" id="sd-use-style" onchange="sdToggleStyleField()" style="margin:0">
                 стиль
               </label>
-              <label style="font-size:0.78rem;color:var(--muted);display:inline-flex;align-items:center;gap:4px"
+              <label id="sd-base-only-label" style="font-size:0.78rem;color:var(--muted);display:inline-flex;align-items:center;gap:4px"
                      title="Composer не выбирает варианты костюмов (outfits) — для каждого персонажа берётся только его базовое референс-фото. Полезно когда в сериале outfits сделаны под другие сцены и в текущей надо вернуться к базе.">
-                <input type="checkbox" id="sd-base-only" style="margin:0">
+                <input type="checkbox" id="sd-base-only" style="margin:0" onchange="sdUpdateBaseOnlyHint()">
                 только базовые образы персов
               </label>
               <label style="font-size:0.78rem;color:var(--muted);display:inline-flex;align-items:center;gap:4px"
@@ -552,10 +559,10 @@
                   <option value="reference-pro">pro</option>
                 </select>
               </label>
-              <label>Обход модер:
+              <label title="off — без обхода (большинство dialog-сцен проходят и без него; нет риска оставшейся сетки). grid / collage_grid включай ВРУЧНУЮ для рискованных сцен: поцелуи, кровь, удары, обнажёнка. cartoon — стилизация под мульт.">Обход модер:
                 <select id="sd-mod-bypass">
-                  <option value="off">off</option>
-                  <option value="grid" selected>grid</option>
+                  <option value="off" selected>off</option>
+                  <option value="grid">grid</option>
                   <option value="collage_grid">collage_grid</option>
                   <option value="cartoon">cartoon</option>
                 </select>
@@ -829,7 +836,7 @@
 <!-- ══════════════════════════════════════════════════════ -->
 
 <!-- Create Series Modal -->
-<div id="modal-create-series" class="modal hidden">
+<div id="modal-create-series" class="modal hidden no-backdrop-close">
   <div class="modal-box modal-wide">
     <div class="modal-header">
       <h2>Новый сериал</h2>
@@ -871,9 +878,11 @@
           <div style="display:flex;gap:8px;flex-wrap:wrap">
             <button type="button" class="btn-ghost btn-sm" onclick="importPreviewSplit()">👁 Превью разбивки на серии</button>
             <button type="button" class="btn-ghost btn-sm" onclick="importLogicCheck(this)">🧠 Проверить логику</button>
+            <button type="button" class="btn-ghost btn-sm" onclick="importAdaptToStandard(this)">🔧 Адаптировать под стандарт</button>
           </div>
           <div id="import-series-preview" style="margin-top:8px"></div>
           <div id="import-series-logic" style="margin-top:8px"></div>
+          <div id="import-adapt-result" style="margin-top:8px"></div>
         </div>
         <!-- ─── Per-type extraction toggles + manual uploads ─── -->
         <div style="background:rgba(132,94,247,0.06);border:1px solid rgba(132,94,247,0.2);border-radius:8px;padding:12px 14px;margin-top:6px">
@@ -958,6 +967,19 @@
 
       <!-- ─── GENERATE MODE ─── (existing UI wrapped) -->
       <div id="series-generate-block">
+
+      <!-- Format mode picker — short drama vs Instagram series. -->
+      <div style="display:flex;gap:8px;margin-bottom:14px;background:var(--surface2);border-radius:10px;padding:5px">
+        <button type="button" class="btn-mode-pill active" id="format-mode-short_drama-btn" onclick="setFormatMode('short_drama')">
+          📱 Short Drama
+          <div style="font-size:0.72rem;color:var(--muted);font-weight:400;margin-top:2px">TikTok/ReelShort — длинная арка, шок-клиффхэнгеры, 70 серий</div>
+        </button>
+        <button type="button" class="btn-mode-pill" id="format-mode-instagram_series-btn" onclick="setFormatMode('instagram_series')">
+          🟪 Instagram Series
+          <div style="font-size:0.72rem;color:var(--muted);font-weight:400;margin-top:2px">Компактный сериал 6-10 серий: резкий хук + клиффхэнгер в каждой</div>
+        </button>
+      </div>
+      <input type="hidden" id="new-series-format-mode" value="short_drama">
 
       <!-- AI idea block -->
       <div class="idea-gen-block">
@@ -1105,6 +1127,42 @@
         <div class="muted" style="font-size:0.78rem;margin-top:4px">
           Этот стиль автоматически применяется при генерации фото персонажей, локаций и при компоновке промптов Seedance.
           Оставь пустым для realistic photo look.
+        </div>
+      </div>
+      <div class="field-group">
+        <label>👥 Лимит главных персонажей в сцене</label>
+        <div style="display:flex;align-items:center;gap:10px">
+          <input id="bible-max-chars-per-scene" type="number" min="1" max="6" style="width:80px"
+                 placeholder="2">
+          <span style="font-size:0.82rem;color:var(--muted)">по умолчанию 2 | макс 6</span>
+        </div>
+        <div class="muted" style="font-size:0.78rem;margin-top:4px">
+          Жёсткое правило: сколько именованных персонажей могут одновременно говорить/действовать в одной сцене.
+          Массовка и фоновые фигуры без реплик — не считаются. Применяется при генерации каждой серии.
+        </div>
+      </div>
+      <div class="field-group">
+        <label>⏱ Длина серии (секунд экрана)</label>
+        <div style="display:flex;align-items:center;gap:10px">
+          <input id="bible-target-duration-sec" type="number" min="30" max="240" style="width:90px"
+                 placeholder="60">
+          <span style="font-size:0.82rem;color:var(--muted)">по умолчанию 60с (~100 слов / ~12-15 строк)</span>
+        </div>
+        <div class="muted" style="font-size:0.78rem;margin-top:4px">
+          Программный детектор после генерации считает диалоговые строки и слова. Если &gt;130% от лимита —
+          сценарий автоматически переписывается. Применяется ко всем режимам генерации (вкл. "До финала").
+        </div>
+      </div>
+      <div class="field-group">
+        <label>📐 Формат сериала</label>
+        <select id="bible-format-mode" style="width:100%">
+          <option value="short_drama">📱 Short Drama (TikTok/ReelShort)</option>
+          <option value="instagram_series">🟪 Instagram Series (компактный сериал)</option>
+        </select>
+        <div class="muted" style="font-size:0.78rem;margin-top:4px">
+          <b>Short Drama</b> — длинная арка, шок-клиффхэнгеры, 70 серий, серии идут подряд.<br>
+          <b>Instagram Series</b> — 6-10 серий, в каждой резкий хук + клиффхэнгер, каждая — самостоятельная глава большого сюжета. Локации меняются, конфликт ясен в двух фразах.
+          Переключение меняет поведение всех генераторов (идеи, синопсисы, сценарии).
         </div>
       </div>
     </div>
@@ -1345,7 +1403,7 @@
 </div>
 
 <!-- Append script to existing series modal -->
-<div id="modal-append-script" class="modal hidden">
+<div id="modal-append-script" class="modal hidden no-backdrop-close">
   <div class="modal-box" style="max-width:760px">
     <div class="modal-header">
       <h2>📜 Добавить сценарий в сериал</h2>
@@ -1367,8 +1425,40 @@
         <p id="append-gen-help" style="color:var(--muted);font-size:0.85rem;margin-top:0">
           <!-- Filled dynamically by setAppendMode based on whether the series has existing episodes -->
         </p>
+
+        <!-- ─── LANDMARK-ATTACHED MODE (shown only when finale / nearest-checkpoint is ahead) ─── -->
+        <div id="append-landmark-block" style="display:none;background:linear-gradient(135deg,rgba(168,85,247,0.10),rgba(236,72,153,0.10));border:1px solid rgba(168,85,247,0.35);border-radius:10px;padding:14px;margin-bottom:14px">
+          <div style="font-weight:600;font-size:0.95rem;color:var(--text);margin-bottom:4px">🎯 Сгенерировать с привязкой к ориентиру</div>
+          <div style="font-size:0.8rem;color:var(--muted);line-height:1.5;margin-bottom:10px">
+            Этот режим строит мост-план от текущего состояния к выбранному ориентиру.
+            Для каждой серии синопсис ПЕРЕЗАПИСЫВАЕТСЯ из bridge-плана, потом пишется сценарий
+            — модель не может уйти в сторону. Серии создаются <b>напрямую</b> (без textarea-импорта).
+          </div>
+          <div id="append-landmark-info" style="font-size:0.85rem;color:var(--text);margin-bottom:10px"></div>
+          <!-- Overwrite-from input — appears when all episodes up to the landmark are already written -->
+          <div id="append-landmark-overwrite-row" style="display:none;background:rgba(251,191,36,0.10);border:1px solid rgba(251,191,36,0.35);border-radius:8px;padding:10px 12px;margin-bottom:10px">
+            <div style="font-size:0.82rem;color:#fbbf24;font-weight:600;margin-bottom:4px">⚠ У всех серий до ориентира уже есть сценарии</div>
+            <div style="font-size:0.78rem;color:var(--muted);margin-bottom:8px">
+              Можно перезаписать серии начиная с указанной (старые сценарии уйдут в history каждой серии).
+            </div>
+            <label style="display:flex;align-items:center;gap:8px;font-size:0.85rem">
+              <span>Перезаписать с серии:</span>
+              <input type="number" id="append-landmark-start-ep" min="1" style="width:80px">
+            </label>
+          </div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap">
+            <button class="btn-accent" id="append-to-finale-btn" onclick="appendGenerateToLandmark('finale')" style="display:none">
+              🏁 До финала
+            </button>
+            <button class="btn-accent" id="append-to-checkpoint-btn" onclick="appendGenerateToLandmark('checkpoint')" style="display:none">
+              📍 До контрольной точки
+            </button>
+          </div>
+          <div id="append-landmark-status" style="font-size:0.82rem;color:var(--muted);margin-top:10px"></div>
+        </div>
+
         <div class="field-group">
-          <label>Сколько серий сгенерировать</label>
+          <label>Сколько серий сгенерировать <span style="font-size:0.74rem;color:var(--muted);font-weight:400">(свободная генерация — без привязки к финалу)</span></label>
           <input type="number" id="append-gen-count" min="1" max="20" value="5" style="width:80px">
           <span style="font-size:0.78rem;color:var(--muted);margin-left:8px">~30-90с на серию · до 20 за раз</span>
         </div>
@@ -1449,9 +1539,11 @@
         <div style="display:flex;gap:8px;flex-wrap:wrap">
           <button type="button" class="btn-ghost btn-sm" onclick="appendPreviewSplit()">👁 Превью разбивки на серии</button>
           <button type="button" class="btn-ghost btn-sm" onclick="appendLogicCheck()" title="Claude прочитает все серии по порядку и найдёт противоречия, плот-холы, забытые сюжетные линии — до того как сценарий ляжет в сериал">🧠 Проверить логику</button>
+          <button type="button" class="btn-ghost btn-sm" onclick="appendAdaptToStandard(this)" title="Добавить позиционные блоки, перевести не-английские реплики и проверить на модерацию Seedance">🔧 Адаптировать под стандарт</button>
         </div>
         <div id="append-script-preview" style="margin-top:8px"></div>
         <div id="append-script-logic" style="margin-top:8px"></div>
+        <div id="append-adapt-result" style="margin-top:8px"></div>
       </div>
       <label class="cb" style="display:flex;align-items:flex-start;gap:8px;background:rgba(132,94,247,0.06);border:1px solid rgba(132,94,247,0.2);border-radius:8px;padding:10px 12px">
         <input type="checkbox" id="append-extract-entities" checked style="margin-top:3px">
@@ -1728,6 +1820,45 @@
         </div>
         <button class="btn-ghost btn-sm" onclick="Sounds.speak('Episode generation finished.')" style="margin-top:6px">▶ test голос</button>
       </div>
+      <div class="field-group" style="border-top:1px solid var(--border);padding-top:14px;margin-top:14px">
+        <label style="display:flex;align-items:center;gap:8px;font-weight:600;color:var(--text)">
+          🚀 Турбо-движок (Auto-mode параллельный)
+        </label>
+        <div class="muted" style="font-size:0.78rem;margin:4px 0 8px">
+          Какую реализацию использовать при запуске Auto-mode в Turbo. На последовательный режим не влияет — он всегда работает как раньше.
+        </div>
+        <label style="display:flex;align-items:flex-start;gap:8px;cursor:pointer;padding:6px;border-radius:6px">
+          <input type="radio" name="turbo-engine" value="parallel-sequential" id="turbo-engine-parallel" style="margin-top:3px">
+          <span>
+            <strong>Параллельный (на базе последовательного)</strong> <span style="opacity:0.7">— по умолчанию</span><br>
+            <span class="muted" style="font-size:0.78rem">Per-chunk Claude compose как в sequential, но все чанки шлются в Seedance параллельно. Без last-frame/cut-frames, без batch JSON, без scene blocking, без авто-правки. Дёшево и просто.</span>
+          </span>
+        </label>
+        <label style="display:flex;align-items:flex-start;gap:8px;cursor:pointer;padding:6px;border-radius:6px">
+          <input type="radio" name="turbo-engine" value="shadow" id="turbo-engine-shadow" style="margin-top:3px">
+          <span>
+            <strong>Shadow</strong> <span style="opacity:0.7">— исходная реализация из проекта коллеги</span><br>
+            <span class="muted" style="font-size:0.78rem">Scene blocking → batch JSON (один Claude-call на всю серию) → авто-правка → parallel /start с готовыми промптами. Тяжелее, но spatial-continuity между чанками крепче.</span>
+          </span>
+        </label>
+      </div>
+      <div class="field-group" style="border-top:1px solid var(--border);padding-top:14px;margin-top:14px">
+        <label style="display:flex;align-items:center;gap:8px;font-weight:600;color:var(--text)">
+          🎬 Автоматическая правка <span class="muted" style="font-weight:400;font-size:0.78rem">(только Shadow-движок)</span>
+        </label>
+        <div class="muted" style="font-size:0.78rem;margin:4px 0 8px">
+          Эта инструкция применяется AI ко всем main-промптам серии в Turbo-режиме после batch-compose. Цель — чтобы персонажи не прыгали в пространстве, диалоги читались, чанки склеивались монтажно. Можно подкручивать под свой стиль.
+        </div>
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-bottom:8px">
+          <input type="checkbox" id="settings-auto-revise-enabled" style="margin:0">
+          <span>Применять автоматически в Turbo-режиме (Auto-mode параллельный)</span>
+        </label>
+        <textarea id="settings-auto-revise-instruction" rows="10"
+                  style="width:100%;font-family:inherit;font-size:0.86rem;line-height:1.4;padding:8px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:var(--text);resize:vertical"></textarea>
+        <div style="display:flex;gap:6px;margin-top:6px">
+          <button class="btn-ghost btn-sm" type="button" onclick="resetAutoReviseDefault()">↺ Вернуть дефолт</button>
+        </div>
+      </div>
       <div class="field-group">
         <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
           <input type="checkbox" id="settings-mlg-hitmarker" style="margin:0">
@@ -1772,13 +1903,25 @@
       <div class="canonical-desc-section" style="margin-top:12px;padding:10px;background:var(--surface3);border:1px solid var(--border);border-radius:6px">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
           <span style="font-size:0.76rem;font-weight:700;text-transform:uppercase;letter-spacing:0.6px;color:var(--muted)">
-            Каноническое описание (используется в Seedance)
+            Appearance (внешность — редактируемая)
           </span>
-          <button class="btn-ghost btn-sm" onclick="copyCanonicalDescription()" title="Скопировать в буфер обмена">📋 Копировать</button>
+          <span id="char-appearance-save-status" style="font-size:0.74rem;color:var(--muted)"></span>
         </div>
-        <div id="char-canonical-desc" style="font-size:0.84rem;line-height:1.45;color:var(--text);white-space:pre-wrap"></div>
-        <div class="muted" style="font-size:0.74rem;margin-top:6px">
-          Тот же текст, по которому генерилось ref-фото. При компоновке Seedance-промпта он автоматически вставляется в BINDING-строку рядом с @Image-ссылкой персонажа — ref-картинка и текст совпадают, минимизируя дрейф.
+        <textarea id="char-appearance-edit" rows="4"
+          style="width:100%;font-size:0.84rem;line-height:1.45;color:var(--text);background:var(--bg-input);border:1px solid var(--border);border-radius:4px;padding:6px 8px;resize:vertical;font-family:inherit"
+          oninput="_markCharAppearanceDirty()"
+          placeholder="Опиши внешность: возраст, телосложение, волосы, лицо, отличительные черты..."></textarea>
+        <div style="display:flex;gap:6px;margin-top:6px;align-items:center;flex-wrap:wrap">
+          <button id="char-appearance-save-btn" class="btn-ghost btn-sm" onclick="saveCharAppearance()" disabled title="Сохранить изменения в appearance">💾 Сохранить</button>
+          <button class="btn-ghost btn-sm" onclick="_revertCharAppearance()" title="Откатить несохранённые изменения">↺ Сбросить</button>
+          <button class="btn-ghost btn-sm" onclick="copyCanonicalDescription()" title="Скопировать каноническое описание (appearance + base outfit) в буфер">📋 Копировать каноническое</button>
+        </div>
+        <div style="margin-top:10px;padding-top:8px;border-top:1px dashed var(--border)">
+          <div style="font-size:0.72rem;color:var(--muted);margin-bottom:4px">Превью канонического описания (appearance + base outfit) — то что попадает в Seedance BINDING:</div>
+          <div id="char-canonical-desc" style="font-size:0.82rem;line-height:1.4;color:var(--text);white-space:pre-wrap;opacity:0.85"></div>
+        </div>
+        <div class="muted" style="font-size:0.72rem;margin-top:6px">
+          После Save новое appearance применится в следующей перегенерации фото и в Seedance-промптах. Существующее ref-фото не меняется автоматически.
         </div>
       </div>
 
@@ -1890,6 +2033,14 @@
     </div>
     <div class="modal-body">
       <p class="muted" style="margin:0">Опиши финальную серию и её события. Сценарист будет следить, чтобы сюжет вёл к этому финалу и не нарушал его условий (не убивал нужных живыми персонажей, не раскрывал тайны раньше времени и т. п.).</p>
+      <!-- Trajectory validation warning — appears when finale/checkpoints reference characters that aren't in the cast -->
+      <div id="fin-mismatch-warning" style="display:none;background:rgba(255,158,68,0.15);border:1px solid rgba(255,158,68,0.45);border-radius:8px;padding:12px 14px">
+        <div style="font-weight:600;color:#ff9e44;margin-bottom:6px">⚠️ Финал использует имена которых нет в касте</div>
+        <div id="fin-mismatch-detail" style="font-size:0.82rem;color:var(--text);line-height:1.5"></div>
+        <div style="margin-top:8px">
+          <button class="btn-ghost btn-sm" onclick="generateFinaleDraft()" style="border:1px solid rgba(255,158,68,0.5);color:#ff9e44">🔄 Перегенерировать финал с реальным кастом</button>
+        </div>
+      </div>
       <div class="form-row" style="display:flex;gap:10px;align-items:center">
         <label style="margin:0;min-width:140px">Номер финальной серии:</label>
         <input type="number" id="fin-episode" min="1" step="1" style="width:120px" placeholder="напр. 70">
