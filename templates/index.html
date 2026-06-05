@@ -72,6 +72,16 @@
     <div class="filter-group">
       <button class="star-filter-btn" id="star-filter-btn" onclick="toggleStarFilter()" title="Только избранные">☆ Только избранные</button>
     </div>
+    <div class="filter-group">
+      <span class="filter-label">Сортировка:</span>
+      <select id="sort-select" class="sort-select" onchange="setSortMode(this.value)" title="Порядок сериалов в списке">
+        <option value="default">По имени (A→Я)</option>
+        <option value="created_desc">Сначала новые (по созданию)</option>
+        <option value="created_asc">Сначала старые (по созданию)</option>
+        <option value="updated_desc">Недавно изменённые</option>
+        <option value="updated_asc">Давно не трогали</option>
+      </select>
+    </div>
   </div>
   <div id="projects-grid" class="projects-grid"></div>
   <div id="projects-empty" class="empty-state hidden">
@@ -91,6 +101,29 @@
         frameborder="0"
         allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
         allowfullscreen></iframe>
+    </div>
+  </div>
+</div>
+
+<!-- Cover viewer modal (short-drama poster) -->
+<div id="modal-cover-viewer" class="modal hidden" onclick="if(event.target===this)closeCoverViewer()">
+  <div class="modal-box cover-viewer-box">
+    <div class="modal-header">
+      <h2 id="cover-viewer-title">Обложка</h2>
+      <button class="btn-icon" onclick="closeCoverViewer()">✕</button>
+    </div>
+    <div class="modal-body cover-viewer-body">
+      <div class="cover-viewer-img-wrap">
+        <img id="cover-viewer-img" alt="" />
+      </div>
+      <div id="cover-viewer-meta" class="cover-viewer-meta"></div>
+      <div id="cover-viewer-synopsis" class="cover-viewer-synopsis"></div>
+      <div id="cover-viewer-status" class="cover-viewer-status"></div>
+    </div>
+    <div class="modal-footer">
+      <button id="cover-viewer-regen" class="btn-primary" onclick="regenerateCoverFromViewer()">🎲 Перегенерить</button>
+      <a id="cover-viewer-download" class="btn-ghost" href="#" download>⬇ Скачать</a>
+      <button class="btn-ghost" onclick="closeCoverViewer()">Закрыть</button>
     </div>
   </div>
 </div>
@@ -1064,6 +1097,12 @@
         <label>Синопсис</label>
         <textarea id="new-series-synopsis" rows="3" placeholder="Краткое описание основного конфликта и арки сериала..."></textarea>
       </div>
+      <div class="field-group">
+        <label>Длительность серии (секунд)</label>
+        <input id="new-series-target-duration" type="number" min="30" max="240" step="5" value="60"
+               placeholder="60" style="max-width:120px"
+               title="Целевая длительность одной серии в секундах. Влияет на бюджет слов писателя. 60 = стандартная TikTok-серия, 70-90 = чуть длиннее, 120+ = расширенный формат.">
+      </div>
 
       </div><!-- /#series-generate-block -->
     </div>
@@ -1819,6 +1858,27 @@
           Когда Auto-mode заканчивает все сегменты эпизода — браузерный TTS произносит фразу на английском. Использует встроенный SpeechSynthesis API (бесплатно, без сервера, работает оффлайн).
         </div>
         <button class="btn-ghost btn-sm" onclick="Sounds.speak('Episode generation finished.')" style="margin-top:6px">▶ test голос</button>
+      </div>
+      <div class="field-group" style="border-top:1px solid var(--border);padding-top:14px;margin-top:14px">
+        <label style="display:flex;align-items:center;gap:8px;font-weight:600;color:var(--text)">
+          🤖 Авто-обработка после «✨ Сгенерировать новые»
+        </label>
+        <div class="muted" style="font-size:0.78rem;margin:4px 0 8px">
+          Сразу после генерации сценария выполнять шаги автоматически (как вручную), блокируя экран до конца.
+          Сними галочку у любого шага чтобы делать его руками. По умолчанию всё включено.
+        </div>
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-bottom:6px">
+          <input type="checkbox" id="settings-auto-pipe-adapt" style="margin:0">
+          <span>🔧 Подгонять под стандарт</span>
+        </label>
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-bottom:6px">
+          <input type="checkbox" id="settings-auto-pipe-logic" style="margin:0">
+          <span>🧠 Проверять логику и 🩹 лечить все найденные проблемы</span>
+        </label>
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+          <input type="checkbox" id="settings-auto-pipe-add" style="margin:0">
+          <span>📜 Автоматически добавлять серии в конце</span>
+        </label>
       </div>
       <div class="field-group" style="border-top:1px solid var(--border);padding-top:14px;margin-top:14px">
         <label style="display:flex;align-items:center;gap:8px;font-weight:600;color:var(--text)">

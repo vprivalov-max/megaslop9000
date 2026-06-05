@@ -1,5 +1,36 @@
 import json
 import os
+import sys
+
+# ── macOS fork-safety ────────────────────────────────────────────────────
+# This process is multithreaded (ThreadPoolExecutor drives the QC pipeline
+# and autogen). When a worker thread shells out via subprocess (fork+exec of
+# ffmpeg / `open` / ffprobe), macOS's Objective-C runtime detects a fork from
+# a multithreaded Obj-C-initialized process and SIGKILLs the child *between*
+# fork and exec — crash signature:
+#     Termination Reason: Namespace OBJC, Code 1
+#     "crashed on child side of fork pre-exec"  (Thread: ThreadPoolExecutor-0_0)
+# The Obj-C runtime gets initialized in the parent by `requests`/urllib doing
+# a CFNetwork system-proxy lookup. OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES
+# tells the runtime not to abort the forked child.
+#
+# CRITICAL: libobjc reads this env var exactly once, when its runtime
+# initializes (_objc_init) — which on a Python.framework build can happen at
+# interpreter startup, BEFORE this module runs. Setting os.environ here would
+# then be too late and the crash returns. So when launched directly (dev:
+# `python app.py`) and the var isn't already present, we re-exec the
+# interpreter with the var set in the environment — guaranteeing it's seen
+# before libobjc initializes. The value-check guards against an exec loop and
+# also covers Werkzeug's debug reloader child (which inherits the env).
+if __name__ == '__main__' and os.environ.get('OBJC_DISABLE_INITIALIZE_FORK_SAFETY') != 'YES':
+    os.environ['OBJC_DISABLE_INITIALIZE_FORK_SAFETY'] = 'YES'
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+# Production runs under gunicorn (imports this module, __name__ != '__main__')
+# on Linux, where this whole class of crash doesn't exist — setdefault is a
+# harmless no-op signal there. Local `gunicorn app:app` on macOS would still
+# want the var in its launch env; the re-exec above only covers `python app.py`.
+os.environ.setdefault('OBJC_DISABLE_INITIALIZE_FORK_SAFETY', 'YES')
+
 import re
 import uuid
 import random
@@ -8,7 +39,6 @@ import shutil
 import datetime
 import time
 import subprocess
-import sys
 import threading
 import hashlib
 import requests
@@ -2136,7 +2166,14 @@ def _avai_call(provider: str, prompt: str, reference_url: str = None, aspect_rat
     if provider == 'banana':
         payload['model'] = 'pro'
     if reference_url:
-        payload['contextImages'] = [{'url': reference_url}]
+        # Accept either a single URL (legacy callers) or a list/tuple
+        # (cover-art uses 2 leads as refs).
+        if isinstance(reference_url, (list, tuple)):
+            urls = [u for u in reference_url if u]
+            if urls:
+                payload['contextImages'] = [{'url': u} for u in urls]
+        else:
+            payload['contextImages'] = [{'url': reference_url}]
     avai_key = _get_user_avai_key()
     if not avai_key:
         # Empty key → AVAI returns generic 401. Surface a specific error so the
@@ -2402,6 +2439,11 @@ def load_series(sid):
     data.setdefault('items', [])                         # story-relevant props (handbag, gun, locket...)
     data.setdefault('devices_index', {})                 # plot-device anti-repetition registry
     data.setdefault('cadence_policy', {'default_min_gap': 4, 'hard_limit': 3})
+    # Cover art (short-drama style poster) — shown as background on the
+    # project card in the main menu. Generated via /api/series/<sid>/cover/generate.
+    data.setdefault('cover_image', '')          # rel path inside series dir, e.g. 'assets/cover.jpg'
+    data.setdefault('cover_image_url', '')      # AVAI-hosted URL (set when freshly generated)
+    data.setdefault('cover_image_version', 0)   # cache-buster bumped on every regeneration
     return data
 
 def save_series(sid, data):
@@ -2988,12 +3030,25 @@ def list_series():
             ep_dir = d / 'episodes'
             ready = 0
             total = 0
+            # Track latest mtime across series.json + every episode file so the
+            # main-page "sort by modification" reflects real editing activity
+            # (writing/regenerating an episode doesn't touch series.json itself).
+            try:
+                latest_mtime = int(sf.stat().st_mtime)
+            except Exception:
+                latest_mtime = 0
             if ep_dir.exists():
                 for p in ep_dir.glob('*.json'):
                     # Filter out macOS AppleDouble metadata (._*) and any dotfile
                     if p.name.startswith('.'):
                         continue
                     total += 1
+                    try:
+                        mt = int(p.stat().st_mtime)
+                        if mt > latest_mtime:
+                            latest_mtime = mt
+                    except Exception:
+                        pass
                     try:
                         ep_data = json.loads(p.read_text())
                     except Exception:
@@ -3002,6 +3057,7 @@ def list_series():
                         ready += 1
             s['_episode_count'] = ready
             s['_episode_total'] = total
+            s['_updated_at'] = latest_mtime
             result.append(s)
     if want_archived:
         # Most recently archived first
@@ -5333,10 +5389,27 @@ def generate_script_batch(sid):
     lines_range_word = (
         f"{max(3, eff_lines-2)}-{eff_lines+2}"  # ±2 wiggle so Claude isn't pinned to exact number
     )
+    # ── SPOKEN-WORD BUDGET (the real driver of episode runtime & chunk count) ──
+    # The renderer (static/app.js segmenter — DO NOT TOUCH) packs the script into
+    # ~14-15s Seedance chunks driven almost entirely by SPOKEN WORDS @2.65 wps.
+    # A 60s episode needs ~100-110 spoken words to fill 4+ chunks. The batch path
+    # historically framed length as a CEILING only ("≤N lines, режь беспощадно")
+    # with NO word floor — so the writer skimped (e.g. 9 dialogue lines / 51
+    # words → ~50s → only 2-3 chunks). We now give an explicit FLOOR tied to the
+    # ≥4-chunks-per-minute requirement, separate from the action-line budget.
+    eff_spoken_target  = round(eff_duration / 60 * 110)        # words actually spoken
+    eff_spoken_floor   = round(eff_duration / 60 * 95)         # hard floor — below this = too few chunks
+    eff_spoken_ceiling = round(eff_duration / 60 * 125)        # don't overflow the minute
+    eff_dlg_lines      = eff_lines                              # DIALOGUE lines only (action excluded)
+    eff_dlg_floor      = max(4, round(eff_dlg_lines * 0.8))
+    eff_dlg_ceiling    = eff_dlg_lines + 3
+    eff_action_budget  = max(3, round(eff_duration / 12))      # action lines — SEPARATE budget
+    eff_min_chunks     = max(4, round(eff_duration / 15))      # renderer ≈ 1 chunk / 14-15s
     length_clause = (
-        f"Каждая серия ≈ {eff_duration}с экрана ≈ {lines_range_word} реплик/действий. "
-        if (duration_sec or lines_count) else
-        f"Каждая серия = ~1 минута экрана ≈ {lines_range_word} реплик/действий. "
+        f"Каждая серия ≈ {eff_duration}с экрана: ~{eff_spoken_target} ПРОИЗНЕСЁННЫХ слов "
+        f"(диапазон {eff_spoken_floor}–{eff_spoken_ceiling}), ~{eff_dlg_lines} реплик диалога, "
+        f"+ до {eff_action_budget} action-строк. Это НИЖНЯЯ планка тоже — не недобирай, "
+        f"иначе серия порежется всего на 2-3 чанка вместо нужных {eff_min_chunks}+. "
     )
     style_block = (f"\nСТИЛЬ РЕПЛИК: {style_clause}\n" if style_clause else '')
     # Scene-character cap directive. NOT about total cast size — about how
@@ -5405,9 +5478,18 @@ def generate_script_batch(sid):
         "   DEDUP: НЕ плоди 10 имён для практически одинаковой одежды. Если перс в своём базовом образе — пиши `Base` или существующий лейбл. Новое имя = реальная смена костюма.\n"
         "   Если предоставлен PREV_END_POSITION и серия открывается в той же локации — [BLOCKING] ДОЛЖЕН СОВПАДАТЬ с ним.\n"
         "   ⛔ ЗАПРЕЩЕНО писать [SCENE_OPEN], [EPISODE_END] — это старые устаревшие теги. Только [BLOCKING]/[BLOCKING_END].\n\n"
-        f"1. РЕПЛИКИ: ровно {eff_lines} (±2). Реплика = одна строка диалога ИЛИ закадровый VO ИЛИ короткое действие (action line). "
-        f"VOICEOVER считается как обычная реплика — он жрёт хронометраж так же. Если насчитал больше {eff_lines + 2} — режь беспощадно (включая VO). "
-        "НЕ ВЫХОДИ за лимит «у меня важная сцена не помещается» — значит сцена слишком жирная, упрощай.\n"
+        f"1. 🎯 ДЛИНА КАЖДОЙ СЕРИИ — это ДИАПАЗОН, который НУЖНО ПОПАСТЬ (не потолок!):\n"
+        f"   • ПРОИЗНЕСЁННЫЕ СЛОВА (то что персонажи реально говорят вслух — диалог + VO): "
+        f"ЦЕЛЬ ~{eff_spoken_target}, ДИАПАЗОН {eff_spoken_floor}–{eff_spoken_ceiling}. "
+        f"⚠ НЕ НЕДОБИРАЙ ниже {eff_spoken_floor} — иначе серия выходит на {eff_duration//2}с и режется всего на 2-3 чанка "
+        f"вместо нужных {eff_min_chunks}+ (рендер режет по словам ~2.65 сл/сек).\n"
+        f"   • РЕПЛИКИ ДИАЛОГА: {eff_dlg_floor}–{eff_dlg_ceiling} строк (цель {eff_dlg_lines}). "
+        f"Каждая реплика 4-9 слов; >12 слов — разбей на две короткие.\n"
+        f"   • ACTION-СТРОКИ — ОТДЕЛЬНЫЙ бюджет, НЕ заменяют диалог: максимум {eff_action_budget}. "
+        f"Нельзя добивать длину серии действиями вместо реплик — слова важнее.\n"
+        f"   • VOICEOVER считается в слова, но НЕ строй серию на нём (макс 1-2 блока).\n"
+        f"   САМОПРОВЕРКА: посчитай произнесённые слова. Меньше {eff_spoken_floor}? → ДОПИШИ диалог. "
+        f"Больше {eff_spoken_ceiling}? → сократи. Цель — РОВНО на {eff_duration}с, не короче.\n"
         f"2. СЦЕНЫ: {scene_clause} Сцена = одна локация/время. Переезд = новая сцена. Каждая дополнительная сцена жрёт 3-4 реплики только на сетап.\n"
         "3. VOICEOVER: разрешён точечно (1-2 на серию максимум, как стилистический приём — открытие/закрытие). "
         "НЕ строй сюжет через закадр: откровения, эмоции, мотивацию персонажа показывай через диалог и действие, не через монолог в камеру. "
@@ -5422,7 +5504,10 @@ def generate_script_batch(sid):
         "5. CLIFFHANGER в конце — да, но НЕ через прибывшее письмо/звонок/тайный документ/USB-флешку/запись с камеры. И НЕ через «увидимся в суде», «подаю иск завтра», «дело передано в суд». "
         "Лучше: фраза которая меняет всё, неожиданное появление человека, прямая угроза в лицо, действие которое нельзя отменить, оружие в кадре, удар, объятия с тем кого считали врагом.\n"
         "6. САМОПРОВЕРКА перед выводом каждой серии — посчитай:\n"
-        f"   – Сколько реплик/строк действия/VO суммарно? (должно быть {eff_lines} ±2)\n"
+        f"   – Сколько ПРОИЗНЕСЁННЫХ слов? (ДОЛЖНО быть {eff_spoken_floor}–{eff_spoken_ceiling}, цель {eff_spoken_target}. "
+        f"Меньше {eff_spoken_floor} = серия слишком короткая, ДОПИШИ диалог!)\n"
+        f"   – Сколько реплик диалога? (должно быть {eff_dlg_floor}–{eff_dlg_ceiling})\n"
+        f"   – Сколько action-строк? (≤ {eff_action_budget} — НЕ добивай длину действиями)\n"
         f"   – Сколько разных локаций/сцен? (должно быть ≤ {max_scenes})\n"
         "   – Сколько VO-блоков? (≤ 2, и сюжет НЕ должен ими двигаться)\n"
         "   – Двигается ли сюжет через бумагу/экран/запись? (должно быть НЕТ)\n"
@@ -5565,7 +5650,11 @@ def generate_script_batch(sid):
         + f"<содержимое>\n"
         + "\n"
         + f"... и так далее до Episode {last_new_num}.\n\n"
-        + f"⏱ ХРОНОМЕТРАЖ — ЖЁСТКО: каждая серия = ровно ~{eff_duration}с экрана, не больше. Если на одну серию вышло >{eff_lines + 3} реплик/действий — режь до {eff_lines}±2. Не «полторы серии в одной». Не «расширенная сцена». РОВНО 1 минута на серию (если не указано иначе) — лишнее переноси в следующую серию или вырезай.\n"
+        + f"⏱ ХРОНОМЕТРАЖ — ЖЁСТКО И В ОБЕ СТОРОНЫ: каждая серия = ~{eff_duration}с экрана. "
+        + f"Это значит {eff_spoken_floor}–{eff_spoken_ceiling} ПРОИЗНЕСЁННЫХ слов (цель {eff_spoken_target}). "
+        + f"⚠ НЕДОБОР так же плох как перебор: серия на {eff_spoken_floor-20} слов выходит на {eff_duration//2}с и режется на 2-3 чанка вместо {eff_min_chunks}+. "
+        + f"Если слов меньше {eff_spoken_floor} — ДОПИШИ живой диалог (короткие реплики, реакции, обострение), НЕ растягивай action. "
+        + f"Если больше {eff_spoken_ceiling} — сократи или перенеси в следующую серию. РОВНО ~{eff_duration}с на каждую серию.\n"
         + "Каждая серия начинается с СТРОГО строки 'Episode N: <title>' — без других маркеров. "
         + "Никакой markdown, никаких '===', никаких '#'. Только plain text. "
         + ("Язык по контексту: если синопсис/направление на русском — пишем по-русски; "
@@ -5599,7 +5688,9 @@ def generate_script_batch(sid):
         + (f"НАПИШИ ПЕРВЫЕ {count} СЕРИЙ (Эп.{first_new_num}–{last_new_num}). "
             if from_scratch else
            f"НАПИШИ СЛЕДУЮЩИЕ {count} СЕРИЙ (Эп.{first_new_num}–{last_new_num}). ")
-        + f"Каждая РОВНО ≈ {eff_duration}с экрана / {lines_range_word} реплик-действий (НЕ больше — переполнение = переписать), обязательно cliffhanger в конце.\n\n"
+        + f"Каждая РОВНО ≈ {eff_duration}с экрана = {eff_spoken_floor}–{eff_spoken_ceiling} произнесённых слов "
+        + f"(цель {eff_spoken_target}), ~{eff_dlg_lines} реплик диалога, до {eff_action_budget} action-строк. "
+        + f"НЕ НЕДОБИРАЙ (короткая серия = 2-3 чанка вместо {eff_min_chunks}+) и не переполняй. Обязательно cliffhanger в конце.\n\n"
         + "🚨 ПОСЛЕДНЯЯ ПРОВЕРКА ПЕРЕД ВЫВОДОМ — пройдись по КАЖДОЙ серии:\n"
         + "  ✗ Если в строке «Кратко: …» есть слова: фото, фотограф, фотоснимок, файл, папка, конверт, "
         + "записка, письмо, визитка, USB, флешка, диктофон, запись, камера наблюдения, телеобъектив, SMS, "
@@ -5611,7 +5702,8 @@ def generate_script_batch(sid):
         + "публичное унижение, физический удар, неожиданное появление человека).\n"
         + "  ✗ Если локация сцены — COURTROOM / LAW FIRM / DA'S OFFICE / JUDGE'S CHAMBERS / DEPOSITION ROOM "
         + "— ПЕРЕПИШИ сцену в спальне / кухне / отеле / коридоре / больнице / машине / на крыше.\n"
-        + f"  ✗ Если в одной серии больше {eff_lines + 3} реплик/строк — РЕЖЬ до {eff_lines}±2 или переноси лишнее в следующую.\n"
+        + f"  ✗ Если в серии МЕНЬШЕ {eff_spoken_floor} произнесённых слов — серия СЛИШКОМ КОРОТКАЯ, ДОПИШИ диалог до ~{eff_spoken_target} "
+        + f"(порежется на 2-3 чанка вместо {eff_min_chunks}+). Если больше {eff_spoken_ceiling} — сократи/перенеси.\n"
         + "Эти проверки делай для КАЖДОЙ из серий перед выводом. Не выводи серию, которая хоть одну проверку провалила."
     )
     try:
@@ -5625,6 +5717,78 @@ def generate_script_batch(sid):
             if lines[0].startswith('```'): lines = lines[1:]
             if lines and lines[-1].startswith('```'): lines = lines[:-1]
             text = '\n'.join(lines).strip()
+
+        # ── PER-EPISODE LENGTH SAFETY NET ──────────────────────────────────
+        # Instructions alone don't guarantee length — the model still skimps on
+        # some episodes (esp. early ones in a batch), producing scripts that the
+        # renderer slices into only 2-3 chunks. We measure EACH episode with the
+        # same detector the single-episode path uses and, if any UNDERSHOOT, do
+        # ONE corrective pass that names the short episodes + their word deficit
+        # and asks for the full batch back with those episodes expanded. We do
+        # NOT touch the chunking system — we only push the WRITER to hit length.
+        _len_series = {'target_duration_sec': eff_duration}
+        def _short_episodes(script_text):
+            shorts = []
+            for ep in (_split_script_into_episodes(script_text) or []):
+                body = ep.get('body') or ''
+                m = _script_runtime_metrics(body)
+                # Undershoot = rendered runtime well under target OR spoken words
+                # below the floor (either → too few chunks).
+                if (m['est_runtime_sec'] < eff_duration * 0.85) or (m['dialogue_words'] < eff_spoken_floor):
+                    shorts.append({
+                        'number': ep.get('number'),
+                        'title': ep.get('title') or '',
+                        'words': m['dialogue_words'],
+                        'est': m['est_runtime_sec'],
+                        'deficit': max(0, eff_spoken_target - m['dialogue_words']),
+                    })
+            return shorts
+
+        shorts = _short_episodes(text)
+        if shorts:
+            short_list = '; '.join(
+                f"Эп.{x['number']} ({x['words']} слов ≈ {x['est']}с — добавь ещё ~{x['deficit']} слов)"
+                for x in shorts
+            )
+            print(f'[batch-length] {len(shorts)} short episode(s): {short_list}', flush=True)
+            fix_msg = (
+                "Ниже — сгенерированный многосерийный сценарий. ЧАСТЬ СЕРИЙ СЛИШКОМ КОРОТКИЕ: "
+                "у них мало ПРОИЗНЕСЁННЫХ слов, поэтому рендер порежет их всего на 2-3 чанка "
+                f"вместо нужных {eff_min_chunks}+.\n\n"
+                f"СЕРИИ ТРЕБУЮЩИЕ РАСШИРЕНИЯ: {short_list}.\n\n"
+                f"ЗАДАЧА: верни ВЕСЬ сценарий целиком (все {count} серий, Эп.{first_new_num}–{last_new_num}, "
+                "в том же формате 'Episode N: …' + 'Кратко: …' + тело), но КАЖДУЮ помеченную серию "
+                f"допиши до {eff_spoken_floor}–{eff_spoken_ceiling} произнесённых слов (цель {eff_spoken_target}). "
+                "КАК расширять — правильно:\n"
+                "• добавляй КОРОТКИЕ живые реплики (4-9 слов): реакции, возражения, подколы, угрозы, признания;\n"
+                "• углубляй конфликт сцены — больше обмена ударами между персонажами;\n"
+                "• НЕ добивай длину action-строками («он смотрит», «пауза») и НЕ растягивай монологами;\n"
+                "• сохрани cliffhanger, локации, [BLOCKING] блоки и сюжет — меняется только плотность диалога;\n"
+                "• серии, которые НЕ помечены, оставь как есть.\n"
+                "Соблюдай ВСЕ прежние запреты (никаких бумаг/экранов/судов). Верни ТОЛЬКО сценарий."
+            )
+            try:
+                raw2 = claude_ask(fix_msg + "\n\n=== СЦЕНАРИЙ ДЛЯ ДОРАБОТКИ ===\n" + text,
+                                  system=system, max_tokens=24000)
+                text2 = raw2.strip()
+                if text2.startswith('```'):
+                    l2 = text2.split('\n')
+                    if l2[0].startswith('```'): l2 = l2[1:]
+                    if l2 and l2[-1].startswith('```'): l2 = l2[:-1]
+                    text2 = '\n'.join(l2).strip()
+                # Accept the retry only if it actually reduced the shortfall and
+                # still splits into the expected episode count (guard against the
+                # model returning a partial / mangled batch).
+                eps2 = _split_script_into_episodes(text2)
+                if eps2 and len(_short_episodes(text2)) < len(shorts):
+                    print(f'[batch-length] corrective pass improved: '
+                          f'{len(shorts)} → {len(_short_episodes(text2))} short', flush=True)
+                    text = text2
+                else:
+                    print('[batch-length] corrective pass did not improve — keeping original', flush=True)
+            except Exception as _re:
+                print(f'[batch-length] corrective pass FAILED: {_re}', flush=True)
+
         payload = {
             'script': text,
             'first_episode': first_new_num,
@@ -5814,6 +5978,14 @@ def create_series():
         'auto_generate_assets': bool(data.get('auto_generate_assets', True)),
         'batch_mode':           bool(data.get('batch_mode', False)),
         'batch_size':           int(data.get('batch_size', 5)) if data.get('batch_mode') else 1,
+        # Episode duration target — accepts None (server default = 60s applied
+        # downstream by the writer prompt). Clamp to writer-safe range matching
+        # the bible modal's validator. Skip the override entirely on bad input.
+        'target_duration_sec':  (
+            max(30, min(240, int(data['target_duration_sec'])))
+            if str(data.get('target_duration_sec') or '').strip().lstrip('-').isdigit()
+            else None
+        ),
         # Skip the legacy stage-1/2 milestones pipeline — new series start with empty
         # episode list. User adds episodes manually + optionally pins checkpoints / finale.
         'stage': 4,
@@ -5986,6 +6158,34 @@ def get_series(sid):
     # racing modals (script-accept flow couldn't show «Не генерить» options
     # because the sweep was already running). User explicitly drives autogen
     # via the «🎨 Сгенерировать недостающее» button when they want it.
+    #
+    # Era-detection telemetry for UI — non-persisted, recomputed each GET.
+    # If detection finds a non-modern era AND the user hasn't confirmed/picked
+    # yet, the client shows a confirmation banner before any non-modern style
+    # is applied to characters/outfits.
+    try:
+        _era_det, _era_kw = _detect_series_era(s)
+        s['_era_detected'] = _era_det or ''
+        s['_era_detected_keyword'] = _era_kw or ''
+        s['_era_detected_label'] = _ERA_LABELS.get(_era_det or '', '')
+        s['_era_choice'] = (s.get('era_choice') or 'auto')
+        s['_era_confirmed'] = bool(s.get('era_confirmed'))
+        s['_era_options'] = [{'key': k, 'label': v} for k, v in _ERA_LABELS.items()]
+    except Exception as e:
+        print(f'[get_series {sid}] era-telemetry failed: {e}', flush=True)
+    # Anthro-detection telemetry — same gate pattern as era. If the detector
+    # would flag this as an anthropomorphic-animal world (furry universe)
+    # and the user hasn't confirmed, the UI shows a banner asking accept /
+    # «это человеческий мир» before any species features are propagated to
+    # secondary characters.
+    try:
+        _anthro_raw = _detect_anthro_world_raw(s)
+        s['_anthro_detected'] = bool(_anthro_raw['anthro'])
+        s['_anthro_evidence'] = _anthro_raw['evidence']
+        s['_anthro_choice'] = (s.get('anthro_choice') or 'auto')
+        s['_anthro_confirmed'] = bool(s.get('anthro_confirmed'))
+    except Exception as e:
+        print(f'[get_series {sid}] anthro-telemetry failed: {e}', flush=True)
     return jsonify(s)
 
 @app.route('/api/series/<sid>', methods=['PUT'])
@@ -6013,6 +6213,153 @@ def update_series(sid):
     s.update(data)
     save_series(sid, s)
     return jsonify(s)
+
+
+@app.route('/api/series/<sid>/era', methods=['POST'])
+def set_series_era(sid):
+    """Set the user's choice for the historical/genre era used during asset
+    generation. Body: {choice: 'modern'|'auto'|<era_key>, clear_portraits?: bool}.
+
+    Behavior:
+      • Stores `era_choice` + `era_confirmed=True` on the series so that
+        `_series_era_hint` returns the correct guide (or '' for modern).
+      • When `clear_portraits` is true (default false), wipes existing
+        character/outfit images so the user can regenerate them with the new
+        era applied — useful when the prior auto-detect picked the wrong era
+        and the user wants to retake the photos."""
+    s = load_series(sid)
+    if not s:
+        return jsonify({'error': 'not found'}), 404
+    body = request.get_json(silent=True) or {}
+    choice = (body.get('choice') or '').strip().lower()
+    # Validate: only allow 'auto', 'modern', 'none', or a known era key
+    valid = {'auto', 'modern', 'none'} | set(_ERA_GUIDES.keys())
+    if choice not in valid:
+        return jsonify({'error': f'invalid choice; must be one of {sorted(valid)}'}), 400
+    s['era_choice'] = choice
+    # 'auto' explicitly means "let the detector pick" — only counts as
+    # confirmed when the user actually picks a specific value (otherwise the
+    # UI banner would never go away).
+    s['era_confirmed'] = (choice != 'auto')
+    cleared = []
+    if body.get('clear_portraits'):
+        sp = series_path(sid)
+        for c in (s.get('characters') or []):
+            for rel in (c.get('ref_images') or []):
+                try:
+                    (sp / rel).unlink(missing_ok=True)
+                except Exception:
+                    pass
+            c['ref_images'] = []
+            c.pop('avai_base_url', None)
+            c['image_version'] = int(time.time())
+            for o in (c.get('outfits') or []):
+                if o.get('photo'):
+                    try:
+                        (sp / o['photo']).unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                o['photo'] = ''
+                o.pop('avai_url', None)
+            cleared.append(c.get('name') or c.get('id'))
+    save_series(sid, s)
+    return jsonify({
+        'ok': True,
+        'era_choice': s['era_choice'],
+        'era_confirmed': s['era_confirmed'],
+        'cleared_portraits': cleared,
+    })
+
+
+@app.route('/api/series/<sid>/anthro', methods=['POST'])
+def set_series_anthro(sid):
+    """Set the user's choice for anthropomorphic-animal world.
+    Body: {choice: 'human'|'anthro'|'auto', strip_species?: bool, clear_portraits?: bool}.
+
+    When `strip_species` is true (default true for choice='human'), removes
+    «anthropomorphic <species>», animal-anatomy markers and species-bearing
+    name tokens from character.appearance — fixes the case where a cast
+    extractor incorrectly tagged human characters as furries.
+
+    When `clear_portraits` is true, also wipes character ref images so the
+    next autogen produces fresh portraits under the corrected world."""
+    s = load_series(sid)
+    if not s:
+        return jsonify({'error': 'not found'}), 404
+    body = request.get_json(silent=True) or {}
+    choice = (body.get('choice') or '').strip().lower()
+    if choice not in ('auto', 'human', 'anthro', 'none'):
+        return jsonify({'error': 'choice must be one of: auto, human, anthro'}), 400
+    if choice == 'none':
+        choice = 'human'
+    s['anthro_choice'] = choice
+    s['anthro_confirmed'] = (choice != 'auto')
+    stripped = []
+    cleared_portraits = []
+    if choice == 'human' and body.get('strip_species', True):
+        sp = series_path(sid)
+        # Pass 1: kill long phrases like "anthropomorphic deer female".
+        anthro_phrase_re = re.compile(
+            r'\b(?:anthropomorphic|anthro|furry)\s+\w+(?:\s+(?:female|male))?\b',
+            re.IGNORECASE)
+        # Pass 2: kill bare anatomy markers (the ones _detect_animal_species
+        # uses as a fallback signal, plus compound forms).
+        anatomy_words = (
+            'fur', 'fur-tied', 'thick-furred', 'furred',
+            'muzzle', 'snout', 'whiskers',
+            'paws', 'claws', 'fang', 'fangs',
+            'antler', 'antlers', 'mane', 'tail', 'tails',
+            'feathers', 'beak', 'scales', 'tusks',
+        )
+        anatomy_re = re.compile(
+            r'\b(?:' + '|'.join(re.escape(w) for w in anatomy_words) + r')\b',
+            re.IGNORECASE)
+        # Pass 3: kill bare species words ("deer", "wolf", etc.).
+        species_word_re = re.compile(
+            r'\b(?:' + '|'.join(re.escape(sp_kw) for sp_kw in _ANIMAL_SPECIES.keys()) + r')\b',
+            re.IGNORECASE)
+        # Pass 4: sweep up the connective filler left behind ("with soft brown ,
+        # delicate ,") so the cleaned string reads cleanly.
+        sweep_filler_re = re.compile(
+            r'\b(?:with|has)\s+(?:soft|sharp|short|long|tied|visible|delicate|gentle|thick)?\s*(?=[,\s])',
+            re.IGNORECASE)
+        for c in (s.get('characters') or []):
+            orig = c.get('appearance') or ''
+            new = anthro_phrase_re.sub('', orig)
+            new = anatomy_re.sub('', new)
+            new = species_word_re.sub('', new)
+            new = sweep_filler_re.sub('', new)
+            new = re.sub(r'\s*,\s*,+', ',', new)
+            new = re.sub(r'\s{2,}', ' ', new)
+            new = re.sub(r'^[\s,;:.]+|[\s,;:]+$', '', new)
+            if not new:
+                gender = (c.get('gender') or '').strip()
+                new = ('Young woman' if gender == 'female' else 'Young man') + ', neutral appearance'
+            if new != orig:
+                c['appearance'] = new
+                stripped.append(c.get('name') or c.get('id'))
+            if body.get('clear_portraits'):
+                for rel in (c.get('ref_images') or []):
+                    try: (sp / rel).unlink(missing_ok=True)
+                    except Exception: pass
+                c['ref_images'] = []
+                c.pop('avai_base_url', None)
+                c['image_version'] = int(time.time())
+                for o in (c.get('outfits') or []):
+                    if o.get('photo'):
+                        try: (sp / o['photo']).unlink(missing_ok=True)
+                        except Exception: pass
+                    o['photo'] = ''
+                    o.pop('avai_url', None)
+                cleared_portraits.append(c.get('name') or c.get('id'))
+    save_series(sid, s)
+    return jsonify({
+        'ok': True,
+        'anthro_choice': s['anthro_choice'],
+        'anthro_confirmed': s['anthro_confirmed'],
+        'stripped_appearances': stripped,
+        'cleared_portraits': cleared_portraits,
+    })
 
 
 @app.route('/api/style-presets')
@@ -6326,33 +6673,38 @@ def _char_name_in_text(char_name: str, text: str) -> bool:
     return False
 
 
-def _series_era_hint(s):
-    """Detect a likely historical/genre era from the series' genre + synopsis +
-    tone. Returns either a short period-context string (e.g. «Ancient Egypt —
-    period-accurate Egyptian attire (linen kalasiris, gold collar, kohl eye
-    makeup); NO modern clothing.») or '' when no clear era detected.
+def _detect_series_era(s):
+    """Pure detection: return (era_key, matched_keyword) or (None, None).
 
-    Detection is conservative — only fires on explicit keyword matches in
-    `genre`/`synopsis`/`title`. Modern/contemporary settings stay default."""
+    Word-boundary matching — `\\b…\\b` covers both Latin and Cyrillic under
+    Python's default Unicode `re`. This prevents the 2026-05-30 incident
+    where keyword `'нил'` (Nile river) was substring-matching inside
+    «ра**нил**и» in a Russian synopsis and turning a modern crime series
+    into an Ancient Egypt asset palette."""
     hay = ' '.join([
         (s.get('genre') or ''),
         (s.get('synopsis') or '')[:500],
         (s.get('title') or ''),
         (s.get('tone') or ''),
         (s.get('logline') or ''),
+        (s.get('world_description') or '')[:500],
     ]).lower()
     if not hay.strip():
-        return ''
-    matched = None
+        return (None, None)
     for era, kws in _ERA_KEYWORDS.items():
-        if any(kw in hay for kw in kws):
-            matched = era
-            break
-    if not matched:
-        return ''
-    # Period-specific guidance per matched era — clothing, accessories,
-    # silhouette cues that Banana/Seedream need to render correctly.
-    guides = {
+        for kw in kws:
+            try:
+                pat = re.compile(rf'\b{re.escape(kw)}\b', re.UNICODE)
+            except re.error:
+                continue
+            if pat.search(hay):
+                return (era, kw)
+    return (None, None)
+
+
+# Period-specific guidance per matched era — clothing, accessories,
+# silhouette cues that Banana/Seedream need to render correctly.
+_ERA_GUIDES = {
         'ancient_egypt':
             "ERA CONTEXT: Ancient Egypt — period-accurate attire (linen kalasiris/schenti, "
             "gold collar (usekh), kohl eye makeup, sandals or barefoot, bronze/gold jewelry, "
@@ -6413,8 +6765,62 @@ def _series_era_hint(s):
         'sci_fi':
             "ERA CONTEXT: Sci-fi / futuristic — futuristic attire (sleek bodysuits, tech "
             "accessories, smart fabrics, asymmetric cuts). NO contemporary 2020s casual wear.",
-    }
-    return guides.get(matched, '')
+}
+
+
+# Human-readable era labels — used by UI confirmation banner.
+_ERA_LABELS = {
+    'ancient_egypt':       'Древний Египет',
+    'ancient_rome':        'Древний Рим',
+    'ancient_greece':      'Древняя Греция',
+    'medieval':            'Средневековье',
+    'renaissance':         'Возрождение',
+    'victorian':           'Викторианская эпоха',
+    'wild_west':           'Дикий Запад',
+    'edwardian_20s':       '1920-е',
+    'wwii':                '1940-е / Вторая Мировая',
+    'cold_war_60s':        '1960-е',
+    '70s':                 '1970-е',
+    '80s':                 '1980-е',
+    '90s':                 '1990-е',
+    'feudal_japan':        'Феодальная Япония',
+    'victorian_steampunk': 'Стимпанк',
+    'fantasy':             'Фэнтези',
+    'post_apocalyptic':    'Постапокалипсис',
+    'sci_fi':              'Sci-fi / Будущее',
+}
+
+
+def _series_era_hint(s):
+    """Return era-context guide string for asset generation, or '' for modern.
+
+    Respects the user's explicit choice stored on the series:
+      • era_choice='modern' (or 'none')   → '' (always modern)
+      • era_choice=<era key in _ERA_GUIDES> → that era's guide
+      • era_choice='auto'/missing/'pending':
+          – run detection;
+          – if nothing detected → ''
+          – if detected AND `era_confirmed` is True → guide for detected era
+          – if detected AND not confirmed → '' (safe default; UI surfaces
+            a confirmation banner asking the user to accept / change /
+            decline before any non-modern look is applied)
+
+    Why the «not-confirmed → ''» branch: detection has fired false-positives
+    in production (substring match of «нил» in «ранили» → Ancient Egypt for
+    a modern crime series). The user wants a confirmation gate before any
+    non-modern style is locked in."""
+    choice = (s.get('era_choice') or 'auto').strip().lower()
+    if choice in ('modern', 'none', ''):
+        return ''
+    if choice in _ERA_GUIDES:
+        return _ERA_GUIDES[choice]
+    # 'auto' / 'pending' / anything else — fall back to detection
+    era, _kw = _detect_series_era(s)
+    if not era:
+        return ''
+    if not s.get('era_confirmed'):
+        return ''  # gated — wait for user to confirm via UI
+    return _ERA_GUIDES.get(era, '')
 
 
 # Keywords that indicate clothing is already described in appearance/description.
@@ -7122,6 +7528,48 @@ _ANIMAL_SPECIES = {
     'elk':       'anthropomorphic elk',
 }
 
+# Species tokens that are also common human-skin-feature words. When matched
+# in appearance text we must check the surrounding context — otherwise a
+# description like «distinctive mole near temple» (a beauty mark on a human
+# face) gets read as «this character is an anthropomorphic mole».
+_AMBIGUOUS_APPEARANCE_SPECIES = {'mole'}
+
+_SKIN_FEATURE_CONTEXT_WORDS = (
+    # descriptors that almost always precede a face/body mark
+    'beauty', 'birth', 'birthmark', 'small', 'tiny', 'little', 'dark',
+    'distinctive', 'prominent', 'visible', 'faint', 'subtle', 'noticeable',
+    # spatial/anatomical context — «mole on/near/above/below <face part>»
+    'on', 'near', 'above', 'below', 'under', 'beside', 'next',
+    'cheek', 'cheeks', 'temple', 'temples', 'chin', 'jaw', 'jawline',
+    'lip', 'lips', 'mouth', 'nose', 'brow', 'eyebrow', 'eye', 'eyes',
+    'eyelid', 'forehead', 'neck', 'ear', 'ears', 'face', 'hairline',
+    'shoulder', 'collarbone', 'wrist', 'hand',
+)
+
+
+def _is_skin_feature_context(low, start, end, term):
+    """Return True if `term` (at offsets [start,end) within `low`) is being
+    used as a human-skin-feature word rather than the species name.
+
+    Currently only `mole` is treated as ambiguous — it's both a burrowing
+    mammal and the standard English word for a small dark skin mark, and
+    short-drama character descriptions overwhelmingly use it in the latter
+    sense («distinctive mole near temple», «small mole above her lip»).
+    """
+    if term not in _AMBIGUOUS_APPEARANCE_SPECIES:
+        return False
+    window_start = max(0, start - 40)
+    window_end = min(len(low), end + 40)
+    window = low[window_start:window_end]
+    neighbour_tokens = re.findall(r"[a-zа-яё]+", window)
+    for tok in neighbour_tokens:
+        if tok == term:
+            continue
+        if tok in _SKIN_FEATURE_CONTEXT_WORDS:
+            return True
+    return False
+
+
 def _detect_animal_species(name, appearance=None):
     """Detect anthropomorphic species from a character's name (and as a
     secondary signal, from appearance keywords). Returns the species hint
@@ -7155,12 +7603,26 @@ def _detect_animal_species(name, appearance=None):
         low = appearance.lower()
         # Scan for exact species name as a whole word.
         for sp_name, sp_hint in _ANIMAL_SPECIES.items():
-            if re.search(rf'\b{re.escape(sp_name)}\b', low):
+            for m in re.finditer(rf'\b{re.escape(sp_name)}\b', low):
+                if _is_skin_feature_context(low, m.start(), m.end(), sp_name):
+                    # «distinctive mole near temple» — homograph (mole = beauty
+                    # mark, not the burrowing animal). 2026-06-04 incident:
+                    # Ethan Morgan rendered as anthropomorphic mole in a hoodie
+                    # because his appearance string described a face mole.
+                    continue
                 return sp_hint
-        if any(w in low for w in ('fur', 'muzzle', 'snout', 'tail', 'paws',
-                                   'claws', 'whiskers', 'mane', 'feathers',
-                                   'beak', 'fang', 'fangs')):
-            return 'anthropomorphic animal'
+        # Generic anthropomorphic markers — word-boundary match REQUIRED.
+        # Substring `in` was matching 'tail' inside 'tailcoat' (a stage
+        # magician costume!) and 'mane' inside 'manage'/'maneuver' — every
+        # gentleman-in-tailcoat got flagged as anthropomorphic animal and
+        # the series-level detector then flipped to «furry universe» on
+        # 2+ such hits, producing deer/wolf companions for human leads.
+        # (2026-05-30 incident: «I Became My Dead Brother's Wife's Assistant»)
+        for w in ('fur', 'muzzle', 'snout', 'tail', 'paws',
+                  'claws', 'whiskers', 'mane', 'feathers',
+                  'beak', 'fang', 'fangs'):
+            if re.search(rf'\b{re.escape(w)}\b', low):
+                return 'anthropomorphic animal'
     return ''
 
 
@@ -7180,39 +7642,86 @@ _ANTHRO_WORLD_KEYWORDS = (
 )
 
 
-def _is_anthro_world(s) -> bool:
-    """Return True when the series clearly lives in an anthropomorphic-animal
-    world. Signals (any one is enough):
-      • explicit keyword (furry / anthropomorphic / Zootopia / Beastars / Bojack)
-      • ≥2 species words mentioned in title+genre+world+synopsis
-      • ≥2 characters with species in name or appearance
-      • ≥1 char-with-species AND ≥1 species mention in synopsis
+def _detect_anthro_world_raw(s) -> dict:
+    """Pure detection — returns the raw signals without consulting the user's
+    explicit choice. Used by `_is_anthro_world` and by the UI confirmation
+    banner. Returns:
+      {
+        'anthro': bool,             # would this world be classified anthro?
+        'keyword': str,             # explicit keyword found, or ''
+        'blob_species_count': int,  # species mentions in title/world/synopsis
+        'char_species_count': int,  # characters carrying a species
+        'evidence': list[str],      # human-readable explanation, max 4 items
+      }
     """
+    out = {'anthro': False, 'keyword': '', 'blob_species_count': 0,
+           'char_species_count': 0, 'evidence': []}
     if not isinstance(s, dict):
-        return False
+        return out
     text_blob = ' '.join(str(s.get(k) or '') for k in (
         'title', 'genre', 'tone', 'world_description', 'synopsis',
         'target_audience',
     )).lower()
-    if any(kw in text_blob for kw in _ANTHRO_WORLD_KEYWORDS):
-        return True
-    char_species_count = 0
+    for kw in _ANTHRO_WORLD_KEYWORDS:
+        if re.search(rf'\b{re.escape(kw)}\b', text_blob):
+            out['keyword'] = kw
+            out['anthro'] = True
+            out['evidence'].append(f"ключевое слово «{kw}» в описании сериала")
+            break
+    char_hits = []
     for c in (s.get('characters') or []):
-        if _detect_animal_species(c.get('name'), c.get('appearance')):
-            char_species_count += 1
-    blob_species_count = 0
+        sp = _detect_animal_species(c.get('name'), c.get('appearance'))
+        if sp:
+            out['char_species_count'] += 1
+            if len(char_hits) < 3:
+                char_hits.append(f"{c.get('name','?')} = {sp.replace('anthropomorphic ','')}")
+    if char_hits:
+        out['evidence'].append('персонажи: ' + ', '.join(char_hits))
+    blob_species_hits = []
     for sp in _ANIMAL_SPECIES.keys():
         if re.search(rf'\b{re.escape(sp)}\b', text_blob):
-            blob_species_count += 1
-            if blob_species_count >= 2:
-                break
-    if blob_species_count >= 2:
+            out['blob_species_count'] += 1
+            if len(blob_species_hits) < 3:
+                blob_species_hits.append(sp)
+    if blob_species_hits:
+        out['evidence'].append('виды животных в описании: ' + ', '.join(blob_species_hits))
+    if out['blob_species_count'] >= 2:
+        out['anthro'] = True
+    elif out['char_species_count'] >= 1 and out['blob_species_count'] >= 1:
+        out['anthro'] = True
+    elif out['char_species_count'] >= 2:
+        out['anthro'] = True
+    return out
+
+
+def _is_anthro_world(s) -> bool:
+    """Return True when the series lives in an anthropomorphic-animal world.
+
+    Respects the user's explicit choice stored on the series:
+      • anthro_choice='human' (or 'none')   → False (always human)
+      • anthro_choice='anthro'              → True (always furry)
+      • anthro_choice='auto'/missing/'pending':
+          – run detection;
+          – if detector says NOT anthro → False
+          – if detector says anthro AND `anthro_confirmed`=True → True
+          – if detector says anthro AND NOT confirmed → False (safe default;
+            UI surfaces a confirmation banner). Without this gate, a single
+            substring bug (e.g. `'tail' in 'tailcoat'`) tagged every magician
+            in a tailcoat as anthropomorphic and propagated furry features
+            to side characters via the LLM species inferrer."""
+    if not isinstance(s, dict):
+        return False
+    choice = (s.get('anthro_choice') or 'auto').strip().lower()
+    if choice in ('human', 'none'):
+        return False
+    if choice == 'anthro':
         return True
-    if char_species_count >= 1 and blob_species_count >= 1:
-        return True
-    if char_species_count >= 2:
-        return True
-    return False
+    raw = _detect_anthro_world_raw(s)
+    if not raw['anthro']:
+        return False
+    if not s.get('anthro_confirmed'):
+        return False  # gated — wait for the user
+    return True
 
 
 def _anthro_world_block(s) -> str:
@@ -8126,6 +8635,230 @@ def regenerate_location(sid, loc_id):
         return jsonify({'error': str(e)}), 500
 
 
+# ── Series cover art (short-drama poster) ───────────────────────────────────
+# One JPEG at assets/cover.jpg, used as the background of the project card on
+# the main menu and openable in a viewer modal with Regenerate / Download.
+# Banana ('pro' model) accepts up to 2 contextImages → we pull the top 2
+# characters with portraits as visual refs so the leads look on-model.
+
+def _cover_lead_refs(s, sid):
+    """Pick up to 2 main characters' AVAI portrait URLs to use as references.
+    Order: characters that already have an `avai_base_url` (portrait was
+    generated via AVAI), then characters with local `ref_images` (uploaded)
+    which we upload to AVAI on the fly. Skips characters with no portrait."""
+    refs = []
+    leads = []
+    for c in (s.get('characters') or []):
+        if c.get('avai_base_url'):
+            refs.append(c['avai_base_url'])
+            leads.append(c)
+            if len(refs) >= 2:
+                return refs, leads
+    # Fallback: upload first local ref image for any remaining slots.
+    for c in (s.get('characters') or []):
+        if c in leads:
+            continue
+        rels = c.get('ref_images') or []
+        if not rels:
+            continue
+        local = series_path(sid) / rels[0]
+        if not local.exists():
+            continue
+        try:
+            url = _avai_upload_local_image(local)
+            refs.append(url)
+            leads.append(c)
+            # Cache it on the character so we don't re-upload next time.
+            c['avai_base_url'] = url
+        except Exception as e:
+            print(f'[cover] upload ref for {c.get("name")} failed: {e}', flush=True)
+            continue
+        if len(refs) >= 2:
+            break
+    return refs, leads
+
+
+def _build_cover_prompt(s, leads):
+    """Compose a short-drama poster prompt from the series bible + lead
+    characters. Tuned for ReelShort/DramaBox-style key art."""
+    title = (s.get('title') or '').strip() or 'Untitled'
+    synopsis = (s.get('synopsis') or '').strip()
+    world = (s.get('world_description') or '').strip()
+    genre = (s.get('tone') or '').strip()
+    tone = (s.get('tone') or '').strip()
+    style_clause = _series_style_clause(s)
+
+    # Per-character one-liner: «Name — appearance (short)»
+    lead_lines = []
+    for c in leads:
+        name = (c.get('name') or '').strip()
+        app = (c.get('appearance') or c.get('description') or '').strip()
+        # Trim long appearance to keep the prompt focused.
+        if len(app) > 220:
+            app = app[:217].rstrip() + '...'
+        if name and app:
+            lead_lines.append(f'{name} — {app}')
+        elif name:
+            lead_lines.append(name)
+    leads_clause = ''
+    if lead_lines:
+        leads_clause = (
+            'HERO COMPOSITION — feature these lead character(s) (match the '
+            'reference images for face / hair / build): '
+            + '; '.join(lead_lines)
+            + '. '
+        )
+
+    syn_short = synopsis[:400].strip()
+    world_short = world[:200].strip()
+    story_clause = ''
+    if syn_short:
+        story_clause = f'STORY VIBE: {syn_short} '
+    if world_short:
+        story_clause += f'World: {world_short}. '
+
+    genre_clause = ''
+    if genre or tone:
+        bits = [b for b in (genre, tone) if b]
+        if bits:
+            genre_clause = f'Genre/mood: {" / ".join(bits)}. '
+
+    safe_title = title.replace('"', '\\"')
+
+    prompt = (
+        f'Vertical 3:4 key-art poster for a short-form mobile drama series '
+        f'(ReelShort / DramaBox style), cinematic and emotional. '
+        f'TITLE — render the words "{safe_title}" as bold large display '
+        f'typography at the top of the poster, white with subtle drop '
+        f'shadow, perfectly legible, no typos, no extra words. '
+        f'{leads_clause}'
+        f'{story_clause}'
+        f'{genre_clause}'
+        f'Composition: 3:4 vertical poster, leads in mid-shot or expressive '
+        f'close-up looking into camera with intense emotion, dramatic '
+        f'cinematic key-light, high contrast, vivid saturated palette (deep '
+        f'teals, magentas, golden accents) typical of viral short-drama '
+        f'covers, shallow depth of field, evocative background hinting at '
+        f'the world of the story. '
+        f'No watermarks, no captions other than the title, no episode '
+        f'numbers, no UI elements, no frame borders. '
+        f'{style_clause}'
+    )
+    return re.sub(r'\s+', ' ', prompt).strip()
+
+
+def _translate_synopsis_to_en(text: str) -> str:
+    """Translate a synopsis blurb to English via Claude Haiku. Idempotent on
+    text already in English (Claude returns it unchanged)."""
+    text = (text or '').strip()
+    if not text:
+        return ''
+    try:
+        out = claude_ask_fast(
+            f'Translate the following short series logline / synopsis to natural English. '
+            f'Return ONLY the translation, no quotes, no preface, no labels. If the text '
+            f'is already in English, return it unchanged.\n\n{text}',
+            system='You are a professional translator for short-form drama loglines. Preserve tone and meaning, output English prose only.'
+        )
+        return (out or '').strip().strip('"').strip()
+    except Exception as e:
+        print(f'[cover/translate] failed: {e}', flush=True)
+        return ''
+
+
+@app.route('/api/series/<sid>/cover/synopsis-en', methods=['GET'])
+def get_series_synopsis_en(sid):
+    """Returns the series' synopsis + world_description + genre/tone/audience
+    chips in English. Caches every translation on series.json with a
+    `<field>_en_source` companion so we re-translate only when the source
+    text changes."""
+    s = load_series(sid)
+    if not s:
+        return jsonify({'error': 'not found'}), 404
+    fields = ('synopsis', 'world_description', 'genre')
+    changed = False
+    # If genre is blank, infer one short English label from the synopsis so the
+    # viewer has something to show. Bible-author can still override manually.
+    if not (s.get('genre') or '').strip() and (s.get('synopsis') or '').strip():
+        try:
+            inferred = claude_ask_fast(
+                'Read this short-drama series synopsis and reply with ONE short '
+                'English genre label (2-4 words, e.g. "Cinderella revenge", '
+                '"Family melodrama", "Billionaire romance", "Revenge thriller"). '
+                'Reply with only the label, no quotes, no period.\n\n'
+                + (s.get('synopsis') or '').strip()[:1200],
+                system='You classify short-form mobile drama series into concise English genre labels.'
+            )
+            inferred = (inferred or '').strip().strip('"').strip().split('\n')[0][:60]
+            if inferred:
+                s['genre'] = inferred
+                s['genre_en'] = inferred
+                s['genre_en_source'] = inferred
+                changed = True
+        except Exception as e:
+            print(f'[cover/genre-infer] failed: {e}', flush=True)
+    for f in fields:
+        src = (s.get(f) or '').strip()
+        en_key = f + '_en'
+        src_key = en_key + '_source'
+        if src and (s.get(src_key) != src or not s.get(en_key)):
+            en = _translate_synopsis_to_en(src)
+            if en:
+                s[en_key] = en
+                s[src_key] = src
+                changed = True
+    if changed:
+        save_series(sid, s)
+    # Return both source + EN so the frontend can refresh stale chips after
+    # server-side genre inference, not just the translations.
+    out = {f + '_en': s.get(f + '_en') or '' for f in fields}
+    out.update({f: s.get(f) or '' for f in fields})
+    return jsonify(out)
+
+
+@app.route('/api/series/<sid>/cover/generate', methods=['POST'])
+def generate_series_cover(sid):
+    """Generate (or regenerate) the series cover poster. 3:4 JPEG 1K.
+    Body (optional): { wishes: 'extra art direction from the user' }
+    Persists rel path to series.cover_image + bumps cover_image_version."""
+    s = load_series(sid)
+    if not s:
+        return jsonify({'error': 'not found'}), 404
+    body = request.get_json(silent=True) or {}
+    wishes = (body.get('wishes') or '').strip()
+
+    refs, leads = _cover_lead_refs(s, sid)
+    prompt = _build_cover_prompt(s, leads)
+    if wishes:
+        prompt += f' Additional art direction from the user (follow strictly): {wishes}.'
+
+    out_path = assets_dir(sid) / 'cover.jpg'
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        # Pass refs as a list — _avai_call handles list-or-str.
+        image_url = avai_generate(
+            prompt, out_path,
+            reference_url=refs if refs else None,
+            aspect_ratio='3:4',
+            preferred_provider=_series_image_provider(s),
+        )
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+    rel_path = str(out_path.relative_to(series_path(sid)))
+    s['cover_image'] = rel_path
+    s['cover_image_url'] = image_url
+    s['cover_image_version'] = int(time.time())
+    save_series(sid, s)
+    return jsonify({
+        'ready': True,
+        'url': f'/assets/{sid}/{rel_path}',
+        'image_url': image_url,
+        'image_version': s['cover_image_version'],
+        'used_refs': len(refs),
+    })
+
+
 # ── Building facades ────────────────────────────────────────────────────────
 # Per-series feature: cluster interior locations into their parent building
 # (e.g. «Marcus's office» + «Marcus's bedroom» → «Bellacourt Mansion»), then
@@ -8442,6 +9175,14 @@ def auto_facades_for_new_locations(sid):
     if not new_locs:
         return  # nothing to do — fully idempotent
 
+    # Mark `running` during the Claude-grouping phase too — otherwise the
+    # facades modal renders «ещё нет сгенерированных фасадов» for the 3-5s
+    # while Claude clusters, then suddenly flips to «генерирую» when
+    # _facade_worker takes over. Setting it here gives the UI a continuous
+    # signal that something IS happening. Reset to False in the no-work-
+    # found branches below.
+    st.update({'running': True, 'phase': 'grouping', 'current': 'Группирую локации…',
+               'total': 0, 'done': 0, 'errors': []})
     print(f'[auto-facades {sid}] {len(new_locs)} new location(s) need facade — grouping…', flush=True)
     try:
         existing_names = sorted({f.get('building_name', '').strip() for f in existing_facades if f.get('building_name')})
@@ -8449,6 +9190,8 @@ def auto_facades_for_new_locations(sid):
     except Exception as e:
         print(f'[auto-facades {sid}] grouping failed: {e}', flush=True)
         _log_event('WARN', 'auto_facades_group_failed', sid=sid, err=str(e)[:200])
+        st.update({'running': False, 'phase': None, 'current': None,
+                   'errors': [{'error': f'grouping failed: {str(e)[:200]}'}]})
         return
 
     # Split: groups whose building_name matches an existing facade → merge.
@@ -8493,7 +9236,14 @@ def auto_facades_for_new_locations(sid):
     if work_groups:
         print(f'[auto-facades {sid}] kicking off facade gen for {len(work_groups)} new building(s): '
               + ', '.join(g["building_name"] for g in work_groups), flush=True)
+        # _facade_worker re-sets status.running with its own total/done counters,
+        # so the grouping-phase flag we set above is transparently superseded.
         _spawn_with_keys(_facade_worker, sid, work_groups)
+    else:
+        # Pure-merge path or grouping yielded only exteriors — no renders to
+        # do. Clear the grouping-phase flag we set at the top so the UI stops
+        # showing «Группирую…».
+        st.update({'running': False, 'phase': None, 'current': None})
 
 
 @app.route('/api/series/<sid>/facades', methods=['GET'])
@@ -8501,9 +9251,48 @@ def facades_list(sid):
     s = load_series(sid)
     if not s:
         return jsonify({'error': 'not found'}), 404
+    # Belt-and-suspenders auto-trigger: if the user is looking at the facades
+    # panel and there are interior locations that aren't a member of any
+    # facade group yet, kick off `auto_facades_for_new_locations` in the
+    # background. The function is fully idempotent (running-flag check +
+    # no-op when nothing new), so polling this endpoint every 6s while the
+    # modal is open is safe. Catches series whose autogen sweep ended before
+    # the facade auto-trigger was wired up — and any future case where the
+    # sweep-tail trigger failed silently.
+    if s.get('auto_facades') is not False:
+        existing_facades = s.get('location_facades') or []
+        member_ids = {mid for f in existing_facades for mid in (f.get('member_loc_ids') or [])}
+        has_ungrouped = any(
+            l.get('id') and l['id'] not in member_ids
+            and not l.get('_skip_autogen')
+            and (l.get('ref_images') or [])
+            for l in (s.get('locations') or [])
+        )
+        if has_ungrouped and not _facade_status(sid).get('running'):
+            try:
+                _spawn_with_keys(auto_facades_for_new_locations, sid)
+                # Surface an «about to start» hint immediately so the first
+                # response (before the worker thread has ticked) tells the UI
+                # to poll. Worker itself overwrites status.running with the
+                # full grouping/rendering state within milliseconds. We use
+                # a hint flag instead of running=True to avoid tripping the
+                # worker's «already running — skip» guard.
+                _facade_status(sid)['_pending_autostart'] = True
+            except Exception as e:
+                print(f'[facades_list {sid}] auto-trigger spawn failed: {e}', flush=True)
+    live = _facade_status(sid)
+    pending = bool(live.pop('_pending_autostart', False))
+    st_out = dict(live)
+    if pending and not st_out.get('running'):
+        # Pre-populate the running flag for THIS response so the frontend's
+        # facadesRefresh() sees running=true and starts polling. Subsequent
+        # polls read the worker's real state.
+        st_out.update({'running': True, 'phase': 'grouping',
+                       'current': 'Группирую локации…',
+                       'total': 0, 'done': 0, 'errors': []})
     return jsonify({
         'facades': s.get('location_facades') or [],
-        'status': _facade_status(sid),
+        'status': st_out,
         'folder': str(facades_dir(sid).resolve()),
     })
 
@@ -9684,16 +10473,18 @@ def auto_generate_missing_assets(sid):
                     # _spawn_with_keys), so _capture_user_keys() reads the propagated
                     # keys and forwards them to the recursive sweep.
                     _spawn_with_keys(auto_generate_missing_assets, sid)
-                else:
-                    # Interiors are settled — kick off facade auto-grouping for any
-                    # locations that came out of this sweep without an existing
-                    # facade. Idempotent: re-running on an unchanged series is a
-                    # no-op. Runs in its own background thread so this sweep can
-                    # release its lock immediately.
-                    try:
-                        _spawn_with_keys(auto_facades_for_new_locations, sid)
-                    except Exception as e:
-                        print(f'[autogen {sid}] facade auto-trigger failed to spawn: {e}')
+                # ALWAYS kick off facade auto-grouping after a sweep — not gated
+                # on pending==0. If a recursive sweep is also spawned above,
+                # auto_facades_for_new_locations is idempotent (its own running-
+                # flag check + no-op when no ungrouped locs) so the duplicate
+                # spawn is harmless. Without this, a sweep that ends with
+                # pending>0 only fires facades on the recursive tail — which
+                # could fail silently (Claude outage, key issue) and never
+                # retry. Firing here too gives us a second chance.
+                try:
+                    _spawn_with_keys(auto_facades_for_new_locations, sid)
+                except Exception as e:
+                    print(f'[autogen {sid}] facade auto-trigger failed to spawn: {e}')
         except Exception as e:
             print(f'[autogen {sid}] re-check failed: {e}')
 
@@ -11820,7 +12611,16 @@ def _script_runtime_metrics(script: str) -> dict:
             'dialogue_lines': 0, 'dialogue_words': 0, 'action_lines': 0,
             'longest_line_words': 0, 'avg_line_words': 0, 'est_runtime_sec': 0,
         }
-    dialogue_re = re.compile(r'^\s*[A-ZА-ЯЁ][A-ZA-Zа-яёА-ЯЁ\.\-\' ]{1,40}:\s*(.*)$')
+    # Speaker cue. CRITICAL: must accept parenthetical cues like
+    #   DEREK (O.S.):  /  JESSICA (V.O.):  /  ETHAN (CONT'D):  /  MAYA (тихо):
+    # Before 2026-06-04 the char-class excluded '(' ')' so EVERY `NAME (O.S.):`
+    # line fell through to "action line" — the detector saw 3 dialogue lines +
+    # 17 action lines in a normal 8-line dialogue scene, undercounting spoken
+    # words ~75% and overcounting action. That made the length governor fire
+    # contradictory violations (too few words AND too much action at once),
+    # broke the retry loop, and shipped wildly inconsistent episode lengths.
+    dialogue_re = re.compile(
+        r'^\s*[A-ZА-ЯЁ][A-ZA-Zа-яёА-ЯЁ0-9\.\-\' ]{0,40}(?:\([^)]*\))?\s*:\s*(.*)$')
     # Skip lines inside [BLOCKING]/[BLOCKING_END] / scene headers / cut-markers
     scene_header_re = re.compile(r'^\s*(?:INT\.|EXT\.|ИНТ\.|ЭКСТ\.|INT/EXT\.)', re.IGNORECASE)
     cut_marker_re   = re.compile(r'═══\s*END\s+EPISODE', re.IGNORECASE)
@@ -11830,6 +12630,14 @@ def _script_runtime_metrics(script: str) -> dict:
     _word_to_num = {'one':1,'two':2,'three':3,'four':4,'five':5,'ten':10,'fifteen':15,'twenty':20,'thirty':30,
                     'одну':1,'один':1,'две':2,'два':2,'три':3,'четыре':4,'пять':5,'десять':10}
 
+    # Parenthetical stage directions inside a dialogue line — e.g.
+    # `ETHAN: (в микрофон, указывая на Кайна) Viktor Kain laundered three…`
+    # The parenthetical is stage direction, NOT spoken text — strip before
+    # counting words. Real bug 2026-05-30: «I Became My Dead Brother's Ghost»
+    # ep 1 reported 91 spoken words; user said «по факту персонажи говорят
+    # около 50 слов». Difference was 100% explained by parentheticals being
+    # counted as speech.
+    paren_re = re.compile(r'\([^)]*\)')
     in_blocking = False
     in_dialogue_continuation = False  # for multi-line dialogue (NAME:\n"line")
     current_speaker = None
@@ -11865,23 +12673,30 @@ def _script_runtime_metrics(script: str) -> dict:
         if m:
             current_speaker = True
             tail = m.group(1).strip()
-            if tail:
+            # Strip parenthetical stage directions — they're NOT spoken words.
+            tail_spoken = paren_re.sub('', tail).strip()
+            if tail_spoken:
                 # Inline dialogue: NAME: text
-                wc = len(tail.split())
+                wc = len(tail_spoken.split())
                 dialogue_lines += 1
                 dialogue_words += wc
                 line_word_counts.append(wc)
                 if wc > longest_line_words:
                     longest_line_words = wc
                 in_dialogue_continuation = False
+            elif tail:
+                # Header had ONLY a parenthetical (e.g. `ETHAN: (whispers)`) —
+                # the spoken text comes on the next line.
+                in_dialogue_continuation = True
             else:
                 # Header on its own — next non-empty line is the actual dialogue
                 in_dialogue_continuation = True
             continue
         # Continuation of a dialogue header (multi-line: NAME:\n"text")
         if in_dialogue_continuation:
-            # Strip surrounding quotes
+            # Strip surrounding quotes + parenthetical stage directions
             tail = line.strip('"').strip("'").strip('«»').strip()
+            tail = paren_re.sub('', tail).strip()
             if tail:
                 wc = len(tail.split())
                 dialogue_lines += 1
@@ -11905,17 +12720,30 @@ def _script_runtime_metrics(script: str) -> dict:
 
     avg_line = round(dialogue_words / dialogue_lines, 1) if dialogue_lines else 0
 
-    # Runtime estimate:
-    spoken_sec = dialogue_words / 135 * 60
-    # Per-beat overhead — short beats 1.2s, long beats +0.8s extra
-    beat_overhead = 0.0
-    for wc in line_word_counts:
-        beat_overhead += 1.2 + (0.8 if wc > 8 else 0)
-    action_sec = action_lines * 2.0
+    # Runtime estimate — CALIBRATED TO THE JS SEGMENTER (static/app.js), which is
+    # the ground truth for actual rendered video length. The segmenter packs the
+    # script into Seedance chunks using SPEECH_WPS=2.65 and ACTION_BEAT_SEC=1.5,
+    # then each chunk carries a ~1.5s buffer. If THIS estimator uses a different
+    # calibration (it used 135wpm≈2.25wps + 2.0s/action before 2026-06-04) the
+    # writer is told "60s" by one yardstick while the renderer produces ~45s —
+    # which is exactly why 60s-target episodes came out at 30/40/60s.
+    _SPEECH_WPS = 2.65          # mirror SPEECH_WPS in app.js
+    _ACTION_BEAT_SEC = 1.5      # mirror ACTION_BEAT_SEC in app.js
+    _LINE_PREPAUSE = 0.4        # mirror per-line 0.4s pre-pause in _lineDuration
+    _CHUNK_BUFFER = 1.5         # mirror per-chunk buffer in _estimateChunkDurationSec
+    _CHUNK_SEC = 14.0           # mirror effective chunk packing size
+
+    spoken_sec = dialogue_words / _SPEECH_WPS
+    beat_overhead = _LINE_PREPAUSE * len(line_word_counts)
+    action_sec = action_lines * _ACTION_BEAT_SEC
     # Cap explicit_time_sec at 120s to avoid runaway from typos like "100 минут"
     explicit_time_sec = min(explicit_time_sec, 120)
 
-    est_runtime = round(spoken_sec + beat_overhead + action_sec + explicit_time_sec)
+    content_sec = spoken_sec + beat_overhead + action_sec + explicit_time_sec
+    # Per-chunk buffer: the renderer splits content into ~14s chunks, each padded.
+    import math as _math
+    num_chunks = max(1, _math.ceil(content_sec / _CHUNK_SEC)) if content_sec > 0 else 0
+    est_runtime = round(content_sec + num_chunks * _CHUNK_BUFFER)
 
     return {
         'dialogue_lines': dialogue_lines,
@@ -11929,22 +12757,34 @@ def _script_runtime_metrics(script: str) -> dict:
 
 
 def detect_script_overlength(s, script: str) -> dict:
-    """Programmatic over-length detector. Returns either {} (within budget) or a violation dict.
+    """Programmatic length-budget detector. Returns {} (within budget) or a violation dict.
 
-    Target episode duration comes from series setting `target_duration_sec` (falls back to 60s).
-    Triggers when ANY of:
-      • estimated runtime >130% of target
-      • any single dialogue line >12 words (long monologues kill short-drama pacing)
-      • avg dialogue line >9 words (too talky overall)
-      • action line count >6 (too much narrative business)
+    Target duration comes from `target_duration_sec` on the series (default 60s).
+    Triggers (any of):
+      • estimated runtime > 130% of target (script too long)
+      • any single dialogue line > 12 words (long monologues kill TikTok pacing)
+      • avg dialogue line > 9 words (overall too talky)
+      • action line count > 1.5× action budget (too much narrative business)
+      • dialogue_words < 60% of target — UNDERSHOOT. Writer is too cautious and
+        delivers half the spoken-words target; the resulting video has long
+        silent stretches because the chunker still produces the BLOCKING-driven
+        scenes but the audio runs out. Catches the 2026-05-30 issue where a
+        ~100-word target produced ~50 spoken words.
     """
     try:
         target_sec = int((s or {}).get('target_duration_sec') or 60)
     except (TypeError, ValueError):
         target_sec = 60
-    # Speech budget: ~135 wpm spoken → ~100 words / 60s with pauses
-    target_words = round(target_sec / 60 * 100)
+    # Speech budget @2.65 wps (matches JS segmenter): ~110 words fills a 60s
+    # episode once per-line pre-pauses, action beats and chunk buffers are added.
+    target_words = round(target_sec / 60 * 110)
     target_lines = max(3, min(40, round(target_sec / 4.5)))
+    # SYMMETRIC band — the whole point of this detector is that a 60s target
+    # produces ~60s, not 30/40/60. Both ends are enforced so the writer can't
+    # under- OR over-shoot. Floor 0.8×, ceiling 1.2× of target runtime.
+    floor_sec = target_sec * 0.8
+    ceil_sec = target_sec * 1.2
+    floor_words = round(target_words * 0.75)
     m = _script_runtime_metrics(script)
     est_sec = m['est_runtime_sec']
     dialogue_lines = m['dialogue_lines']
@@ -11954,8 +12794,14 @@ def detect_script_overlength(s, script: str) -> dict:
     action_lines = m['action_lines']
 
     reasons = []
-    if est_sec > target_sec * 1.3:
-        reasons.append(f"runtime ~{est_sec}с ({round(est_sec/target_sec, 1)}× от {target_sec}с лимита)")
+    if est_sec > ceil_sec:
+        reasons.append(
+            f"runtime ~{est_sec}с — СЛИШКОМ ДЛИННО ({round(est_sec/target_sec, 1)}× от {target_sec}с). "
+            f"Сократи реплики/action до ~{target_sec}с (потолок {round(ceil_sec)}с).")
+    elif est_sec < floor_sec and est_sec > 0:
+        reasons.append(
+            f"runtime ~{est_sec}с — СЛИШКОМ КОРОТКО (нужно ~{target_sec}с, минимум {round(floor_sec)}с). "
+            f"Добавь реплик/действий до ~{target_sec}с. Серия выйдет короче заявленной длины.")
     if longest_line > 12:
         reasons.append(f"самая длинная реплика {longest_line} слов (лимит 10, идеал 3-7)")
     if avg_line > 9:
@@ -11964,6 +12810,13 @@ def detect_script_overlength(s, script: str) -> dict:
     action_budget = max(3, round(target_sec / 12))
     if action_lines > action_budget * 1.5:
         reasons.append(f"action-строк {action_lines} (лимит ~{action_budget})")
+    # Words floor only fires when runtime didn't already flag undershoot (avoid
+    # double-reporting the same problem).
+    if dialogue_words < floor_words and est_sec >= floor_sec:
+        reasons.append(
+            f"спикерских слов {dialogue_words} — мало (минимум {floor_words}, цель {target_words}). "
+            f"ACTION/BLOCKING не считаются. Сцена выйдет полупустой."
+        )
 
     if not reasons:
         return {}
@@ -12747,6 +13600,74 @@ If the estimated runtime exceeds 60 seconds — DELETE beats and re-output. Do n
 OUTPUT ONLY the cast block + script + episode notes. No JSON, no extra commentary."""
 
 
+def _build_script_system(s):
+    """Return the writer system prompt with a length-override block appended
+    when the series asks for a non-default episode duration.
+
+    The base `_SCRIPT_SYSTEM` constant is calibrated for the standard 60-second
+    TikTok unit (80–100 spoken words, 6–10 dialogue lines, hook 6-8s / body
+    38-44s / cliff 8-10s). When the user picks 70s / 90s / 120s via the
+    creation form or bible modal, those hardcoded numbers fight the override
+    that the per-episode `instruction` injects downstream → writer played safe
+    and undershot. Pinning an explicit override AT THE END of the system
+    prompt is the simplest fix: later instructions trump earlier ones in
+    standard prompt-engineering practice, and the model never has to puzzle
+    out which budget to apply.
+    """
+    try:
+        target_sec = int((s or {}).get('target_duration_sec') or 60)
+    except (TypeError, ValueError):
+        target_sec = 60
+    if target_sec == 60:
+        return _SCRIPT_SYSTEM  # no override needed — base already tuned for 60s
+    # Scale every number proportionally to a 60s baseline. Round to nearest
+    # 5 / nearest int for readability in the prompt.
+    ratio = target_sec / 60.0
+    floor_w = max(40, round(80 * ratio / 5) * 5)
+    target_w = max(60, round(100 * ratio / 5) * 5)
+    ceiling_w = max(70, round(110 * ratio / 5) * 5)
+    body_floor_w = max(30, round(50 * ratio / 5) * 5)
+    body_ceiling_w = max(40, round(75 * ratio / 5) * 5)
+    lines_lo = max(3, round(6 * ratio))
+    lines_hi = max(4, round(10 * ratio))
+    lines_max = max(5, round(12 * ratio))
+    action_lo = max(1, round(2 * ratio))
+    action_hi = max(2, round(4 * ratio))
+    hook_lo = max(4, round(6 * ratio))
+    hook_hi = max(5, round(8 * ratio))
+    body_lo = max(20, round(38 * ratio))
+    body_hi = max(25, round(44 * ratio))
+    cliff_lo = max(6, round(8 * ratio))
+    cliff_hi = max(8, round(10 * ratio))
+    override_block = (
+        "\n\n"
+        "═══════════════════════════════════════════════════════════════════════\n"
+        f"⚠  LENGTH OVERRIDE — THIS SERIES TARGETS {target_sec} SECONDS PER EPISODE\n"
+        "═══════════════════════════════════════════════════════════════════════\n"
+        f"All length numbers in the rules above were calibrated for a standard 60-second TikTok unit.\n"
+        f"THIS SERIES IS DIFFERENT. Recalibrate to {target_sec}s before writing. The numbers below\n"
+        f"SUPERSEDE every conflicting number in the HARD RUNTIME BUDGET section.\n\n"
+        f"NEW BUDGET (use THESE, not the 60s numbers):\n"
+        f"  • Spoken words PER EPISODE: target {target_w}, acceptable range {floor_w}–{ceiling_w}.\n"
+        f"    HARD FLOOR: do NOT deliver fewer than {floor_w} spoken words — silent scenes are a fail.\n"
+        f"    HARD CEILING: do NOT exceed {ceiling_w}.\n"
+        f"  • Dialogue lines: {lines_lo}–{lines_hi}, never more than {lines_max}.\n"
+        f"  • Action beats: {action_lo}–{action_hi} (does NOT count toward spoken-word budget).\n"
+        f"  • Apportionment of the {target_sec} seconds:\n"
+        f"      HOOK ≈ {hook_lo}–{hook_hi} sec\n"
+        f"      BODY ≈ {body_lo}–{body_hi} sec  ({body_floor_w}–{body_ceiling_w} spoken words)\n"
+        f"      CLIFFHANGER ≈ {cliff_lo}–{cliff_hi} sec\n"
+        f"  • Locations: 1 preferred, 2 maximum.\n"
+        f"  • Estimated_runtime in episode notes: target ≤{target_sec}+10 seconds (was «≤60»).\n\n"
+        f"COMMON FAILURE MODE to AVOID: writing a 60-second-sized script and stopping. If the script\n"
+        f"only fills ~30s of screen time (e.g. ~50 spoken words) — you have undershot. Add more dialogue\n"
+        f"beats and reactions UNTIL the spoken-word count is ≥{floor_w}. Action lines and [BLOCKING]\n"
+        f"blocks do NOT contribute to the spoken-word total — only what is said after «NAME:» counts.\n"
+        "═══════════════════════════════════════════════════════════════════════\n"
+    )
+    return _SCRIPT_SYSTEM + override_block
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # BATCH MODE — write {batch_size} consecutive 60-second episodes as ONE flowing
 # script. Each sub-episode ends on its own cliffhanger; the chunk overall plays
@@ -12961,10 +13882,20 @@ OUTPUT ONLY the cast block + script (with cut markers) + chunk notes. No JSON, n
 
 
 def _build_batch_script_system(s):
-    """Render the batch system prompt with N filled in from series.batch_size."""
+    """Render the batch system prompt with N filled in from series.batch_size.
+
+    Honours `target_duration_sec` so a series targeting 70s/episode in a
+    batch of 5 gets `total_sec=350`, not the hardcoded 300. Falls back to
+    60s/episode when not set."""
     N = batch_size(s) or 5
-    total_sec = N * 60
-    per_words = 95
+    try:
+        per_episode_sec = int((s or {}).get('target_duration_sec') or 60)
+    except (TypeError, ValueError):
+        per_episode_sec = 60
+    total_sec = N * per_episode_sec
+    # Scale spoken-words/episode same way as the single-episode prompt:
+    # ~95 words / 60s baseline → linear scale by duration ratio.
+    per_words = max(60, round(95 * per_episode_sec / 60))
     total_words = N * per_words
     return _BATCH_SCRIPT_SYSTEM.format(
         N=N, TOTAL=total_sec,
@@ -12988,7 +13919,7 @@ def generate_arcs(sid):
         'Return JSON: {"arcs": [{"title": "...", "summary": "2-3 paragraphs"}, ...]}'
     )
     try:
-        data = json.loads(strip_json(llm_ask(_resolve_writer_model(request.json or {}, s), prompt, system=_WRITER_SYSTEM)))
+        data = json.loads(strip_json(llm_ask(_resolve_writer_model(request.get_json(silent=True) or {}, s), prompt, system=_WRITER_SYSTEM)))
         arcs = data.get('arcs', data)
         s['arc_variants'] = arcs
         save_series(sid, s)
@@ -13087,7 +14018,7 @@ def generate_milestones(sid):
             'Return JSON: {"milestones": {"1": "...", "10": "...", "70": "..."}}'
         )
     try:
-        data = json.loads(strip_json(llm_ask(_resolve_writer_model(request.json or {}, s), prompt, system=_WRITER_SYSTEM)))
+        data = json.loads(strip_json(llm_ask(_resolve_writer_model(request.get_json(silent=True) or {}, s), prompt, system=_WRITER_SYSTEM)))
         milestones = data.get('milestones', {})
         s.setdefault('milestone_synopses', {}).update({str(k): v for k, v in milestones.items()})
         save_series(sid, s)
@@ -13144,7 +14075,7 @@ def regenerate_milestone(sid, ep_num):
         'Return JSON: {"synopsis": "..."}'
     )
     try:
-        data = json.loads(strip_json(llm_ask(_resolve_writer_model(request.json or {}, s), prompt, system=_WRITER_SYSTEM)))
+        data = json.loads(strip_json(llm_ask(_resolve_writer_model(request.get_json(silent=True) or {}, s), prompt, system=_WRITER_SYSTEM)))
         syn = data.get('synopsis', '')
         s.setdefault('milestone_synopses', {})[str(ep_num)] = syn
         save_series(sid, s)
@@ -13183,7 +14114,7 @@ def extract_from_story(sid):
         '"locations": [{"name":"...","description":"..."},...] }'
     )
     try:
-        data = json.loads(strip_json(llm_ask(_resolve_writer_model(request.json or {}, s), prompt, system=_WRITER_SYSTEM)))
+        data = json.loads(strip_json(llm_ask(_resolve_writer_model(request.get_json(silent=True) or {}, s), prompt, system=_WRITER_SYSTEM)))
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -13516,7 +14447,7 @@ def extract_characters_from_script(sid, num):
         '}'
     )
     try:
-        data = json.loads(strip_json(llm_ask(_resolve_writer_model(request.json or {}, s), prompt, system=_WRITER_SYSTEM)))
+        data = json.loads(strip_json(llm_ask(_resolve_writer_model(request.get_json(silent=True) or {}, s), prompt, system=_WRITER_SYSTEM)))
     except Exception as e:
         return jsonify({'error': f'Не удалось разобрать ответ Claude: {e}'}), 500
 
@@ -13946,7 +14877,7 @@ def generate_next_episode_synopsis(sid):
             )
 
     try:
-        data = json.loads(strip_json(llm_ask(_resolve_writer_model(request.json or {}, s), prompt, system=_WRITER_SYSTEM)))
+        data = json.loads(strip_json(llm_ask(_resolve_writer_model(request.get_json(silent=True) or {}, s), prompt, system=_WRITER_SYSTEM)))
         syn = data.get('synopsis', '')
         dsp = data.get('days_since_previous')
         # If the episode ALREADY exists (user pre-created it), just patch its
@@ -14024,7 +14955,7 @@ def generate_episode_synopses(sid):
             'Return JSON: {"episodes": {"1": {"synopsis":"...", "days_since_previous": 0}, "2": {"synopsis":"...", "days_since_previous": 1}, ...}}'
         )
     try:
-        data = json.loads(strip_json(llm_ask(_resolve_writer_model(request.json or {}, s), prompt, system=_WRITER_SYSTEM)))
+        data = json.loads(strip_json(llm_ask(_resolve_writer_model(request.get_json(silent=True) or {}, s), prompt, system=_WRITER_SYSTEM)))
         synopses = data.get('episodes', {})
         result = {}
         for num_str, payload in synopses.items():
@@ -14635,29 +15566,50 @@ def generate_episode_script(sid, num):
                 + 'Apply ALL 7 rules of the HARD CONTRACT above.'
             )
         else:
-            # Hard length cap — series-level target_duration_sec (default 60s).
+            # Length budget — series-level target_duration_sec (default 60s).
             try:
                 _target_sec = int(s.get('target_duration_sec') or 60)
             except (TypeError, ValueError):
                 _target_sec = 60
-            _target_words = round(_target_sec / 60 * 100)
-            _target_lines = max(3, min(40, round(_target_sec / 4.5)))
+            # Spoken words ≈ 100 words per 60s of TikTok-paced drama (135 wpm
+            # speaking rate w/ pauses). Floor at 75% of target — model was
+            # observed undershooting to ~50 spoken words on a 100-word target
+            # because the prior phrasing was «MAXIMUM, never exceed, cut
+            # mercilessly». Now framed as a RANGE the model must HIT, not a
+            # ceiling to fear.
+            _spoken_target = round(_target_sec / 60 * 100)
+            _spoken_floor = round(_spoken_target * 0.75)
+            _spoken_ceiling = round(_spoken_target * 1.10)
+            # Dialogue lines (each NAME: line) — separate from action.
+            _dlg_target = max(3, min(40, round(_target_sec / 4.5)))
+            _dlg_floor = max(3, round(_dlg_target * 0.75))
+            _dlg_ceiling = _dlg_target + 3
+            _action_budget = max(3, round(_target_sec / 12))
             instruction = (
                 f'Write the complete script for Episode {num}. '
                 + ('Continue naturally from where Episode {prev} ended.'.format(prev=num-1) if prev_script else 'Hook the viewer immediately.')
                 + ' End on a cliffhanger. '
-                + f'\n\n⚠ HARD LENGTH LIMIT — серия = {_target_sec} секунд экрана. ЖЁСТКИЕ ПРАВИЛА:\n'
-                + f'• ВСЕГО ~{_target_lines} ± 2 диалоговых/action строк (НЕ больше {_target_lines + 3}).\n'
-                + f'• ВСЕГО ~{_target_words} спикерских слов МАКСИМУМ (НИКОГДА не превышай {int(_target_words * 1.1)}).\n'
-                + f'• КАЖДАЯ реплика: 3-7 слов. МАКСИМУМ 10 слов. >10 — РАЗРЕЖЬ на две короткие.\n'
-                + f'• МОНОЛОГИ ЗАПРЕЩЕНЫ. Никаких "Your Honor, I would like to explain..." речей. Короткие рваные удары.\n'
-                + f'• ACTION-СТРОК максимум ~{max(3, round(_target_sec/12))}. Не описывай каждое движение.\n'
-                + f'• НИКАКИХ time-markers в action-lines: запрещены фразы "слушает две минуты молча", '
-                + f'"молчит десять секунд", "проходит минута". Это раздувает хронометраж в кадре.\n'
-                + f'• Если на черновике насчитал >{_target_words} слов или >{_target_lines + 3} строк — '
-                + f'РЕЖЬ беспощадно перед выводом, не отдавай длинный драфт.\n'
-                + f'• Это короткая драма для TikTok/Reels, НЕ полнометражный сценарий.\n'
-                + f'• Программный детектор проверит длину + длину каждой реплики; нарушения = автоматическая перезапись.'
+                + f'\n\n⚠ БЮДЖЕТ ДЛИНЫ — серия ≈ {_target_sec} секунд экрана.\n'
+                + f'\n📣 РЕЧЕВЫЕ СЛОВА (только то, что произносят персонажи — слова после «NAME:» / в кавычках):\n'
+                + f'• ЦЕЛЬ: {_spoken_target} слов. ДИАПАЗОН: {_spoken_floor}–{_spoken_ceiling}.\n'
+                + f'• НЕ НЕДОБИРАЙ ниже {_spoken_floor} — иначе сцена пустая, аудио короче нужного.\n'
+                + f'• НЕ ПРЕВЫШАЙ {_spoken_ceiling} — иначе сцена не влезет в {_target_sec}с.\n'
+                + f'• Каждая реплика: 3-8 слов в среднем, максимум 10. >10 слов → РАЗБЕЙ на две короткие реплики.\n'
+                + f'• МОНОЛОГОВ НЕТ. Короткие рваные удары. Никаких речей «Your Honor, I would like to explain…».\n'
+                + f'\n💬 РЕПЛИКИ (количество строк диалога):\n'
+                + f'• ЦЕЛЬ: {_dlg_target} строк диалога. ДИАПАЗОН: {_dlg_floor}–{_dlg_ceiling}.\n'
+                + f'\n🎬 ACTION / BLOCKING (описание движения, [BLOCKING] блоки, ремарки):\n'
+                + f'• Это ОТДЕЛЬНЫЙ бюджет — НЕ СЧИТАЕТСЯ как речевые слова.\n'
+                + f'• Максимум ~{_action_budget} action-строк. Описывай только ключевое движение, не каждое мелкое.\n'
+                + f'• [BLOCKING] / [BLOCKING_END] блоки пиши столько сколько нужно — они вне счёта.\n'
+                + f'• ЗАПРЕЩЕНЫ time-markers в action-lines: «слушает две минуты молча», «молчит десять секунд», '
+                + f'«проходит минута» — это раздувает хронометраж экрана.\n'
+                + f'\n✅ ПРОВЕРЬ ПЕРЕД ВЫВОДОМ:\n'
+                + f'• Речевых слов в диапазоне {_spoken_floor}–{_spoken_ceiling}? (action и BLOCKING НЕ В СЧЁТ)\n'
+                + f'• Строк диалога в диапазоне {_dlg_floor}–{_dlg_ceiling}?\n'
+                + f'• Action-строк не больше {_action_budget}?\n'
+                + f'• Это короткая драма для TikTok/Reels — НЕ полнометражный сценарий, но и НЕ обрубок на 50 слов.\n'
+                + f'• Программный детектор проверит спикерские слова + длину каждой реплики; нарушения → автоматическая перезапись.'
             )
 
     base_prompt = (
@@ -14705,7 +15657,7 @@ def generate_episode_script(sid, num):
            'NEVER continue a subplot the bridge plan does not include.' if bridge_this_beat else '')
     )
 
-    script_system = _build_batch_script_system(s) if batch else _SCRIPT_SYSTEM
+    script_system = _build_batch_script_system(s) if batch else _build_script_system(s)
 
     try:
         # ─── WRITE → AUDIT → RETRY loop (max 2 retries, fully automated)
@@ -14753,6 +15705,38 @@ def generate_episode_script(sid, num):
             if length_violation:
                 lv = length_violation
                 reasons_str = '; '.join(lv.get('reasons') or [])
+                # Branch the fix message based on direction. Undershoot
+                # (writer delivered too few spoken words) gets a different
+                # corrective than overshoot (writer was too verbose).
+                _floor_words = round(lv['target_words'] * 0.75)
+                # Undershoot = rendered runtime falls below target (the renderer
+                # would produce a clip shorter than the series setting). Word
+                # count is the secondary signal.
+                _undershoot = (lv['est_sec'] < lv['target_sec'] * 0.9) or (lv['dialogue_words'] < _floor_words)
+                if _undershoot:
+                    fix_msg = (
+                        f"ДОПИШИ диалог до целевого объёма. Конкретно: "
+                        f"(a) у тебя сейчас {lv['dialogue_words']} спикерских слов, нужно ~{lv['target_words']} "
+                        f"(минимум {_floor_words}) — НЕДОБОР почти в два раза; "
+                        f"(b) добавь {lv['target_words'] - lv['dialogue_words']}+ спикерских слов через "
+                        f"новые короткие реплики (3-7 слов каждая), НЕ через длинные монологи; "
+                        f"(c) ACTION/BLOCKING НЕ СЧИТАЮТСЯ — речь только то, что произносят персонажи "
+                        f"после «NAME:» или в кавычках; "
+                        f"(d) сцена развивается через диалог — добавь обмены репликами, реакции, "
+                        f"подколы, угрозы, признания. НЕ через action-описания «он смотрит на неё»; "
+                        f"(e) cliffhanger остаётся, но к нему ведёт больше реплик."
+                    )
+                else:
+                    fix_msg = (
+                        f"СОКРАТИ беспощадно. Конкретно: "
+                        f"(a) каждая реплика МАКСИМУМ 7 слов, идеал 3-5 (короткие рваные удары); "
+                        f"(b) если есть монолог >10 слов — разрежь на короткие реплики ИЛИ удали лишнее; "
+                        f"(c) action-строк не больше {max(3, round(lv['target_sec']/12))} — убери все 'смотрит / встаёт / делает паузу' если они не двигают сцену; "
+                        f"(d) общий лимит: ~{lv['target_words']} спикерских слов, ~{lv['target_lines']} диалоговых строк суммарно; "
+                        f"(e) НИКАКИХ time-markers вроде 'в течение двух минут' / 'десять секунд молча' — это раздувает хронометраж; "
+                        f"(f) удали экспозицию и повторы — только живые удары + cliffhanger. "
+                        f"Это короткая драма для TikTok ({lv['target_sec']}с), не полнометражный сценарий."
+                    )
                 length_critical.append({
                     'type': 'script_overlength',
                     'severity': 'critical',
@@ -14764,16 +15748,7 @@ def generate_episode_script(sid, num):
                         f"средняя {lv['avg_line_words']} слов · оценка ~{lv['est_sec']}с экрана. "
                         f"Лимит сериала: {lv['target_sec']}с, ~{lv['target_words']} слов, ~{lv['target_lines']} строк."
                     ),
-                    'fix': (
-                        f"СОКРАТИ беспощадно. Конкретно: "
-                        f"(a) каждая реплика МАКСИМУМ 7 слов, идеал 3-5 (короткие рваные удары); "
-                        f"(b) если есть монолог >10 слов — разрежь на короткие реплики ИЛИ удали лишнее; "
-                        f"(c) action-строк не больше {max(3, round(lv['target_sec']/12))} — убери все 'смотрит / встаёт / делает паузу' если они не двигают сцену; "
-                        f"(d) общий лимит: ~{lv['target_words']} спикерских слов, ~{lv['target_lines']} диалоговых строк суммарно; "
-                        f"(e) НИКАКИХ time-markers вроде 'в течение двух минут' / 'десять секунд молча' — это раздувает хронометраж; "
-                        f"(f) удали экспозицию и повторы — только живые удары + cliffhanger. "
-                        f"Это короткая драма для TikTok ({lv['target_sec']}с), не полнометражный сценарий."
-                    ),
+                    'fix': fix_msg,
                 })
                 print(f'[script-length] ep {num} attempt {attempt+1}: {lv["est_sec"]}s ({lv["ratio"]}×), '
                       f'lines={lv["dialogue_lines"]} words={lv["dialogue_words"]} '
@@ -17379,13 +18354,19 @@ def _qc_extract_frame_at(sid, video_relpath, sec, label):
 
 def _qc_whisper_detect(audio_abs_path):
     """Run OpenAI Whisper on the chunk's audio. Returns dict with detected
-    language code, confidence, and transcript text. Falls through to a
-    pass-through result when OPENAI_KEY is missing — language QC stage is
-    OPTIONAL by design (silent video / no key both → skip)."""
+    language code, confidence, transcript text, and `no_speech` flag.
+
+    `no_speech=True` when the chunk has no real spoken dialogue — silent
+    video, only SFX/music, or Whisper hallucinated over near-silence.
+    The caller MUST skip language enforcement in that case (a chunk
+    with no speech has no language to fail).
+
+    Falls through to a pass-through result when OPENAI_KEY is missing —
+    language QC stage is OPTIONAL by design."""
     if not OPENAI_KEY:
-        return {'lang': '', 'confidence': 0.0, 'transcript': '', 'skipped': 'no_openai_key'}
+        return {'lang': '', 'confidence': 0.0, 'transcript': '', 'no_speech': True, 'skipped': 'no_openai_key'}
     if not audio_abs_path or not Path(audio_abs_path).exists():
-        return {'lang': '', 'confidence': 0.0, 'transcript': '', 'skipped': 'no_audio'}
+        return {'lang': '', 'confidence': 0.0, 'transcript': '', 'no_speech': True, 'skipped': 'no_audio'}
     try:
         import openai
         client = openai.OpenAI(api_key=OPENAI_KEY)
@@ -17396,16 +18377,60 @@ def _qc_whisper_detect(audio_abs_path):
                 response_format='verbose_json',
             )
         # whisper-1 verbose_json fields: language (ISO code), text, segments[],
-        # duration. No per-segment confidence by default; we treat language
-        # as high-confidence when transcript has >= 6 alphabetic chars.
+        # duration. Each segment exposes `no_speech_prob` (0..1) — high
+        # values mean Whisper itself thinks the segment is non-speech.
         transcript = (getattr(resp, 'text', '') or '').strip()
         lang = (getattr(resp, 'language', '') or '').lower().strip()
         alphabetic = sum(1 for ch in transcript if ch.isalpha())
         confidence = 1.0 if alphabetic >= 6 else (alphabetic / 6.0)
-        return {'lang': lang, 'confidence': confidence, 'transcript': transcript[:500]}
+
+        raw_segments = getattr(resp, 'segments', None) or []
+        seg_probs = []
+        for s in raw_segments:
+            p = s.get('no_speech_prob') if isinstance(s, dict) else getattr(s, 'no_speech_prob', None)
+            if p is None:
+                continue
+            try:
+                seg_probs.append(float(p))
+            except (TypeError, ValueError):
+                pass
+
+        # No-speech heuristic — chunk is "silent" when ANY of:
+        #   (a) transcript has < 4 alphabetic chars (nothing said), OR
+        #   (b) every segment has no_speech_prob ≥ 0.6 (Whisper itself
+        #       thinks each segment is non-speech), OR
+        #   (c) transcript matches a known Whisper hallucination on
+        #       near-silence (e.g. «Thank you for watching»,
+        #       «Продолжение следует», music tag «[Музыка]»).
+        # (b) uses ALL not avg: a 10s chunk with 1s of grunt + 9s of
+        # silence averages ~0.5 but DOES contain speech — we should
+        # still language-check it. Only skip when literally no segment
+        # contains speech.
+        no_speech = alphabetic < 4
+        if not no_speech and seg_probs:
+            no_speech = all(p >= 0.6 for p in seg_probs)
+        if not no_speech:
+            t_low = transcript.lower().strip(' .!?,«»"\'')
+            HALLUCINATIONS = {
+                'thank you', 'thanks for watching', 'thank you for watching',
+                'thanks for watching!', 'bye', 'okay', 'you',
+                'продолжение следует', 'спасибо за просмотр', 'спасибо',
+                '[музыка]', '[music]', '(music)', '(музыка)',
+            }
+            if t_low in HALLUCINATIONS:
+                no_speech = True
+
+        return {
+            'lang': lang,
+            'confidence': confidence,
+            'transcript': transcript[:500],
+            'no_speech': no_speech,
+            'segments_count': len(seg_probs),
+            'avg_no_speech_prob': round(sum(seg_probs) / len(seg_probs), 3) if seg_probs else None,
+        }
     except Exception as e:
         print(f'[qc] whisper call failed: {type(e).__name__}: {e}', flush=True)
-        return {'lang': '', 'confidence': 0.0, 'transcript': '', 'skipped': f'whisper_error:{type(e).__name__}'}
+        return {'lang': '', 'confidence': 0.0, 'transcript': '', 'no_speech': True, 'skipped': f'whisper_error:{type(e).__name__}'}
 
 
 def _qc_vision_grid_and_subs(frame_urls, frame_labels):
@@ -17547,11 +18572,19 @@ def _qc_run_chunk(sid, num, idx):
     details = {}
     fails = []
 
-    # Stage 0 — prompt english check (cheap, no API)
+    # Stage 0 — prompt english check (cheap, no API).
+    # NOTE: this is recorded but NOT added to `fails` here. Whisper (Stage 3)
+    # inspects the actual generated audio and is the authoritative signal for
+    # «is the chunk in English». The prompt scan is only a fallback for when
+    # Whisper is unavailable (no audio / API down) — see Stage 3 below where
+    # we promote `prompt_non_english` to a fail only in that case.
+    # Real production bug: composer sometimes leaves Russian dialogue in
+    # quotes inside the prompt («Vera (@Image2), отвечает: "Да, всё оформлено..."»),
+    # but the prompt's trailing `VOICE: standard American English` hard-instruction
+    # makes Seedance translate dialogue → audio comes out English anyway.
+    # Whisper confirms English with confidence=1.0 — the chunk is fine.
     p_res = _qc_check_prompt_english(chunk.get('prompt') or '')
     details['prompt'] = p_res
-    if not p_res['ok']:
-        fails.append('prompt_non_english')
 
     # Stage 1 — extract probe frames (frame@2s if duration > 2.5s, else mid; + lastframe)
     duration_sec = float(chunk.get('duration') or chunk.get('durationSec') or 10)
@@ -17594,6 +18627,7 @@ def _qc_run_chunk(sid, num, idx):
         details['vision'] = {'skipped': 'no_frames'}
 
     # Stage 3 — whisper lang
+    whisper_authoritative = False  # True iff Whisper actually inspected audio
     audio = _qc_extract_audio(sid, video_relpath)
     if audio:
         l_res = _qc_whisper_detect(audio)
@@ -17602,13 +18636,29 @@ def _qc_run_chunk(sid, num, idx):
         # ('english') depending on response_format. Be permissive: accept
         # any English marker. Real production bug: every chunk was failing
         # `lang:english` because Whisper sent 'english' and we required 'en'.
+        # Skip the language gate entirely when the chunk has no actual
+        # speech — silent / SFX-only chunks have no language to fail and
+        # Whisper otherwise hallucinates a non-English label on noise.
         ENGLISH_MARKERS = {'en', 'eng', 'english'}
         detected_lang = (l_res.get('lang') or '').lower().strip()
-        if (detected_lang and detected_lang not in ENGLISH_MARKERS
-                and (l_res.get('confidence') or 0) >= 0.5):
-            fails.append(f'lang:{detected_lang}')
+        if l_res.get('skipped'):
+            # Whisper API call failed — fall through; not authoritative.
+            pass
+        elif l_res.get('no_speech'):
+            whisper_authoritative = True  # silent chunk = nothing to fail on
+        elif detected_lang:
+            whisper_authoritative = True
+            if (detected_lang not in ENGLISH_MARKERS
+                    and (l_res.get('confidence') or 0) >= 0.5):
+                fails.append(f'lang:{detected_lang}')
     else:
         details['lang'] = {'skipped': 'no_audio'}
+
+    # Promote the prompt-language check to a fail ONLY when Whisper couldn't
+    # give us an authoritative answer about the audio. With a real Whisper
+    # verdict in hand, we trust the audio over the prompt text.
+    if not p_res['ok'] and not whisper_authoritative:
+        fails.append('prompt_non_english')
 
     # `attempts` already includes self (own_attempts >= 1) + siblings, so we
     # compare directly to the cap. No further +1.
@@ -22742,6 +23792,23 @@ _HEAL_PROMPT_SYSPROMPT = (
     "• 'smash' / 'beat' / 'punch' → 'wreck' / 'break' / 'shatter (метафорически)'\n"
     "• 'hate' → 'despise' / 'loathe'\n"
     "• 'stupid' / 'idiot' / 'moron' — обычно проходит, не трогай если контекст подходит\n\n"
+    "ДЕПЕРСОНАЛИЗАЦИЯ И ПСИХОЛОГИЧЕСКОЕ НАСИЛИЕ В ДИАЛОГЕ:\n"
+    "Seedance блокирует фразы которые буквально отрицают существование / идентичность человека, "
+    "даже в контексте драмы. Найди и замени:\n"
+    "• 'you don't exist' / 'you cease to exist' → 'you're only here when I call' / 'make yourself scarce'\n"
+    "• 'you are invisible' / 'be invisible' / 'stay invisible' → 'stay in the background' / 'keep out of sight' / 'don't draw attention to yourself'\n"
+    "• 'you are nothing' / 'you're nothing' → 'you're just here to do a job'\n"
+    "• 'you don't matter' / 'you don't count' → 'your presence isn't required'\n"
+    "• 'you are nobody' / 'you're nobody' → 'you're just staff'\n"
+    "• 'you have no voice' / 'you have no say' → 'this isn't your decision'\n"
+    "• 'you belong to me' / 'you're mine' (в контексте контроля) → 'you answer to me'\n"
+    "• 'worthless' → 'replaceable' / 'expendable'\n"
+    "• 'beneath me' / 'below me' (о человеке) → 'not at my level'\n"
+    "• 'I own you' → 'I'm the one giving orders here'\n\n"
+    "КЛЮЧЕВОЙ ПРИНЦИП для этой категории: сохрани власть и холодность говорящего, "
+    "убери буквальное отрицание существования адресата. "
+    "'You don't exist' → 'You're invisible to my guests' или 'Act like you're not here' — "
+    "смысл тот же, но без прямого отрицания человека как такового.\n\n"
     "Сохраняй при замене:\n"
     "- Смысл и драматургическую функцию (угроза остаётся угрозой)\n"
     "- Примерную длину (плюс-минус 1-2 слова — КРИТИЧНО для lip-sync)\n"

@@ -45,7 +45,16 @@ function stage2ChunkRange(s) {
 async function parseApiError(r) {
   const text = await r.text();
   let msg = text;
-  try { const j = JSON.parse(text); msg = j.error || text; } catch {}
+  let payload = null;
+  try {
+    const j = JSON.parse(text);
+    payload = j;
+    // Prefer the human-readable `message` (set by handlers that pair a short
+    // `error` code with a full sentence — e.g. moderation_precheck_reject)
+    // and fall back to the bare code. Keeps callers without payload-aware
+    // catches from showing just «moderation_precheck_reject» in toasts.
+    msg = (typeof j.message === 'string' && j.message.trim()) ? j.message : (j.error || text);
+  } catch {}
   // If the backend signals an AVAI auth problem, surface a focused modal that
   // points the user at Settings instead of just throwing the raw error string
   // up the stack (which usually ends as a giant JSON wall in a toast). This
@@ -58,13 +67,16 @@ async function parseApiError(r) {
       }
     }
   } catch {}
-  return msg;
+  const err = new Error(msg);
+  err.payload = payload;
+  err.status = r.status;
+  return err;
 }
 
 const api = {
   async get(url) {
     const r = await fetch(url);
-    if (!r.ok) throw new Error(await parseApiError(r));
+    if (!r.ok) throw await parseApiError(r);
     return r.json();
   },
   async post(url, body, { timeoutMs, idempotencyKey } = {}) {
@@ -75,17 +87,17 @@ const api = {
     let r;
     try { r = await fetch(url, opts); }
     catch (e) { throw new Error(e.name === 'TimeoutError' ? `Таймаут (${Math.round(timeoutMs/1000)}с) — сервер не ответил` : e.message); }
-    if (!r.ok) throw new Error(await parseApiError(r));
+    if (!r.ok) throw await parseApiError(r);
     return r.json();
   },
   async put(url, body) {
     const r = await fetch(url, { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
-    if (!r.ok) throw new Error(await parseApiError(r));
+    if (!r.ok) throw await parseApiError(r);
     return r.json();
   },
   async del(url) {
     const r = await fetch(url, { method: 'DELETE' });
-    if (!r.ok) throw new Error(await parseApiError(r));
+    if (!r.ok) throw await parseApiError(r);
     return r.json();
   },
   async upload(url, formData) {
@@ -101,7 +113,7 @@ const api = {
     let r;
     try { r = await fetch(url, opts); }
     catch (e) { throw new Error(e.name === 'TimeoutError' ? `Таймаут (${Math.round(timeoutMs/1000)}с) — сервер не ответил` : e.message); }
-    if (!r.ok) throw new Error(await parseApiError(r));
+    if (!r.ok) throw await parseApiError(r);
     return r.json();
   },
 };
@@ -772,6 +784,15 @@ function goBackToSeries() {
 let _allProjects = [];
 let _filterColor = '';      // '' = any
 let _filterStarred = false; // true = only starred
+// Sort mode: persisted across reloads. Default keeps legacy behavior (pinned →
+// alphabetic by directory order). Other modes still respect pinned-on-top.
+const _SORT_MODES = new Set(['default', 'created_desc', 'created_asc', 'updated_desc', 'updated_asc']);
+let _sortMode = (() => {
+  try {
+    const v = localStorage.getItem('projects_sort_mode') || 'default';
+    return _SORT_MODES.has(v) ? v : 'default';
+  } catch { return 'default'; }
+})();
 
 async function loadProjects() {
   _allProjects = await api.get('/api/series');
@@ -779,10 +800,40 @@ async function loadProjects() {
   loadBalance();
 }
 
+function _projectCreatedTs(s) {
+  // created_at is an ISO string (UTC). Parse → epoch ms. Falsy/invalid → 0.
+  const v = s.created_at;
+  if (!v) return 0;
+  const t = Date.parse(v);
+  return Number.isFinite(t) ? t : 0;
+}
+
+function _sortProjects(list, mode) {
+  const arr = list.slice();
+  // Always keep pinned cards on top, regardless of sort mode — pinning would
+  // be useless otherwise.
+  const pinKey = s => (s.pinned ? 0 : 1);
+  const pinTie = s => -(s.pinned_at || 0); // newer pin first within pinned group
+  if (mode === 'created_desc') {
+    arr.sort((a, b) => pinKey(a) - pinKey(b) || _projectCreatedTs(b) - _projectCreatedTs(a));
+  } else if (mode === 'created_asc') {
+    arr.sort((a, b) => pinKey(a) - pinKey(b) || _projectCreatedTs(a) - _projectCreatedTs(b));
+  } else if (mode === 'updated_desc') {
+    arr.sort((a, b) => pinKey(a) - pinKey(b) || (b._updated_at || 0) - (a._updated_at || 0));
+  } else if (mode === 'updated_asc') {
+    arr.sort((a, b) => pinKey(a) - pinKey(b) || (a._updated_at || 0) - (b._updated_at || 0));
+  } else {
+    // Default: pinned first (newer pin earlier), then keep server's alphabetic order.
+    arr.sort((a, b) => pinKey(a) - pinKey(b) || pinTie(a) - pinTie(b));
+  }
+  return arr;
+}
+
 function applyProjectFilters() {
   let list = _allProjects;
   if (_filterColor) list = list.filter(s => (s.color || '') === _filterColor);
   if (_filterStarred) list = list.filter(s => !!s.starred);
+  list = _sortProjects(list, _sortMode);
   renderProjects(list);
   // sync filter-bar visual state
   document.querySelectorAll('.color-filter-btn').forEach(b => {
@@ -793,6 +844,8 @@ function applyProjectFilters() {
     starBtn.classList.toggle('active', _filterStarred);
     starBtn.innerHTML = _filterStarred ? '★ Только избранные' : '☆ Только избранные';
   }
+  const sortSel = document.getElementById('sort-select');
+  if (sortSel && sortSel.value !== _sortMode) sortSel.value = _sortMode;
 }
 
 function setColorFilter(color) {
@@ -802,6 +855,12 @@ function setColorFilter(color) {
 
 function toggleStarFilter() {
   _filterStarred = !_filterStarred;
+  applyProjectFilters();
+}
+
+function setSortMode(mode) {
+  _sortMode = _SORT_MODES.has(mode) ? mode : 'default';
+  try { localStorage.setItem('projects_sort_mode', _sortMode); } catch {}
   applyProjectFilters();
 }
 
@@ -826,20 +885,35 @@ function renderProjects(list) {
   grid.innerHTML = list.map(s => {
     const colorCls = s.color ? ` color-${s.color}` : '';
     const starGlyph = s.starred ? '★' : '☆';
+    const hasCover = !!s.cover_image;
+    const coverUrl = hasCover
+      ? `/assets/${s.id}/${s.cover_image}?v=${s.cover_image_version || 0}`
+      : '';
+    const coverCls = hasCover ? ' has-cover' : '';
+    const coverStyle = hasCover ? ` style="background-image:url('${coverUrl}')"` : '';
+    // Always-visible cover CTA: «🖼 Открыть обложку» when present (opens viewer),
+    // «🎬 Сгенерить обложку» when missing (kicks off the generator). Sits at the
+    // bottom of the card content so the user discovers it without hovering.
+    const coverCta = hasCover
+      ? `<button class="project-cover-cta has" type="button" onmousedown="event.stopPropagation()" onclick="event.stopPropagation();event.preventDefault();openCoverViewer('${s.id}')" title="Открыть обложку, перегенерить или скачать">🖼 Обложка</button>`
+      : `<button class="project-cover-cta" type="button" onmousedown="event.stopPropagation()" onclick="event.stopPropagation();event.preventDefault();generateCoverFromCard('${s.id}', this)" title="Создать обложку через AVAI (3:4 JPEG, использует синопсис + главных героев)">🎬 Сгенерить обложку</button>`;
     return `
-    <div class="project-card${s.pinned ? ' pinned' : ''}${colorCls}" draggable="true" data-sid="${s.id}" data-title="${esc(s.title)}" onclick="if(event.target.closest('.project-delete-btn')||event.target.closest('.project-pin-btn')||event.target.closest('.project-star-btn')||event.target.closest('.project-color-btn')||event.target.closest('.project-color-popover'))return;navigate('series',{seriesId:'${s.id}'})">
+    <div class="project-card${s.pinned ? ' pinned' : ''}${colorCls}${coverCls}"${coverStyle} draggable="true" data-sid="${s.id}" data-title="${esc(s.title)}" onclick="if(event.target.closest('.project-delete-btn')||event.target.closest('.project-pin-btn')||event.target.closest('.project-star-btn')||event.target.closest('.project-color-btn')||event.target.closest('.project-cover-btn')||event.target.closest('.project-cover-cta')||event.target.closest('.project-color-popover'))return;navigate('series',{seriesId:'${s.id}'})">
       <button class="project-pin-btn${s.pinned ? ' active' : ''}" type="button" onmousedown="event.stopPropagation()" ontouchstart="event.stopPropagation()" onclick="event.stopPropagation();event.preventDefault();togglePin('${s.id}')" title="${s.pinned ? 'Открепить' : 'Закрепить вверху'}">${s.pinned ? '📌' : '📍'}</button>
       <div class="project-card-tools">
         <button class="project-star-btn${s.starred ? ' active' : ''}" type="button" onmousedown="event.stopPropagation()" onclick="event.stopPropagation();event.preventDefault();toggleStar('${s.id}')" title="${s.starred ? 'Убрать из избранного' : 'В избранное'}">${starGlyph}</button>
         <button class="project-color-btn" type="button" onmousedown="event.stopPropagation()" onclick="event.stopPropagation();event.preventDefault();openColorPicker(event,'${s.id}')" title="Цвет ячейки">🎨</button>
         <button class="project-delete-btn" type="button" onmousedown="event.stopPropagation()" ontouchstart="event.stopPropagation()" onclick="event.stopPropagation();event.preventDefault();confirmDeleteSeries('${s.id}','${esc(s.title)}')" title="Удалить">✕</button>
       </div>
-      <h3>${esc(s.title)}</h3>
-      <div class="meta">
-        <span>${esc(s.genre || '—')}</span>
-        <span>${esc(s.tone || '—')}</span>
+      <div class="project-card-content">
+        <h3>${esc(s.title)}</h3>
+        <div class="meta">
+          <span>${esc(s.genre || '—')}</span>
+          <span>${esc(s.tone || '—')}</span>
+        </div>
+        <div class="ep-count">${s._episode_count}/${s._episode_total ?? s._episode_count} ${s.batch_mode ? `чанков × ${s.batch_size || 5}` : 'эп.'}</div>
+        ${coverCta}
       </div>
-      <div class="ep-count">${s._episode_count}/${s._episode_total ?? s._episode_count} ${s.batch_mode ? `чанков × ${s.batch_size || 5}` : 'эп.'}</div>
       <div class="project-ep-badge" title="Готовых серий: ${s._episode_count} из ${s._episode_total ?? s._episode_count}">${s._episode_count}</div>
     </div>
   `;
@@ -921,6 +995,197 @@ async function setProjectColor(sid, color) {
     if (s) s.color = prev;
     applyProjectFilters();
     alert('Не удалось задать цвет: ' + e.message);
+  }
+}
+
+// ── Series cover art (short-drama poster on the project card) ───────────────
+// Cover lives at assets/cover.jpg inside the series dir; the project-card on
+// the main menu uses it as its background, and a viewer modal opens for a
+// closer look with Regenerate + Download.
+let _coverViewerSid = null;
+
+async function generateCoverFromCard(sid, btn) {
+  // Card-level «🎬» button when no cover exists yet. Spinner on the button,
+  // then refresh the project list so the new cover paints itself in.
+  if (!sid) return;
+  const original = btn ? btn.innerHTML : '';
+  if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>'; }
+  showToast('🎨 Генерю обложку…', 4000);
+  try {
+    const r = await api.post(`/api/series/${sid}/cover/generate`, {}, { timeoutMs: 240_000 });
+    if (r.error) throw new Error(r.error);
+    // Sync local state so the next render picks up the new cover without a
+    // full round-trip.
+    const s = _allProjects.find(x => x.id === sid);
+    if (s) {
+      s.cover_image = r.url.replace(`/assets/${sid}/`, '').split('?')[0];
+      s.cover_image_url = r.image_url || '';
+      s.cover_image_version = r.image_version || Date.now();
+    }
+    applyProjectFilters();
+    showToast('✓ Обложка готова', 3000);
+  } catch (e) {
+    showToast('Ошибка генерации обложки: ' + (e.message || e), 7000);
+    if (btn) { btn.disabled = false; btn.innerHTML = original; }
+  }
+}
+
+function openCoverViewer(sid) {
+  const s = _allProjects.find(x => x.id === sid);
+  if (!s || !s.cover_image) return;
+  _coverViewerSid = sid;
+  const url = `/assets/${sid}/${s.cover_image}?v=${s.cover_image_version || 0}`;
+  document.getElementById('cover-viewer-title').textContent = s.title || 'Обложка';
+  const img = document.getElementById('cover-viewer-img');
+  img.src = url;
+  img.alt = s.title || '';
+  // Meta chips + synopsis are shown in English. We render whatever cached
+  // English we have right now and, in parallel, fire one request that
+  // translates whatever is missing and caches it on series.json. When the
+  // promise resolves we just re-render with the fresh values.
+  const metaEl = document.getElementById('cover-viewer-meta');
+  const renderMeta = () => {
+    // Genre only — tone & target audience are NOT shown here per user request.
+    const genre = (s.genre_en || s.genre || '').trim();
+    metaEl.innerHTML = genre ? `<span class="cv-meta-chip">${esc(genre)}</span>` : '';
+  };
+  renderMeta();
+  // Synopsis is shown in English. If we already have a cached translation on
+  // the series (synopsis_en / world_description_en), paint it immediately;
+  // otherwise show the source while Claude Haiku translates in the
+  // background, then swap in the translation.
+  const synEl = document.getElementById('cover-viewer-synopsis');
+  const renderSyn = (synText, worldText, isTranslating) => {
+    let html = '';
+    const block = (label, body, isTr) => `
+      <div class="cv-syn-block">
+        <div class="cv-syn-label">
+          ${label}${isTr ? ' <span class="cv-translating">переводится…</span>' : ''}
+          <button class="cv-copy-btn" type="button" onclick="copyCoverSynopsis(this)" title="Скопировать">📋</button>
+        </div>
+        <div class="cv-syn-body">${esc(body)}</div>
+      </div>`;
+    if (synText) html += block('Synopsis', synText, isTranslating);
+    if (worldText) html += block('World', worldText, false);
+    if (!html) html = '<div class="cv-syn-empty">No synopsis yet — add one in the series bible.</div>';
+    synEl.innerHTML = html;
+  };
+  const synSrc = (s.synopsis || '').trim();
+  const worldSrc = (s.world_description || '').trim();
+  const synEnCached = (s.synopsis_en || '').trim();
+  const worldEnCached = (s.world_description_en || '').trim();
+  // Prefer cached English; fall back to source while waiting for translation.
+  const initialSyn = synEnCached || synSrc;
+  const initialWorld = worldEnCached || worldSrc;
+  // Hit the endpoint whenever (a) any source field needs translating, or
+  // (b) genre is still blank — the endpoint also infers a genre label from
+  // the synopsis when it's missing, so we want to fetch even when nothing
+  // needs translation.
+  const needsTranslate =
+    ['synopsis', 'world_description', 'genre']
+      .some(f => (s[f] || '').trim() && !(s[f + '_en'] || '').trim())
+    || (!(s.genre || '').trim() && (s.synopsis || '').trim());
+  renderSyn(initialSyn, initialWorld, needsTranslate);
+  if (needsTranslate) {
+    api.get(`/api/series/${sid}/cover/synopsis-en`)
+      .then(r => {
+        if (_coverViewerSid !== sid) return;  // user closed / opened another
+        // Cache every returned EN field back onto our in-memory series so
+        // the next viewer-open hits the cache without a round-trip.
+        if (s && r) {
+          for (const k of Object.keys(r)) {
+            if (r[k]) s[k] = r[k];
+          }
+        }
+        renderSyn(r.synopsis_en || synSrc, r.world_description_en || worldSrc, false);
+        renderMeta();
+      })
+      .catch(e => {
+        if (_coverViewerSid !== sid) return;
+        // Translation failed — leave source text in place, drop the spinner.
+        renderSyn(initialSyn, initialWorld, false);
+        console.warn('[cover viewer] synopsis translation failed:', e);
+      });
+  }
+  document.getElementById('cover-viewer-status').textContent = '';
+  // Wire the download button to point at the live URL.
+  const dl = document.getElementById('cover-viewer-download');
+  dl.href = url;
+  // Force-download with a friendly filename instead of cover.jpg.
+  const safe = (s.title || 'cover').replace(/[^\wЀ-ӿ -]+/g, '').replace(/\s+/g, '_') || 'cover';
+  dl.download = `${safe}_cover.jpg`;
+  openModal('modal-cover-viewer');
+}
+
+function closeCoverViewer() {
+  closeModal('modal-cover-viewer');
+  _coverViewerSid = null;
+}
+
+function copyCoverSynopsis(btn) {
+  const block = btn.closest('.cv-syn-block');
+  if (!block) return;
+  const text = (block.querySelector('.cv-syn-body')?.textContent || '').trim();
+  if (!text) return;
+  const ok = (label) => {
+    const orig = btn.innerHTML;
+    btn.innerHTML = '✓';
+    btn.classList.add('cv-copy-done');
+    setTimeout(() => { btn.innerHTML = orig; btn.classList.remove('cv-copy-done'); }, 1400);
+    if (typeof showToast === 'function') showToast(label, 2000);
+  };
+  const fail = (e) => {
+    if (typeof showToast === 'function') showToast('Не удалось скопировать: ' + (e?.message || e), 4000);
+  };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(() => ok('Скопировано в буфер'), fail);
+  } else {
+    // Fallback for older browsers / non-https contexts.
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed'; ta.style.opacity = '0';
+      document.body.appendChild(ta); ta.select();
+      document.execCommand('copy');
+      document.body.removeChild(ta);
+      ok('Скопировано в буфер');
+    } catch (e) { fail(e); }
+  }
+}
+
+async function regenerateCoverFromViewer() {
+  const sid = _coverViewerSid;
+  if (!sid) return;
+  const statusEl = document.getElementById('cover-viewer-status');
+  const regenBtn = document.getElementById('cover-viewer-regen');
+  const img = document.getElementById('cover-viewer-img');
+  const original = regenBtn.innerHTML;
+  regenBtn.disabled = true;
+  regenBtn.innerHTML = '<span class="spinner"></span> Перегенерирую…';
+  statusEl.textContent = 'AVAI рисует новую версию (10-40с)…';
+  img.style.opacity = '0.45';
+  try {
+    const r = await api.post(`/api/series/${sid}/cover/generate`, {}, { timeoutMs: 240_000 });
+    if (r.error) throw new Error(r.error);
+    const s = _allProjects.find(x => x.id === sid);
+    if (s) {
+      s.cover_image = r.url.replace(`/assets/${sid}/`, '').split('?')[0];
+      s.cover_image_url = r.image_url || '';
+      s.cover_image_version = r.image_version || Date.now();
+    }
+    const url = `/assets/${sid}/${s.cover_image}?v=${s.cover_image_version}`;
+    img.src = url;
+    img.style.opacity = '1';
+    const dl = document.getElementById('cover-viewer-download');
+    dl.href = url;
+    statusEl.innerHTML = '<span style="color:#4ade80">✓ Готово</span>';
+    applyProjectFilters();
+  } catch (e) {
+    img.style.opacity = '1';
+    statusEl.innerHTML = `<span style="color:#f87171">Ошибка: ${esc(e.message || e)}</span>`;
+  } finally {
+    regenBtn.disabled = false;
+    regenBtn.innerHTML = original;
   }
 }
 
@@ -1816,6 +2081,170 @@ async function appendGenerateToLandmark(landmarkType) {
 // Call Claude to write N new episodes continuing the series. Result lands in
 // the textarea so user can preview/logic-check/edit/commit via the existing
 // paste-flow buttons (no separate commit path — same «Добавить серии»).
+// ── Auto-pipeline after «✨ Сгенерировать новые» ──────────────────────────────
+// After batch-generation fills the textarea, optionally run the exact chain a
+// user does by hand: 🔧 под стандарт → 🧠 проверка логики → 🩹 лечение всех
+// проблем → 📜 добавить серии. Each stage is independently toggleable in
+// Настройки and defaults ON. While the chain runs, a full-screen overlay blocks
+// every click/keypress so nothing can be touched mid-process, and shows live
+// per-stage status.
+const AUTO_PIPE_KEYS = { adapt: 'auto_pipe_adapt', logic: 'auto_pipe_logic', add: 'auto_pipe_add' };
+function autoPipeEnabled(key) { return localStorage.getItem(AUTO_PIPE_KEYS[key]) !== 'false'; }
+function setAutoPipeEnabled(key, on) { try { localStorage.setItem(AUTO_PIPE_KEYS[key], on ? 'true' : 'false'); } catch {} }
+
+// Full-screen blocking overlay with a live checklist of pipeline stages.
+const AppendPipelineOverlay = (() => {
+  let _el = null, _timer = null, _start = 0, _running = false, _keyBlock = null, _steps = [];
+  const ICON = {
+    pending: '<span style="color:var(--muted);font-size:1.05rem">○</span>',
+    run:     '<span class="spinner" style="width:15px;height:15px;border-width:2px;display:inline-block;vertical-align:middle"></span>',
+    done:    '<span style="color:#4ade80;font-weight:700">✓</span>',
+    skip:    '<span style="color:var(--muted)">–</span>',
+    error:   '<span style="color:#f87171;font-weight:700">✗</span>',
+  };
+  function rowsHtml() {
+    return _steps.map(s => {
+      const dim = (s.status === 'pending' || s.status === 'skip') ? 'opacity:0.55' : '';
+      const note = s.note ? `<span style="color:var(--muted);font-size:0.8rem;margin-left:auto">${esc(s.note)}</span>` : '';
+      return `<div style="display:flex;align-items:center;gap:12px;padding:9px 4px;border-bottom:1px solid var(--border);${dim}">
+        <span style="flex:0 0 20px;text-align:center">${ICON[s.status] || ICON.pending}</span>
+        <span style="font-size:0.92rem">${s.label}</span>${note}
+      </div>`;
+    }).join('');
+  }
+  function render() {
+    if (!_el) return;
+    const body = _el.querySelector('[data-role="rows"]');
+    if (body) body.innerHTML = rowsHtml();
+  }
+  function show(steps) {
+    close();
+    _start = Date.now(); _running = true;
+    _steps = steps.map(s => ({ ...s, status: 'pending', note: '' }));
+    _el = document.createElement('div');
+    Object.assign(_el.style, {
+      position: 'fixed', inset: '0', zIndex: '50000', padding: '20px',
+      background: 'rgba(8,10,18,0.82)', backdropFilter: 'blur(3px)',
+      display: 'flex', alignItems: 'center', justifyContent: 'center',
+    });
+    _el.innerHTML = `
+      <div style="background:var(--surface);border:1px solid var(--border);border-radius:14px;box-shadow:var(--shadow);width:480px;max-width:92vw;padding:22px 24px">
+        <div style="display:flex;align-items:center;gap:12px;margin-bottom:14px">
+          <span style="font-size:1.3rem">🤖</span>
+          <div style="flex:1">
+            <div style="font-weight:700;font-size:1.02rem">Автоматическая обработка сценария</div>
+            <div data-role="sub" style="font-size:0.8rem;color:var(--muted)">Не трогай ничего — идёт процесс…</div>
+          </div>
+          <span data-role="elapsed" style="font-family:ui-monospace,monospace;font-size:0.85rem;background:var(--surface2);border:1px solid var(--border);padding:3px 8px;border-radius:6px">0:00</span>
+        </div>
+        <div data-role="rows"></div>
+        <div data-role="foot" style="margin-top:16px;display:none;justify-content:flex-end">
+          <button class="btn-primary" data-role="close-btn">Закрыть</button>
+        </div>
+      </div>`;
+    document.body.appendChild(_el);
+    render();
+    // Swallow every keystroke (esp. Escape, which would close the modal) while
+    // the pipeline is running.
+    _keyBlock = (e) => { if (_running) { e.stopPropagation(); if (e.key === 'Escape') e.preventDefault(); } };
+    document.addEventListener('keydown', _keyBlock, true);
+    _timer = setInterval(() => {
+      if (!_el) return;
+      const sec = Math.floor((Date.now() - _start) / 1000);
+      const el = _el.querySelector('[data-role="elapsed"]');
+      if (el) el.textContent = `${Math.floor(sec / 60)}:${(sec % 60).toString().padStart(2, '0')}`;
+    }, 1000);
+    return { set, finish, fail, close };
+  }
+  function set(key, status, note) {
+    const s = _steps.find(x => x.key === key);
+    if (s) { s.status = status; if (note != null) s.note = note; }
+    render();
+  }
+  function _stopRunning() {
+    _running = false;
+    if (_timer) { clearInterval(_timer); _timer = null; }
+  }
+  function _showFoot(label) {
+    if (!_el) return;
+    const foot = _el.querySelector('[data-role="foot"]');
+    const btn = _el.querySelector('[data-role="close-btn"]');
+    if (btn) { btn.textContent = label || 'Закрыть'; btn.onclick = close; }
+    if (foot) foot.style.display = 'flex';
+  }
+  // Pipeline ran to the end. autoClose=true means episodes were already added
+  // and the modal closed — fade the overlay out on its own.
+  function finish(autoClose, msg) {
+    _stopRunning();
+    if (_el) {
+      const sub = _el.querySelector('[data-role="sub"]');
+      if (sub) sub.textContent = msg || '✅ Готово';
+    }
+    if (autoClose) { setTimeout(close, 1100); }
+    else { _showFoot('Закрыть'); }
+  }
+  function fail(msg) {
+    _stopRunning();
+    if (_el) {
+      const sub = _el.querySelector('[data-role="sub"]');
+      if (sub) { sub.innerHTML = `<span style="color:#f87171">✗ ${esc(msg || 'Ошибка')}</span>`; }
+    }
+    _showFoot('Закрыть');
+  }
+  function close() {
+    _stopRunning();
+    if (_keyBlock) { document.removeEventListener('keydown', _keyBlock, true); _keyBlock = null; }
+    if (_el) { _el.remove(); _el = null; }
+  }
+  return { show };
+})();
+
+// Runs adapt → logic → heal → add against the textarea, driving the overlay.
+// Throws on the first failing stage (caller marks the overlay failed).
+async function _runAppendPipeline(overlay) {
+  const ta = document.getElementById('append-script-text');
+  const getScript = () => (ta?.value || '').trim();
+  // 1) ADAPT TO STANDARD
+  if (autoPipeEnabled('adapt')) {
+    overlay.set('adapt', 'run');
+    const r = await api.post('/api/adapt-script-to-standard', { script: getScript() }, { timeoutMs: 180000 });
+    if (r.error) throw new Error('Подгонка под стандарт: ' + r.error);
+    if (r.script) { ta.dataset.preAdaptSnapshot = ta.value; ta.value = r.script; appendUpdateStats(); }
+    overlay.set('adapt', 'done');
+  } else { overlay.set('adapt', 'skip', 'выключено'); }
+  // 2) LOGIC CHECK + 3) HEAL ALL FOUND ISSUES
+  if (autoPipeEnabled('logic')) {
+    overlay.set('logic', 'run');
+    const lc = await api.post('/api/series/import-from-script/logic-check', { script: getScript() }, { timeoutMs: 120000 });
+    if (lc.error) throw new Error('Проверка логики: ' + lc.error);
+    const issues = lc.issues || [];
+    if (!issues.length) {
+      overlay.set('logic', 'done', 'чисто');
+      overlay.set('heal', 'skip', 'нет проблем');
+    } else {
+      overlay.set('logic', 'done', `${issues.length} замеч.`);
+      overlay.set('heal', 'run');
+      const fx = await api.post('/api/series/import-from-script/apply-fixes', { script: getScript(), issues }, { timeoutMs: 180000 });
+      if (fx.error) throw new Error('Лечение проблем: ' + fx.error);
+      if (fx.script) { ta.dataset.preFixSnapshot = ta.value; ta.value = fx.script; appendUpdateStats(); }
+      overlay.set('heal', 'done', `${fx.applied_count ?? issues.length} правок`);
+    }
+  } else {
+    overlay.set('logic', 'skip', 'выключено');
+    overlay.set('heal', 'skip', 'выключено');
+  }
+  // 4) ADD EPISODES
+  if (autoPipeEnabled('add')) {
+    overlay.set('add', 'run');
+    await _appendCommitScript();   // closes the modal + refreshes series on success
+    overlay.set('add', 'done');
+    overlay.finish(true);
+  } else {
+    overlay.set('add', 'skip', 'выключено');
+    overlay.finish(false, 'Готово — проверь сценарий и нажми «📜 Добавить серии».');
+  }
+}
+
 async function appendGenerateScript(btn) {
   if (!S.seriesId) { showToast('Открой сериал'); return; }
   const count = parseInt(document.getElementById('append-gen-count')?.value, 10) || 5;
@@ -1840,12 +2269,24 @@ async function appendGenerateScript(btn) {
     okStyle: 'accent',
   })) return;
 
+  // Decide whether the post-generation chain runs. If every stage is off in
+  // Настройки, we keep the old manual behavior (preview + manual buttons).
+  const usePipeline = autoPipeEnabled('adapt') || autoPipeEnabled('logic') || autoPipeEnabled('add');
+  const overlay = usePipeline ? AppendPipelineOverlay.show([
+    { key: 'generate', label: '✨ Генерация сценария' },
+    { key: 'adapt',    label: '🔧 Подгонка под стандарт' },
+    { key: 'logic',    label: '🧠 Проверка логики' },
+    { key: 'heal',     label: '🩹 Лечение проблем' },
+    { key: 'add',      label: '📜 Добавление серий' },
+  ]) : null;
+
   const orig = btn.innerHTML;
   btn.disabled = true;
   btn.innerHTML = '<span class="spinner"></span> Claude пишет…';
   if (statusEl) statusEl.innerHTML = `<span class="spinner"></span> Генерирую ${count} серий… ~${30 * count}-${90 * count}с`;
 
   try {
+    if (overlay) overlay.set('generate', 'run');
     const r = await api.post(
       `/api/series/${S.seriesId}/generate-script-batch`,
       { count, direction, duration_sec: durationSec, lines_count: linesCount, style: styleVal, max_main_chars_per_scene: maxChars, no_interruptions: noInterruptions },
@@ -1863,6 +2304,15 @@ async function appendGenerateScript(btn) {
     }
     // Auto-switch to paste mode so user sees the textarea + preview/logic buttons.
     setAppendMode('paste');
+    if (overlay) {
+      overlay.set('generate', 'done', `№${r.first_episode}–${r.last_episode}`);
+      // Re-enable the generate button now — the overlay blocks input anyway, and
+      // the chain may close the whole modal on success.
+      btn.disabled = false;
+      btn.innerHTML = orig;
+      await _runAppendPipeline(overlay);
+      return;
+    }
     showToast(`✓ Сгенерировано ${r.count} серий — проверяй и добавляй`, 6000);
     // Auto-fire preview so the user immediately sees the episode list AND
     // any non-English-dialogue warning (Claude occasionally drifts to RU
@@ -1872,8 +2322,9 @@ async function appendGenerateScript(btn) {
       setTimeout(() => appendPreviewSplit(), 50);
     }
   } catch (e) {
+    if (overlay) overlay.fail(e?.message || e);
     if (statusEl) statusEl.innerHTML = `<span style="color:#f87171">✗ Ошибка: ${esc(e?.message || e)}</span>`;
-    showToast('Ошибка генерации: ' + (e?.message || e), 6000);
+    showToast('Ошибка: ' + (e?.message || e), 6000);
   } finally {
     btn.disabled = false;
     btn.innerHTML = orig;
@@ -2560,33 +3011,44 @@ async function _refreshSeriesAfterOutfitSync() {
   } catch (e) { /* swallow */ }
 }
 
-async function appendScriptGo() {
+// Core commit: POST the textarea script as new episodes, close the modal and
+// refresh the series view. Throws on error (caller handles UI). Extracted from
+// appendScriptGo so the auto-pipeline can reuse it without the alert()/button
+// plumbing.
+async function _appendCommitScript() {
   const script = (document.getElementById('append-script-text')?.value || '').trim();
   const extract = !!document.getElementById('append-extract-entities')?.checked;
+  if (!script) throw new Error('Сценарий пустой — вставь текст или подгрузи файл');
+  const langHint = _LANG_WARN_KEPT['append-script-text'] || '';
+  const body = { script, extract_entities: extract };
+  if (langHint) body.dialogue_language_hint = langHint;
+  const r = await api.post(`/api/series/${S.seriesId}/append-from-script`, body);
+  if (r.error) throw new Error(r.error);
+  closeModal('modal-append-script');
+  _appendDraftClear();
+  const range = (r.first_episode === r.last_episode)
+    ? `№${r.first_episode}`
+    : `№${r.first_episode}–${r.last_episode}`;
+  showToast(`✓ Добавлено ${r.episodes_appended} серий (${range})${extract ? ' · извлечение запущено в фоне' : ''}`, 6000);
+  // Refresh series view so episodes show up in the list.
+  try {
+    S.episodes = await api.get(`/api/series/${S.seriesId}/episodes`);
+    S.series = await api.get(`/api/series/${S.seriesId}`);
+    renderEpisodesList();
+  } catch {}
+  if (extract) setTimeout(() => pollImportStatus(S.seriesId), 600);
+  return r;
+}
+
+async function appendScriptGo() {
+  const script = (document.getElementById('append-script-text')?.value || '').trim();
   if (!script) { alert('Сценарий пустой — вставь текст или подгрузи файл'); return; }
   const btn = document.getElementById('append-script-go-btn');
   const orig = btn.innerHTML;
   btn.disabled = true;
   btn.innerHTML = '<span class="spinner"></span> Добавляю...';
   try {
-    const langHint = _LANG_WARN_KEPT['append-script-text'] || '';
-    const body = { script, extract_entities: extract };
-    if (langHint) body.dialogue_language_hint = langHint;
-    const r = await api.post(`/api/series/${S.seriesId}/append-from-script`, body);
-    if (r.error) throw new Error(r.error);
-    closeModal('modal-append-script');
-    _appendDraftClear();
-    const range = (r.first_episode === r.last_episode)
-      ? `№${r.first_episode}`
-      : `№${r.first_episode}–${r.last_episode}`;
-    showToast(`✓ Добавлено ${r.episodes_appended} серий (${range})${extract ? ' · извлечение запущено в фоне' : ''}`, 6000);
-    // Refresh series view so episodes show up in the list.
-    try {
-      S.episodes = await api.get(`/api/series/${S.seriesId}/episodes`);
-      S.series = await api.get(`/api/series/${S.seriesId}`);
-      renderEpisodesList();
-    } catch {}
-    if (extract) setTimeout(() => pollImportStatus(S.seriesId), 600);
+    await _appendCommitScript();
   } catch (e) {
     alert('Ошибка: ' + (e?.message || e));
   } finally {
@@ -3065,6 +3527,10 @@ async function createSeries() {
   const title = val('new-series-title');
   if (!title) return alert('Введи название');
   const autogen = document.getElementById('new-series-autogen')?.checked ?? true;
+  // Episode duration target — clamp to writer-safe range [30, 240] to match
+  // the bible modal validation. Empty/blank → fall back to server default (60s).
+  const _durRaw = val('new-series-target-duration');
+  const target_duration_sec = _durRaw ? Math.max(30, Math.min(240, parseInt(_durRaw, 10))) : null;
   try {
     const data = await api.post('/api/series', {
       title, genre: val('new-series-genre'), tone: val('new-series-tone'),
@@ -3075,6 +3541,7 @@ async function createSeries() {
       batch_mode: false,
       batch_size: 1,
       writer_model: _selectedWriterModel('writer-model-create'),
+      target_duration_sec,
     });
     closeModal('modal-create-series');
     _createSeriesDraftClear();
@@ -4030,6 +4497,8 @@ function renderSeriesView() {
       <strong style="color:var(--text)">📚 Канон сериала</strong> <span style="opacity:0.7">— автоматическая проверка логики</span>
       <div id="canon-summary-stats" style="margin-top:4px;font-size:0.78rem">загрузка…</div>
     </div>
+    ${renderEraBanner(s)}
+    ${renderAnthroBanner(s)}
   `;
   loadCanonSummary();
   checkAutogenOnLoad();
@@ -4356,6 +4825,162 @@ async function resetStuckGenStatuses() {
   }
   renderEpisodesList();
   showToast(`✓ Сброшено ${reset} серий${failed ? ` (${failed} не удалось)` : ''}`, 5000);
+}
+
+function renderEraBanner(s) {
+  // Surface auto-detected historical/genre era so the user can accept,
+  // pick another, or refuse before any non-modern look is baked into
+  // character portraits. The server only applies the era to image-gen
+  // when era_confirmed === true; until then assets stay modern.
+  const detected = s._era_detected || '';
+  const label = s._era_detected_label || '';
+  const confirmed = !!s._era_confirmed;
+  const choice = s._era_choice || 'auto';
+  // Two distinct UI states:
+  //   1) Detected but not confirmed → SUGGESTION banner (yellow).
+  //   2) Confirmed with a specific era → settled INFO chip (subtle).
+  if (detected && !confirmed) {
+    return `
+      <div id="era-banner-suggest" style="margin-top:10px;padding:10px 12px;background:rgba(251,191,36,0.10);border:1px solid rgba(251,191,36,0.45);border-radius:6px;font-size:0.85rem">
+        <div style="margin-bottom:8px;line-height:1.4">
+          <strong style="color:#fbbf24">🏛 Эпоха сериала</strong> —
+          судя по описанию, вашему сериалу подходит эра <strong>«${esc(label)}»</strong>.
+          Это правильно? Если да, портреты персонажей будут сгенерированы в этом стиле.
+          Если нет — поставьте «Современность» или выберите другую эпоху.
+        </div>
+        <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">
+          <button class="btn btn-sm btn-primary" onclick="confirmEra('${detected}')">✓ Принять «${esc(label)}»</button>
+          <button class="btn btn-sm btn-ghost" onclick="confirmEra('modern')">Современность</button>
+          <select id="era-other-pick" style="font-size:0.82rem;padding:5px 8px;background:var(--bg-elev,#1a1a24);color:var(--text);border:1px solid var(--border,#333);border-radius:4px" onchange="if(this.value)confirmEra(this.value)">
+            <option value="">Выбрать другую эпоху…</option>
+            ${(s._era_options || []).map(o => `<option value="${o.key}" ${o.key===detected?'disabled':''}>${esc(o.label)}</option>`).join('')}
+          </select>
+        </div>
+      </div>
+    `;
+  }
+  // Confirmed-state chip — only show when user has explicitly picked something
+  // non-modern (modern is the silent default so no chip needed).
+  if (confirmed && choice && choice !== 'modern' && choice !== 'auto' && choice !== 'none') {
+    const chipLabel = (s._era_options || []).find(o => o.key === choice)?.label || choice;
+    return `
+      <div style="margin-top:10px;padding:6px 10px;background:rgba(132,94,247,0.06);border:1px solid rgba(132,94,247,0.25);border-radius:6px;font-size:0.82rem;display:flex;align-items:center;gap:8px">
+        <span>🏛 Эпоха: <strong>${esc(chipLabel)}</strong></span>
+        <button class="btn btn-sm btn-ghost" style="margin-left:auto;font-size:0.75rem" onclick="confirmEra('modern')">Сменить на современность</button>
+      </div>
+    `;
+  }
+  return '';
+}
+
+function renderAnthroBanner(s) {
+  // Surface auto-detected anthropomorphic (furry) world so the user can
+  // accept or refuse BEFORE any species features are propagated to side
+  // characters. Same safe-default-modern pattern as the era banner: until
+  // the user explicitly confirms, asset generation stays human-world.
+  const detected = !!s._anthro_detected;
+  const confirmed = !!s._anthro_confirmed;
+  const choice = s._anthro_choice || 'auto';
+  const evidence = s._anthro_evidence || [];
+  // SUGGEST: detector says yes, user hasn't picked → ask.
+  if (detected && !confirmed) {
+    return `
+      <div id="anthro-banner-suggest" style="margin-top:10px;padding:10px 12px;background:rgba(251,191,36,0.10);border:1px solid rgba(251,191,36,0.45);border-radius:6px;font-size:0.85rem">
+        <div style="margin-bottom:6px;line-height:1.4">
+          <strong style="color:#fbbf24">🐺 Анимало-мир (furry)?</strong> —
+          в сериале обнаружены признаки антропоморфного мира.
+        </div>
+        ${evidence.length ? `<div style="margin-bottom:8px;font-size:0.8rem;color:var(--muted)">Что увидел детектор: ${evidence.map(esc).join('; ')}.</div>` : ''}
+        <div style="margin-bottom:8px;line-height:1.4">
+          Если это сериал про <strong>фурри / зверолюдей</strong> — нажми «Да, фурри-мир».
+          Если про <strong>обычных людей</strong> — нажми «Нет, человеческий мир» (опционально сбросит звериные черты у уже созданных персонажей и портретов).
+        </div>
+        <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">
+          <button class="btn btn-sm btn-primary" onclick="confirmAnthro('anthro')">✓ Да, фурри-мир</button>
+          <button class="btn btn-sm btn-ghost" onclick="confirmAnthro('human')">Нет, человеческий мир</button>
+        </div>
+      </div>
+    `;
+  }
+  // INFO chip — anthro confirmed.
+  if (confirmed && choice === 'anthro') {
+    return `
+      <div style="margin-top:10px;padding:6px 10px;background:rgba(132,94,247,0.06);border:1px solid rgba(132,94,247,0.25);border-radius:6px;font-size:0.82rem;display:flex;align-items:center;gap:8px">
+        <span>🐺 Мир: <strong>антропоморфные животные</strong></span>
+        <button class="btn btn-sm btn-ghost" style="margin-left:auto;font-size:0.75rem" onclick="confirmAnthro('human')">Сделать человеческим</button>
+      </div>
+    `;
+  }
+  return '';
+}
+
+async function confirmAnthro(choice) {
+  const sid = S.seriesId;
+  if (!sid) return;
+  const hasPortraits = (S.series.characters || []).some(c => (c.ref_images || []).length > 0);
+  let stripSpecies = true;
+  let clearPortraits = false;
+  if (choice === 'human') {
+    // For a switch to human world — offer to strip species markers AND
+    // optionally wipe portraits. Default: strip yes, wipe portraits only
+    // if user wants to regenerate.
+    if (hasPortraits) {
+      clearPortraits = confirm(
+        'Сбросить уже сгенерированные звериные портреты, чтобы перегенерировать персонажей как людей?\n\n' +
+        'OK — удалить и перегенерировать.\n' +
+        'Cancel — оставить старые портреты (только описания будут очищены).'
+      );
+    }
+  }
+  try {
+    const r = await api.post(`/api/series/${sid}/anthro`, {
+      choice, strip_species: stripSpecies, clear_portraits: clearPortraits,
+    });
+    if (r && r.ok) {
+      const fresh = await api.get(`/api/series/${sid}`);
+      S.series = fresh;
+      renderSeriesView();
+      if ((r.cleared_portraits || []).length) {
+        try { triggerAutogenSweep && triggerAutogenSweep(); } catch {}
+      }
+    }
+  } catch (e) {
+    alert('Не удалось сохранить выбор мира: ' + (e?.message || e));
+  }
+}
+
+async function confirmEra(choice) {
+  const sid = S.seriesId;
+  if (!sid) return;
+  // When switching AWAY from a confirmed non-modern era OR accepting a
+  // detected one, ask whether to wipe existing portraits — they were
+  // generated under the wrong era and would otherwise stay stale.
+  const prevChoice = S.series._era_choice || 'auto';
+  const prevConfirmed = !!S.series._era_confirmed;
+  const hasPortraits = (S.series.characters || []).some(c => (c.ref_images || []).length > 0);
+  let clearPortraits = false;
+  if (hasPortraits && (choice !== prevChoice) && (prevConfirmed || S.series._era_detected)) {
+    clearPortraits = confirm(
+      'Удалить уже сгенерированные портреты персонажей, чтобы перегенерировать их под новую эпоху?\n\n' +
+      'OK — удалить и перегенерировать с новым стилем.\n' +
+      'Cancel — оставить как есть (старые фото останутся, новый стиль применится только к новым).'
+    );
+  }
+  try {
+    const r = await api.post(`/api/series/${sid}/era`, { choice, clear_portraits: clearPortraits });
+    if (r && r.ok) {
+      // Refresh series so banner state + portrait list reflect the new choice.
+      const fresh = await api.get(`/api/series/${sid}`);
+      S.series = fresh;
+      renderSeriesView();
+      if ((r.cleared_portraits || []).length) {
+        // Optional: kick autogen so user doesn't have to click manually.
+        try { triggerAutogenSweep && triggerAutogenSweep(); } catch {}
+      }
+    }
+  } catch (e) {
+    alert('Не удалось сохранить выбор эпохи: ' + (e?.message || e));
+  }
 }
 
 function renderCharactersList() {
@@ -5315,7 +5940,15 @@ function _renderFacadesList(facades, status) {
   // Status banner
   if (status?.running) {
     stEl.style.display = '';
-    stEl.innerHTML = `<span class="spinner"></span> Генерирую: ${status.done || 0}/${status.total || 0}${status.current ? ' · ' + esc(status.current) : ''}`;
+    if (status.phase === 'grouping') {
+      // Pre-render phase: Claude is clustering locations into building groups.
+      // No total/done counter is meaningful yet — show a generic message so
+      // the user knows something is happening (the modal would otherwise
+      // render «ещё нет фасадов» for 3-5s while Claude responds).
+      stEl.innerHTML = `<span class="spinner"></span> 🤖 Авто-группирую локации по зданиям…`;
+    } else {
+      stEl.innerHTML = `<span class="spinner"></span> Генерирую: ${status.done || 0}/${status.total || 0}${status.current ? ' · ' + esc(status.current) : ''}`;
+    }
   } else if (status?.errors?.length) {
     stEl.style.display = '';
     stEl.innerHTML = `⚠ Завершено с ошибками (${status.errors.length}): ${status.errors.slice(0, 2).map(e => esc(e.building || '') + ' — ' + esc(e.error || '')).join('; ')}`;
@@ -5351,7 +5984,13 @@ function _renderFacadesList(facades, status) {
       </div>
     </div>` : '';
   if (!facades.length) {
-    host.innerHTML = ungroupedHtml + '<div style="font-size:0.86rem;color:var(--muted);padding:24px;text-align:center">Ещё нет сгенерированных фасадов. Нажми «🤖 Сгруппировать локации» чтобы Claude разбил по зданиям ИЛИ выбери конкретную локацию выше для одного фасада.</div>';
+    // While auto-grouping is in flight, suppress the «ещё нет» CTA — the
+    // banner above already says «Авто-группирую…» and the locations list
+    // will populate within seconds. Showing both would be contradictory.
+    const emptyCta = status?.running
+      ? '<div style="font-size:0.86rem;color:var(--muted);padding:24px;text-align:center">⏳ Группировка идёт автоматически — фасады появятся через несколько секунд.</div>'
+      : '<div style="font-size:0.86rem;color:var(--muted);padding:24px;text-align:center">Ещё нет сгенерированных фасадов. Нажми «🤖 Сгруппировать локации» чтобы Claude разбил по зданиям ИЛИ выбери конкретную локацию выше для одного фасада.</div>';
+    host.innerHTML = ungroupedHtml + emptyCta;
     return;
   }
   host.innerHTML = ungroupedHtml + facades.map(f => {
@@ -7832,20 +8471,19 @@ function _parseScriptScenes(scriptText, overrides) {
   //   Pass 2 (merge tiny): post-walk segments. Any segment < MIN_SEGMENT gets
   //     merged into a neighbour if the combined size stays ≤ HARD_MAX.
   const TARGET = 14.0;          // aim around this (informational)
-  const SOFT_MAX = 16.0;        // primary pack threshold. Bumped beyond the
-                                // 15s Seedance limit so Pass 1 packs into the
-                                // luft zone directly (chunks at 15-16s show ⚡
-                                // and ride slightly-compressed pacing). Was 14.5
-                                // → many chunks ended at 11-14s with a small
-                                // tail next door; now they grow to ~15-16s
-                                // and absorb that tail naturally.
+  const LUFT_MAX_SEC = 18.5;    // Hard ceiling everywhere (Pass 1 break threshold,
+                                // Pass 3 luft-merge, Pass 5 line-pull, Pass 7
+                                // final sweep). Seedance hard-caps at 15s, but
+                                // a 15-18.5s content chunk renders fine —
+                                // characters just speak ~20% faster. Trading
+                                // up to 3.5s of pacing tightness for fewer
+                                // generation cycles is a clear net win.
+                                // Was 17 (2s luft) → bumped to 18.5 (3.5s luft).
+  const SOFT_MAX = LUFT_MAX_SEC; // Pack directly to luft from Pass 1 — no
+                                // separate "soft" threshold. Pass 3/5/7 only
+                                // touch up edge cases (small leftover tails).
   const MIN_SEGMENT_SEC = 5.0;  // smaller than this = wasted Seedance chunk
   const HARD_MAX_SEC = 14.5;    // absolute ceiling for Pass-2 small-segment merges
-  const LUFT_MAX_SEC = 17.0;    // Pass-3 luft-merge ceiling. Seedance hard-caps
-                                // at 15s, but a 16-17s content chunk renders
-                                // fine — characters just speak slightly faster.
-                                // Trading 1-2s of pacing tightness for one
-                                // fewer generation cycle is a clear net win.
   // Speaker cue detector — a line that's ONLY a character-name cue, no
   // dialogue text. Two formats supported:
   //   (a) Classic screenplay ALL-CAPS:  ETHAN  / ETHAN (CONT'D) / ETHAN (V.O.)
@@ -8052,6 +8690,61 @@ function _parseScriptScenes(scriptText, overrides) {
         _lm2++;
       }
     }
+
+    // Pass 8 (de-dangle speaker cues): after every merge/shuffle above, a
+    // chunk may END with a speaker cue (+ trailing tone-note parentheticals)
+    // whose actual dialogue line landed in the NEXT chunk. That orphans the
+    // cue — the next chunk opens with a dialogue line and nobody knows who's
+    // speaking. Real user bug: chunk ends «VERA / (coldly)» and the next chunk
+    // starts «Helen signed the documents…».
+    //
+    // Pass-1 already pulls a cue forward, but ONLY when the cue sits
+    // IMMEDIATELY before the break. A parenthetical between cue and dialogue
+    // («VERA / (coldly) / Helen…») defeats it, and later merge passes can
+    // re-separate a cue from its payload. So we sweep one more time here,
+    // after the layout is final.
+    //
+    // "Glue" lines = speaker cues + parenthetical tone-notes (these attach to
+    // the FOLLOWING dialogue). We collect the trailing glue run at each
+    // chunk's tail; if it contains a speaker cue, we move everything from the
+    // first such cue onward into the next chunk. Moving these (≤0.4s each)
+    // never meaningfully affects luft but guarantees cue+payload stay paired.
+    {
+      const _isParenOnly = (text) => /^\(.+\)\.?$/.test((text || '').trim());
+      // Snapshot per-segment line indices in document order.
+      const segLineIdxs = [];
+      for (let li = 0; li < sc.lines.length; li++) {
+        const s = sc.lines[li].segIdx;
+        while (segLineIdxs.length <= s) segLineIdxs.push([]);
+        segLineIdxs[s].push(li);
+      }
+      // Last segment has no "next" chunk to host the cue — skip it.
+      for (let s = 0; s < segLineIdxs.length - 1; s++) {
+        const lis = segLineIdxs[s];
+        if (lis.length < 2) continue;
+        // Walk backward over the trailing glue run (cues + parentheticals).
+        let k = lis.length - 1;
+        while (k >= 0) {
+          const txt = sc.lines[lis[k]].text;
+          if (_isSpeakerCue(txt) || _isParenOnly(txt) || sc.lines[lis[k]].duration <= 0.01) {
+            k--;
+          } else {
+            break;
+          }
+        }
+        // Trailing glue run is lis[k+1 .. end]. Find the first speaker cue in it.
+        let cueAt = -1;
+        for (let m = k + 1; m < lis.length; m++) {
+          if (_isSpeakerCue(sc.lines[lis[m]].text)) { cueAt = m; break; }
+        }
+        if (cueAt <= 0) continue;            // no dangling cue, or it would empty the chunk
+        // Push cue + everything after it into the next chunk (prepends in
+        // correct document order since these are the segment's last lines).
+        for (let m = cueAt; m < lis.length; m++) {
+          sc.lines[lis[m]].segIdx = s + 1;
+        }
+      }
+    }
     sc.segCount = sc.lines.length ? (sc.lines[sc.lines.length - 1].segIdx + 1) : 0;
   }
 
@@ -8244,13 +8937,14 @@ function _renderScenesHTML(scenes, coverage = []) {
         // Compute this segment's total seconds for the toolbar summary
         const segLines = sc.lines.filter(x => x.segIdx === l.segIdx);
         const segTotal = segLines.reduce((s, x) => s + x.duration, 0);
-        // Two-tier warning. Segments in (15, 17]s were intentionally luft-merged
-        // by Pass 3 (one fewer Seedance call, characters speak slightly faster
-        // — accepted). Only >17s is a real overflow that won't fit cleanly.
-        const overflowWarn = segTotal > 17.0
+        // Two-tier warning. Segments in (15, 18.5]s were intentionally luft-merged
+        // by Pass 3/5/7 (one fewer Seedance call, characters speak ~20% faster
+        // — accepted up to 3.5s overflow). Only >18.5s is a real overflow that
+        // won't fit cleanly and needs manual splitting.
+        const overflowWarn = segTotal > 18.5
           ? `<span class="ep-seg-warn" title="Содержимое сильно выходит за 15-сек лимит Seedance — нужна ручная разбивка">${segTotal.toFixed(1)}с ⚠</span>`
           : segTotal > 15.0
-          ? `<span class="ep-seg-dur ep-seg-luft" title="Luft-merge: 16-17с контента в 15-сек чанке — пацинг будет слегка ускоренный">${segTotal.toFixed(1)}с ⚡</span>`
+          ? `<span class="ep-seg-dur ep-seg-luft" title="Luft-merge: 15-18.5с контента в 15-сек чанке — пацинг будет слегка ускоренный">${segTotal.toFixed(1)}с ⚡</span>`
           : `<span class="ep-seg-dur" title="Расчётная длительность сегмента">${segTotal.toFixed(1)}с</span>`;
         // First-line anchor of this segment for the MERGE button (per-line, OK
         // if it shifts when the user edits text — merge is a local operation).
@@ -13611,6 +14305,13 @@ async function openSettings() {
   if (voiceCb) voiceCb.checked = Sounds.isVoiceEnabled();
   const mlgCb = document.getElementById('settings-mlg-hitmarker');
   if (mlgCb) mlgCb.checked = Sounds.isHitmarkerEnabled();
+  // Auto-pipeline toggles (default ON).
+  const apA = document.getElementById('settings-auto-pipe-adapt');
+  const apL = document.getElementById('settings-auto-pipe-logic');
+  const apD = document.getElementById('settings-auto-pipe-add');
+  if (apA) apA.checked = autoPipeEnabled('adapt');
+  if (apL) apL.checked = autoPipeEnabled('logic');
+  if (apD) apD.checked = autoPipeEnabled('add');
   // Turbo-engine radio — sync with current localStorage choice.
   const teCur = _turboEngine();
   const teP = document.getElementById('turbo-engine-parallel');
@@ -13680,6 +14381,13 @@ async function saveSettings() {
   if (voiceCb) Sounds.setVoiceEnabled(!!voiceCb.checked);
   const mlgCb = document.getElementById('settings-mlg-hitmarker');
   if (mlgCb) Sounds.setHitmarkerEnabled(!!mlgCb.checked);
+  // Auto-pipeline toggles.
+  const apA = document.getElementById('settings-auto-pipe-adapt');
+  const apL = document.getElementById('settings-auto-pipe-logic');
+  const apD = document.getElementById('settings-auto-pipe-add');
+  if (apA) setAutoPipeEnabled('adapt', !!apA.checked);
+  if (apL) setAutoPipeEnabled('logic', !!apL.checked);
+  if (apD) setAutoPipeEnabled('add', !!apD.checked);
   closeModal('modal-settings');
   loadBalance();
 }
@@ -15510,17 +16218,40 @@ async function sdGenerate() {
     if (SD._continuityResetReason) {
       startBody.continuity_reset_reason = SD._continuityResetReason;
     }
-    const res = await api.post(
-      `/api/series/${S.seriesId}/episodes/${S.episode.number}/seedance/start`,
-      startBody
-    );
+    const startUrl = `/api/series/${S.seriesId}/episodes/${S.episode.number}/seedance/start`;
+    let res;
+    try {
+      res = await api.post(startUrl, startBody);
+    } catch (e) {
+      // Precheck false-positive escape hatch: backend's Haiku precheck is
+      // conservative on self-harm-adjacent scenes (e.g. character holding a
+      // pill bottle). Show reasoning + suggestion and let the user override
+      // via skip_precheck. Without this the toast only shows the bare code.
+      if (e?.payload?.error === 'moderation_precheck_reject') {
+        const pc = e.payload.precheck || {};
+        const ok = window.confirm(
+          '⚠ Pre-flight модерация Seedance отклонила промпт.\n\n' +
+          'Причина: ' + (pc.reasoning || '—') + '\n' +
+          (pc.categories?.length ? 'Категории: ' + pc.categories.join(', ') + '\n' : '') +
+          'Подсказка: ' + (pc.suggestion || '—') + '\n\n' +
+          'Отправить всё равно? (Seedance может всё же отклонить — но если это false positive, прорвётся.)'
+        );
+        if (!ok) throw e;
+        res = await api.post(startUrl, { ...startBody, skip_precheck: true });
+        showToast(`▶ Чанк #${res.chunk?.idx ?? '?'} в очереди (precheck bypassed)`);
+        await sdRefreshList();
+        sdEnsurePoll();
+        return;
+      }
+      throw e;
+    }
     showToast(`▶ Чанк #${res.chunk?.idx ?? '?'} в очереди — можно листать дальше, генерация 1-15 мин`);
     // Не очищаем prompt/chunk_text/refs — часто хочется доработать тот же промпт
     // и сгенерировать вариацию. Хочешь чистый лист — кнопка ↻ Reuse / руками.
     await sdRefreshList();
     sdEnsurePoll();
   } catch (e) {
-    showToast('✗ Ошибка запуска: ' + (e.message || e));
+    showToast('✗ Ошибка запуска: ' + (e.message || e), 8000);
     await sdRefreshList();
   } finally {
     if (btn) { btn.disabled = false; btn.innerHTML = oldHtml || '▶ Сгенерировать'; }
