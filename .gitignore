@@ -34,3 +34,7 @@ concat_*.txt
 # User data — never commit
 data/
 *.orig
+
+# Conversation / session exports — not part of the app
+last_*_turns.md
+last_*_turns.docx
