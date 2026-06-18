@@ -1027,6 +1027,62 @@
         </div>
         <div id="genre-tooltip" class="genre-tooltip hidden"></div>
 
+        <!-- Scenario constructor (ноды) — an ORDERED skeleton of hook-beats. The 5
+             ideas unfold through them in order; episode generation marches the opening
+             episodes through them in sequence, then improvises. Replaces завязки. -->
+        <details id="beat-constructor-block" style="margin-top:8px;background:rgba(132,94,247,0.04);border:1px solid rgba(132,94,247,0.15);border-radius:8px;padding:6px 12px">
+          <summary style="cursor:pointer;font-size:0.82rem;color:var(--muted);user-select:none">
+            🧩 Конструктор сценария <span id="beat-count" style="color:var(--accent,#845ef7)"></span>
+            <span style="color:var(--muted);font-weight:400"> — собери порядок хук-сцен, с которых стартует сюжет (опционально)</span>
+          </summary>
+          <!-- Chosen ordered sequence -->
+          <div id="beat-sequence-list" style="margin-top:8px;display:flex;flex-direction:column;gap:5px"></div>
+          <!-- Custom beat input -->
+          <div style="display:flex;gap:6px;margin-top:8px">
+            <input id="beat-custom-input" type="text" placeholder="Своя нода (например: «Тайный близнец возвращается»)…"
+              onkeydown="if(event.key==='Enter'){event.preventDefault();addCustomBeat();}"
+              style="flex:1;font-size:0.82rem;padding:5px 8px;background:#1a1a1f;border:1px solid #333;border-radius:6px;color:#eee">
+            <button type="button" class="btn-ghost" onclick="addCustomBeat()" style="font-size:0.82rem;padding:4px 10px;white-space:nowrap">+ добавить</button>
+          </div>
+          <!-- Palette of catalog beats grouped by section -->
+          <div style="font-size:0.74rem;color:var(--muted);margin:10px 0 2px;font-weight:600">Каталог хук-сцен — клик добавляет в конец последовательности:</div>
+          <div id="beat-palette" class="genre-filter-block" style="margin-top:4px"></div>
+          <div style="font-size:0.72rem;color:var(--muted);margin-top:6px">Пример порядка: Измена → Узнаёт что беременна → Выгнали под дождь → Роман с миллиардером → Месть. Первые серии пойдут строго по этому порядку, пока ноды не закончатся — дальше полная импровизация. Можно оставить пустым.</div>
+        </details>
+
+        <!-- Era + world setting — applied to «5 идей» and «по идее». Default = современность + реалистичный. -->
+        <div style="margin-top:8px;display:flex;gap:10px;flex-wrap:wrap">
+          <label style="flex:1;min-width:170px;font-size:0.85rem;color:var(--muted);display:flex;flex-direction:column;gap:4px">🕰 Эпоха
+            <select id="series-era" onchange="_toggleCustomEra()" style="font-size:0.85rem;padding:5px 6px;background:#1a1a1f;border:1px solid #333;border-radius:6px;color:#eee">
+              <option value="modern" selected>Современность</option>
+              <option value="near_future">Ближайшее будущее</option>
+              <option value="1980s">1980-е</option>
+              <option value="1950s">1950-е</option>
+              <option value="1920s">1920-е (эпоха джаза)</option>
+              <option value="victorian">Викторианская эпоха / 1800-е</option>
+              <option value="medieval">Средневековье</option>
+              <option value="ancient">Античность</option>
+              <option value="far_future">Далёкое будущее / космос</option>
+              <option value="__custom__">✏️ Своя эпоха…</option>
+            </select>
+            <input id="series-era-custom" class="hidden" type="text" placeholder="например: 1970-е, СССР"
+              style="font-size:0.85rem;padding:5px 6px;background:#1a1a1f;border:1px solid #333;border-radius:6px;color:#eee">
+          </label>
+          <label style="flex:1;min-width:170px;font-size:0.85rem;color:var(--muted);display:flex;flex-direction:column;gap:4px">🌍 Сеттинг
+            <select id="series-world" onchange="_toggleCustomWorld()" style="font-size:0.85rem;padding:5px 6px;background:#1a1a1f;border:1px solid #333;border-radius:6px;color:#eee">
+              <option value="realistic" selected>Реалистичный</option>
+              <option value="fantasy">Фэнтези</option>
+              <option value="scifi">Sci-Fi</option>
+              <option value="supernatural">Сверхъестественное / мистика</option>
+              <option value="postapoc">Постапокалипсис</option>
+              <option value="dystopian">Антиутопия</option>
+              <option value="__custom__">✏️ Свой сеттинг…</option>
+            </select>
+            <input id="series-world-custom" class="hidden" type="text" placeholder="например: стимпанк, нуар"
+              style="font-size:0.85rem;padding:5px 6px;background:#1a1a1f;border:1px solid #333;border-radius:6px;color:#eee">
+          </label>
+        </div>
+
         <div style="margin-top:6px;display:flex;justify-content:space-between;align-items:center;gap:8px">
           <label style="font-size:0.85rem;color:var(--muted);display:inline-flex;align-items:center;gap:4px"
                  title="Сценарист-LLM. Claude — текущий дефолт, заточен под наш формат. GPT-5.5 — альтернатива, может выдавать другой стиль. Влияет на «5 идей» / «по идее» здесь и на синопсисы/скрипты эпизодов далее.">🖋 Сценарист:

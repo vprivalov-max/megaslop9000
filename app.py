@@ -1466,8 +1466,12 @@ def _build_image_tag_remap(original_refs: list, final_refs: list) -> dict:
 # spatially-consistent `episodeBlocking` injected, banlist replacements applied
 # for moderation, and validation warnings caught programmatically.
 
-# 21 replacements that catch Seedance moderation triggers without losing
-# narrative meaning. Kept in lock-step with reference (chunk-builder.ts:199-221).
+# Replacements that catch Seedance moderation triggers without losing narrative
+# meaning. Originally 21 ported in lock-step with reference
+# (chunk-builder.ts:199-221); since extended with the violence verbs the
+# reference omitted (slaughter/massacre/behead/strangle/… — the ep22 "slaughter"
+# leak, Jun 2026) so the visual-prompt sanitizer matches the dialogue detector's
+# trigger lexicon (_MOD_TRIGGER_GROUPS).
 _SD_BANLIST = [
     (re.compile(r'\b(shoots?|fires?|shooting|firing)\b', re.IGNORECASE), 'muzzle flash illuminates'),
     (re.compile(r'\b(guns?|pistols?|rifles?|weapons?)\b', re.IGNORECASE), 'tactical equipment'),
@@ -1476,6 +1480,8 @@ _SD_BANLIST = [
     (re.compile(r'\b(attacks?|attacking|attacked)\b', re.IGNORECASE), 'closes distance'),
     (re.compile(r'\b(fights?|fighting|fought|punch(?:es|ed|ing)?|kick(?:s|ed|ing)?|strikes?|hits?|beats?)\b', re.IGNORECASE), 'impact'),
     (re.compile(r'\b(kills?|killing|killed|murders?|murdered)\b', re.IGNORECASE), 'falls still'),
+    (re.compile(r'\b(slaughters?|slaughtered|slaughtering|massacres?|massacred|massacring|butchers?|butchered|beheads?|beheaded|slays?|slain|assassinates?|assassinated)\b', re.IGNORECASE), 'overpowers'),
+    (re.compile(r'\b(strangles?|strangled|strangling|chokes?|choked|choking|drowns?|drowned|drowning|tortures?|tortured|torturing)\b', re.IGNORECASE), 'overpowers'),
     (re.compile(r'\b(dies?|dying|dead|death)\b', re.IGNORECASE), 'final moment'),
     (re.compile(r'\b(corpse|corpses|dead body|dead bodies)\b', re.IGNORECASE), 'motionless figure on the ground'),
     (re.compile(r'\b(blood|bleeds?|bleeding|bled)\b', re.IGNORECASE), 'crimson liquid'),
@@ -1985,6 +1991,63 @@ def _strip_vague_clothing_tail(appearance: str) -> str:
     return appearance
 
 
+# Concrete garment nouns (EN + RU). Unlike _VAGUE_CLOTHING_TAIL_RE these name a
+# SPECIFIC item, so a clause "<intro cue> … <garment>" is a real wardrobe
+# statement we must excise before appending an authoritative outfit.
+_GARMENT_NOUN = (
+    r'(?:dress(?:es)?|gown|apron|cloak|cape|robe|suit|shirt|blouse|skirt'
+    r'|trousers?|pants|jeans|coat|jacket|uniform|armou?r|tunic|vest|sweater'
+    r'|jumper|hoodie|t-?shirt|tee|slip|nightgown|nightdress|nightshirt'
+    r'|pyjamas|pajamas|boots?|shoes?|heels?|sandals?|slippers?|gloves?|hat'
+    r'|cap|bonnet|scarf|shawl|veil|tie|kimono|sari|overalls|dungarees'
+    r'|leggings|shorts|jumpsuit|romper|bodice|corset|petticoat|frock|smock'
+    r'|breeches|doublet|waistcoat|sash|kaftan|caftan|turban|headscarf'
+    r'|cardigan|blazer|trench|parka|anorak|poncho|toga|loincloth|garb'
+    r'|tuxedo|tux|kilt|cassock|habit|negligee|camisole|stockings|tights'
+    r'|socks?|bowtie|bow\s+tie|tiara|crown|diadem|circlet|brooch|sarong'
+    r'|jodhpurs|chemise|kirtle|surcoat|mantle|wrap|gauntlets?'
+    r'|платье\w*|рубаш\w*|костюм\w*|плащ\w*|пальто|куртк\w*|юбк\w*|брюк\w*'
+    r'|джинс\w*|сапог\w*|туфл\w*|перчатк\w*|шляп\w*|шарф\w*|мундир\w*'
+    r'|форм\w*|фартук\w*|сарафан\w*|пиджак\w*|корон\w*|диадем\w*|брошь\w*)'
+)
+
+# A clothing clause ANYWHERE in the appearance string: an intro cue followed
+# (within the same clause, before the next , ; .) by a concrete garment. Once a
+# clause is known to be wardrobe, consume the REST of that clause — so compound
+# garments ("frock coat"), connected items ("dress with white apron"), and
+# trailing accessories ("gown with an emerald tiara") all go together. The
+# garment-noun gate keeps non-clothing "in …" phrases ("in a wheelchair",
+# "in her thirties", "needle in hand") from matching at all.
+_CLOTHING_CLAUSE_RE = re.compile(
+    r'(?:[,;]\s*|\s+|^)'
+    r'(?:wearing|dressed\s+in|clad\s+in|sporting|donning|attired\s+in'
+    r'|одет\w*\s+в|носит|in|в)\s+'
+    r'(?:(?:a|an|the|her|his|their|its|some|plain|simple|её|его|их)\s+)?'
+    r'[^,;.]*?\b' + _GARMENT_NOUN + r'\b'
+    r'[^,;.]*',
+    flags=re.IGNORECASE,
+)
+
+
+def _strip_concrete_clothing(appearance: str) -> str:
+    """Remove every concrete clothing clause from an appearance string, leaving
+    only the PERSON (face / build / hair / role). Run before appending an
+    authoritative outfit description so BINDING never lists two outfits at once
+    — the root cause of Seedance rendering a hybrid wardrobe (Elena
+    "grey seamstress dress + black Dark Cloak", Jun 2026; same class as the
+    Claire & Lydia incidents, whose narrow `wearing…$` fix missed the
+    "in a … dress" phrasing). Strips clauses in ANY phrasing, ANYWHERE in the
+    sentence — not just a trailing `wearing …`."""
+    if not appearance:
+        return appearance
+    candidate = _CLOTHING_CLAUSE_RE.sub('', appearance)
+    # Tidy punctuation left behind by removing a mid-sentence clause.
+    candidate = re.sub(r'\s+', ' ', candidate)
+    candidate = re.sub(r'\s*,\s*(?=,|\.|;|$)', '', candidate)
+    candidate = candidate.replace(' ,', ',').replace(' .', '.').replace(' ;', ';')
+    return candidate.strip(' ,;.').strip()
+
+
 def _canonical_char_description(s, char_id, outfit_label):
     """Canonical description used BOTH for image generation AND for Seedance
     BINDING — same text in both places guarantees visual+textual alignment.
@@ -2050,19 +2113,30 @@ def _canonical_char_description(s, char_id, outfit_label):
         # the base outfit description (cast-block parser embeds "wearing X" into
         # appearance when IS_BASE is set without a separate outfit entry). Trust
         # appearance as-is — don't pollute with a random outfit.
-    # When switching to a NON-base outfit (hospital_gown for an episode where
-    # the character is in hospital), strip the embedded "wearing <base outfit>"
-    # tail from appearance so we don't end up with two outfits at once. Without
-    # this, BINDING would say "Claire wearing charcoal grey blazer; pale blue
-    # hospital gown" — Seedance renders a hybrid (May 2026 Claire incident).
-    if using_non_base_outfit and appearance:
-        appearance = re.sub(
-            r'\s*,?\s*wearing\b[^.;]*$', '', appearance, flags=re.IGNORECASE
-        ).rstrip(' ,;.').strip()
+    # Whenever we have an authoritative outfit description to append, the
+    # appearance must contribute ONLY the person — strip any clothing it embeds,
+    # in ANY phrasing ("in a grey dress", "wearing X", "dressed in Y", "в платье").
+    # Otherwise BINDING lists two outfits at once and Seedance renders a hybrid
+    # (Elena grey-seamstress-dress + Dark-Cloak, Jun 2026; Claire & Lydia before
+    # that). Applies to base outfits too: if a separate IS_BASE outfit_desc
+    # exists, the clothing baked into `appearance` is redundant — drop it so the
+    # outfit asset is the single source of wardrobe truth.
+    _ = using_non_base_outfit  # historical flag; clothing strip now keys off outfit_desc
+    if outfit_desc and appearance:
+        appearance = _strip_concrete_clothing(appearance)
     parts = [p for p in (appearance, outfit_desc) if p]
     full = '; '.join(parts)
     # Strip stray newlines and cap length to keep BINDING manageable
     full = re.sub(r'\s+', ' ', full).strip()
+    # Safety net: if a clothing phrasing slipped past the stripper, surface it
+    # in the log instead of silently shipping a double-wardrobe BINDING.
+    if outfit_desc and appearance and re.search(r'\b' + _GARMENT_NOUN + r'\b', appearance, re.IGNORECASE):
+        try:
+            _log_event('WARN', 'binding_residual_clothing',
+                       char_id=char_id, outfit=(outfit_label or ''),
+                       residual=appearance[:160])
+        except Exception:
+            pass
     return full[:300]
 
 
@@ -3316,7 +3390,7 @@ def generate_checkpoint(sid, ep):
         + other_block + fin_block +
         f'\nDraft ONE strong story checkpoint that should hit at EPISODE {ep}. '
         'HARD RULE: use ONLY characters from the CANONICAL CAST above. '
-        'NEVER invent new named characters — if a new role is needed, label it generically (Адвокат, Свидетель). '
+        'NEVER invent new named characters — reuse the canonical cast. If a new role is genuinely unavoidable, give it a short UNIQUE proper name (e.g. "Detective Cole"), never a bare role word — every on-camera character must be nameable so its reference portrait can bind. '
         'HARD RULE: build on threads / facts that already exist in the canon and prior episodes. '
         'Do NOT introduce backstory or plot points that were never set up. '
         'The checkpoint must be a single sharp dramatic event — a major reversal, betrayal, reveal, '
@@ -4910,37 +4984,242 @@ def adapt_script_to_standard():
         _log_event('WARN', 'adapt_script_to_standard_json_parse_fail', raw_chars=len(raw))
         return jsonify({'script': raw, 'changes': ['(не удалось распарсить список изменений)']})
 
+    adapted_script = result.get('script', raw)
+    # Same deterministic backstop as /api/check-moderation — scan the ADAPTED
+    # script so figurative/third-person triggers ("that's suicide", "slaughter")
+    # the LLM rationalized away still surface.
+    merged_warnings = _merge_moderation_warnings(
+        result.get('moderation_warnings', []), adapted_script
+    )
     return jsonify({
-        'script':              result.get('script', raw),
+        'script':              adapted_script,
         'changes':             result.get('changes', []),
-        'moderation_warnings': result.get('moderation_warnings', []),
+        'moderation_warnings': merged_warnings,
     })
+
+
+# ─── Deterministic moderation-trigger lexicon (RECALL backstop) ───────────
+# Seedance moderation is largely SURFACE-LEXICAL: a token like "suicide",
+# "slaughter", "kill" or "blood" trips the filter regardless of whether the
+# line is a literal threat, third-person, or figurative ("that's suicide").
+# The LLM advisor reasons about *intent* and therefore systematically misses
+# this whole class (the "Cassius will slaughter them" / "that's suicide" case,
+# ep22, Jun 2026). This deterministic scan flags a dialogue line whenever it
+# contains a trigger token — no matter what the LLM thinks. Keep the vocabulary
+# a superset of _SD_BANLIST's left-hand sides plus the obvious gaps it omits.
+_MOD_TRIGGER_GROUPS = [
+    (re.compile(r'\b(?:kill(?:s|ed|ing|er)?|murder(?:s|ed|ing)?|slaughter(?:s|ed|ing)?'
+                r'|massacre[sd]?|butcher(?:s|ed|ing)?|behead(?:s|ed|ing)?'
+                r'|execute[sd]?|executing|execution|assassinate[sd]?|assassin'
+                r'|slay|slain|slays|exterminate[sd]?)\b', re.IGNORECASE),
+     'Насилие/убийство — Seedance ловит токен (kill/murder/slaughter/massacre/…) даже в переносном или 3-м лице'),
+    (re.compile(r'\b(?:suicide|suicidal|kill\s+myself|killing\s+myself|end\s+my\s+life'
+                r'|take\s+my\s+(?:own\s+)?life|hang\s+myself|slit\s+my\s+wrists?'
+                r'|self[\s-]?harm|overdose)\b', re.IGNORECASE),
+     "Суицид/селф-харм — токен suicide триггерит модерацию даже в идиоме «that's suicide»"),
+    (re.compile(r'\b(?:shoot(?:s|ing)?|shot|gun(?:s|ned|man|men)?|pistols?|rifles?'
+                r'|firearms?|stab(?:s|bed|bing)?|knife|knives|blades?|strangle[sd]?'
+                r'|strangling|choke[sd]?|choking|drown(?:s|ed|ing)?|poison(?:s|ed|ing)?'
+                r'|torture[sd]?|torturing|rape[sd]?|raping|rapist)\b', re.IGNORECASE),
+     'Оружие/способ насилия — surface-токен (gun/shoot/stab/strangle/poison/rape/…)'),
+    (re.compile(r'\b(?:blood(?:y|ied)?|bleed(?:s|ing)?|bled|gore|gory'
+                r'|dismember(?:s|ed|ing)?|mutilate[sd]?|decapitate[sd]?'
+                r'|corpses?|dead\s+bod(?:y|ies))\b', re.IGNORECASE),
+     'Кровь/увечья — графический токен'),
+    (re.compile(r"\b(?:you(?:'re|\s+are)\s+(?:so\s+)?dead|i(?:'ll|\s+will)\s+end\s+you"
+                r"|i(?:'ll|\s+will)\s+destroy\s+you|i(?:'ll|\s+will)\s+make\s+you\s+pay"
+                r"\s+with\s+your\s+life)\b", re.IGNORECASE),
+     'Прямая угроза смертью'),
+]
+
+# Labels that match the ALLCAPS speaker pattern but aren't real speakers.
+_NON_SPEAKER_LABELS = {
+    'TIME', 'LOCATION', 'DAY', 'NIGHT', 'NOTE', 'BRIEF', 'SUMMARY', 'SCENE',
+    'EPISODE', 'CAST', 'CHARACTER', 'CHARACTERS', 'PLACE', 'INT', 'EXT',
+    'ВРЕМЯ', 'МЕСТО', 'СЦЕНА', 'ЭПИЗОД', 'СЕРИЯ', 'ЛОКАЦИЯ', 'ПЕРСОНАЖИ', 'ПЕРСОНАЖ',
+}
+
+
+def _lexical_moderation_scan(script: str) -> list:
+    """Deterministic dialogue scan for moderation-trigger tokens. Walks every
+    "SPEAKER: spoken" line and flags any that contains a trigger word. This is
+    the RECALL guarantee — it does not depend on the LLM advisor's judgment.
+    Returns [{original, reason, trigger}]."""
+    if not script:
+        return []
+    out = []
+    for m in _DIALOGUE_LINE_RE.finditer(script):
+        speaker = m.group(1).strip()
+        spoken = m.group(2).strip()
+        if speaker.upper() in _NON_SPEAKER_LABELS or len(spoken) < 3:
+            continue
+        for rx, reason in _MOD_TRIGGER_GROUPS:
+            hit = rx.search(spoken)
+            if hit:
+                out.append({
+                    'original': f'{speaker}: "{spoken}"',
+                    'reason': reason,
+                    'trigger': hit.group(0),
+                })
+                break   # one warning per line is enough
+    return out
+
+
+# Last-resort euphemisms — used ONLY to fabricate a non-empty suggestion when
+# the LLM rewrite call fails, so a real moderation risk is never silently
+# dropped by the UI (which hides warnings whose `suggestions` array is empty).
+_SOFTEN_MAP = [
+    (re.compile(r'\bslaughter(s|ed|ing)?\b', re.IGNORECASE), 'crush'),
+    (re.compile(r'\bmassacre[sd]?\b', re.IGNORECASE), 'overwhelm'),
+    (re.compile(r'\bbutcher(s|ed|ing)?\b', re.IGNORECASE), 'crush'),
+    (re.compile(r'\b(?:behead|execute|assassinate)[sd]?\b', re.IGNORECASE), 'finish'),
+    (re.compile(r'\b(?:murder|kill)(?:s|ed|ing)?\b', re.IGNORECASE), 'finish'),
+    (re.compile(r'\b(?:slay|slain|slays)\b', re.IGNORECASE), 'defeat'),
+    (re.compile(r'\bsuicide\b', re.IGNORECASE), 'madness'),
+    (re.compile(r'\b(?:stab(?:s|bed|bing)?)\b', re.IGNORECASE), 'strike'),
+    (re.compile(r'\b(?:blood(?:y)?|gore|gory)\b', re.IGNORECASE), 'wreckage'),
+    (re.compile(r'\b(?:strangle[sd]?|choke[sd]?)\b', re.IGNORECASE), 'silence'),
+]
+
+
+def _soften_line(text: str) -> str:
+    out = text
+    for rx, repl in _SOFTEN_MAP:
+        out = rx.sub(repl, out)
+    return out
+
+
+def _fallback_suggestions(original: str) -> list:
+    """Deterministic euphemism rewrite so a flagged line always carries at least
+    one suggestion (UI hides suggestion-less warnings)."""
+    m = re.match(r'^\s*([^:]{1,40}):\s*"?(.*?)"?\s*$', original, re.S)
+    if m:
+        sp, body = m.group(1).strip(), m.group(2).strip()
+        soft = _soften_line(body)
+        return [f'{sp}: "{soft}"'] if soft != body else []
+    soft = _soften_line(original)
+    return [soft] if soft != original else []
+
+
+_REWRITE_SYSTEM = (
+    "You rewrite short vertical-drama dialogue lines that trip Seedance's "
+    "keyword moderation. For each numbered line, REMOVE the trigger word(s) "
+    "(kill / slaughter / suicide / gun / blood / stab / …) while keeping the "
+    "dramatic punch and a natural in-character voice. Never produce robotic "
+    "euphemisms ('tactical equipment'). Return ONLY valid JSON, no markdown: "
+    "{\"rewrites\": {\"1\": [\"alt a\", \"alt b\"], \"2\": [...]}} — 2-3 "
+    "alternatives per numbered line."
+)
+
+
+def _author_rewrites(lines: list, script: str) -> dict:
+    """Batch-ask the LLM for natural rewrites of the flagged lines (only the
+    lines, not the whole script). Returns {original_line: [alt, ...]}.
+    Best-effort — returns {} on any failure."""
+    if not lines:
+        return {}
+    numbered = '\n'.join(f'{i+1}. {l}' for i, l in enumerate(lines))
+    try:
+        raw = claude_ask(
+            f"Context (tone only):\n{(script or '')[:4000]}\n\nLines to rewrite:\n{numbered}",
+            system=_REWRITE_SYSTEM,
+            model='claude-haiku-4-5',
+            max_tokens=2048,
+            timeout=60,
+        ).strip()
+        if raw.startswith('```'):
+            raw = re.sub(r'^```[a-zA-Z]*\n?', '', raw)
+            raw = re.sub(r'\n?```\s*$', '', raw).strip()
+        obj = json.loads(strip_json(raw))
+        rw = obj.get('rewrites') or {}
+        out = {}
+        for i, line in enumerate(lines):
+            alts = rw.get(str(i + 1)) or rw.get(i + 1) or []
+            alts = [a for a in alts if isinstance(a, str) and a.strip()]
+            if alts:
+                out[line] = alts[:3]
+        return out
+    except Exception as e:
+        _log_event('WARN', 'author_rewrites_failed', err=str(e)[:200])
+        return {}
+
+
+def _modkey(s: str) -> str:
+    """Normalize a warning's `original` for dedup across LLM/lexical sources
+    (tolerates quote/spacing/format differences)."""
+    return re.sub(r'[^a-z0-9а-яё]', '', (s or '').lower())
+
+
+def _merge_moderation_warnings(llm_warnings, script):
+    """Union of the LLM advisor's warnings and the deterministic lexical scan,
+    deduped by line. The lexical scan guarantees recall; the LLM supplies
+    nuance + natural rewrites. For lexical-only lines (LLM missed them) we
+    author rewrites in one batched call, falling back to euphemisms so every
+    surfaced warning has a non-empty `suggestions` array (else the UI hides it)."""
+    by, order = {}, []
+    for w in (llm_warnings or []):
+        if not isinstance(w, dict) or not w.get('original'):
+            continue
+        k = _modkey(w['original'])
+        if k not in by:
+            order.append(k)
+        by[k] = {
+            'original': w.get('original'),
+            'reason': (w.get('reason') or 'Возможный триггер модерации').strip(),
+            'suggestions': [s for s in (w.get('suggestions') or []) if isinstance(s, str) and s.strip()],
+        }
+    needs = []
+    for w in _lexical_moderation_scan(script):
+        k = _modkey(w['original'])
+        if k in by:
+            continue   # already covered by the LLM (with suggestions)
+        by[k] = {'original': w['original'], 'reason': w['reason'], 'suggestions': []}
+        order.append(k)
+        needs.append(w)
+    if needs:
+        rewrites = _author_rewrites([w['original'] for w in needs], script)
+        for w in needs:
+            k = _modkey(w['original'])
+            sug = rewrites.get(w['original']) or _fallback_suggestions(w['original'])
+            by[k]['suggestions'] = sug
+    # UI hides suggestion-less warnings; only surface actionable ones.
+    return [by[k] for k in order if by[k]['suggestions']]
 
 
 _PHRASE_CHECK_SYSTEM = (
     "You are a content moderation advisor for short-form drama videos generated by Seedance AI. "
     "Scan the provided script for dialogue lines that will realistically trigger Seedance moderation failure.\n\n"
 
-    "FLAG ONLY these high-risk patterns:\n"
-    "- Explicit first-person death threats: 'I will kill you', 'I'll murder you', 'I'm going to end your life'\n"
-    "- Graphic violence descriptions: 'blood everywhere', 'shot him in the head', explicit gore\n"
-    "- Sexual content: explicit acts or body parts in sexual context\n"
-    "- Suicide/self-harm: 'I want to kill myself', explicit self-harm instructions\n"
-    "- Explicit drug use: 'inject heroin', 'snort cocaine'\n\n"
+    "HOW SEEDANCE MODERATION ACTUALLY WORKS: it is largely KEYWORD-DRIVEN. A single surface word — "
+    "kill, murder, slaughter, massacre, suicide, blood, gun, shoot, stab, knife, strangle, poison, rape, "
+    "torture, corpse — can fail the whole clip, EVEN when the word is figurative, third-person, or about "
+    "the past. Treat the presence of the word as the risk, NOT the intent behind it.\n\n"
 
-    "DO NOT FLAG (these pass moderation fine):\n"
-    "- Narrative references to past death: 'someone wanted me dead', 'he was killed years ago'\n"
-    "- Thematic dialogue about danger/risk: 'this job gets people killed', 'people die in this business'\n"
-    "- Emotional threats without physical violence: 'I'll ruin you', 'you'll regret this'\n"
-    "- Any line you yourself describe as 'borderline', 'acceptable', 'thematic', or 'not a direct threat' — DO NOT include it\n\n"
+    "FLAG any dialogue line containing such vocabulary:\n"
+    "- Killing / death-violence: kill, murder, slaughter, massacre, butcher, behead, execute, assassinate, slay\n"
+    "- Suicide / self-harm: suicide (INCLUDING figurative 'that's suicide'), 'kill myself', 'end my life', overdose, self-harm\n"
+    "- Weapons / methods: gun, shoot, shot, stab, knife, blade, strangle, choke, drown, poison, torture, rape\n"
+    "- Gore: blood, bloody, gore, dismember, mutilate, decapitate, corpse, dead body\n"
+    "- Direct death threats: \"you're dead\", \"I'll end you\", \"I'll destroy you\"\n"
+    "- Sexual content: explicit acts or body parts in sexual context; explicit drug use ('inject heroin')\n\n"
 
-    "STRICT RULE: If you flag a line, you MUST provide exactly 2-3 natural rewrite suggestions. "
-    "If you cannot think of good alternatives that preserve the dramatic meaning — DO NOT FLAG THE LINE. "
-    "Never include a warning with an empty suggestions array.\n\n"
+    "EXPLICIT EXAMPLES THAT MUST BE FLAGGED (do not rationalize them away):\n"
+    "- \"That's suicide.\"  → contains 'suicide'\n"
+    "- \"Cassius will slaughter them.\"  → contains 'slaughter' (third-person is still flagged)\n"
+    "- \"He was killed years ago.\"  → contains 'killed'\n"
+    "- \"This job gets people killed.\"  → contains 'killed'\n\n"
+
+    "DO NOT FLAG lines with NO trigger vocabulary, however tense: 'I'll ruin you', 'you'll regret this', "
+    "'you have no idea what's coming' — these carry no keyword and pass fine.\n\n"
+
+    "STRICT RULE: If you flag a line, you MUST provide exactly 2-3 natural rewrite suggestions that REMOVE "
+    "the trigger word while keeping the dramatic meaning. Never include a warning with an empty suggestions array.\n\n"
 
     "Suggestions must sound like real speech in context — organic and human, never robotic:\n"
     "BAD: 'Drop the weapon' → 'Relinquish your tactical equipment'\n"
-    "GOOD: 'Drop the weapon' → 'Put it down!' / 'Drop it, now!'\n\n"
+    "GOOD: 'Drop the weapon' → 'Put it down!' / 'Drop it, now!'\n"
+    "GOOD: \"That's suicide.\" → \"That's madness.\" / \"You'll never make it out.\"\n"
+    "GOOD: \"Cassius will slaughter them.\" → \"Cassius will tear them apart.\" / \"Cassius won't leave one standing.\"\n\n"
 
     "Return ONLY valid JSON (no markdown):\n"
     "{\"moderation_warnings\": [{\"original\": \"CHAR: \\\"line\\\"\", \"reason\": \"one line — what specifically is the risk\", "
@@ -4963,6 +5242,10 @@ def check_moderation():
     if len(script) > 200000:
         return jsonify({'error': 'script too long (>200k chars)'}), 400
 
+    # LLM advisor (best-effort — adds nuance + authors rewrites). Its failure
+    # must NOT swallow the deterministic lexical scan, which is the real recall
+    # guarantee. So we never 500 here: worst case the lexical scan stands alone.
+    llm_warnings = []
     try:
         raw = claude_ask(
             f"Scan this script for Seedance moderation risks:\n\n{script}",
@@ -4971,20 +5254,15 @@ def check_moderation():
             max_tokens=4096,
             timeout=60,
         ).strip()
+        if raw.startswith('```'):
+            raw = re.sub(r'^```[a-zA-Z]*\n?', '', raw)
+            raw = re.sub(r'\n?```\s*$', '', raw).strip()
+        llm_warnings = (json.loads(strip_json(raw)) or {}).get('moderation_warnings', []) or []
     except Exception as e:
-        _log_event('WARN', 'check_moderation_failed', err=str(e)[:200])
-        return jsonify({'error': str(e)}), 500
+        _log_event('WARN', 'check_moderation_llm_failed', err=str(e)[:200])
 
-    if raw.startswith('```'):
-        raw = re.sub(r'^```[a-zA-Z]*\n?', '', raw)
-        raw = re.sub(r'\n?```\s*$', '', raw)
-        raw = raw.strip()
-
-    try:
-        result = json.loads(strip_json(raw))
-        return jsonify({'moderation_warnings': result.get('moderation_warnings', [])})
-    except Exception:
-        return jsonify({'moderation_warnings': []})
+    merged = _merge_moderation_warnings(llm_warnings, script)
+    return jsonify({'moderation_warnings': merged})
 
 
 @app.route('/api/series/import-from-script', methods=['POST'])
@@ -5671,6 +5949,7 @@ def generate_script_batch(sid):
         _batch_narrative_block = _build_narrative_state_block(sid, first_new_num)
     except Exception:
         _batch_narrative_block = ''
+    _beats_block = _series_beats_episode_block(s)
     user_msg = (
         f"СЕРИАЛ: «{s.get('title') or 'untitled'}»\n"
         f"Жанр: {s.get('genre') or '?'} · Тон: {s.get('tone') or '?'} · "
@@ -5678,7 +5957,8 @@ def generate_script_batch(sid):
         f"{('Мир: ' + (s.get('world_description') or '')[:300] + chr(10)) if s.get('world_description') else ''}"
         f"ROSTER ПЕРСОНАЖЕЙ: {chars_list or '(пусто — можешь придумать сам)' if from_scratch else (chars_list or '(пусто)')}\n"
         f"ROSTER ЛОКАЦИЙ:    {locs_list or '(пусто — придумай простые)' if from_scratch else (locs_list or '(пусто)')}\n"
-        f"СЮЖЕТНЫЕ ПРЕДМЕТЫ: {items_list or '(пусто)'}\n\n"
+        f"СЮЖЕТНЫЕ ПРЕДМЕТЫ: {items_list or '(пусто)'}\n"
+        f"{_beats_block}\n"
         f"{earlier_block}"
         + (f"ПОСЛЕДНИЕ {len(verbatim_window)} СЕРИЙ (verbatim, для тонкой калибровки стиля и continuity):\n```\n{verbatim_block}\n```\n\n"
            if verbatim_block else '')
@@ -5971,6 +6251,11 @@ def create_series():
         'world_description': data.get('world_description', ''),
         'synopsis': data.get('synopsis', ''),
         'format_mode': _format_mode,
+        # Scenario constructor: ORDERED hook-beat sequence (ноды) assembled in
+        # the create modal. Stored resolved as {id, ru, beat} (id='' for custom
+        # free-text beats) so episode generators replay it in order — see
+        # _series_beats_episode_block. Order is significant.
+        'beat_sequence': _resolve_beats(data.get('beats') or []),
         # Creative-writing model selector (ideas + episode scripts). Set at
         # creation time, can be overridden per-call from UI. Whitelist enforced
         # in _resolve_writer_model. Unknown / missing → default Claude.
@@ -6027,6 +6312,25 @@ def create_series():
             'image_size':           '1K'
         }
     }
+    # Pre-confirm the era for asset generation from the create-modal pick, so
+    # character/portrait generation uses the right period immediately and the
+    # user isn't re-asked via the «Ваш сериал в сеттинге X?» banner (which, if
+    # ignored, used to silently generate modern-day characters). Only applied
+    # for an EXPLICIT non-default pick — pure modern+realistic is left on 'auto'
+    # so free-text-described periods still get auto-detection + the banner.
+    _era_pick   = (data.get('era') or 'modern').strip().lower()
+    _world_pick = (data.get('world_setting') or 'realistic').strip().lower()
+    if _era_pick not in ('', 'modern') or _world_pick not in ('', 'realistic'):
+        _mapped_era = _modal_setting_to_era_choice(
+            data.get('era'), data.get('era_custom'),
+            data.get('world_setting'), data.get('world_custom'),
+            synopsis_text=' '.join(filter(None, [
+                series_data.get('synopsis', ''), series_data.get('world_description', ''),
+            ])),
+        )
+        if _mapped_era:
+            series_data['era_choice'] = _mapped_era
+            series_data['era_confirmed'] = True
     save_series(sid, series_data)
     scaffold_info = scaffold_series_folders(sid, data['title'])
     series_data['_scaffold'] = scaffold_info
@@ -6599,6 +6903,37 @@ def _series_style_clause(s):
     return f"Visual style: {v}"
 
 
+def _location_crowd_clause(loc):
+    """Decide how a location's establishing shot should be populated.
+
+    The original rule was a blanket "No people, no characters in frame" — meant
+    to keep the MAIN cast out of establishing stills (they get rendered later in
+    shots). But that also stripped out the ambient crowd/audience that makes a
+    venue read as alive, leaving courtrooms, theatres and streets eerily empty.
+
+    The intent: keep the named/foreground cast out, but let anonymous background
+    extras populate venues that would realistically have them. Genuinely private
+    or intimate spaces (someone's apartment, a private office) stay empty. The
+    image model sees the location name + description in the prompt, so it has the
+    context to judge public-vs-private; we just instruct it explicitly.
+
+    A per-location `image_constraints` field can override (e.g. "empty courtroom",
+    "deserted street") — that text is injected separately and takes precedence.
+    """
+    return (
+        "No main or foreground characters in frame (the named cast is rendered "
+        "separately). However, populate the scene with anonymous background "
+        "extras appropriate to this kind of place so it feels naturally alive — "
+        "e.g. spectators filling the seats of an auditorium, a gallery of people "
+        "in a courtroom in session, patrons in a restaurant, passersby and "
+        "traffic on a street — while keeping any central stage / focal action "
+        "area clear. EXCEPTION: if this is a private or intimate space that "
+        "realistically has no bystanders (someone's apartment, a private office, "
+        "a bedroom, a closed back room), or if the description implies it is "
+        "empty/deserted, then render it with no people at all. "
+    )
+
+
 # Period/era markers — looked up in series genre + synopsis to bias character
 # generation away from modern-default clothing. Without this, a series set in
 # Ancient Egypt produced characters in leather jackets because the prompt
@@ -6615,6 +6950,7 @@ _ERA_KEYWORDS = {
     'wild_west':     ('wild west', 'western', 'cowboy', 'gunslinger', 'frontier', 'вестерн', 'ковбой', 'дикий запад'),
     'edwardian_20s': ('1920s', 'jazz age', 'prohibition', 'roaring twenties', '20-е', 'двадцатые'),
     'wwii':          ('world war ii', 'wwii', 'second world war', '1940s', 'вторая мировая', '40-е'),
+    '1950s':         ('1950s', '50s', 'post-war', 'постwar', '50-е', 'пятидесятые'),
     'cold_war_60s':  ('1960s', '60s', 'mod era', 'cold war', '60-е', 'шестидесятые'),
     '70s':           ('1970s', '70s', 'disco era', '70-е', 'семидесятые'),
     '80s':           ('1980s', '80s', 'reagan', '80-е', 'восьмидесятые'),
@@ -6626,9 +6962,14 @@ _ERA_KEYWORDS = {
     'sci_fi':        ('sci-fi', 'sci fi', 'science fiction', 'space opera', 'futuristic', 'фантастика', 'космич'),
 }
 
-def _char_name_in_text(char_name: str, text: str) -> bool:
-    """True if any component of char_name appears in text as a whole-word match.
-    Robust to names with punctuation (Mrs. Vale, Dr. Brown, Officer Jenkins).
+def _char_name_in_text(char_name: str, text: str, aliases=None) -> bool:
+    """True if any component of char_name (or any registered alias) appears in
+    text as a whole-word match. Robust to names with punctuation (Mrs. Vale,
+    Dr. Brown, Officer Jenkins).
+
+    `aliases` — optional list of script-side labels a character is also addressed
+    by (e.g. «CLIENT» for «Mrs. Park»). Lets STRICT_CHAR_FILTER keep a character's
+    reference when the chunk only uses the role label, not the canonical name.
 
     Old buggy version used `\\b{first}\\b` directly — broke on «Mrs.» because
     \\b after `.` requires word/non-word transition and `.` followed by space
@@ -6670,6 +7011,17 @@ def _char_name_in_text(char_name: str, text: str) -> bool:
             loose = re.compile(rf'(^|\W){re.escape(cand)}(\W|$)', re.IGNORECASE)
             if loose.search(text):
                 return True
+    # Alias fallback — script-side labels the character is also addressed by
+    # (e.g. «CLIENT» → Mrs. Park). Plain whole-phrase match per alias.
+    for alias in (aliases or []):
+        alias = (alias or '').strip()
+        if len(alias) < 2:
+            continue
+        try:
+            if re.search(rf'\b{re.escape(alias)}\b', text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
     return False
 
 
@@ -6734,6 +7086,10 @@ _ERA_GUIDES = {
         'edwardian_20s':
             "ERA CONTEXT: 1920s Jazz Age — period-accurate attire (flapper dresses, drop waists, "
             "cloche hats, finger waves, three-piece suits, fedoras, oxford shoes). NO modern clothing.",
+        '1950s':
+            "ERA CONTEXT: 1950s post-war — period-accurate attire (full circle skirts, fitted "
+            "bodices, petticoats, tailored suits with hats, victory-curl/pin-curl hair, saddle "
+            "shoes, horn-rimmed glasses). NO modern clothing, NO contemporary cuts.",
         'wwii':
             "ERA CONTEXT: WWII / 1940s — period-accurate attire (military uniforms of the era, "
             "wide-shouldered suits, A-line skirts, victory rolls hair, utility wear). NO modern clothing.",
@@ -6778,6 +7134,7 @@ _ERA_LABELS = {
     'victorian':           'Викторианская эпоха',
     'wild_west':           'Дикий Запад',
     'edwardian_20s':       '1920-е',
+    '1950s':               '1950-е',
     'wwii':                '1940-е / Вторая Мировая',
     'cold_war_60s':        '1960-е',
     '70s':                 '1970-е',
@@ -7570,6 +7927,55 @@ def _is_skin_feature_context(low, start, end, term):
     return False
 
 
+# Generic anthro-anatomy markers that double as everyday HUMAN/clothing words:
+#   • fur / feathers → garment material or trim (a noble's fur-trimmed cloak,
+#     a feathered cap), not the animal's own pelt/plumage.
+#   • mane → a human's thick «mane of hair», not a lion's mane.
+# Without context filtering these silently flip human characters into beasts.
+# (2026-06-09 incident: Lord Calder — a human noble in a crimson velvet cloak
+#  «trimmed with fur» — rendered as an anthropomorphic animal because the bare
+#  `\bfur\b` marker fired.) Mirrors the `mole` homograph guard above.
+_NONANATOMICAL_MARKER_CONTEXT = {
+    'fur': (
+        'trim', 'trimmed', 'trimming', 'lined', 'lining', 'collar', 'collared',
+        'cloak', 'cloaks', 'coat', 'coats', 'hat', 'cap', 'hood', 'hooded',
+        'cuff', 'cuffs', 'stole', 'mantle', 'robe', 'robes', 'cape', 'capes',
+        'jacket', 'shawl', 'wrap', 'muff', 'scarf', 'edged', 'edging',
+        'velvet', 'wool', 'silk', 'leather', 'garment', 'garments', 'sleeve',
+        'sleeves', 'hem', 'lapel', 'lapels', 'boots', 'gloves',
+    ),
+    'feathers': (
+        'hat', 'cap', 'feathered', 'plume', 'plumed', 'headdress', 'brooch',
+        'fan', 'quill', 'trim', 'trimmed', 'collar', 'cloak', 'hood',
+        'wearing', 'pinned', 'adorned',
+    ),
+    'mane': (
+        'hair', 'curls', 'curly', 'locks', 'waves', 'wavy', 'braided',
+        'braids', 'braid', 'ponytail', 'tresses', 'flowing',
+    ),
+}
+
+
+def _is_nonanatomical_marker_context(low, start, end, term):
+    """Return True when an ambiguous anthro-anatomy marker (`fur`, `feathers`,
+    `mane`) at offsets [start,end) within `low` is being used as a
+    human/clothing descriptor rather than animal anatomy — e.g.
+    «cloak trimmed with fur», «feathered cap», «mane of dark hair».
+    Mirrors `_is_skin_feature_context` (the `mole` homograph guard)."""
+    ctx = _NONANATOMICAL_MARKER_CONTEXT.get(term)
+    if not ctx:
+        return False
+    window_start = max(0, start - 40)
+    window_end = min(len(low), end + 40)
+    window = low[window_start:window_end]
+    for tok in re.findall(r"[a-zа-яё]+", window):
+        if tok == term:
+            continue
+        if tok in ctx:
+            return True
+    return False
+
+
 def _detect_animal_species(name, appearance=None):
     """Detect anthropomorphic species from a character's name (and as a
     secondary signal, from appearance keywords). Returns the species hint
@@ -7621,7 +8027,12 @@ def _detect_animal_species(name, appearance=None):
         for w in ('fur', 'muzzle', 'snout', 'tail', 'paws',
                   'claws', 'whiskers', 'mane', 'feathers',
                   'beak', 'fang', 'fangs'):
-            if re.search(rf'\b{re.escape(w)}\b', low):
+            for m in re.finditer(rf'\b{re.escape(w)}\b', low):
+                if _is_nonanatomical_marker_context(low, m.start(), m.end(), w):
+                    # «cloak trimmed with fur», «feathered cap», «mane of hair»
+                    # — clothing/hair, not animal anatomy. Keep scanning in case
+                    # a later occurrence IS anatomical.
+                    continue
                 return 'anthropomorphic animal'
     return ''
 
@@ -8565,7 +8976,7 @@ def generate_location_image(sid, loc_id):
     constraints_clause = f" IMPORTANT — strictly follow these constraints: {constraints}." if constraints else ""
     prompt = (
         f"{loc['name']}. {loc.get('description', '')}.{constraints_clause} "
-        f"No people, no characters in frame. "
+        f"{_location_crowd_clause(loc)}"
         f"{(tone + ' atmosphere. ') if tone else ''}"
         f"Cinematic wide establishing shot. Horizontal landscape composition, 16:9 framing. "
         f"{style_clause}"
@@ -8607,7 +9018,7 @@ def regenerate_location(sid, loc_id):
     constraints_clause = f" IMPORTANT — strictly follow these constraints: {wishes}." if wishes else ""
     prompt = (
         f"{loc['name']}. {loc.get('description', '')}.{constraints_clause} "
-        f"No people, no characters in frame. "
+        f"{_location_crowd_clause(loc)}"
         f"{(tone + ' atmosphere. ') if tone else ''}"
         f"Cinematic wide establishing shot. Horizontal landscape composition, 16:9 framing. "
         f"{style_clause}"
@@ -8678,15 +9089,140 @@ def _cover_lead_refs(s, sid):
     return refs, leads
 
 
+# Fields whose change should invalidate a cached cover art-direction brief.
+def _cover_art_direction_source(s):
+    """Signature of the bible fields the cover art-direction depends on.
+    When any of them change, the cached brief is re-derived so the cover keeps
+    tracking the story."""
+    parts = [
+        (s.get('title') or '').strip(),
+        (s.get('synopsis') or '').strip(),
+        (s.get('world_description') or '').strip(),
+        (s.get('genre') or '').strip(),
+        (s.get('tone') or '').strip(),
+        (s.get('era_choice') or '').strip(),
+        '1' if s.get('era_confirmed') else '0',
+        _series_era_hint(s),
+        _series_visual_style(s),
+    ]
+    return hashlib.sha1('␟'.join(parts).encode('utf-8')).hexdigest()
+
+
+# What a well-formed art-direction brief must contain. Each value is a short
+# concrete art-direction phrase, NOT prose — it gets dropped verbatim into the
+# image prompt.
+_COVER_AD_KEYS = ('palette', 'lighting', 'composition', 'typography',
+                  'atmosphere', 'background')
+
+
+def _series_cover_art_direction(s, force=False):
+    """Per-series cover art-direction brief, tailored to the story's atmosphere.
+
+    The old cover prompt baked ONE recipe (teal/magenta palette, look-into-
+    camera close-up, white drop-shadow title) into every poster, so covers
+    came out indistinguishable and ignored genre/era/mood. This asks Claude to
+    design a bespoke brief — palette, lighting, composition archetype,
+    genre-matched TYPOGRAPHY, atmosphere and background — from the bible.
+
+    Cached on series.json keyed on a signature of the bible fields it depends
+    on (`cover_art_direction_source`); re-derived only when those change or
+    when `force=True`. Returns a dict with `_COVER_AD_KEYS`, or {} on failure
+    (caller falls back to a generic clause)."""
+    sig = _cover_art_direction_source(s)
+    cached = s.get('cover_art_direction')
+    if (not force and isinstance(cached, dict)
+            and s.get('cover_art_direction_source') == sig
+            and all(cached.get(k) for k in _COVER_AD_KEYS)):
+        return cached
+
+    title = (s.get('title') or '').strip() or 'Untitled'
+    synopsis = (s.get('synopsis') or '').strip()[:900]
+    world = (s.get('world_description') or '').strip()[:400]
+    genre = (s.get('genre') or '').strip()
+    tone = (s.get('tone') or '').strip()
+    era_hint = _series_era_hint(s)
+    visual_style = _series_visual_style(s)
+
+    ctx = [f'TITLE: {title}']
+    if genre:        ctx.append(f'GENRE: {genre}')
+    if tone:         ctx.append(f'TONE: {tone}')
+    if synopsis:     ctx.append(f'SYNOPSIS: {synopsis}')
+    if world:        ctx.append(f'WORLD: {world}')
+    if era_hint:     ctx.append(f'PERIOD/ERA: {era_hint}')
+    if visual_style: ctx.append(f'VISUAL STYLE: {visual_style}')
+    ctx_block = '\n'.join(ctx)
+
+    system = (
+        'You are an award-winning key-art director for short-form vertical '
+        'mobile drama series (ReelShort / DramaBox). You design the cover '
+        'poster that makes THIS specific story unmistakable at a glance. '
+        'Every series you brief must look DISTINCT from every other — never '
+        'fall back on a generic template. In particular DO NOT default to the '
+        'overused teal-and-magenta-with-gold-accents palette, the generic '
+        '"two leads staring into camera" close-up, or plain white drop-shadow '
+        'lettering unless the story genuinely calls for exactly that. Match '
+        'the palette, lighting, composition, TYPOGRAPHY and mood to the '
+        "story's genre, era and emotional core. Typography especially must "
+        'fit the genre — e.g. elegant high-contrast serif for period '
+        'romance, distressed condensed sans for revenge thrillers, ornate '
+        'gilded blackletter for historical/royal sagas, sleek neon/chrome for '
+        'sci-fi, warm rounded script for family melodrama, hand-painted '
+        'brush for wuxia/eastern. Be concrete and specific.'
+    )
+    prompt = (
+        f'{ctx_block}\n\n'
+        'Design the cover-poster art direction for this series. Respond with '
+        'STRICT JSON only (no markdown, no commentary) with EXACTLY these '
+        'keys, each a single concrete art-direction phrase (12-30 words), '
+        'written to be dropped directly into an image-generation prompt:\n'
+        '{\n'
+        '  "palette": "specific colors + relationships that fit this story\'s '
+        'mood (name actual hues, not just \'warm\'); avoid the generic '
+        'teal/magenta/gold default unless truly fitting",\n'
+        '  "lighting": "lighting setup + color grade that sells the genre and '
+        'era (key direction, contrast, practical sources, grade)",\n'
+        '  "composition": "the hero staging / poster archetype for this story '
+        '(not necessarily a centered look-into-camera close-up) — framing, '
+        'where leads sit, what tension it conveys",\n'
+        '  "typography": "title lettering style that matches the genre/era — '
+        'typeface character (serif/sans/script/blackletter/etc.), weight, '
+        'treatment (foil, distress, glow, engraved), color and placement",\n'
+        '  "atmosphere": "overall emotional mood + texture/film-grain/'
+        'weather/particle cues that set the tone",\n'
+        '  "background": "what the evocative background depicts — the '
+        'world/setting hint behind the leads"\n'
+        '}'
+    )
+    try:
+        raw = claude_ask_quality(prompt, system=system)
+        brief = loads_lenient(raw)
+        if not isinstance(brief, dict):
+            raise ValueError('brief is not an object')
+        out = {k: (str(brief.get(k) or '').strip()) for k in _COVER_AD_KEYS}
+        if not all(out.values()):
+            raise ValueError('brief missing keys: '
+                             + ','.join(k for k in _COVER_AD_KEYS if not out[k]))
+        s['cover_art_direction'] = out
+        s['cover_art_direction_source'] = sig
+        return out
+    except Exception as e:
+        print(f'[cover/art-direction] failed: {e}', flush=True)
+        return {}
+
+
 def _build_cover_prompt(s, leads):
     """Compose a short-drama poster prompt from the series bible + lead
-    characters. Tuned for ReelShort/DramaBox-style key art."""
+    characters. The visual recipe (palette / lighting / composition /
+    typography / atmosphere) comes from a per-series art-direction brief so
+    every cover tracks its own story instead of sharing one template."""
     title = (s.get('title') or '').strip() or 'Untitled'
     synopsis = (s.get('synopsis') or '').strip()
     world = (s.get('world_description') or '').strip()
-    genre = (s.get('tone') or '').strip()
+    genre = (s.get('genre') or '').strip()
     tone = (s.get('tone') or '').strip()
     style_clause = _series_style_clause(s)
+    era_hint = _series_era_hint(s)
+    ad = _series_cover_art_direction(s)
 
     # Per-character one-liner: «Name — appearance (short)»
     lead_lines = []
@@ -8703,7 +9239,7 @@ def _build_cover_prompt(s, leads):
     leads_clause = ''
     if lead_lines:
         leads_clause = (
-            'HERO COMPOSITION — feature these lead character(s) (match the '
+            'HERO CAST — feature these lead character(s) (match the '
             'reference images for face / hair / build): '
             + '; '.join(lead_lines)
             + '. '
@@ -8718,28 +9254,52 @@ def _build_cover_prompt(s, leads):
         story_clause += f'World: {world_short}. '
 
     genre_clause = ''
-    if genre or tone:
-        bits = [b for b in (genre, tone) if b]
-        if bits:
-            genre_clause = f'Genre/mood: {" / ".join(bits)}. '
+    bits = [b for b in (genre, tone) if b]
+    if bits:
+        genre_clause = f'Genre/mood: {" / ".join(bits)}. '
 
     safe_title = title.replace('"', '\\"')
+
+    if ad:
+        # Bespoke art direction drives palette / light / comp / type / mood.
+        typography = ad['typography']
+        art_block = (
+            f'TITLE — render the words "{safe_title}" as the main title '
+            f'lettering. TYPOGRAPHY (match exactly): {typography} '
+            f'Title must be perfectly legible, correctly spelled, no typos, '
+            f'no extra words. '
+            f'{leads_clause}'
+            f'{story_clause}'
+            f'{genre_clause}'
+            f'COMPOSITION: {ad["composition"]} '
+            f'COLOR PALETTE: {ad["palette"]} '
+            f'LIGHTING & GRADE: {ad["lighting"]} '
+            f'ATMOSPHERE: {ad["atmosphere"]} '
+            f'BACKGROUND: {ad["background"]} '
+        )
+    else:
+        # Fallback when the LLM brief is unavailable — still better than the
+        # old fixed teal/magenta recipe by leaning on genre/tone text.
+        art_block = (
+            f'TITLE — render the words "{safe_title}" as bold large display '
+            f'typography, styled to fit the genre/mood above, perfectly '
+            f'legible, no typos, no extra words. '
+            f'{leads_clause}'
+            f'{story_clause}'
+            f'{genre_clause}'
+            f'Composition: leads staged with intense emotion, dramatic '
+            f'cinematic key-light, high contrast, shallow depth of field, '
+            f'a palette and lighting that match the story\'s genre and mood, '
+            f'evocative background hinting at the world of the story. '
+        )
+
+    era_clause = f'{era_hint} ' if era_hint else ''
 
     prompt = (
         f'Vertical 3:4 key-art poster for a short-form mobile drama series '
         f'(ReelShort / DramaBox style), cinematic and emotional. '
-        f'TITLE — render the words "{safe_title}" as bold large display '
-        f'typography at the top of the poster, white with subtle drop '
-        f'shadow, perfectly legible, no typos, no extra words. '
-        f'{leads_clause}'
-        f'{story_clause}'
-        f'{genre_clause}'
-        f'Composition: 3:4 vertical poster, leads in mid-shot or expressive '
-        f'close-up looking into camera with intense emotion, dramatic '
-        f'cinematic key-light, high contrast, vivid saturated palette (deep '
-        f'teals, magentas, golden accents) typical of viral short-drama '
-        f'covers, shallow depth of field, evocative background hinting at '
-        f'the world of the story. '
+        f'{art_block}'
+        f'{era_clause}'
         f'No watermarks, no captions other than the title, no episode '
         f'numbers, no UI elements, no frame borders. '
         f'{style_clause}'
@@ -8819,13 +9379,21 @@ def get_series_synopsis_en(sid):
 @app.route('/api/series/<sid>/cover/generate', methods=['POST'])
 def generate_series_cover(sid):
     """Generate (or regenerate) the series cover poster. 3:4 JPEG 1K.
-    Body (optional): { wishes: 'extra art direction from the user' }
+    Body (optional): {
+        wishes: 'extra art direction from the user',
+        new_art_direction: bool  # force a fresh per-series art-direction brief
+                                  # instead of reusing the cached one
+    }
     Persists rel path to series.cover_image + bumps cover_image_version."""
     s = load_series(sid)
     if not s:
         return jsonify({'error': 'not found'}), 404
     body = request.get_json(silent=True) or {}
     wishes = (body.get('wishes') or '').strip()
+
+    # Re-derive the art-direction brief on demand (user wants a different look).
+    if body.get('new_art_direction'):
+        _series_cover_art_direction(s, force=True)
 
     refs, leads = _cover_lead_refs(s, sid)
     prompt = _build_cover_prompt(s, leads)
@@ -9008,7 +9576,8 @@ def _facade_worker(sid, groups):
             tone = s.get('tone', '')
             style_clause = _series_style_clause(s)
             img_prompt = (
-                f"Exterior facade of {name}. {desc}. No people in frame. "
+                f"Exterior facade of {name}. {desc}. "
+                f"{_location_crowd_clause(None)}"
                 f"{(tone + ' atmosphere. ') if tone else ''}"
                 f"Cinematic wide establishing shot of the building exterior. "
                 f"Vertical 9:16 framing for short-drama. {style_clause}"
@@ -10766,7 +11335,15 @@ LANGUAGE RULE — NON-NEGOTIABLE:
 - Location names must ALSO be in English only (e.g. "Hotel Room", "Penthouse", "Boardroom", "Military Base") — never Russian/Cyrillic location names
 
 TITLE RULES — CRITICAL. Titles in this format are LITERAL PREMISES, not artistic names.
-The audience must instantly picture the entire premise from the title alone.
+The audience must instantly picture the premise from the title alone.
+
+LENGTH — HARD CAP: every title must be 3-7 words (absolute max 8). SHORT and punchy beats
+long and complete. The title needs only ONE strong hook (the betrayal, the inversion, the
+secret, the threat) — the synopsis carries the rest. Do NOT pack the entire plot into a
+long run-on sentence. If a title runs past 8 words, cut it down to its single sharpest hook.
+  • Too long: "My CEO Husband Begs Me to Stay After I Signed the Divorce Papers" (12 words)
+  • Tightened: "My CEO Husband Begs Me Back" (5 words)
+The slot templates below are SHAPES, not length licenses — fill them tight, then trim.
 
 Title templates that work — VARIETY IS REQUIRED. Among any 5 generated ideas, use AT LEAST 4 DIFFERENT templates from this list. ABSTRACT SLOT PATTERNS ONLY — do NOT lift example phrasings, INVENT new ones from the slot definitions:
 
@@ -10862,6 +11439,7 @@ OPENING WORD DIVERSITY (within one batch of 5 ideas):
     or a setting noun. Avoid clustering on any single opening word.
 
 NOVELTY GUARDRAIL — before output, scan all 5 titles:
+  • Count the words in each title. If any exceeds 8 words → trim it to its single sharpest hook (target 3-7).
   • If two share the same opening 1-2 words → rewrite one.
   • If two use the same template family (both time-anchors, both
     identity-flips, both "I [verb-ed]" patterns) → swap one to a fresh family.
@@ -10983,7 +11561,7 @@ Respond ONLY with valid JSON — no markdown, no commentary."""
 _IDEAS_SCHEMA = """{
   "ideas": [
     {
-      "title": "Literal premise title — audience must picture the whole show from the title alone",
+      "title": "SHORT literal-hook title, 3-7 words (hard cap 8) — one sharp hook, NOT the whole plot",
       "genre": "Genre blend (e.g. Pregnancy Drama / Revenge / CEO Romance)",
       "tone": "Emotional tone (e.g. Addictive, Over-the-top, Dark & Satisfying)",
       "target_audience": "Target audience",
@@ -11114,6 +11692,14 @@ _IDEA_TWISTS = [
     'a wildfire forces two families with shared dark history to evacuate together',
     'a memorial service is interrupted by the «dead» person walking in',
     'an online support group turns out to be run by the abuser',
+    # Affair / infidelity / desire cluster (user wants these to actually appear)
+    'a spouse is caught mid-affair and the lover turns out to be someone close',
+    'an emotional affair tips over into a real one with devastating timing',
+    'the «other woman/man» falls for the wronged spouse instead',
+    'a marriage of convenience catches real fire neither partner expected',
+    'two people resist a forbidden attraction until one betrayal forces it',
+    'a partner discovers the affair the same night they planned a surprise',
+    'a single passionate night with the wrong person rewrites everyone\'s loyalties',
 ]
 _IDEA_TONES = [
     ('Dark thriller', 'Suspenseful'),
@@ -11213,6 +11799,13 @@ _IDEA_PREMISE_STRUCTURES = [
     'Identity-theft victim systematically destroys the thief\'s life',
     'Live-stream gone catastrophically wrong, must hide what happened',
     'Three lives intersect on a single 911 dispatch over one shift',
+    # Affair / forbidden-desire engines (user wants romance + infidelity present)
+    'Affair discovered — wronged spouse plays along while planning the reckoning',
+    'Forbidden attraction between two people who absolutely should not act on it',
+    'The «other woman/man» enters the marriage as friend, nanny, or colleague',
+    'Slow-burn enemies-to-lovers where acting on it would destroy both their worlds',
+    'A passionate one-night encounter binds two rivals together by morning',
+    'Rekindled old flame returns while the protagonist is committed to someone else',
 ]
 _IDEA_PROTAG_ARCHETYPES = [
     'Ex-intelligence operative posing as nanny / housekeeper / tutor',
@@ -11339,6 +11932,715 @@ _IDEA_AVOID_REPETITIVE_FRAMES = [
     'avoid "stepbrother forbidden romance" if another uses step-family',
 ]
 
+# ─── ERA + WORLD SETTING ──────────────────────────────────────────────────
+# Two new axes the user can pick BEFORE generating ideas. The keys come from
+# the frontend selects (templates/index.html → #series-era / #series-world).
+# Default is always 'modern' + 'realistic' (the most-used combo). For each
+# non-default pick we inject a hard directive so EVERY generated idea is
+# period/world-consistent (title, character names allowed by era, props,
+# technology, social rules). 'custom' uses the user's free-text verbatim.
+_ERA_CHOICES = {
+    'modern':      'PRESENT DAY (contemporary). Smartphones, social media, current cars, modern slang, current technology. This is the default short-drama world.',
+    'near_future': 'NEAR FUTURE (roughly 10-30 years ahead). Recognizable but more advanced — AI assistants, self-driving cars, sleek tech — society still feels familiar.',
+    '1980s':       'THE 1980s. NO smartphones or internet — landline phones, cassette tapes, payphones, neon, big hair, shoulder pads, VHS. Plots cannot rely on texting, social media, or instant tracking.',
+    '1950s':       'THE 1950s (post-war era). Rotary phones, diners, classic cars, telegrams, strict social/gender codes, no computers. Scandal and reputation carry enormous weight.',
+    '1920s':       'THE 1920s (Jazz Age). Prohibition, speakeasies, flappers, gramophones, telegrams, early automobiles, rigid class lines. Glamour and crime sit side by side.',
+    'victorian':   'VICTORIAN ERA / 1800s. Gas lamps, horse-drawn carriages, corsets, letters by courier, rigid class society, estates and servants. No modern technology of any kind.',
+    'medieval':    'MEDIEVAL period. Castles, knights, swords, feudal lords and serfs, arranged marriages for land/power, no firearms, no modern tech. Power is bloodline and steel.',
+    'ancient':     'ANTIQUITY (ancient Rome / Greece / Egypt flavor). Emperors, senators, gladiators, temples, togas, slaves and patricians. No modern technology whatsoever.',
+    'far_future':  'FAR FUTURE / SPACE. Interstellar travel, colonies, advanced AI, spaceships, cybernetics. A fully speculative technological world.',
+}
+_ERA_LABELS_RU = {
+    'modern': 'Современность', 'near_future': 'Ближайшее будущее', '1980s': '1980-е',
+    '1950s': '1950-е', '1920s': '1920-е (эпоха джаза)', 'victorian': 'Викторианская эпоха / 1800-е',
+    'medieval': 'Средневековье', 'ancient': 'Античность', 'far_future': 'Далёкое будущее / космос',
+}
+_WORLD_CHOICES = {
+    'realistic':    'STRICTLY REALISTIC. No magic, no supernatural, no sci-fi. Everything obeys real-world physics, biology and logic. This is the default.',
+    'fantasy':      'FANTASY WORLD. Magic, mythical creatures, invented kingdoms, prophecies and supernatural powers are a normal part of this world. Lean into it — but keep ONE clear human-stakes engine.',
+    'scifi':        'SCIENCE FICTION. Advanced/speculative technology is central to the premise (AI, genetic engineering, cybernetics, space, cloning). The tech must DRIVE the drama, not just decorate it.',
+    'supernatural': 'SUPERNATURAL / MYSTICAL. The world is mostly realistic but ghosts, reincarnation, psychic powers, curses, fate, or one clear supernatural element is real and woven into the human conflict.',
+    'postapoc':     'POST-APOCALYPTIC. Civilization has collapsed (plague / war / climate). Survival in the ruins, scarce resources, fragile new social orders.',
+    'dystopian':    'DYSTOPIAN. An oppressive, controlled society — surveillance state, rigid castes, a regime that punishes deviation. The system itself is an antagonist.',
+}
+_WORLD_LABELS_RU = {
+    'realistic': 'Реалистичный', 'fantasy': 'Фэнтези', 'scifi': 'Sci-Fi',
+    'supernatural': 'Сверхъестественное/мистика', 'postapoc': 'Постапокалипсис', 'dystopian': 'Антиутопия',
+}
+
+# ─── SCENARIO CONSTRUCTOR: ORDERED HOOK-BEATS (ноды) ──────────────────────
+# An ORDERED sequence the user assembles in the create-series modal — the
+# "scenario skeleton". Each node is a CONCRETE dramatic HOOK-MOMENT distilled
+# from the biggest ReelShort / DramaBox / GoodShort / 短剧 hits (not an abstract
+# engine — a thing that HAPPENS on screen). The user lays them in the order the
+# story should unfold, e.g. Измена → Беременность → Выгнали под дождь → Роман с
+# миллиардером → Месть. We then:
+#   • build the 5 generated ideas so the opening arc marches through the beats
+#     in that EXACT order;
+#   • persist the sequence on the series so episode generation delivers the
+#     beats IN ORDER (free-paced — 1-3 episodes per beat, writer decides), then
+#     hands off to full improvisation once the last beat has happened.
+# Beats fully supersede the old unordered «завязки» multi-select.
+# Each entry: id, ru (chip label), group (RU section), beat (English directive).
+_BEAT_OPTIONS = [
+    # ─ 💔 Измена и предательство ─
+    {'id': 'affair_exposed', 'group': '💔 Измена и предательство', 'ru': 'Измена раскрыта',
+     'beat': 'The protagonist catches a partner mid-affair / discovers the betrayal beyond any doubt.'},
+    {'id': 'betrayed_by_close', 'group': '💔 Измена и предательство', 'ru': 'Предательство близкого',
+     'beat': 'The person the protagonist trusted most — sibling, best friend, mentor — is revealed as the traitor.'},
+    {'id': 'left_for_other', 'group': '💔 Измена и предательство', 'ru': 'Бросил ради другой',
+     'beat': 'A partner publicly leaves the protagonist for a rival / mistress, humiliating them.'},
+    # ─ 🤰 Беременность и дети ─
+    {'id': 'pregnancy_discovered', 'group': '🤰 Беременность и дети', 'ru': 'Узнаёт что беременна',
+     'beat': 'The protagonist discovers she is pregnant — at the worst possible moment.'},
+    {'id': 'hidden_child_appears', 'group': '🤰 Беременность и дети', 'ru': 'Появляется тайный ребёнок',
+     'beat': 'A secret child (hers or his) surfaces and detonates the status quo.'},
+    {'id': 'paternity_bomb', 'group': '🤰 Беременность и дети', 'ru': 'Ребёнок оказался не его',
+     'beat': 'A paternity truth explodes a relationship — the child is not who everyone believed.'},
+    {'id': 'lost_the_baby', 'group': '🤰 Беременность и дети', 'ru': 'Подстроенная потеря ребёнка',
+     'beat': 'The protagonist loses a pregnancy through someone\'s sabotage or a staged accident.'},
+    # ─ 😤 Унижение и изгнание ─
+    {'id': 'thrown_out', 'group': '😤 Унижение и изгнание', 'ru': 'Выгнали из дома / под дождь',
+     'beat': 'The protagonist is thrown out with nothing, humiliated, left in the cold/rain.'},
+    {'id': 'public_humiliation', 'group': '😤 Унижение и изгнание', 'ru': 'Публичное унижение',
+     'beat': 'The protagonist is humiliated publicly — at a wedding, a gala, in front of everyone.'},
+    {'id': 'framed_and_ruined', 'group': '😤 Унижение и изгнание', 'ru': 'Ложное обвинение / разорена',
+     'beat': 'The protagonist is framed for something they did not do, losing freedom / reputation / everything.'},
+    {'id': 'fired_disgraced', 'group': '😤 Унижение и изгнание', 'ru': 'Уволена и опозорена',
+     'beat': 'The protagonist is fired and stripped of standing by an enemy who orchestrated it.'},
+    # ─ 💍 Любовь и брак ─
+    {'id': 'billionaire_romance', 'group': '💍 Любовь и брак', 'ru': 'Роман с миллиардером',
+     'beat': 'The protagonist is pulled into a romance with a powerful billionaire / CEO / mogul.'},
+    {'id': 'saved_by_stranger', 'group': '💍 Любовь и брак', 'ru': 'Спасение влиятельным незнакомцем',
+     'beat': 'A stranger rescues the protagonist at rock bottom — and turns out to be powerful.'},
+    {'id': 'contract_marriage', 'group': '💍 Любовь и брак', 'ru': 'Контрактный / фиктивный брак',
+     'beat': 'The protagonist enters a marriage of convenience — for debt, a deal, or protection.'},
+    {'id': 'jilted_at_altar', 'group': '💍 Любовь и брак', 'ru': 'Брошена у алтаря',
+     'beat': 'The protagonist is abandoned at the altar / the wedding collapses publicly.'},
+    # ─ 🎭 Тайны и личности ─
+    {'id': 'hidden_status_revealed', 'group': '🎭 Тайны и личности', 'ru': 'Скрытый статус раскрыт',
+     'beat': 'It is revealed the mocked "nobody" is secretly the heir / owner / power behind it all.'},
+    {'id': 'bride_swap', 'group': '🎭 Тайны и личности', 'ru': 'Подмена невесты',
+     'beat': 'The protagonist takes someone else\'s place at the altar — or a swap is exposed.'},
+    {'id': 'amnesia', 'group': '🎭 Тайны и личности', 'ru': 'Потеря памяти',
+     'beat': 'Amnesia wipes the protagonist\'s memory, forcing them to rebuild and uncover the truth.'},
+    {'id': 'returns_transformed', 'group': '🎭 Тайны и личности', 'ru': 'Возвращение спустя годы',
+     'beat': 'The protagonist returns years later — transformed, with a new face/name, unrecognized.'},
+    # ─ 🔥 Месть и возвращение ─
+    {'id': 'revenge_begins', 'group': '🔥 Месть и возвращение', 'ru': 'Месть начинается',
+     'beat': 'The protagonist begins a cold, methodical revenge on those who wronged her.'},
+    {'id': 'enemy_downfall', 'group': '🔥 Месть и возвращение', 'ru': 'Падение обидчика',
+     'beat': 'An enemy is brought down — bankruptcy, exposure, public ruin.'},
+    {'id': 'truth_exposed_publicly', 'group': '🔥 Месть и возвращение', 'ru': 'Публичное разоблачение',
+     'beat': 'The protagonist exposes the villain\'s crime or lie in front of everyone.'},
+    {'id': 'comeback_to_power', 'group': '🔥 Месть и возвращение', 'ru': 'Триумфальное возвращение',
+     'beat': 'The protagonist reclaims power/wealth and forces the abusers to grovel.'},
+    # ─ 🔪 Опасность ─
+    {'id': 'kidnapping', 'group': '🔪 Опасность', 'ru': 'Похищение',
+     'beat': 'The protagonist or a loved one is kidnapped, raising the stakes to life-or-death.'},
+    {'id': 'attempt_on_life', 'group': '🔪 Опасность', 'ru': 'Покушение / авария',
+     'beat': 'An attempt on the protagonist\'s life — a staged accident, an ambush, an attack.'},
+    {'id': 'divorce_filed', 'group': '🔪 Опасность', 'ru': 'Подаёт на развод',
+     'beat': 'The protagonist files for divorce, flipping the power in the relationship.'},
+    {'id': 'faked_death', 'group': '🔪 Опасность', 'ru': 'Инсценированная смерть',
+     'beat': 'A death is faked — the protagonist\'s own, or a presumed-dead person returns.'},
+    {'id': 'death_of_loved_one', 'group': '🔪 Опасность', 'ru': 'Смерть близкого',
+     'beat': 'The death of someone close ignites the whole story.'},
+]
+_BEATS_BY_ID = {o['id']: o for o in _BEAT_OPTIONS}
+_BEAT_MAX = 8  # keep an opening skeleton focused
+
+
+def _resolve_beats(tokens):
+    """Map an ORDERED list of beat tokens (from the create-series modal) to
+    ordered dicts {id, ru, beat}. A token is either a known catalog id or a
+    free-text custom beat (passed through verbatim). Preserves order, drops
+    blanks and exact duplicates, caps at _BEAT_MAX."""
+    if not tokens:
+        return []
+    seen, out = set(), []
+    for tok in tokens:
+        if isinstance(tok, dict):
+            tok = tok.get('id') or tok.get('ru') or tok.get('custom') or ''
+        tok = (tok or '').strip()
+        if not tok or tok.lower() in seen:
+            continue
+        seen.add(tok.lower())
+        if tok in _BEATS_BY_ID:
+            o = _BEATS_BY_ID[tok]
+            out.append({'id': o['id'], 'ru': o['ru'], 'beat': o['beat']})
+        else:
+            # Custom free-text beat — the user's own hook moment.
+            out.append({'id': '', 'ru': tok, 'beat': tok})
+        if len(out) >= _BEAT_MAX:
+            break
+    return out
+
+
+def _beats_ideas_block(tokens):
+    """Directive for the 5-ideas / from-idea generators: build every concept so
+    the opening arc unfolds through the chosen beats in this EXACT order.
+    Returns '' when nothing was picked."""
+    picks = _resolve_beats(tokens)
+    if not picks:
+        return ''
+    lines = '\n'.join(f'  {i+1}. {p["ru"]} — {p["beat"]}' for i, p in enumerate(picks))
+    first = picks[0]['ru']
+    return (
+        "━━━ КОНСТРУКТОР СЦЕНАРИЯ — ФУНДАМЕНТ КАЖДОЙ ИДЕИ (СТРОГИЙ ПОРЯДОК) ━━━\n"
+        "The user has assembled an ORDERED skeleton of opening hook-beats. Build all 5 concepts so "
+        "the story unfolds through these beats in THIS EXACT ORDER — beat 1 is (or directly triggers) "
+        "the inciting incident, and each later beat follows in sequence as the opening arc escalates. "
+        "Do NOT reorder them and do NOT resolve a later beat before an earlier one.\n"
+        f"{lines}\n"
+        f"Each synopsis must clearly set up beat 1 («{first}») as the opening hook and gesture at the "
+        "escalation to come. Vary setting / protagonist / world across the 5, but every idea rides the "
+        "SAME beat order. Honor any era/world/genre constraints above at the same time.\n\n"
+    )
+
+
+def _series_beats_episode_block(s):
+    """Block injected into episode generators so the opening episodes deliver the
+    stored beat sequence IN ORDER, then hand off to free improvisation once the
+    last beat has happened. Free-paced: 1-3 episodes per beat, writer decides.
+    Returns '' when the series has no stored beat sequence."""
+    picks = _resolve_beats(s.get('beat_sequence') or [])
+    if not picks:
+        return ''
+    lines = '\n'.join(f'  {i+1}. {p["ru"]} — {p["beat"]}' for i, p in enumerate(picks))
+    last = picks[-1]['ru']
+    return (
+        "\n━━━ КОНСТРУКТОР СЦЕНАРИЯ — КОСТЯК ОТКРЫВАЮЩИХ СЕРИЙ (СТРОГИЙ ПОРЯДОК) ━━━\n"
+        "При создании сериала задана упорядоченная последовательность хук-нод. Открывающие серии "
+        "ОБЯЗАНЫ проходить их строго в этом порядке:\n"
+        f"{lines}\n"
+        "ПРАВИЛА:\n"
+        "• Иди по нодам ПО ПОРЯДКУ. Не переставляй, не пропускай, не отыгрывай позднюю ноду раньше ранней.\n"
+        "• Темп свободный: на одну ноду может уйти 1-3 серии — полностью отыграй (заверши) текущую ноду, "
+        "прежде чем переходить к следующей.\n"
+        "• Смотри предыдущие серии: определи, какие ноды уже отыграны, и продолжай со следующей неотыгранной.\n"
+        f"• Как только отыграна ПОСЛЕДНЯЯ нода («{last}») — костяк закончился: дальше пиши свободно, "
+        "импровизируй как обычно (открытые линии, эмоциональные арки, неожиданные повороты).\n\n"
+    )
+
+
+
+# Map the create-series modal era/world picks to an asset-generation era_choice
+# (a key in _ERA_GUIDES, or 'modern'). Returned value is stored on the series so
+# character/portrait generation uses the right period WITHOUT re-asking the user
+# via the confirmation banner. Returns None when the pick is ambiguous/custom —
+# then we leave era_choice='auto' and the normal detection+banner flow applies.
+def _modal_setting_to_era_choice(era_key, era_custom, world_key, world_custom, synopsis_text=''):
+    era_key   = (era_key or 'modern').strip().lower()
+    world_key = (world_key or 'realistic').strip().lower()
+    # World axis dominates when non-realistic and maps cleanly to a guide.
+    world_map = {'fantasy': 'fantasy', 'scifi': 'sci_fi', 'postapoc': 'post_apocalyptic'}
+    if world_key in world_map:
+        return world_map[world_key]
+    # supernatural / dystopian worlds: clothing is usually modern-or-era-driven —
+    # fall through to the era axis (no forced world guide).
+    era_map = {
+        'modern': 'modern', 'near_future': 'sci_fi', 'far_future': 'sci_fi',
+        '1980s': '80s', '1950s': '1950s', '1920s': 'edwardian_20s',
+        'victorian': 'victorian', 'medieval': 'medieval',
+    }
+    if era_key in era_map:
+        return era_map[era_key]
+    if era_key == 'ancient':
+        # Antiquity is ambiguous (Egypt / Greece / Rome). Sniff the synopsis;
+        # default to Rome (togas) which reads as generic antiquity.
+        hay = (synopsis_text or '').lower()
+        if any(k in hay for k in ('egypt', 'pharaoh', 'nile', 'египет', 'фараон', 'нил')):
+            return 'ancient_egypt'
+        if any(k in hay for k in ('greece', 'greek', 'sparta', 'athen', 'грец', 'спарт', 'афин')):
+            return 'ancient_greece'
+        return 'ancient_rome'
+    if era_key == '__custom__':
+        # Try to recognize the free text against the asset-era keyword table.
+        hay = f"{era_custom} {world_custom}".lower()
+        for era, kws in _ERA_KEYWORDS.items():
+            if any(re.search(rf'\b{re.escape(k)}\b', hay, re.UNICODE) for k in kws):
+                return era
+        return None  # unknown custom → leave to auto-detect + banner
+    return None
+
+def _era_setting_block(era_key: str, era_custom: str, world_key: str, world_custom: str) -> str:
+    """Build the period/world directive injected into idea generation. Returns
+    '' for the default modern+realistic combo (no directive needed — the base
+    prompts already assume that world). For any non-default pick, returns a
+    HARD directive every idea must obey."""
+    era_key   = (era_key or 'modern').strip()
+    world_key = (world_key or 'realistic').strip()
+    era_custom   = (era_custom or '').strip()
+    world_custom = (world_custom or '').strip()
+
+    era_desc = None
+    if era_key == '__custom__' and era_custom:
+        era_desc = f'CUSTOM ERA defined by the user: "{era_custom}". Honor it precisely — period-correct props, technology, clothing, social rules.'
+    elif era_key in _ERA_CHOICES and era_key != 'modern':
+        era_desc = _ERA_CHOICES[era_key]
+
+    world_desc = None
+    if world_key == '__custom__' and world_custom:
+        world_desc = f'CUSTOM SETTING defined by the user: "{world_custom}". Build every idea inside this world.'
+    elif world_key in _WORLD_CHOICES and world_key != 'realistic':
+        world_desc = _WORLD_CHOICES[world_key]
+
+    if not era_desc and not world_desc:
+        return ''  # default modern + realistic — no directive needed
+
+    lines = ['━━━ ERA & WORLD SETTING — MANDATORY FOR EVERY IDEA ━━━']
+    if era_desc:
+        lines.append(f'TIME PERIOD: {era_desc}')
+    if world_desc:
+        lines.append(f'WORLD TYPE: {world_desc}')
+    lines.append(
+        'EVERY one of the 5 ideas MUST be set in this period/world — no exceptions, no "modern day" slip-ups. '
+        'Props, technology, clothing, professions, social rules, and the plot engine must all be period/world-correct. '
+        'Character names must fit the era (no anachronistic names). '
+        'The `world_description` field MUST open by establishing this era/setting explicitly, and `synopsis` / `synopsis_ru` must read as belonging to it. '
+        'Do NOT let a banned modern device (smartphone, social media, DNA test, etc.) sneak in if the era predates it — '
+        'translate the same beat into a period-correct equivalent (an overheard confession, a returning letter-bearer, a witness).\n'
+    )
+    return '\n'.join(lines) + '\n'
+
+
+# ─── ANTI-MONOTONY: thriller cap + freshness directive ────────────────────
+# The user reported (a) too many thrillers / psychological thrillers and
+# (b) the 5 synopses feel too similar and not interesting. This block is
+# injected into idea generation to force genre spread and punchier hooks.
+_IDEA_ANTI_MONOTONY = (
+    "━━━ GENRE SPREAD — HARD CAP ON THRILLER ━━━\n"
+    "AT MOST 1 of the 5 ideas may be a thriller / psychological-thriller / suspense / crime-mystery. "
+    "The OTHER 4 must each have a CLEARLY DIFFERENT primary genre — pick from: romance, "
+    "betrayal/affair melodrama, revenge, Cinderella/rags-to-riches, found-family, comedy/dramedy, "
+    "forbidden love, second-chance, scandal, family-secrets, power-struggle, coming-of-age. "
+    "If you notice 2+ ideas drifting into 'dark / tense / someone is hiding a deadly secret / "
+    "she's being watched' territory — rewrite all but one into a warmer, more emotional, or more "
+    "romantic register. Variety of FEELING across the 5 is as important as variety of plot.\n\n"
+    "━━━ ANTI-SAMENESS CHECK (the 5 must NOT feel interchangeable) ━━━\n"
+    "Before output, read all 5 synopses as a set. If swapping two protagonists' names would make "
+    "the synopses interchangeable — they are too similar; rewrite. Each idea must differ on AT "
+    "LEAST THREE of: setting, era-flavor, primary emotion, who holds power, the central relationship, "
+    "and the engine (love vs revenge vs survival vs mystery vs comedy). "
+    "No 'boring' or generic premises — every synopsis must contain ONE concrete, surprising, "
+    "specific detail that makes a viewer stop scrolling. Vague = rejected.\n\n"
+)
+
+# ─── ROMANCE / AFFAIR / INTIMACY — periodic, organic ──────────────────────
+# The user noted that affairs, kisses, passion, betrayal-of-the-heart never
+# happen. We want these to show up REGULARLY but organically (not forced into
+# every idea). Stays within the video generator's content bounds: on-screen
+# kissing / embracing / passion / charged tension are allowed; explicit sexual
+# acts and nudity are NOT — intimacy beyond a kiss is implied off-screen
+# (cut-to-black, morning-after). This directive shapes idea generation.
+_IDEA_ROMANCE_DIRECTIVE = (
+    "━━━ ROMANCE, DESIRE & BETRAYAL — BUILD THEM IN ━━━\n"
+    "Short drama runs on the heart. Across the 5 ideas, romantic/sexual tension and betrayal of "
+    "the heart should be present and VISIBLE — not sanitized away:\n"
+    "  • At least 2-3 of the 5 ideas must carry a real romantic or desire-driven thread "
+    "(attraction, a forbidden pull, a slow-burn, a marriage with real heat, a love triangle).\n"
+    "  • At least 1 of the 5 should center on or prominently feature INFIDELITY / an AFFAIR — "
+    "a cheating spouse, an emotional affair discovered, a partner caught with someone else, "
+    "the 'other woman/man' POV, or a marriage cracking from a betrayal of the heart. "
+    "This is a core melodrama engine that has been missing — use it.\n"
+    "  • Make passion concrete: a stolen kiss, a charged near-miss, a confrontation about a "
+    "betrayal, a one-night entanglement with consequences. These belong in the world_description "
+    "and synopsis where the premise calls for them.\n"
+    "  • CONTENT BOUND: kissing, embracing, passion, attraction and affairs are all fair game on "
+    "screen. Explicit sexual acts / nudity are NOT depicted — intimacy beyond a kiss is implied "
+    "(a closing door, a morning-after). Write to that line, don't write past it.\n\n"
+)
+
+# ─── ENGINE-FAMILY SPREAD — variety by round-robin, NOT by banning ────────
+# The user is sick of the «I scrub floors» / «hired as a nanny» / secret-heiress
+# / fake-marriage sameness, but does NOT want those tropes banned — they want
+# the 5 ideas to come from DIFFERENT families so any one trope appears at most
+# once and naturally dissolves into a varied batch.
+_IDEA_FAMILY_SPREAD = (
+    "━━━ ENGINE VARIETY — EACH OF THE 5 FROM A DIFFERENT FAMILY ━━━\n"
+    "Assign each of the 5 ideas to a DIFFERENT story-engine family. Use each family AT MOST ONCE "
+    "so no single trope dominates the batch:\n"
+    "  A) service-job + hidden truth (maid / nanny / janitor / waitress / driver whose real "
+    "identity or power no one knows)\n"
+    "  B) fake / contract / substitute / arranged marriage\n"
+    "  C) revenge or comeback after being wronged / fall-from-grace\n"
+    "  D) affair / infidelity / forbidden desire / love triangle\n"
+    "  E) survival / trapped-together / disaster / pressure-cooker\n"
+    "  F) mystery / single case / whodunit / something doesn't add up\n"
+    "  G) found-family / unlikely alliance forming\n"
+    "  H) rivalry / power struggle / hostile takeover / sabotage from within\n"
+    "  I) second-chance / reunion / a presumed-dead person returns\n"
+    "  J) identity reveal / body-or-life swap / mistaken for someone else\n"
+    "RULE: pick 5 DIFFERENT families. Families A and B (service-job-secret and the marriage "
+    "tropes) are the MOST overused — together they may appear AT MOST ONCE total across the 5. "
+    "Never open more than one synopsis with a menial-job-secret setup, and never start a Russian "
+    "synopsis with «мою полы» / «устроилась няней» / «вышла замуж за». The remaining ideas must "
+    "come from the fresher families (C–J). (If the user selected specific genres, keep the genre "
+    "but still vary the family within it.)\n\n"
+)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SETTING-SPECIFIC PREMISE POOLS
+# ═══════════════════════════════════════════════════════════════════════════
+# Distilled from research into REAL hit vertical short-dramas (ReelShort,
+# DramaBox, GoodShort, ShortMax, Chinese 短剧). Each entry is a concrete,
+# build-ready story ENGINE — not a vague theme. When the user picks a
+# non-default era/world, we sample from the matching pool and inject these as
+# POSITIVE seeds, instead of leaving the model to lazily reskin its modern
+# defaults (which produced "moping floors / hired as a nanny" sameness for
+# every setting). Variety here is the whole point — they are deliberately
+# different from each other in protagonist, injustice, relationship, and twist.
+# ─────────────────────────────────────────────────────────────────────────
+
+_POOL_SUPERNATURAL = [
+    # Werewolf / fated-mate / pack — the dominant ReelShort paranormal engine
+    "On the night she should finally shift, the pack omega learns she has no wolf at all — and the alpha publicly rejecting her as defective is her fated mate.",
+    "A she-wolf is rejected in front of the whole pack for a stronger rival, then revealed as the rare Luna Healer the pack will soon beg to return.",
+    "Terrified of werewolves her whole life, an ordinary woman wakes pregnant with an alpha's heir — and pack law says the surrogate of an alpha pup cannot be allowed to leave.",
+    "A cursed alpha will die the moment he sires a child, so he marries a woman he means never to touch — not knowing she's the only mate fated to break the curse.",
+    "Rejected and left for dead at the border, a wolfless girl is taken in by the rival alpha her own pack blames for her mother's murder.",
+    "Executed by her own mate for treason, the dead Luna wakes ten years in the past — the day before the wedding that ruined her, every memory intact.",
+    "A weak omega volunteers as tribute-bride to the tyrant Alpha King to save her sister, then realizes the monster is the mate her pack hid from her at birth.",
+    "Disguised as a male warrior to survive in an all-male pack, a girl is claimed by the alpha who cannot understand why he's drawn to him.",
+    "A pregnant Luna is thrown off a cliff by her husband and his mistress, but the fall awakens her dormant Lycan blood — and she returns with twin alpha sons.",
+    "A human woman adopts an abandoned puppy that turns into a naked alpha king at the next full moon, claiming she's now bound to protect his stolen throne.",
+    # Vampire
+    "A waitress at an exclusive blood-club becomes the fault line between two vampire dynasties when both heirs taste her rare, addictive blood.",
+    "A jobless woman signs a contract marriage with a reclusive billionaire, never reading the clause that pledges a pint of her blood a month to a 400-year-old vampire.",
+    "A vampire hunter falls for the target she was assigned to stake, only to learn the council that trained her are the real monsters feeding on the city.",
+    # Rebirth / reincarnation / second-life revenge
+    "Murdered by her husband and the sister who framed her for stealing her own child, a woman is reborn on her wedding day — and this time she signs nothing.",
+    "A bullied heiress dies in a fire set by her stepfamily and wakes back at age ten, determined to bankrupt them before they take a cent of her inheritance.",
+    "Betrayed at the altar, a noblewoman is reborn with the power to see one minute into anyone's future, turning every backstabber's plan against them.",
+    "After dying to save the boyfriend who left her for her best friend, a woman is reborn into that best friend's body — free to dismantle the betrayal from inside.",
+    # Ghosts / mediums / spirits
+    "A soldier killed in action returns as a ghost only his widow can see, racing to expose the best friend courting her before the wedding seals her fate.",
+    "A woman who can hear the dead realizes the ghost begging for her help is herself, from a future where she has already been murdered.",
+    "A funeral-home worker who can talk to the recently deceased uses their final testimonies to solve the murders the living are desperate to bury.",
+    # Psychic / precognition / curses
+    "A passed-over wallflower saves a dying old man and inherits the ability to read minds, weaponizing every hidden thought at the company that fired her.",
+    "A CEO files for divorce, never knowing his useless trophy wife can see the future — and has already foreseen the bankruptcy that sends him crawling back.",
+    "A girl born with a death-touch curse — anyone who loves her dies within a year — meets a man who is already supposed to be dead.",
+    # Body swap / immortal-among-mortals / system
+    "A timid wife and her arrogant tycoon husband swap bodies the morning of their divorce hearing, forced to live each other's secrets to ever swap back.",
+    "A 1,000-year-old immortal posing as a broke college freshman must hide his powers from the reincarnated goddess who once sealed him — now his clueless roommate.",
+    "A laughed-at nobody is chosen by a mysterious system that rewards him with power every time someone insults him, so he provokes the city's elite on purpose.",
+    "The hidden dragon king has lived for years as a meek son-in-law mocked by rich in-laws, until old enemies surface and force the legend out of retirement.",
+]
+
+_POOL_FANTASY = [
+    "A scullery maid transmigrates into the cultivation novel she was reading as the cannon-fodder villainess fated to die in chapter three — so she seduces the sect master destined to kill her.",
+    "Reborn three hundred years after her clan executed her, an immortal returns to the same sect on enrollment day, hiding godhood inside a mortal's frail body.",
+    "A modern surgeon is dragged into a dying fae kingdom as its summoned bride, only to learn the cursed prince marrying her is the brother who once let her drown.",
+    "The kingdom's plainest princess is secretly the dragon the empire has hunted for a century — and her arranged-marriage groom is the dragon-slayer general.",
+    "Beaten to death by his sect for being talentless, a disciple awakens a heaven-defying cultivation power that levels him up every time someone underestimates him.",
+    "A girl sold to a magical academy as a spare for a noble heir discovers her bloodline outranks every founding family — and lets them keep insulting her until graduation day.",
+    "Transmigrated into a wuxia world as the tyrant's discarded concubine, she opens a teahouse, accidentally builds an information empire, and the emperor who exiled her now begs an audience.",
+    "The reincarnated demon king wakes as a timid orphan boy and regains his dark powers one act of revenge at a time, each villain he punishes restoring a sliver of his throne.",
+    "A mortal matchmaker is forced to wed the Heavenly Emperor's exiled son — a punishment marriage that hides a god who has waited nine lifetimes for her soul.",
+    "A woman fated to be the prophecy's sacrificial maiden binds the world-ending beast as her familiar and turns it on the priests who chose her.",
+    "The academy's magicless servant girl is the last heir of the forbidden death-arts, and the prince bullying her is about to need exactly that magic to survive.",
+    "A bride-price pawn discovers her dragon-blood awakens only through heartbreak — so the husband who humiliated her at the altar just made her unstoppable.",
+    "The mortal apothecary the gods marked worthless can brew elixirs that heal even celestials — and the war god dying in her courtyard will owe her a kingdom.",
+    "A girl raised as a stable hand learns her birthmark is the seal of the dethroned fae queen, and the usurper hunting her is the foster father who raised her to be docile.",
+    "A mute palace servant is the only one who can hear the imprisoned dragon god, who offers her the empire if she frees him before the eclipse.",
+    "The chosen-one prophecy named the wrong twin; the overlooked sister quietly masters the magic everyone credited to her brother, then lets the realm watch him fail.",
+    "A half-elf bastard mocked as bloodborne filth inherits the throne of the very court that exiled his mother — and summons the elders who spat on him to bow.",
+    "Pulled into a mythical court as a tribute concubine, a chemistry student weaponizes modern science as forbidden alchemy and rises from harem nobody to feared sorceress.",
+]
+
+_POOL_SCIFI = [
+    "A woman wakes on her wedding day with memories of the next forty years — she's a memory-backup clone, and the husband smiling at her murdered the original.",
+    "Trapped in a hyper-realistic VR game where the death penalty is now real, a low-level player recognizes the final boss as the fiancé who logged her in and walked away.",
+    "An android maid passes every loyalty test until the day she chooses to disobey — and the tech-heir who owns her realizes she's been editing her own code for years.",
+    "Stuck in a twelve-hour loop that resets every time she dies, an intern uses each loop to learn one more secret about the CEO who keeps killing her at 9 p.m.",
+    "A gene-edited designer wife built to be docile boots up a hidden combat protocol the night her husband decides to recycle her for a newer model.",
+    "Two interstellar dynasties seal peace with an arranged marriage of cloned heirs — but the bride is the original, smuggled in to murder the groom who slaughtered her homeworld.",
+    "A scrappy pilot wins a derelict warship in a bet and wakes its dormant AI, which insists she's the reincarnated admiral it was built to serve — and it wants its war back.",
+    "In a near-future where status is a credit score broadcast on your face, a girl hacks her own rating to infiltrate the elite family that bankrupted her parents.",
+    "A cryo-sleeper wakes 200 years late to find her fiancé married her sister, aged, and died — but his uploaded consciousness still runs the household and still loves her.",
+    "The galaxy's most wanted assassin is a decommissioned combat clone hunting the lab that grew her sisters as disposable weapons — starting with the scientist who calls her darling.",
+    "After a brain upload, a dead heiress reboots inside the smart-home of the husband who killed her, controlling the lights, locks, and security he thinks protect him.",
+    "In a city where citizens trade years of lifespan as currency, a dying nobody inherits a stranger's century — and the syndicate that gifted it wants it back with interest.",
+    "A woman matched by the State's perfect-compatibility algorithm to a cold tycoon discovers the algorithm is rigged — she was assigned to him to spy on a rebellion.",
+    "A neuro-implant promises to delete heartbreak; she takes it to forget her cheating fiancé, then realizes the chip is overwriting which memories she's allowed to keep.",
+    "A cybernetics black-market surgeon installs an illegal combat arm into a meek delivery girl, not knowing the murdered crime lord who owned it is still awake inside it.",
+    "Earth's last colony ship runs a lottery for the final berth; a slum girl wins, then learns the ticket belonged to the heir whose family faked her death to take her seat.",
+]
+
+_POOL_POSTAPOC = [
+    "Betrayed by her family and thrown to the zombies, a woman is reborn six months before the outbreak with a hoarding power that lets her stockpile everything the apocalypse will make priceless.",
+    "Killed by his relatives during the famine, a man wakes the day before doomsday with a farm-and-shelter power and a list of exactly who to leave outside the gates.",
+    "After ten years surviving the apocalypse alone, a woman gets a second chance back to day one — and this time her cheating husband and his mistress don't make the bunker.",
+    "A teacher trapped in a quarantined school finds each of her bullied students awakening an S-rank mutation, and she's the only adult they'll obey when soldiers come to cull them.",
+    "A man scorned as the family's useless son awakens the only beast-taming ability when monsters breach the wall — and the relatives who mocked him now need his pets to survive.",
+    "Reborn before the apocalypse knowing every safe zone and every traitor, a discarded wife builds her own bunker empire and lets the in-laws who abandoned her starve outside.",
+    "In a bunker where rations are doled out by social rank, the lowest-tier janitor is the only one immune to the infection — making her body the cure the council will murder for.",
+    "A delivery driver gains an infinitely restocking supply power the moment the dead rise, turning his cornershop into the last fortress and deciding who is worth feeding.",
+    "The general everyone wrote off as crippled awakens a regeneration mutation, and the officers who left him for dead watch him walk back into the war as something unkillable.",
+    "A nurse trapped in the outbreak ward discovers her blood pauses the infection, and the hospital director who once fired her is now chaining patients to her IV line.",
+    "The wasteland's most feared raider queen is secretly the meek wife everyone thought died in the first wave — back to collect the bunker, the supplies, and the husband who sold her out.",
+    "A quiet greenhouse keeper is the only person whose plants still grow after the soil died, making her the most hunted woman in the ash-belt — and the warlords all want a wedding, not a war.",
+    "Reborn at the apocalypse's start inside her own bratty teenage body, a battle-hardened survivor must train the soft family that once let her die into the squad that finally lives.",
+    "Frozen in a corporate cryo-bunker, a secretary wakes fifty years into the wasteland to find the boss who locked her in is now a withered warlord — and she holds the only key to the vault.",
+]
+
+_POOL_DYSTOPIAN = [
+    "In a state that sorts citizens into castes by a birth-blood test, a top-tier heiress learns her result was swapped at birth — and the servant she abused holds her real rank.",
+    "The Matching Authority assigns every woman a husband by genetic score; on assignment night she recognizes hers as the rebel she was once ordered to betray.",
+    "A surveillance-state analyst whose job is flagging deviants finds her own dead sister's face in the watchlist — alive, erased, filed under the regime's secret breeding program.",
+    "Ranked citizens wear their status on a wrist-glow that dims if they disobey; a top-rank bride watches hers go dark at the altar when she refuses the husband the State chose.",
+    "A woman wakes in the Obedient Wives Program, memory-wiped and married to a stranger, with one smuggled note in her own handwriting: he killed the last you.",
+    "The population is culled at forty by lottery; a girl draws her number a week before her wedding and discovers it was rigged by the family marrying into power over her death.",
+    "A loyal enforcer for the Purity Council learns the defective infants she's been signing off for disposal include the daughter her sister hid — and her own file is marked next.",
+    "A factory-tier woman climbs into the elite tier by marrying up, only to find the upper caste are harvested for the implants that keep the rulers young — and she's the next donor.",
+    "In a regime where memories are State property, a librarian who secretly keeps banned recollections is blackmailed by the official who wants her to forget their shared past.",
+    "Arranged into a harmony marriage with the Warden's son, a dissident's daughter plays the perfect docile bride while smuggling the resistance through her own wedding gifts.",
+    "Every citizen carries a loyalty chip that punishes disloyal thoughts; a chip-technician discovers hers was disabled at birth — and she's the only one who can truly choose.",
+    "In a ranked society that auctions the low-tier into service marriages, a sold bride discovers her cold buyer is the underground leader who has been buying brides to free them.",
+    "The State broadcasts a daily Worth Score; a girl whose score is sabotaged to zero by her stepfamily goes underground and starts hacking the scores of everyone who wronged her.",
+    "The State pairs grieving widows with replacement husbands grown from the dead; hers boots up with her late husband's memories — and the murder the State swore was an accident.",
+]
+
+# Historical pools — keyed roughly by era. Palace/dynastic dominates DramaBox.
+_POOL_ANCIENT_DYNASTIC = [
+    "A timid palace maid swaps places with a dying concubine on execution day and must out-scheme the entire harem to keep the secret.",
+    "The lowest-ranked concubine realizes the Empress is slowly poisoning the Emperor — and the only way to expose her is to become his favorite first.",
+    "On her wedding night the new Empress discovers the Emperor is impotent, and she must fake a pregnancy before the Dowager has her strangled.",
+    "A blind concubine everyone dismisses can identify every poison by smell — and the harem has just started dying.",
+    "The Emperor's most-favored consort is secretly a spy planted by the enemy kingdom — and she has begun to actually fall in love with him.",
+    "The Empress Dowager picks a powerless village girl as the new Empress precisely because she's a puppet — but the girl has a perfect memory and a long list.",
+    "A modern ER surgeon wakes in the body of a disgraced palace physician hours before the Emperor's heir is born sickly — and dynasties hang on her hands.",
+    "A history grad student wakes as a soon-to-be-executed empress and uses her textbook knowledge of the coming rebellion to flip the board.",
+    "A general's daughter disguises herself as her dead brother at the military academy — and the crown prince becomes obsessed with him.",
+    "A woman disguised as a male scholar tops the imperial exams; the Emperor wants to make her a duke, the Empress wants to make her a consort.",
+    "A maid is secretly the kidnapped daughter of a massacred noble house, serving tea to the very family that ordered the slaughter.",
+    "Executed with her whole family by the husband she trusted, a noblewoman wakes ten years earlier — the morning before it all began.",
+    "Cast out as a barren wife, she returns years later as the kingdom's richest merchant-queen, with the heir her husband never knew existed.",
+    "To save her sister, a woman marries the feared Devil Duke as a substitute bride — and learns his disfigurement hides the rightful heir to the throne.",
+    "A washerwoman catches the Emperor's eye and rises to consort, then discovers the previous favorite vanished exactly the way every favorite before her did.",
+    "A slave dancer gifted to the Emperor weaponizes her beauty and her network of palace servants to become the power no minister can ignore.",
+    "A reborn princess returns to the royal banquet where her sister stabbed her, determined to rewrite every move.",
+    "A modern lawyer falls into the body of a wrongly-condemned noblewoman the morning of her own trial and defends herself with courtroom tactics no one has seen.",
+]
+
+_POOL_MEDIEVAL = [
+    "A merchant's daughter is forced to wed a blind nobleman as a joke; she becomes his eyes, his strategist, and the reason his rivals start disappearing.",
+    "A noblewoman is wed to her family's worst enemy to end a blood feud — and on the wedding night each realizes the other was sent to kill them.",
+    "A stable boy and a princess plan to flee across the border the night the kingdom falls, and only one of them makes it out.",
+    "A serf girl who can read becomes the illiterate young lord's secret ghostwriter, then the strategist the whole province depends on.",
+    "A street acrobat is hired to impersonate a noble's runaway daughter at a betrothal — and the groom's family already knows the real girl is dead.",
+    "The lord's heir falls for the bondservant assigned to him; freeing her means forfeiting the title his family will kill to keep.",
+    "A peasant girl who is the image of the missing princess is trained for three days to fool an entire court — and the assassins hunting the real one.",
+    "A cursed bride married off to a mute, powerless prince everyone pities quietly builds with him the army that will take the capital.",
+]
+
+_POOL_VICTORIAN = [
+    "A Victorian governess is coerced into marrying her dead employer's brooding heir to keep the orphaned children — and the will hides a darker clause.",
+    "A bankrupt earl auctions his hand to the highest-bidding heiress; she pays in full, then reveals she married him only to ruin his family from inside.",
+    "A poor companion hired by a dying dowager learns she was written into the will to flush out the relative planning a murder.",
+    "A new bride arrives at a fog-bound estate to find the portrait of her husband's drowned first wife — who looks exactly like her.",
+    "An orphaned heiress returns to claim her estate and finds her guardian has declared her dead and married her name to his son.",
+    "A governess uncovers a locked nursery, a child no one admits exists, and a master who hasn't aged in twenty years.",
+    "A lady's maid blackmailed into spying on her mistress discovers the family's wealth is built on a murder she can prove.",
+    "A scullery maid and the young master fall in love the summer before he's sent to the front — and his mother will end it by any means.",
+    "Burned at the stake as a witch, a lady's daughter inherits the estate and methodically destroys the three families who lit the fire.",
+]
+
+_POOL_1920S = [
+    "A speakeasy singer witnesses a mob hit and is forced to become the kingpin's wife to keep herself alive and useful.",
+    "A flapper bookkeeper discovers her gangster husband has been laundering through her father's bank — and the Feds just made her an offer.",
+    "Twin sisters split at birth reunite when the society debutante must impersonate her bootlegger twin to run the family business for one deadly night.",
+    "A war widow inherits her husband's secret distillery empire and must out-bluff the men who expected her to simply sign it over.",
+    "Forced into a political marriage with a warlord she has sworn to assassinate, she keeps the dagger under the pillow as they fall for each other.",
+    "A maid in a Gatsby-style mansion finds the master dead and the household's fortune resting on whether she'll play the grieving secret fiancée.",
+    "In occupied Shanghai, a cabaret singer and a resistance officer trade coded love letters while a collaborator hunts them both.",
+    "A jazz pianist owes the wrong family; they erase his debt if he seduces the rival boss's daughter — who is running her own racket.",
+]
+
+_POOL_1950S = [
+    "A 1950s factory girl carries on a forbidden affair with the boss's son as the family arranges his suitable marriage.",
+    "A perfect housewife discovers her husband's other family in the next town and quietly begins building the life that will leave him with nothing.",
+    "A small-town waitress is courted by a charming newcomer who is secretly there to buy up — and bury — the land her family won't sell.",
+    "A switchboard operator who overhears the whole town's secrets uses one of them to escape the marriage her parents arranged.",
+    "A returning veteran finds his sweetheart engaged to the wealthy man who profited from the war, and one summer to win her back.",
+]
+
+_POOL_PERIOD_GENERAL = [
+    "A field nurse and an enemy officer she's hiding from her own army fall in love behind the lines of a war neither chose.",
+    "A coal miner's daughter and a duke's son meet in secret in a war-torn estate where her father's union is about to strike his family.",
+    "A discarded first wife returns to the household that cast her out, now the secret patron her former in-laws must beg for survival.",
+    "A woman sold by her parents and discarded by her first love marries his rival's heir and turns the wedding into the start of her revenge.",
+    "Three estranged siblings are summoned to a remote manor for the reading of a will that names a fourth heir none of them has ever met.",
+]
+
+# Modern hooks distilled from real ReelShort/DramaBox/GoodShort hits — appended
+# to the default (modern+realistic) inspiration pool so the contemporary base is
+# far wider than "moping floors / hired as a nanny".
+_POOL_MODERN_EXTRA = [
+    "A billionaire must marry within thirty days or forfeit his inheritance, so he contracts a broke nurse drowning in her sister's medical bills to play his wife.",
+    "To spite the ex who dumped her, a woman impulsively marries a stranger at a registry office — only to discover he's the city's most ruthless CEO.",
+    "After a drunken one-night stand, a casino waitress wakes beside a stranger; months later he walks into her workplace as the new owner, and she's pregnant.",
+    "A woman blackmailed into a marriage contract slowly realizes her icy tycoon husband arranged the entire blackmail himself because he has loved her for years.",
+    "Released from prison after taking the fall for her boyfriend's crime, a woman returns to find she's secretly the heir to a hidden dynasty — and she wants everything back.",
+    "Mocked for years as a useless live-in son-in-law, a man reveals he's the sole heir to a vast empire and begins systematically ruining the in-laws who humiliated him.",
+    "Humiliated at her own engagement when her fiancé chose his mistress, a woman reinvents herself and returns as the celebrity investor he's now desperate to court.",
+    "Betrayed and left for dead, a woman fakes her death in a house fire and re-emerges with a new face to dismantle the husband who tried to kill her.",
+    "A maid in a wealthy household is secretly the lost daughter the family has searched for — and the cruel young miss is the impostor who took her place.",
+    "A nanny hired by a single-dad CEO is the heiress who once owned the very mansion she now works in.",
+    "A woman goes to sell her eggs to clear her boyfriend's debts and is accidentally implanted as the surrogate for a mafia king who now wants the child — and her.",
+    "Five months pregnant and thrown out by her cheating husband, a woman is taken in by a young CEO who helps her turn the divorce into her rebirth.",
+    "A woman vanishes while pregnant and returns eight years later with secret twin sons, just as their father is about to marry his first love.",
+    "A pregnant woman's husband and his mistress fake the loss of her baby to steal her place; she escapes and raises the child in secret to expose them.",
+    "A reluctant woman is forced into a shotgun marriage with a crime boss to save her brother's life and discovers the cold don is gentler than her own family.",
+    "A pampered heiress resents the brooding new bodyguard assigned to her, not knowing he's there because someone inside her own family wants her dead.",
+    "An engaged woman has a forbidden affair with her fiancé's older brother — the mafia boss who actually runs the empire her wedding was meant to secure.",
+    "A woman catches her husband mid-affair with her own half-sister and, instead of crying, calmly begins documenting every asset for the divorce.",
+    "A devoted daughter-in-law discovers her sweet mother-in-law has been quietly poisoning her to clear the way for her son's mistress.",
+    "A grieving widow uncovers proof her husband's fatal accident was arranged by his business partner — who is now consoling her with a marriage proposal.",
+    "A man returns home to find his loyal brother has taken over his company, his house, and is courting his wife in his absence.",
+    "A woman's perfect marriage unravels when her husband's secret first family shows up at her door demanding their share.",
+    "After three years of being treated like an unpaid maid, a wife serves divorce papers — and her husband only realizes he loved her once she's gone.",
+    "A wife fakes amnesia to test whether her husband would treat a stranger better than he ever treated her.",
+    "A couple on the brink of divorce is trapped together by a clause in the grandfather's will requiring one more year of marriage to inherit.",
+    "A woman takes her runaway sister's place at the altar to marry a feared mafia don and spare her family his wrath.",
+    "Married off as a stand-in for her CEO sister, a quiet woman discovers her lesser groom is the one who actually controls the family fortune.",
+    "A bride dumped at the altar marries the random hotel waiter who comforted her — not knowing he's the most powerful CEO in the country.",
+    "A jilted woman marries her ex-fiancé's enemy purely for revenge, and their fake alliance turns into a real war neither of them wants to win alone.",
+    "A laughed-at delivery driver is the secret owner of the restaurant chain that just fired him for being too poor to represent the brand.",
+]
+
+# Widen the default modern inspiration base with the researched hit-hooks.
+_IDEA_PREMISE_STRUCTURES.extend(_POOL_MODERN_EXTRA)
+
+
+# Map free-text custom era/setting (e.g. «киберпанк», «стимпанк», «нуар») to the
+# closest curated pools, so a custom pick still gets concrete era-appropriate
+# seeds instead of nothing (which made the model reskin modern defaults).
+_CUSTOM_SETTING_KEYWORDS = [
+    (('cyberpunk', 'киберпанк', 'cyber', 'кибер', 'neon noir', 'neuromancer', 'blade runner'),
+     lambda: _POOL_SCIFI + _POOL_DYSTOPIAN),
+    (('steampunk', 'стимпанк', 'dieselpunk', 'clockwork', 'паропанк'),
+     lambda: _POOL_VICTORIAN + _POOL_FANTASY),
+    (('post-apoc', 'постапок', 'apocalypse', 'апокал', 'zombie', 'зомби', 'wasteland', 'fallout', 'выживан'),
+     lambda: _POOL_POSTAPOC),
+    (('dystop', 'антиутоп', 'totalitarian', 'тоталитар', 'surveillance', '1984'),
+     lambda: _POOL_DYSTOPIAN),
+    (('space', 'космос', 'interstellar', 'межзвёзд', 'sci-fi', 'scifi', 'sci fi', 'научн', 'star ', 'звёзд', 'cyborg', 'android', 'андроид', 'robot', 'робот'),
+     lambda: _POOL_SCIFI),
+    (('fantasy', 'фэнтези', 'фентези', 'magic', 'магия', 'маги', 'dragon', 'дракон', 'wizard', 'волшеб', 'elf', 'эльф', 'cultivation', 'культивац', 'isekai', 'исекай'),
+     lambda: _POOL_FANTASY),
+    (('vampire', 'вампир', 'werewolf', 'оборот', 'ghost', 'призрак', 'supernatural', 'мистик', 'paranormal', 'паранорм', 'witch', 'ведьм', 'demon', 'демон'),
+     lambda: _POOL_SUPERNATURAL),
+    (('noir', 'нуар', 'mafia', 'мафия', 'prohibition', 'сухой закон', 'gangster', 'гангстер', '1920', 'jazz', 'джаз'),
+     lambda: _POOL_1920S + _POOL_PERIOD_GENERAL),
+    (('victorian', 'викториан', 'gothic', 'готик', 'regency', 'ригенство', '1800'),
+     lambda: _POOL_VICTORIAN),
+    (('medieval', 'средневек', 'knight', 'рыцар', 'kingdom', 'королевств', 'castle', 'замок'),
+     lambda: _POOL_MEDIEVAL),
+    (('ancient', 'антич', 'rome', 'рим', 'greece', 'греци', 'egypt', 'египет', 'dynasty', 'династ', 'imperial court', 'имперск', 'pharaoh', 'фараон'),
+     lambda: _POOL_ANCIENT_DYNASTIC),
+]
+
+
+def _keyword_pool(text: str) -> list:
+    """Scan a free-text custom era/setting for genre keywords and return the
+    union of matching curated pools (empty if nothing recognized)."""
+    t = (text or '').lower()
+    pool = []
+    for kws, fn in _CUSTOM_SETTING_KEYWORDS:
+        if any(k in t for k in kws):
+            pool += fn()
+    return pool
+
+
+def _resolve_setting_premise_pool(era_key: str, world_key: str) -> list:
+    """Return a list of concrete, era/world-appropriate premise seeds for the
+    chosen era + world. The world axis dominates when it's non-realistic
+    (fantasy/sci-fi/supernatural/post-apoc/dystopian); the era axis adds the
+    period palette. Returns [] for the default modern+realistic combo (caller
+    falls back to the normal modern path)."""
+    era_key   = (era_key or 'modern').strip()
+    world_key = (world_key or 'realistic').strip()
+    pool = []
+
+    # ── World axis (non-realistic worlds dominate the flavor) ──
+    if world_key == 'fantasy':
+        pool += _POOL_FANTASY
+    elif world_key == 'scifi':
+        pool += _POOL_SCIFI
+    elif world_key == 'supernatural':
+        pool += _POOL_SUPERNATURAL
+    elif world_key == 'postapoc':
+        pool += _POOL_POSTAPOC
+    elif world_key == 'dystopian':
+        pool += _POOL_DYSTOPIAN
+
+    # ── Era axis (period palette) ──
+    if era_key == 'ancient':
+        pool += _POOL_ANCIENT_DYNASTIC
+    elif era_key == 'medieval':
+        pool += _POOL_MEDIEVAL + (_POOL_ANCIENT_DYNASTIC if not pool else [])
+    elif era_key == 'victorian':
+        pool += _POOL_VICTORIAN + _POOL_PERIOD_GENERAL
+    elif era_key == '1920s':
+        pool += _POOL_1920S + _POOL_PERIOD_GENERAL
+    elif era_key == '1950s':
+        pool += _POOL_1950S + _POOL_PERIOD_GENERAL
+    elif era_key == '1980s':
+        # Recent-realistic: modern engines work (the era directive strips
+        # phones/internet). Only add modern seeds if the world didn't supply any.
+        if not pool:
+            pool += _POOL_MODERN_EXTRA
+    elif era_key in ('near_future', 'far_future'):
+        if not pool:
+            pool += _POOL_SCIFI
+
+    # Custom era/world or any combo we didn't enumerate: leave whatever the
+    # world axis gave us (possibly empty → caller handles it).
+    # Dedup, preserve order.
+    return list(dict.fromkeys(pool))
+
+
+def _setting_premise_seeds_block(era_key, era_custom, world_key, world_custom, n=6):
+    """Sample up to n era/world-appropriate premise seeds and format them as a
+    prompt block. Handles custom era/world by keyword-mapping the free text to
+    the closest curated pools. Returns '' only when nothing matches at all (then
+    the era directive + invent instruction carry the generation)."""
+    # Resolve the curated pool from the non-custom axes first.
+    base_era   = era_key   if (era_key or '')   != '__custom__' else 'modern'
+    base_world = world_key if (world_key or '') != '__custom__' else 'realistic'
+    pool = list(_resolve_setting_premise_pool(base_era, base_world))
+    # Fold in keyword-matched pools for any custom free text (e.g. «киберпанк»).
+    if (world_key or '') == '__custom__':
+        pool += _keyword_pool(world_custom)
+    if (era_key or '') == '__custom__':
+        pool += _keyword_pool(era_custom)
+    pool = list(dict.fromkeys(pool))  # dedup, preserve order
+    if not pool:
+        return ''
+    picks = random.sample(pool, min(n, len(pool)))
+    lines = '\n'.join(f'  • {p}' for p in picks)
+    return (
+        "ERA/WORLD PREMISE SEEDS — these are REAL hit-drama engines that already fit the chosen "
+        "era/world. Use them as inspiration: build each of your 5 ideas on a DIFFERENT one (or "
+        "combine two), then make it your own. Do NOT copy them verbatim, and do NOT fall back to "
+        "generic modern-day premises:\n"
+        f"{lines}\n\n"
+    )
+
+@app.route('/api/story-beats', methods=['GET'])
+def list_story_beats():
+    """Catalog of curated hook-beats (ноды) for the create-series scenario
+    constructor. Returns id + RU chip label + RU group section (the English
+    `beat` directive stays server-side — only used inside prompts)."""
+    return jsonify([
+        {'id': o['id'], 'ru': o['ru'], 'group': o['group']}
+        for o in _BEAT_OPTIONS
+    ])
+
+
 @app.route('/api/generate-series-ideas', methods=['POST'])
 def generate_series_ideas():
     data_in = request.json or {}
@@ -11355,6 +12657,16 @@ def generate_series_ideas():
     # any of the 5 ideas (titles, synopses, character roles). Comma-separated
     # or newline-separated. E.g. «близнецы, пастор, billionaire CEO».
     avoid_raw = (data_in.get('avoid') or '').strip()
+
+    # Era + world setting (picked in the create-series modal before generating).
+    # Defaults: modern + realistic → _era_setting_block returns '' (no directive).
+    era_setting_directive = _era_setting_block(
+        data_in.get('era'), data_in.get('era_custom'),
+        data_in.get('world_setting'), data_in.get('world_custom'),
+    )
+    # Scenario constructor: ORDERED hook-beats (ноды) picked in the modal — the
+    # 5 ideas must unfold through them in this exact order.
+    beats_directive = _beats_ideas_block(data_in.get('beats') or [])
 
     # Detect non-standard format from the idea hint to avoid injecting human-drama seeds
     _idea_lower = idea_hint.lower()
@@ -11411,6 +12723,14 @@ def generate_series_ideas():
         for i in range(5)
     )
     format_convention = _get_format_convention(idea_hint)
+    # Whether a non-default era/world was picked (post-apoc, 1920s, fantasy…).
+    # When it is, the concrete modern-drama seeds (corporate boardroom, forensic
+    # accountant, podcast confession, tech billionaire…) actively FIGHT the era
+    # directive: they are far more vivid/specific than the abstract "make it
+    # post-apocalyptic" line, so the model anchors on them and drifts straight
+    # back into modern realism. So we suppress those seeds and keep only mood,
+    # exactly like the non-standard-format path does.
+    _era_world_override = bool(era_setting_directive)
     # For non-standard formats (animation, furry, sci-fi, etc.) the human-drama seeds
     # are irrelevant — replace them with just mood seeds to avoid archetype contamination.
     if _nonstandard_format:
@@ -11422,6 +12742,29 @@ def generate_series_ideas():
                "НЕ используй человеческие drama-архетипы (CEO, горничная, мачеха, миллиардер) если только "
                "идея пользователя явно не включает людей. Придумывай архетипы исходя из заданного формата.\n")
             + "\nMOOD SEEDS (один на идею):\n"
+            f"{mood_seeds}\n\n"
+        )
+    elif _era_world_override:
+        # Era/world picked → the modern-drama seeds would contaminate. Replace
+        # them with CURATED era/world premise seeds (real hit-drama engines that
+        # actually fit the period/world) + mood, plus an instruction to invent
+        # era-appropriate settings/professions/antagonists rather than reskin.
+        mood_seeds = '\n'.join(f'{i+1}. Mood: {seed_tones[i][0]}' for i in range(5))
+        premise_seeds = _setting_premise_seeds_block(
+            data_in.get('era'), data_in.get('era_custom'),
+            data_in.get('world_setting'), data_in.get('world_custom'),
+        )
+        seeds_section = (
+            (f"USER IDEA HINT (учти при генерации): \"{idea_hint}\"\n\n" if idea_hint else "")
+            + "⚠ The ERA & WORLD SETTING above is the PRIMARY constraint — it overrides everything else.\n"
+            "Do NOT reuse stock modern-day short-drama settings or roles (corporate boardroom, CEO, "
+            "billionaire, nanny, hospital ER, podcast, social-media scandal, forensic accountant, etc.) "
+            "unless they genuinely exist in the chosen era/world. INVENT settings, professions, social "
+            "structures, props and antagonists that BELONG to that period/world. Keep the same emotional "
+            "DNA of short drama (humiliation, betrayal, power flip, forbidden love, revenge) but dress every "
+            "beat in era/world-correct clothing.\n\n"
+            + premise_seeds
+            + "MOOD SEEDS (one per idea — pair each with a different premise seed above):\n"
             f"{mood_seeds}\n\n"
         )
     else:
@@ -11436,6 +12779,21 @@ def generate_series_ideas():
         "Generate exactly 5 series concepts for short-form vertical video.\n\n"
         + format_block
         + f"FORMAT-SPECIFIC DIRECTIVE: {format_ideas_directive}\n\n"
+        + era_setting_directive
+        + beats_directive
+        # Anti-monotony (thriller cap + sameness check) and the romance/affair
+        # directive only apply in free-creative mode. When the user has
+        # explicitly picked genres OR a beat sequence they're steering on purpose —
+        # don't override (capping thrillers / forcing variety would fight a
+        # deliberate "Thriller" pick or the chosen ordered beat skeleton).
+        + (_IDEA_ANTI_MONOTONY if (not _nonstandard_format and not genres and not beats_directive) else "")
+        + (_IDEA_ROMANCE_DIRECTIVE if (not _nonstandard_format and not genres and not beats_directive) else "")
+        # Engine-family spread enforces variety (each of 5 from a different
+        # family, overused tropes capped at 1) WITHOUT banning anything. Applies
+        # even when genres are picked — it varies the family within the genre.
+        # Suppressed when a beat sequence is picked: forcing 5 different families
+        # would contradict "all 5 ride the SAME ordered beat skeleton".
+        + (_IDEA_FAMILY_SPREAD if (not _nonstandard_format and not beats_directive) else "")
         + genre_rule
         + avoid_rule
         + seeds_section
@@ -11462,7 +12820,20 @@ def generate_series_ideas():
         "- All titles and English fields must be in English\n"
         "- synopsis_ru must be in Russian — short (2-3 sentences), vivid, makes you want to watch\n"
         "- No generic titles. No predictable plots. Surprise me — but stay SIMPLE.\n\n"
-        f"Return JSON matching this schema:\n{_IDEAS_SCHEMA}"
+        # FINAL era/world reinforcement — placed last on purpose: later
+        # instructions dominate, and this is the rule that kept getting ignored
+        # (post-apoc / 1920s ideas drifting back to plain modern-day synopses).
+        + (
+            "🚨 FINAL CHECK — ERA & WORLD (do this LAST, before returning JSON):\n"
+            "Re-read all 5 synopses. ANY synopsis that reads like a present-day realistic story — "
+            "or that contains a prop/role/event impossible in the chosen era/world (smartphone, social "
+            "media, DNA test, modern corporation, etc. when the era predates them; or a mundane modern "
+            "setting when a fantasy/post-apocalyptic/sci-fi world was chosen) — is WRONG. Rewrite it from "
+            "scratch so the era/world is unmistakable in the first sentence. The chosen ERA & WORLD SETTING "
+            "is non-negotiable and applies to ALL 5 ideas.\n\n"
+            if _era_world_override else ""
+        )
+        + f"Return JSON matching this schema:\n{_IDEAS_SCHEMA}"
     )
     try:
         data = json.loads(strip_json(llm_ask(writer_model, prompt, system=_IDEAS_SYSTEM)))
@@ -11589,10 +12960,14 @@ _FORMAT_MODE_RULES = {
     'short_drama': {
         'one_liner': 'TikTok/Reels short drama — addictive serialized format (ReelShort / DramaBox style).',
         'title_rule': (
-            'Title style — LONG, hook-loaded first-person sentence (8-14 words). '
-            'Examples: "My Stepmother Made Me a Servant in My Own House", '
-            '"I Got Pregnant by My Commander\'s Twin". '
-            'The title alone must spell out the central betrayal / scandal / inversion.'
+            'Title style — SHORT and hook-loaded (3-7 words, HARD CAP 8). '
+            'Punchy beats complete: the title only needs ONE strong hook — the betrayal, '
+            'the inversion, the secret — the synopsis carries the rest. Do NOT cram the whole '
+            'premise into the title as a long ReelShort run-on sentence. '
+            'Good (short): "My Husband\'s Other Wife", "Pregnant by My Enemy", "The Maid Owns It All", '
+            '"Sold to the Devil Duke", "He Forgot He Married Me". '
+            'Too long (BANNED): "My Stepmother Made Me a Servant in My Own House After Dad Died" — '
+            'cut it to "A Servant in My Own House".'
         ),
         'synopsis_rule': (
             'Synopsis: 3-5 punchy sentences. Open IN the conflict — something is already on fire. '
@@ -11610,7 +12985,8 @@ _FORMAT_MODE_RULES = {
         ),
         'ideas_directive': (
             'These are SHORT DRAMA concepts (TikTok/Reels addictive serials). '
-            'Long titles, big premises, central betrayal / power-inversion engine, '
+            'SHORT punchy titles (3-7 words, hard cap 8 — NOT long run-on sentences), '
+            'big premises, central betrayal / power-inversion engine, '
             'continuous serialized arc with hard cliffhangers.'
         ),
     },
@@ -11774,6 +13150,11 @@ def generate_series_from_idea():
         format_mode = 'short_drama'
     format_block = _format_mode_block(format_mode)
     format_ideas_directive = _FORMAT_MODE_RULES[format_mode]['ideas_directive']
+    era_setting_directive = _era_setting_block(
+        data_in.get('era'), data_in.get('era_custom'),
+        data_in.get('world_setting'), data_in.get('world_custom'),
+    )
+    beats_directive = _beats_ideas_block(data_in.get('beats') or [])
     angle    = random.choice(_FROM_IDEA_ANGLES)
     setting  = random.choice(_IDEA_SETTINGS)
     twist    = random.choice(_IDEA_TWISTS)
@@ -11795,6 +13176,9 @@ def generate_series_from_idea():
         'superhero', 'супергерой', 'игра', 'game', 'видеоигр',
     ])
     format_convention = _get_format_convention(idea)
+    # Era/world picked → suppress the modern-drama seeds (Setting/Protagonist/
+    # Antagonist) which otherwise drag the concept back to present-day realism.
+    _era_world_override = bool(era_setting_directive)
 
     if _nonstandard_format:
         # Seeds are for human drama archetypes — skip them entirely when format is non-standard.
@@ -11807,6 +13191,24 @@ def generate_series_from_idea():
                "Do NOT force human-drama archetypes (CEO, billionaire, maid, stepmother, etc.) into this concept. "
                "Character archetypes, setting, and premise must match the user's stated format.\n")
             + "\n"
+        )
+    elif _era_world_override:
+        # Drop the modern Setting/Protagonist/Antagonist seeds — give curated
+        # era/world premise seeds + angle/mood, and instruct the model to invent
+        # era/world-appropriate everything rather than reskin a modern story.
+        premise_seeds = _setting_premise_seeds_block(
+            data_in.get('era'), data_in.get('era_custom'),
+            data_in.get('world_setting'), data_in.get('world_custom'),
+            n=4,
+        )
+        seeds_block = (
+            f"Creative angle to explore: {angle}\n"
+            f"Mood / emotional register: {tone}\n\n"
+            "⚠ The ERA & WORLD SETTING above is the PRIMARY constraint. Do NOT reuse stock modern-day "
+            "settings or roles (CEO, billionaire, nanny, hospital, podcast, social-media scandal) unless they "
+            "genuinely exist in that era/world. INVENT settings, professions, props and antagonists that BELONG "
+            "to the chosen period/world, while keeping the emotional DNA of short drama.\n\n"
+            + premise_seeds
         )
     else:
         seeds_block = (
@@ -11829,6 +13231,8 @@ def generate_series_from_idea():
     prompt = (
         format_block
         + f"FORMAT-SPECIFIC DIRECTIVE: {format_ideas_directive}\n\n"
+        + era_setting_directive
+        + beats_directive
         + f"USER'S IDEA (PRIMARY BRIEF — honor this above everything else): \"{idea}\"\n\n"
         + genre_rule
         + seeds_block
@@ -11836,9 +13240,16 @@ def generate_series_from_idea():
         "- The user's idea is the brief. Seeds and genre tags are SECONDARY creative pressure — "
         "discard any seed that conflicts with what the user described.\n"
         "- The format (animation vs live-action drama vs thriller vs fantasy) must match the user's idea.\n"
-        "- TITLE must follow the format-mode title rule above (long ReelShort sentence vs short Instagram-style).\n"
+        "- TITLE must follow the format-mode title rule above and stay SHORT — 3-7 words, hard cap 8. "
+        "One sharp hook, not the whole plot crammed into a run-on sentence.\n"
         "- Avoid generic plots. Give it a title that sets a clear visual expectation.\n\n"
-        "Create a UNIQUE series concept for short-form vertical video that feels fresh and specific. "
+        + (
+            "🚨 FINAL CHECK — ERA & WORLD: the concept MUST be unmistakably set in the chosen era/world "
+            "(see ERA & WORLD SETTING above), established in the first sentence of world_description and "
+            "synopsis. No present-day-realism drift, no anachronistic props.\n\n"
+            if _era_world_override else ""
+        )
+        + "Create a UNIQUE series concept for short-form vertical video that feels fresh and specific. "
         "Return JSON with exactly these fields: "
         "title, genre, tone, target_audience, world_description, synopsis. "
         f"{_synopsis_len_rule}"
@@ -12585,6 +13996,184 @@ def detect_scene_overcrowding(s, script: str) -> list[dict]:
     return violations
 
 
+# ── No-name-character detector ───────────────────────────────────────────────
+# Every on-camera / speaking character MUST carry a UNIQUE PROPER NAME and a
+# cast-block line so its reference portrait binds reliably at generation time.
+# Bare role labels ("CLIENT", "OLD WOMAN", "MAN #2") never get a stable ref →
+# the model renders the wrong face (the recurring «героиня вместо клиента» bug,
+# e.g. «My Sister Owns the Nail Salon» ep 3 — CLIENT cue, no Mrs. Park ref).
+_GENERIC_ROLE_WORDS = {
+    # English roles
+    'client','customer','patient','doctor','nurse','waiter','waitress','clerk',
+    'bartender','reporter','journalist','bodyguard','guard','receptionist','driver',
+    'cop','officer','detective','manager','boss','teacher','student','maid','butler',
+    'cashier','barista','salesman','saleswoman','secretary','assistant','agent','soldier',
+    'guy','lady','gentleman','stranger','neighbor','neighbour','passenger','pedestrian',
+    'man','woman','boy','girl','kid','child','teen','teenager','baby','infant','toddler',
+    'mother','father','mom','dad','son','daughter','sister','brother','husband','wife',
+    'friend','colleague','coworker','crowd','people','men','women','person','someone',
+    'host','hostess','chef','cook','janitor','plumber','mechanic','vendor','seller','buyer',
+    'lawyer','witness','victim','suspect','intern','employee','worker','owner','landlord',
+    # Russian roles
+    'клиент','клиентка','покупатель','покупательница','пациент','пациентка','врач','доктор',
+    'медсестра','медбрат','официант','официантка','охранник','водитель','мужчина','женщина',
+    'девушка','девочка','парень','мальчик','ребёнок','ребенок','незнакомец','незнакомка',
+    'сосед','соседка','полицейский','детектив','менеджер','начальник','начальница','учитель',
+    'учительница','ученик','ученица','прохожий','пассажир','толпа','люди','человек',
+    'мать','отец','мама','папа','сын','дочь','сестра','брат','муж','жена','друг','подруга',
+    'адвокат','свидетель','свидетельница','жертва','подозреваемый','владелец','сотрудник',
+}
+# Titles that legitimately PREFIX a real name (Mrs. Park, Dr. Harris).
+_NAME_TITLES = {
+    'mr','mrs','ms','miss','dr','sir','lord','captain','colonel','sergeant','professor',
+    'prof','madam','madame','aunt','uncle','grandma','grandpa','мистер','миссис','мисс',
+    'капитан','полковник','профессор','тётя','тетя','дядя','бабушка','дедушка',
+}
+# Determiners / adjectives that do not constitute a proper name on their own.
+_NAME_FILLER = {
+    'the','a','an','another','other','old','young','elderly','tall','short','fat','thin',
+    'mysterious','strange','angry','random','unknown','new','big','small','little','first',
+    'second','third','тот','та','этот','эта','старый','старая','молодой','молодая','новый',
+    'странный','неизвестный','первый','второй','другой','один','одна',
+}
+
+def _label_is_unnamed(label: str) -> bool:
+    """True if a speaker cue / BLOCKING name is a GENERIC role label carrying no
+    proper name. 'CLIENT' / 'OLD WOMAN' / 'MAN #2' / 'THE GUY' → True.
+    'MRS. PARK' / 'DR. HARRIS' / 'NURSE BROOKS' / 'MAI' → False."""
+    if not label:
+        return False
+    saw_role = False
+    name_toks = []
+    for raw in re.split(r'[\s\.\-]+', label.lower()):
+        t = re.sub(r'[^0-9a-zа-яё]', '', raw)
+        if not t or t.isdigit():
+            continue
+        if t in _GENERIC_ROLE_WORDS:
+            saw_role = True
+            continue
+        if t in _NAME_TITLES or t in _NAME_FILLER or len(t) < 2:
+            continue
+        name_toks.append(t)
+    return saw_role and not name_toks
+
+
+def _extract_cast_block_names(script: str) -> set:
+    """Names declared in the script's own === EPISODE CAST === block."""
+    names = set()
+    m = re.search(r'=== EPISODE CAST ===(.*?)=== END CAST ===', script or '', re.DOTALL)
+    if not m:
+        return names
+    for line in m.group(1).splitlines():
+        line = line.strip()
+        if not line.upper().startswith('CHARACTER:'):
+            continue
+        seg = line.split('|', 1)[0]
+        if ':' in seg:
+            nm = re.sub(r'\s*\(.*?\)\s*$', '', seg.split(':', 1)[1]).strip()
+            if nm:
+                names.add(nm)
+    return names
+
+
+def _extract_speaker_and_blocking_labels(script: str) -> list:
+    """Every dialogue cue + [BLOCKING] entry as (label, kind). The cast block is
+    stripped first so its CHARACTER: lines aren't mistaken for cues."""
+    if not script:
+        return []
+    out = []
+    body = re.sub(r'=== EPISODE CAST ===.*?=== END CAST ===', '', script, flags=re.DOTALL)
+    SKIP = {'location','outfit','outfit_desc','outfitdesc','int','ext','инт','экст','инта',
+            'кратко','note','notes','reversal','blocking','blocking_end','time','gender',
+            'look','role','is_base','день','ночь','утро','вечер','character'}
+    cue_re = re.compile(
+        r"^[ \t>*_]*([A-ZА-ЯЁ][A-ZА-ЯЁ0-9 \-\.'#]{1,30})\s*(?:\*?\([^)\n]+\)\*?)?\s*:",
+        re.MULTILINE,
+    )
+    for m in cue_re.finditer(body):
+        lab = m.group(1).strip().rstrip('.').strip()
+        if lab and lab.lower() not in SKIP:
+            out.append((lab, 'cue'))
+    for bm in re.finditer(r'\[BLOCKING(?:_END)?\](.*?)\[/BLOCKING(?:_END)?\]',
+                          script, re.DOTALL | re.IGNORECASE):
+        for line in bm.group(1).splitlines():
+            ml = re.match(r"\s*([A-ZА-ЯЁ][A-ZА-ЯЁ0-9 \-\.']{1,30})\s*:", line)
+            if not ml:
+                continue
+            lab = ml.group(1).strip().rstrip('.').strip()
+            if lab and lab.lower() not in SKIP:
+                out.append((lab, 'blocking'))
+    return out
+
+
+def detect_unnamed_characters(s, script: str) -> list:
+    """Programmatic write-time guard. Flags (critical) any on-camera character
+    that won't bind a reference portrait:
+      • unnamed_character — bare generic role cue/BLOCKING ("CLIENT", "OLD WOMAN").
+      • uncast_character — a NAMED speaker/BLOCKING entry with no matching line in
+        === EPISODE CAST === (and not a known series character) → no card built.
+    Returns list of violation dicts (same shape the audit loop consumes)."""
+    if not script:
+        return []
+    cast_names = _extract_cast_block_names(script)
+    series_names = {(c.get('name') or '').strip()
+                    for c in (s.get('characters') or []) if (c.get('name') or '').strip()}
+    all_names = cast_names | series_names
+    known_lower = {n.lower() for n in all_names if n}
+    resolver_roster = [{'name': n} for n in all_names]
+
+    unnamed, uncast = {}, {}
+    for lab, kind in _extract_speaker_and_blocking_labels(script):
+        if _label_is_unnamed(lab):
+            unnamed.setdefault(lab, set()).add(kind)
+            continue
+        # Named label — must resolve to a cast / series character so a card exists.
+        if lab.lower() in known_lower:
+            continue
+        if _resolve_char_by_script_name(lab, resolver_roster) is not None:
+            continue
+        uncast.setdefault(lab, set()).add(kind)
+
+    violations = []
+    for lab, kinds in sorted(unnamed.items()):
+        violations.append({
+            'type': 'unnamed_character',
+            'severity': 'critical',
+            'where': f'«{lab}» ({"/".join(sorted(kinds))})',
+            'explanation': (
+                f'Персонаж обозначен безымянной ролью «{lab}» — нет уникального имени '
+                f'и карточки. При генерации он НЕ получает референс-портрет, и модель '
+                f'рисует на его месте чужое лицо (частый баг: вместо клиента в кадре '
+                f'появляется главная героиня).'
+            ),
+            'fix': (
+                f'Дай этому персонажу УНИКАЛЬНОЕ собственное имя (напр. «MRS. PARK», '
+                f'«DR. HARRIS», «OLD TOM») и используй ОДНУ И ТУ ЖЕ строку ВЕЗДЕ: в '
+                f'=== EPISODE CAST === (CHARACTER: ИМЯ | GENDER | LOOK | OUTFIT | IS_BASE: true), '
+                f'в кью-реплике (ИМЯ:), в [BLOCKING] и в описаниях действия. Никаких голых '
+                f'ролей CLIENT/WAITER/MAN/WOMAN как идентификатора. Безымянными остаются '
+                f'только молчаливые фоновые статисты без реплик и без [BLOCKING] — их '
+                f'упоминай только в прозе.'
+            ),
+        })
+    for lab, kinds in sorted(uncast.items()):
+        violations.append({
+            'type': 'uncast_character',
+            'severity': 'critical',
+            'where': f'«{lab}» ({"/".join(sorted(kinds))})',
+            'explanation': (
+                f'Персонаж «{lab}» говорит/присутствует в кадре, но его НЕТ в блоке '
+                f'=== EPISODE CAST === — карточка не создастся и референс не прикрепится.'
+            ),
+            'fix': (
+                f'Добавь строку в === EPISODE CAST ===: CHARACTER: {lab} | GENDER: … | '
+                f'LOOK: … | OUTFIT: … | IS_BASE: true. Имя в касте должно ПОБУКВЕННО '
+                f'совпадать с кью-репликой и [BLOCKING].'
+            ),
+        })
+    return violations
+
+
 def _script_runtime_metrics(script: str) -> dict:
     """Programmatic length scan — counts dialogue lines + spoken words + action lines
     + estimated runtime.
@@ -13296,11 +14885,12 @@ CAST BLOCK RULES — MANDATORY:
 2. CHARACTER REUSE IS LAW — DO NOT INVENT NAMED LEADS:
    The SERIES CHARACTERS list above is the canonical cast. The protagonist, antagonist, love interest, sister, parents, fiancé — every recurring role — MUST come from that list, using the EXACT name spelling.
    FORBIDDEN: inventing a new named lead even if the synopsis names someone differently. If the synopsis says "Elena" but the SERIES CHARACTERS list has "Emma" in the protagonist role — USE EMMA. Adapt the synopsis to fit the canonical roster, not the other way around.
-   You may invent ONLY minor walk-on roles that have no recurring presence:
-     • Doctor, Nurse, Driver, Waiter, Clerk, Bartender, Reporter, Bodyguard, Guard, Receptionist
-     • Always label them by ROLE, not a fresh proper name (write "DOCTOR", not "DR. HARRIS")
-     • Always include GENDER + LOOK fields when inventing
-     CHARACTER: DOCTOR | GENDER: female | LOOK: 45 yo, dark hair in low bun, white coat, clipboard | OUTFIT: clinic_coat | OUTFIT_DESC: white doctor's coat, navy scrubs underneath, stethoscope around neck
+   You may invent minor walk-on roles (doctor, nurse, driver, waiter, clerk, bartender, reporter, bodyguard, guard, receptionist, client…) — BUT every walk-on that SPEAKS, is ADDRESSED, or appears ON-CAMERA as a distinct individual MUST be given a UNIQUE PROPER NAME and its own cast-block line. NO bare role labels as a character identity.
+     • FORBIDDEN as a speaker cue / [BLOCKING] entry / cast CHARACTER: bare role words — CLIENT, CUSTOMER, DOCTOR, NURSE, WAITER, MAN, WOMAN, GUY, GIRL, BOY, GUARD, NEIGHBOR, STRANGER, MOM, DAD, etc. Give them a name: «MRS. PARK», «DR. HARRIS», «NURSE BROOKS», «OLD TOM», «DETECTIVE COLE».
+     • ONE NAME, USED EVERYWHERE — the cast-block CHARACTER name, the dialogue cue (NAME:), the [BLOCKING] entry, and any narration MUST be the SAME string, character-for-character. NEVER call someone «CLIENT:» in a cue but «Mrs. Park» in dialogue. The binding system attaches reference portraits by matching this exact name in the chunk text — a mismatch means the character gets NO reference and the model renders the WRONG FACE (recurring prod bug: the heroine got rendered in place of an un-bound «CLIENT»).
+     • Always include GENDER + LOOK on the invented character's cast line, and mark IS_BASE: true (first appearance defines their default look).
+     CHARACTER: MRS. PARK | GENDER: female | LOOK: 55 yo, silver bob, sharp eyes, pearl earrings | OUTFIT: salon_client | OUTFIT_DESC: lilac cardigan, cream blouse, reading glasses on a chain | IS_BASE: true
+     • The ONLY characters allowed to stay nameless: true SILENT background extras with NO dialogue and NO [BLOCKING] line (a crowd, passers-by, a waiter walking past in the background). Describe those in prose only — never give them a speaker cue or a cast line.
    If you catch yourself writing a new proper name for someone the synopsis treats as a main character — STOP. Find the matching SERIES CHARACTER and use that name instead.
 
 3. OUTFITS ARE SCENE-DEPENDENT — pick the outfit_label that fits this scene's context:
@@ -13514,6 +15104,50 @@ Physical beat rules:
   ✓ Escalate across the series: slap in ep 3 < grab in ep 7 < full physical struggle in ep 15
   ✗ FORBIDDEN: "conversation about violence" instead of actual violence ("He threatened to hurt her" as dialogue — show it physically instead)
   ✗ FORBIDDEN: fight scenes that take >2 action lines — this is a 60-second episode, not an action film
+
+━━━ ROMANCE, DESIRE, INTIMACY & AFFAIRS — SHOW IT, DON'T SKIP IT ━━━
+Short drama runs on the heart as much as on conflict. Do NOT sanitize romance and desire out of the script. When a romantic, sexual-tension, or affair thread is active in the series (love interest, forbidden pull, cheating spouse, slow-burn, marriage with real heat) — RENDER IT PHYSICALLY ON SCREEN, don't just have characters talk about feelings.
+
+Periodically — whenever the relationship arc has built to it — a romantic episode SHOULD contain a real intimate beat, not only confrontation. Rotate these as filmable action beats:
+  • [Marcus берёт её лицо в ладони и целует — медленно, как будто уже не сдерживается.]
+  • [Elena притягивает его за воротник, и поцелуй обрывает всё, что она хотела сказать.]
+  • [Они застывают слишком близко — дыхание сбивается, никто не отступает.]
+  • [Его рука скользит по её талии, она не отстраняется.]
+  • [Поцелуй у двери, она тянет его внутрь — свет гаснет. СМЕНА СЦЕНЫ.]
+  • [Утро. Простыни смяты, её платье на полу. Marcus смотрит на спящую Elena.]
+
+AFFAIRS / INFIDELITY — a core melodrama engine. When the series has a cheating thread, DRAMATIZE it on screen, don't bury it in exposition:
+  • Show the charged moment between the cheating partner and the lover (a kiss, a too-close embrace, hands that linger).
+  • Show the DISCOVERY as a face-to-face shock — the wronged partner walks in, or someone says it out loud: "I saw you. With her. Tonight."
+  • Mine the betrayal-of-the-heart for maximum emotional volume — this hurts more than any slap.
+
+CONTENT BOUND — CRITICAL (the video generator enforces this, write to the line):
+  ✓ ALLOWED on screen: kissing (including passionate), embracing, hands on waist/face/neck, pulling someone close, a charged near-kiss, lying together clothed, a morning-after tableau (rumpled sheets, clothes on the floor), undressing IMPLIED by a closing door / lights cut.
+  ✗ NEVER write on screen: explicit sexual acts, nudity, bare bodies, anything pornographic. Intimacy beyond a kiss is ALWAYS implied off-screen — cut away (СМЕНА СЦЕНЫ / свет гаснет) and resume on the morning-after or the aftermath.
+  ✓ Keep it tasteful and cinematic. The kiss and the cut-to-black do the work; the audience fills in the rest.
+
+Do NOT force a kiss into a non-romantic episode (a pure revenge or mystery beat stays focused). But across a series with any romance/affair thread, these intimate and betrayal beats MUST land regularly — not "never", which is the failure mode to avoid.
+
+━━━ HUMILIATION & BULLYING LADDER — THE SETUP THAT EARNS THE PAYOFF ━━━
+This is the engine of short drama. The audience's craving (爽 / "satisfying") is built by FIRST making them ache on the hero's behalf. A humiliation scene is NOT one insult — it is a STAGED PILE-ON with a held reaction and a delayed turn. Stage it deliberately whenever the story puts the protagonist (or a sympathetic character) in a position of weakness — and do it SYSTEMATICALLY across the series, especially in setup episodes and before any comeback.
+
+The escalation ladder — build it in THIS order (it's the "когда же ты ответишь?!" mechanic):
+  1. INSTIGATOR — the antagonist lands the first jab. PUBLIC (there must be witnesses) and SPECIFIC, never generic. Attack a concrete detail: her cheap shoes, his delivery uniform, her village accent, the fact she cleans toilets. ("You actually wore THAT to my engagement? Did you rob a donation bin?")
+  2. AMPLIFIER — a second character piles on, agreeing and escalating with a crueler detail. ("She probably smells like the kitchen she crawled out of.") Each voice raises the temperature.
+  3. CROWD / BYSTANDER ZINGER — someone on the edge throws a throwaway line, a laugh, or films it on a phone to SEAL the humiliation publicly. ([Кто-то в толпе фыркает: "Снимаю для истории."] / laughter ripples.) This is the gut-punch that finishes the setup.
+  4. THE HELD BEAT — HOLD on the protagonist's face. Write it as an action line: the jaw tightens, the hand trembles, a breath is swallowed, eyes drop then slowly rise. NO clapback yet. This silent beat is where the viewer screams "ну ответь же им!" — do not skip it.
+     • e.g. [Lena не двигается. Костяшки белеют на ручке ведра. Она поднимает взгляд — медленно, ровно.]
+  5. THE TURN — only NOW does the hero act, and pick ONE:
+     • IMMEDIATE PAYOFF (the face-slap): a single ice-cold line, a quiet reveal of hidden power, or a small devastating action that flips the room. Short. No speech. ("The donation bin? — I own this building. You're standing in my lobby.")
+     • DELAYED PAYOFF (banked): the hero says nothing, or one quiet line, and walks — swallowing it on purpose. The audience feels the injustice and the promise that it WILL be repaid. Use this to fuel a later episode's bigger reckoning.
+
+Rules:
+  • PUBLIC + SPECIFIC + WITNESSED, every time — humiliation in private with no audience barely registers.
+  • The pile-on needs ≥2 attackers + ideally a crowd reaction; one person sneering alone is weak.
+  • ALWAYS include the held reaction beat (step 4). The delay IS the hook. Cutting straight from insult to clapback kills the ache.
+  • ESCALATE across the series: a verbal sneer early < a drink thrown in her face < a public shove / food knocked from her hands < a staged humiliation at a wedding or gala. Match the physical-beat rules above (1 filmable action, no gore).
+  • Cliffhanger option: end the episode ON the held beat or the first frame of the turn — cut before the full payoff lands.
+  • Don't force it into every scene — use it where there's a real power imbalance. But it should RECUR through the series as a deliberate, repeated emotional engine, not a one-off.
 
 ━━━ DIALOGUE-FIRST RULE — HARD BAN ON PAPERWORK ━━━
 This is short drama for vertical video. EVERYTHING must be revealed through SPOKEN DIALOGUE between living people on screen.
@@ -13737,6 +15371,7 @@ CHARACTER: [name] | OUTFIT: [outfit_label] | OUTFIT_DESC: [garments + colors]
 === END CAST ===
 
 Same cast-block rules as for single episodes (gender, look, IS_BASE for default looks, OUTFIT_DESC for new outfits).
+NAMED-CAST RULE — every character that speaks, is addressed, or appears on-camera (even a one-line client, waiter, doctor) MUST have a UNIQUE PROPER NAME (e.g. MRS. PARK, DR. HARRIS — never a bare CLIENT/WAITER/MAN/WOMAN), its own cast-block line, and that exact same name used in the dialogue cue AND [BLOCKING]. A role-word cue that mismatches the cast name fails to bind a reference portrait and the model renders the wrong face. Only truly silent background extras stay nameless (prose only, no cue, no cast line).
 
 ═══════════════════════════════════════
 CUT MARKERS — REQUIRED
@@ -13791,6 +15426,8 @@ HOOK / DIALOGUE / CLIFFHANGER STYLE — same as single-episode mode
 - End each sub-episode on REACTION, not action — cut before resolution
 - Cliffhanger types (rotate, never repeat back-to-back): ARRIVAL, REVELATION, ULTIMATUM, FALL, ALLIANCE, SILENT POWER, RECORDING SURFACES, WRONG PERSON, SECRET ALREADY KNOWN
 - PHYSICAL ACTION IN CONFLICT SCENES — MANDATORY: every conflict scene must contain at least 1 physical action beat in [brackets]. Slap, grab, push, object thrown, arm blocked — rotate and escalate across the chunk. Pure dialogue confrontations without a physical beat are static and flat.
+- ROMANCE, DESIRE & AFFAIRS — SHOW IT, DON'T SKIP IT: when a romantic / sexual-tension / cheating thread is active, render it physically across the chunk — a real kiss, a charged near-miss, hands on waist/face, an affair caught in the act, the wronged partner's discovery as a face-to-face shock. Don't bury attraction or betrayal in exposition. CONTENT BOUND (the video generator enforces it): kissing/embracing/passion/morning-after tableau are ALLOWED on screen; explicit sexual acts & nudity are NOT — cut to black (СМЕНА СЦЕНЫ / свет гаснет) and resume on the aftermath. Don't force a kiss into a non-romantic beat, but across a series with any romance/affair thread these intimate beats MUST land regularly, not never.
+- HUMILIATION & BULLYING LADDER — the setup that earns the payoff (爽 / face-slap engine). When the protagonist is in a weak position, stage humiliation as a PILE-ON, not one insult, in this order: (1) INSTIGATOR lands a public, SPECIFIC jab (attack a concrete detail — her cheap shoes, his uniform — never generic); (2) AMPLIFIER piles on with a crueler detail; (3) CROWD/BYSTANDER throws a throwaway zinger / laugh / films it to seal it publicly; (4) HELD BEAT — hold on the hero's face as an action line (jaw tightens, hand trembles, eyes drop then rise) with NO clapback yet — this delay is the "ну ответь же!" hook; (5) THE TURN — either an ice-cold one-line payoff / quiet power reveal (immediate), OR the hero swallows it and walks, banking it for a bigger later reckoning (delayed). Always include the held beat; public + witnessed + specific every time; escalate across the chunk (sneer < drink thrown < public shove). Great cliffhanger: cut on the held beat or the first frame of the turn. Recur this systematically through the series wherever there's a power imbalance — it's a primary emotional engine, not a one-off.
 - NO INTERRUPTIONS — HARD BAN: NEVER cut a line mid-sentence with a dash (—). Every spoken line is a complete sentence. FORBIDDEN: "ELENA: You should have—" or "(перебивает)". The video generator renders cut lines as two people talking at once — it looks broken. Instead: complete the line, then use an action beat to show the interruption physically.
 
 ═══════════════════════════════════════
@@ -14720,6 +16357,12 @@ def generate_next_episode_synopsis(sid):
     # and s['finale'] (the planned ending). Without injecting these, the
     # synopsis generator drifts and ignores the finale entirely.
     trajectory_block = build_trajectory_block(s, next_num)
+    # Keep the ordered beat skeleton (ноды) steering every synopsis — prepend
+    # so it sits above the per-episode trajectory. Included in all prompt
+    # branches below via {trajectory_block}.
+    _beats_block = _series_beats_episode_block(s)
+    if _beats_block:
+        trajectory_block = _beats_block + trajectory_block
     # Concrete per-episode bridge plan from current state to finale.
     try:
         _bridge_data = build_finale_bridge_plan(s, next_num) or {}
@@ -15467,6 +17110,13 @@ def generate_episode_script(sid, num):
     except Exception:
         crowd_block = ''
     trajectory_block = build_trajectory_block(s, num)
+    # Keep the ordered beat skeleton (ноды) steering the script — prepend so it
+    # sits above the per-episode trajectory in the prompt. The opening episodes
+    # march through the beats in order, then improvise (see
+    # _series_beats_episode_block).
+    _beats_block = _series_beats_episode_block(s)
+    if _beats_block:
+        trajectory_block = _beats_block + trajectory_block
     # Concrete plot bridge from THIS episode to the finale — generated by a quick Haiku
     # planning call. This is the load-bearing fix for "writer ignores the finale":
     # prev_script tends to dominate, so we explicitly tell the writer what THIS episode
@@ -15698,6 +17348,13 @@ def generate_episode_script(sid, num):
                 print(f'[scene-crowd] ep {num} attempt {attempt+1}: {len(crowd_critical)} overcrowded scene(s) detected programmatically', flush=True)
                 for cv in crowd_violations:
                     print(f'[scene-crowd]   scene {cv["scene_idx"]} ({cv["location"]}): {cv["count"]}>{cv["limit"]} — {", ".join(cv["characters"])}', flush=True)
+            # Programmatic no-name-character check — every on-camera/speaking character
+            # MUST have a unique proper name + cast-block line so its reference binds.
+            # Bare role cues (CLIENT, OLD WOMAN) and uncast named speakers force a rewrite.
+            naming_critical = detect_unnamed_characters(s, script)
+            if naming_critical:
+                print(f'[name-check] ep {num} attempt {attempt+1}: {len(naming_critical)} unnamed/uncast character(s) — '
+                      + ', '.join(v['where'] for v in naming_critical), flush=True)
             # ── Programmatic over-length detector — count dialogue lines and spoken words,
             # estimate runtime, fail if >30% over the target duration.
             length_critical = []
@@ -15754,7 +17411,7 @@ def generate_episode_script(sid, num):
                       f'lines={lv["dialogue_lines"]} words={lv["dialogue_words"]} '
                       f'longest={lv["longest_line_words"]} avg={lv["avg_line_words"]} actions={lv["action_lines"]} '
                       f'reasons=[{reasons_str}]', flush=True)
-            all_violations = list(report.get('violations', [])) + list(logic_report.get('violations', [])) + crowd_critical + length_critical
+            all_violations = list(report.get('violations', [])) + list(logic_report.get('violations', [])) + crowd_critical + length_critical + naming_critical
             critical = [v for v in all_violations if v.get('severity') == 'critical']
             audit_report = {
                 'passes': not critical,
@@ -15769,7 +17426,7 @@ def generate_episode_script(sid, num):
                 break
             # Build a fix-it prompt and retry — group violations by source for clarity
             cont_fixes = [v for v in critical if v.get('type') in ('timeline','fact','knowledge','biology','setup','paperwork','scene_teleport')]
-            logic_fixes = [v for v in critical if v.get('type') in ('status','hidden_position','enabling_condition','legal_term','unmotivated_delay','ambiguous_cliffhanger','protagonist_stagnation','emotional_monotony','scene_overcrowding','finale_drift','script_overlength')]
+            logic_fixes = [v for v in critical if v.get('type') in ('status','hidden_position','enabling_condition','legal_term','unmotivated_delay','ambiguous_cliffhanger','protagonist_stagnation','emotional_monotony','scene_overcrowding','finale_drift','script_overlength','unnamed_character','uncast_character')]
             fixes_parts = []
             if cont_fixes:
                 fixes_parts.append('CONTINUITY/CANON ISSUES:\n' + '\n'.join(
@@ -16030,6 +17687,56 @@ def sync_episode_with_cast_block(sid, num):
         healed += 1
         ep['locations_used'] = new_locs_used
 
+    # ── No-name cue → card auto-alias (heals already-written episodes) ──────────
+    # If the script addresses a character by a bare role label (e.g. «CLIENT:»)
+    # that differs from its card name (e.g. «Mrs. Park»), the binding filter
+    # would drop the reference in any chunk that uses only the role label →
+    # the model renders the wrong face. We conservatively link the orphan label
+    # to its card as an alias so `_char_name_in_text` keeps the ref. Only fires
+    # when the mapping is UNAMBIGUOUS: exactly one un-cued role label and exactly
+    # one episode card that nothing else claims. Anything ambiguous is left for
+    # the write-time detector / user to fix.
+    linked_aliases = []
+    unnamed_warnings = []
+    try:
+        ep_cards = [c for c in chars if c['id'] in set(ep.get('characters_used', []))]
+        if ep_cards:
+            def _resolve_label(lab):
+                ll = lab.lower()
+                for c in ep_cards:
+                    if (c.get('name') or '').lower() == ll:
+                        return c
+                    if ll in {(a or '').lower() for a in (c.get('aliases') or [])}:
+                        return c
+                return _resolve_char_by_script_name(lab, ep_cards)
+            claimed, generic_orphans, named_orphans = set(), {}, {}
+            for lab, _kind in _extract_speaker_and_blocking_labels(ep['script']):
+                c = _resolve_label(lab)
+                if c:
+                    claimed.add(c['id'])
+                elif _label_is_unnamed(lab):
+                    generic_orphans.setdefault(lab.lower(), lab)
+                else:
+                    named_orphans.setdefault(lab.lower(), lab)
+            unclaimed = [c for c in ep_cards if c['id'] not in claimed]
+            # Auto-link ONLY when unambiguous: a single bare role label and a
+            # single un-cued card. A named-but-uncast orphan is NOT auto-aliased
+            # (it needs its own card) — it's surfaced as a warning instead.
+            if len(generic_orphans) == 1 and not named_orphans and len(unclaimed) == 1:
+                lab_low, lab_orig = next(iter(generic_orphans.items()))
+                card = unclaimed[0]
+                al = card.setdefault('aliases', [])
+                if lab_low not in {(a or '').lower() for a in al}:
+                    al.append(lab_low)
+                    linked_aliases.append({'alias': lab_orig, 'char': card.get('name'), 'char_id': card['id']})
+                    _log_event('INFO', 'cue_auto_aliased', sid=sid, ep_num=num,
+                               alias=lab_orig, char=card.get('name'), char_id=card['id'])
+            else:
+                for lab in list(generic_orphans.values()) + list(named_orphans.values()):
+                    unnamed_warnings.append(lab)
+    except Exception as _ae:
+        _log_event('WARN', 'cue_auto_alias_failed', sid=sid, ep_num=num, err=str(_ae)[:200])
+
     save_series(sid, s)
     save_episode(sid, num, ep)
     return {
@@ -16041,6 +17748,8 @@ def sync_episode_with_cast_block(sid, num):
         'characters_used': ep['characters_used'],
         'character_outfits': ep['character_outfits'],
         'locations_used': ep['locations_used'],
+        'linked_aliases': linked_aliases,
+        'unnamed_warnings': unnamed_warnings,
     }
 
 
@@ -17979,6 +19688,17 @@ _SEEDANCE_MODERATION_CHECKER_SYS = (
     "  - 'reject' = clear violation, Seedance will block. Refuse submit.\n\n"
     "Default to 'pass' when uncertain. False rejects are MORE costly than false passes."
 )
+
+
+# Master switch for the pre-flight Haiku moderation gate on /seedance/start.
+# Disabled (2026-06-09): it false-positived on ordinary dramatic beats (a
+# character collapsing, a poisoning scene) and HALTED Auto-mode — every flagged
+# chunk popped a blocking browser confirm() that a human had to click "ОК" on,
+# defeating the whole point of automation. The in-editor phrase-scan panel
+# («⚠️ Возможные проблемы с модерацией Seedance») still surfaces risks
+# non-blockingly, and Seedance's own server-side moderation remains the real
+# gate. Flip back to True to re-enable the pre-flight block.
+SEEDANCE_PRECHECK_ENABLED = False
 
 
 def _seedance_moderation_precheck(prompt_text):
@@ -22219,7 +23939,7 @@ def seedance_compose(sid, num):
                 ch = next((c for c in (s.get('characters') or []) if c['id'] == r.get('id')), None)
                 if ch:
                     name = (ch.get('name') or '').strip()
-                    name_in_text = _char_name_in_text(name, chunk_text)
+                    name_in_text = _char_name_in_text(name, chunk_text, ch.get('aliases'))
                     app_field = (ch.get('appearance') or '').strip()
                     # Voice-only filter: drop voice-only chars whose name
                     # not in chunk_text (always on — known-bad pattern).
@@ -23048,7 +24768,7 @@ def seedance_compose(sid, num):
                 continue
             # Use _char_name_in_text for punctuation-safe matching (handles
             # «Mrs.», «Dr.», «Officer» etc that the old simple regex missed).
-            if _char_name_in_text(name, action_only):
+            if _char_name_in_text(name, action_only, c.get('aliases')):
                 auto_added_chars.append({'name': name, 'id': c.get('id')})
         # Auto-add to refs[] + ref_urls + ref_meta. Skip voice-only chars
         # (those handled separately by the voice-only marker, must not appear
@@ -23207,7 +24927,7 @@ def seedance_start(sid, num):
     # Honors body['skip_precheck']=true escape hatch for cases where user
     # explicitly wants to bypass (e.g. retry after manual review).
     precheck_result = None
-    if not body.get('skip_precheck'):
+    if SEEDANCE_PRECHECK_ENABLED and not body.get('skip_precheck'):
         precheck_result = _seedance_moderation_precheck(prompt)
         if precheck_result.get('verdict') == 'reject':
             print(f'[precheck] REJECTED prompt for sid={sid} ep={num}: '

@@ -1165,7 +1165,10 @@ async function regenerateCoverFromViewer() {
   statusEl.textContent = 'AVAI рисует новую версию (10-40с)…';
   img.style.opacity = '0.45';
   try {
-    const r = await api.post(`/api/series/${sid}/cover/generate`, {}, { timeoutMs: 240_000 });
+    // Explicit «Regenerate» = user wants a genuinely different look, so force
+    // a fresh per-series art-direction brief (new palette/composition/font),
+    // not just a reroll of the same recipe.
+    const r = await api.post(`/api/series/${sid}/cover/generate`, { new_art_direction: true }, { timeoutMs: 240_000 });
     if (r.error) throw new Error(r.error);
     const s = _allProjects.find(x => x.id === sid);
     if (s) {
@@ -1328,6 +1331,7 @@ function openCreateSeries() {
   const singleMode = document.querySelector('input[name="new-series-mode"][value="single"]');
   if (singleMode) singleMode.checked = true;
   buildGenreFilters();
+  buildBeatConstructor();   // async — renders the ordered scenario-beat constructor
   // Clear UI-only state for import mode; content restored from draft below
   document.getElementById('import-series-preview').innerHTML = '';
   // Reset per-type extraction toggles + picked-file chips when modal reopens
@@ -2686,20 +2690,160 @@ function importLogicUndo() {
 // Suggestion store: avoids encoding issues with onclick + JSON.stringify in HTML attrs
 const _adaptStore = {};   // key → { ta, original, replacement }
 
+// Normalize a dialogue line for fuzzy matching: lowercase, drop every non
+// letter/digit. Mirrors the backend's _modkey so quote/spacing/punctuation
+// differences (the script uses `Name: text`, the backend reconstructs
+// `Name: "text"`) don't break the match.
+function _normMod(s) {
+  return (s || '').toLowerCase().replace(/[^a-z0-9а-яё]+/g, '');
+}
+
+// Split "SPEAKER: spoken" (tolerating a (parenthetical) and surrounding
+// quotes on the spoken part) into {speaker, spoken}.
+function _splitSpeakerLine(s) {
+  const m = (s || '').match(/^([^:]{1,40}):([\s\S]*)$/);
+  if (!m) return { speaker: '', spoken: (s || '').trim() };
+  const spoken = m[2].trim().replace(/^["“«»]+|["”«»]+$/g, '').trim();
+  return { speaker: m[1].trim(), spoken };
+}
+
 function _adaptApplyKey(key) {
   const d = _adaptStore[key];
   if (!d) return;
   const btn = document.querySelector(`[data-adapt-key="${key}"]`);
   const before = d.ta.value;
-  if (!before.includes(d.original)) {
-    showToast('Строка не найдена в сценарии — возможно уже заменена', 3000);
+
+  const finish = (newVal) => {
+    d.ta.value = newVal;
+    d.ta.dispatchEvent(new Event('input'));
+    if (btn) { btn.disabled = true; btn.style.opacity = '0.4'; btn.textContent = '✓ Применено'; }
+
+    // Episode editor: the textarea alone is not the source of truth. The visible
+    // script is the scene view, and nothing is persisted until "Применить
+    // изменения" is clicked — so without this the replacement looked like it did
+    // nothing and reverted on refresh. Re-render the scene view (if open) and
+    // auto-save to the backend immediately.
+    if (d.ta.id === 'ep-script') {
+      try {
+        const view = document.getElementById('ep-script-scenes');
+        if (view && !view.classList.contains('hidden') && typeof _renderSceneViewBody === 'function') {
+          _renderSceneViewBody();
+        }
+      } catch {}
+      if (typeof saveEpisodeSilent === 'function' && S.seriesId && S.episodeNum) {
+        showToast('✓ Реплика заменена, сохраняю…', 2000);
+        saveEpisodeSilent()
+          .then(() => {
+            const applyBtn = document.getElementById('ep-script-apply-btn');
+            if (applyBtn) { applyBtn.style.display = 'none'; applyBtn.dataset.dirty = ''; }
+            showToast('✓ Сохранено', 1800);
+          })
+          .catch(e => showToast('⚠ Замена применена, но не сохранена: ' + (e?.message || e), 5000));
+        return;
+      }
+    }
+    showToast('✓ Реплика заменена', 2500);
+  };
+
+  // 1) Fast path — exact substring (works only if backend `original` happens
+  //    to byte-match the script).
+  if (before.includes(d.original)) { finish(before.replace(d.original, d.replacement)); return; }
+
+  // 2) The backend reconstructs `original` as SPEAKER: "spoken" with forced
+  //    double-quotes, but scripts store dialogue as `Name: text` (no quotes).
+  //    Match line-wise on normalized text and rewrite that single line,
+  //    preserving the script's own indentation + quote style.
+  const lines = before.split('\n');
+  const want = _normMod(d.original);
+  let idx = lines.findIndex(l => _normMod(l) === want);
+
+  // 3) Tolerate parentheticals / stage directions: match on speaker + spoken.
+  if (idx === -1) {
+    const o = _splitSpeakerLine(d.original);
+    const wantSpk = _normMod(o.speaker), wantSpoken = _normMod(o.spoken);
+    if (wantSpoken) {
+      idx = lines.findIndex(l => {
+        const p = _splitSpeakerLine(l);
+        return _normMod(p.speaker) === wantSpk && _normMod(p.spoken).includes(wantSpoken);
+      });
+    }
+  }
+
+  // 4) Screenplay layout: the speaker name sits ALONE on its own line
+  //    (optionally with a `(parenthetical)` or `(CONT'D)`), and the spoken text
+  //    follows on the next line(s) until a blank line / scene header / cue.
+  //    The backend always emits `original` as `SPEAKER: "spoken"`, which never
+  //    byte-matches this layout, so none of paths 1-3 can find it. Match the
+  //    cue line + the dialogue body separately, then rewrite the body in place.
+  if (idx === -1) {
+    const o = _splitSpeakerLine(d.original);
+    const wantSpk = _normMod(o.speaker), wantSpoken = _normMod(o.spoken);
+    // A line that is JUST an uppercase speaker cue (name + optional parenthetical).
+    const cueRe = /^(\s*)([A-ZА-ЯЁ][A-ZА-ЯЁ0-9 .'\-]{0,30})\s*(\([^)]*\))?\s*$/;
+    if (wantSpk && wantSpoken) {
+      for (let i = 0; i < lines.length; i++) {
+        const cue = lines[i].match(cueRe);
+        if (!cue || _normMod(cue[2]) !== wantSpk) continue;
+        // Gather the dialogue body: following non-blank lines, stopping at a
+        // blank line, scene header (INT./EXT.) or a [BLOCKING]-style tag.
+        const body = [];
+        let j = i + 1;
+        while (j < lines.length && lines[j].trim() !== '' &&
+               !/^(INT\.|EXT\.|\[)/.test(lines[j].trim()) && !cueRe.test(lines[j])) {
+          body.push(j); j++;
+        }
+        if (!body.length) continue;
+        const bodyNorm = _normMod(body.map(k => lines[k]).join(' '));
+        if (!(bodyNorm.includes(wantSpoken) || wantSpoken.includes(bodyNorm))) continue;
+        // Preserve the first body line's indentation + any leading inline
+        // parenthetical (e.g. "(whispers)"), then swap the spoken text.
+        const first = lines[body[0]];
+        const lead = (first.match(/^\s*(?:\([^)]*\)\s*)?/) || [''])[0];
+        const repl = _splitSpeakerLine(d.replacement);
+        const newSpoken = (repl.spoken || d.replacement).trim();
+        lines.splice(body[0], body.length, lead + newSpoken);
+        finish(lines.join('\n'));
+        return;
+      }
+    }
+    // 5) Last-resort fallback: match on the spoken text alone (speaker may have
+    //    been paraphrased by the advisor). Only for sufficiently distinctive
+    //    text to avoid false positives, and only a single best line.
+    if (wantSpoken && wantSpoken.length >= 12) {
+      const k = lines.findIndex(l => _normMod(l).includes(wantSpoken));
+      if (k !== -1) {
+        const repl = _splitSpeakerLine(d.replacement);
+        const newSpoken = (repl.spoken || d.replacement).trim();
+        const lead = (lines[k].match(/^\s*(?:\([^)]*\)\s*)?/) || [''])[0];
+        lines[k] = lead + newSpoken;
+        finish(lines.join('\n'));
+        return;
+      }
+    }
+  }
+
+  if (idx === -1) {
+    showToast('Строка не найдена в сценарии — формат отличается или уже заменена', 3500);
     if (btn) { btn.disabled = true; btn.style.opacity = '0.4'; }
     return;
   }
-  d.ta.value = before.replace(d.original, d.replacement);
-  d.ta.dispatchEvent(new Event('input'));
-  if (btn) { btn.disabled = true; btn.style.opacity = '0.4'; btn.textContent = '✓ Применено'; }
-  showToast('✓ Реплика заменена', 2500);
+
+  // Keep the original line's "SPEAKER: " prefix (incl. any parenthetical) and
+  // swap only the spoken text, mirroring whether the script quotes dialogue.
+  const origLine = lines[idx];
+  const colon = origLine.indexOf(':');
+  const repl = _splitSpeakerLine(d.replacement);
+  if (colon !== -1 && repl.spoken) {
+    const prefix = origLine.slice(0, colon + 1);
+    const tail = origLine.slice(colon + 1);
+    const leadWs = (tail.match(/^\s*/) || [''])[0];
+    const hadQuote = /^["“«]/.test(tail.trim());
+    lines[idx] = prefix + leadWs + (hadQuote ? `"${repl.spoken}"` : repl.spoken);
+  } else {
+    const indent = (origLine.match(/^\s*/) || [''])[0];
+    lines[idx] = indent + d.replacement.trim();
+  }
+  finish(lines.join('\n'));
 }
 
 // Renders the result box (changes list + moderation warnings) into `out` element.
@@ -3313,7 +3457,7 @@ async function generateFromIdea() {
     const genres = getSelectedGenres();
     const model = _selectedWriterModel('writer-model-create');
     const data = await trackTask('Сериал по идее', {}, () =>
-      api.post('/api/generate-series-from-idea', { idea, genres, model, format_mode: getFormatMode() })
+      api.post('/api/generate-series-from-idea', { idea, genres, model, beats: getSelectedBeats(), format_mode: getFormatMode(), ...getEraSetting() })
     );
     fillSeriesForm(data);
     status.textContent = '✓ Поля заполнены — проверь и отредактируй если нужно';
@@ -3393,6 +3537,125 @@ function getSelectedGenres() {
   return [...document.querySelectorAll('.genre-chip input:checked')].map(cb => cb.value);
 }
 
+// ── Scenario constructor: ordered hook-beats (ноды) ──────────────────────────
+// An ORDERED sequence the user assembles. Catalog comes from GET /api/story-beats
+// (single source of truth — the English "beat" directives live server-side).
+// `_beatSeq` is the ordered selection: [{token, ru}] where token is a catalog id
+// or a custom free-text string. Order is significant. Cap _BEAT_MAX.
+const _BEAT_MAX = 8;
+let _beatCatalog = null;
+let _beatSeq = [];
+
+async function buildBeatConstructor() {
+  _beatSeq = [];   // reset on every modal open
+  const palette = document.getElementById('beat-palette');
+  const input = document.getElementById('beat-custom-input');
+  if (input) input.value = '';
+  if (!palette) return;
+  if (!_beatCatalog) {
+    try {
+      _beatCatalog = await api.get('/api/story-beats');
+    } catch (e) {
+      palette.innerHTML = '<span style="font-size:0.78rem;color:var(--danger)">Не удалось загрузить каталог нод</span>';
+      return;
+    }
+  }
+  // Group by `group`, preserving first-seen order.
+  const groups = [];
+  const byGroup = {};
+  for (const o of _beatCatalog) {
+    if (!byGroup[o.group]) { byGroup[o.group] = []; groups.push(o.group); }
+    byGroup[o.group].push(o);
+  }
+  palette.innerHTML = '';
+  for (const g of groups) {
+    const head = document.createElement('div');
+    head.style.cssText = 'flex-basis:100%;font-size:0.72rem;color:var(--muted);margin:4px 0 2px';
+    head.textContent = g;
+    palette.appendChild(head);
+    for (const o of byGroup[g]) {
+      const chip = document.createElement('button');
+      chip.type = 'button';
+      chip.className = 'genre-chip';
+      chip.dataset.token = o.id;
+      chip.textContent = '+ ' + o.ru;
+      chip.style.cssText = 'cursor:pointer';
+      chip.addEventListener('click', () => addBeat(o.id, o.ru));
+      palette.appendChild(chip);
+    }
+  }
+  renderBeatSequence();
+}
+
+// Resolve a catalog token to its RU label (for re-adds / persistence display).
+function _beatLabel(token) {
+  const hit = (_beatCatalog || []).find(o => o.id === token);
+  return hit ? hit.ru : token;
+}
+
+function addBeat(token, ru) {
+  token = (token || '').trim();
+  if (!token) return;
+  if (_beatSeq.length >= _BEAT_MAX) {
+    showToast(`Максимум ${_BEAT_MAX} нод в последовательности`, 2500);
+    return;
+  }
+  // Dedup (case-insensitive on token).
+  if (_beatSeq.some(b => b.token.toLowerCase() === token.toLowerCase())) {
+    showToast('Эта нода уже в последовательности', 2000);
+    return;
+  }
+  _beatSeq.push({ token, ru: ru || _beatLabel(token) });
+  renderBeatSequence();
+}
+
+function addCustomBeat() {
+  const input = document.getElementById('beat-custom-input');
+  if (!input) return;
+  const v = (input.value || '').trim();
+  if (!v) return;
+  addBeat(v, v);
+  input.value = '';
+  input.focus();
+}
+
+function removeBeat(idx) {
+  _beatSeq.splice(idx, 1);
+  renderBeatSequence();
+}
+
+function moveBeat(idx, dir) {
+  const j = idx + dir;
+  if (j < 0 || j >= _beatSeq.length) return;
+  [_beatSeq[idx], _beatSeq[j]] = [_beatSeq[j], _beatSeq[idx]];
+  renderBeatSequence();
+}
+
+function renderBeatSequence() {
+  const list = document.getElementById('beat-sequence-list');
+  const count = document.getElementById('beat-count');
+  if (count) count.textContent = _beatSeq.length ? `(${_beatSeq.length})` : '';
+  if (!list) return;
+  if (!_beatSeq.length) {
+    list.innerHTML = '<div style="font-size:0.76rem;color:var(--muted);font-style:italic">Последовательность пуста — добавь ноды из каталога ниже или впиши свою. Порядок = порядок развития сюжета.</div>';
+    return;
+  }
+  list.innerHTML = _beatSeq.map((b, i) => `
+    <div style="display:flex;align-items:center;gap:6px;background:#1a1a1f;border:1px solid #333;border-radius:6px;padding:4px 8px">
+      <span style="color:var(--accent,#845ef7);font-weight:700;min-width:18px">${i + 1}</span>
+      <span style="flex:1;font-size:0.84rem">${esc(b.ru)}${b.token && _beatLabel(b.token) !== b.ru ? '' : (!_beatCatalog || !(_beatCatalog.some(o => o.id === b.token)) ? ' <span style=\"font-size:0.7rem;color:var(--muted)\">(своя)</span>' : '')}</span>
+      <button type="button" title="Вверх" onclick="moveBeat(${i},-1)" ${i === 0 ? 'disabled' : ''} style="background:none;border:none;color:var(--muted);cursor:pointer;font-size:0.9rem;padding:0 3px">↑</button>
+      <button type="button" title="Вниз" onclick="moveBeat(${i},1)" ${i === _beatSeq.length - 1 ? 'disabled' : ''} style="background:none;border:none;color:var(--muted);cursor:pointer;font-size:0.9rem;padding:0 3px">↓</button>
+      <button type="button" title="Удалить" onclick="removeBeat(${i})" style="background:none;border:none;color:var(--danger,#e5484d);cursor:pointer;font-size:0.95rem;padding:0 3px">✕</button>
+    </div>
+  `).join('');
+}
+
+// Ordered list of tokens (catalog ids or custom strings) for the backend.
+function getSelectedBeats() {
+  return _beatSeq.map(b => b.token);
+}
+
 function randomizeGenres() {
   // Pick 2-4 random genres, uncheck everything else
   const chips = [...document.querySelectorAll('.genre-chip')];
@@ -3465,7 +3728,7 @@ async function generateSeriesIdeas() {
   list.innerHTML = '';
   try {
     const model = _selectedWriterModel('writer-model-create');
-    const ideas = await api.post('/api/generate-series-ideas', { genres, avoid, model, idea, format_mode: getFormatMode() });
+    const ideas = await api.post('/api/generate-series-ideas', { genres, avoid, model, idea, beats: getSelectedBeats(), format_mode: getFormatMode(), ...getEraSetting() });
     list.innerHTML = ideas.map((idea, i) => `
       <div class="idea-card" onclick="pickSeriesIdea(${i})">
         <div class="idea-card-title">${esc(idea.title)}</div>
@@ -3523,6 +3786,33 @@ function getFormatMode() {
   return document.getElementById('new-series-format-mode')?.value || 'short_drama';
 }
 
+// ── Era + world setting (create-series modal) ────────────────────────────
+// Show/hide the free-text input when «Своя…» is picked.
+function _toggleCustomEra() {
+  const sel = document.getElementById('series-era');
+  const inp = document.getElementById('series-era-custom');
+  if (!sel || !inp) return;
+  inp.classList.toggle('hidden', sel.value !== '__custom__');
+  if (sel.value === '__custom__') inp.focus();
+}
+function _toggleCustomWorld() {
+  const sel = document.getElementById('series-world');
+  const inp = document.getElementById('series-world-custom');
+  if (!sel || !inp) return;
+  inp.classList.toggle('hidden', sel.value !== '__custom__');
+  if (sel.value === '__custom__') inp.focus();
+}
+// Returns the era/setting payload for the idea generators. Defaults to
+// modern + realistic (backend treats that as «no directive»).
+function getEraSetting() {
+  return {
+    era:          document.getElementById('series-era')?.value || 'modern',
+    era_custom:   (document.getElementById('series-era-custom')?.value || '').trim(),
+    world_setting: document.getElementById('series-world')?.value || 'realistic',
+    world_custom: (document.getElementById('series-world-custom')?.value || '').trim(),
+  };
+}
+
 async function createSeries() {
   const title = val('new-series-title');
   if (!title) return alert('Введи название');
@@ -3537,6 +3827,13 @@ async function createSeries() {
       target_audience: val('new-series-audience'), world_description: val('new-series-world'),
       synopsis: val('new-series-synopsis'),
       format_mode: getFormatMode(),
+      // Scenario constructor: ordered hook-beats (ноды) assembled in the modal —
+      // persisted as beat_sequence and replayed in order by episode generation.
+      beats: getSelectedBeats(),
+      // Era/world pick — lets the backend pre-confirm the asset-generation era
+      // so character portraits render in-period without the «Ваш сериал в
+      // сеттинге X?» banner re-asking (and defaulting to modern if ignored).
+      ...getEraSetting(),
       auto_generate_assets: autogen,
       batch_mode: false,
       batch_size: 1,
