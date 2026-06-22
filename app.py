@@ -23782,22 +23782,38 @@ def seedance_batch_compose(sid, num):
         if loc_tag:
             refs.append({'kind': 'loc', 'id': loc_tag['id']})
 
-        # CLOSE-UP filter (mirrors compose endpoint)
+        # CLOSE-UP filter (mirrors compose endpoint) — keep every SPEAKING
+        # char (dialogue cue "NAME:"); a back-and-forth close-up needs both
+        # faces for reverse shots. Drop only non-speaking bystanders. Falls
+        # back to a single first-named subject on a silent action beat.
         is_close_up = bool(plan.get('close_up')) or spec.get('has_close_up') or bool(out.get('close_up'))
         if is_close_up:
-            chunk_lower = spec['text'].lower()
-            chars_in_chunk = []
+            spec_text = spec['text']
+            speaker_ids = set()
             for r in refs:
                 if r.get('kind') != 'char': continue
                 ch = next((c for c in (s.get('characters') or []) if c['id'] == r.get('id')), None)
-                if not ch: continue
-                pos = chunk_lower.find(ch['name'].lower())
-                if pos >= 0: chars_in_chunk.append((r.get('id'), pos))
-            chars_in_chunk.sort(key=lambda x: x[1])
-            keep_id = chars_in_chunk[0][0] if chars_in_chunk else next(
-                (r.get('id') for r in refs if r.get('kind') == 'char'), None
-            )
-            refs = [r for r in refs if r.get('kind') != 'char' or r.get('id') == keep_id]
+                nm = (ch.get('name') or '').strip() if ch else ''
+                if not nm: continue
+                if re.search(r'^\s*' + re.escape(nm) + r'\s*[:：(]', spec_text, re.MULTILINE | re.IGNORECASE):
+                    speaker_ids.add(r.get('id'))
+            if speaker_ids:
+                keep_ids = speaker_ids
+            else:
+                chunk_lower = spec_text.lower()
+                chars_in_chunk = []
+                for r in refs:
+                    if r.get('kind') != 'char': continue
+                    ch = next((c for c in (s.get('characters') or []) if c['id'] == r.get('id')), None)
+                    if not ch: continue
+                    pos = chunk_lower.find(ch['name'].lower())
+                    if pos >= 0: chars_in_chunk.append((r.get('id'), pos))
+                chars_in_chunk.sort(key=lambda x: x[1])
+                first_id = chars_in_chunk[0][0] if chars_in_chunk else next(
+                    (r.get('id') for r in refs if r.get('kind') == 'char'), None
+                )
+                keep_ids = {first_id} if first_id else set()
+            refs = [r for r in refs if r.get('kind') != 'char' or r.get('id') in keep_ids]
 
         # De-dup char refs
         seen_char = set(); deduped = []
@@ -25325,26 +25341,51 @@ def seedance_compose(sid, num):
     # bystanders we strip them here.
     closeup_dropped = []
     if close_up_only:
-        # Build name → first chunk-text appearance position for each char in roster
-        chars_in_chunk = []  # list of (id, position-in-chunk) for chars whose name appears
-        ct_lower = chunk_text.lower()
+        # Keep every SPEAKING character — a char with a dialogue cue ("NAME:")
+        # in chunk_text. A close-up of a back-and-forth dialogue is a
+        # shot/reverse-shot of close-ups and still needs BOTH faces; dropping a
+        # co-speaker's ref makes their reverse shot hallucinate a face. Only
+        # non-speaking bystanders are stripped for tight framing.
+        # Bug it fixes: a 2-speaker segment (per-line close-up auto-ticks the
+        # global close-up flag) kept only the FIRST-NAMED char — often just a
+        # stage-direction mention ("Victoria enters") — silently dropping the
+        # other speaker (Emma). «My Boss…Sleep With Him» ep4 chunk 3.
+        speaker_ids = set()
         for r in refs:
             if r.get('kind') != 'char':
                 continue
             ch = next((c for c in (s.get('characters') or []) if c['id'] == r.get('id')), None)
-            if not ch:
+            nm = (ch.get('name') or '').strip() if ch else ''
+            if not nm:
                 continue
-            pos = ct_lower.find(ch['name'].lower())
-            if pos >= 0:
-                chars_in_chunk.append((r.get('id'), pos))
-        chars_in_chunk.sort(key=lambda x: x[1])
-        keep_id = chars_in_chunk[0][0] if chars_in_chunk else (
-            # No char names found in chunk — keep first char ref the composer chose
-            next((r.get('id') for r in refs if r.get('kind') == 'char'), None)
-        )
+            # Dialogue cue: line starts with "NAME:" / "NAME (beat):" / "NAME：".
+            cue = re.compile(r'^\s*' + re.escape(nm) + r'\s*[:：(]', re.MULTILINE | re.IGNORECASE)
+            if cue.search(chunk_text):
+                speaker_ids.add(r.get('id'))
+        if speaker_ids:
+            keep_ids = speaker_ids
+        else:
+            # No dialogue cues — a silent action beat. Fall back to a single
+            # subject: the first char NAMED in chunk_text (or composer's first).
+            chars_in_chunk = []
+            ct_lower = chunk_text.lower()
+            for r in refs:
+                if r.get('kind') != 'char':
+                    continue
+                ch = next((c for c in (s.get('characters') or []) if c['id'] == r.get('id')), None)
+                if not ch:
+                    continue
+                pos = ct_lower.find(ch['name'].lower())
+                if pos >= 0:
+                    chars_in_chunk.append((r.get('id'), pos))
+            chars_in_chunk.sort(key=lambda x: x[1])
+            first_id = chars_in_chunk[0][0] if chars_in_chunk else (
+                next((r.get('id') for r in refs if r.get('kind') == 'char'), None)
+            )
+            keep_ids = {first_id} if first_id else set()
         filtered = []
         for r in refs:
-            if r.get('kind') == 'char' and r.get('id') != keep_id:
+            if r.get('kind') == 'char' and r.get('id') not in keep_ids:
                 ch = next((c for c in (s.get('characters') or []) if c['id'] == r.get('id')), None)
                 closeup_dropped.append({'char_id': r.get('id'), 'char_name': ch['name'] if ch else r.get('id')})
                 continue
