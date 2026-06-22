@@ -36,6 +36,7 @@ import uuid
 import random
 import secrets
 import shutil
+import copy
 import datetime
 import time
 import subprocess
@@ -1276,7 +1277,9 @@ def _describe_character_visual(image_url: str, char_name: str = '') -> str:
         # Hard-cap so we don't pollute BINDING with a wall of text.
         if len(text) > 280:
             text = text[:277] + '...'
-        return text
+        # A user-uploaded portrait may be risqué; keep the persisted description
+        # moderation-safe so it never trips the filter on downstream prompts.
+        return _sanitize_appearance_for_moderation(text)
     except Exception as e:
         print(f'[char_vision] failed for {char_name or image_url}: {e}', flush=True)
         return ''
@@ -1995,36 +1998,60 @@ def _strip_vague_clothing_tail(appearance: str) -> str:
 # SPECIFIC item, so a clause "<intro cue> … <garment>" is a real wardrobe
 # statement we must excise before appending an authoritative outfit.
 _GARMENT_NOUN = (
-    r'(?:dress(?:es)?|gown|apron|cloak|cape|robe|suit|shirt|blouse|skirt'
-    r'|trousers?|pants|jeans|coat|jacket|uniform|armou?r|tunic|vest|sweater'
-    r'|jumper|hoodie|t-?shirt|tee|slip|nightgown|nightdress|nightshirt'
-    r'|pyjamas|pajamas|boots?|shoes?|heels?|sandals?|slippers?|gloves?|hat'
-    r'|cap|bonnet|scarf|shawl|veil|tie|kimono|sari|overalls|dungarees'
-    r'|leggings|shorts|jumpsuit|romper|bodice|corset|petticoat|frock|smock'
-    r'|breeches|doublet|waistcoat|sash|kaftan|caftan|turban|headscarf'
-    r'|cardigan|blazer|trench|parka|anorak|poncho|toga|loincloth|garb'
-    r'|tuxedo|tux|kilt|cassock|habit|negligee|camisole|stockings|tights'
-    r'|socks?|bowtie|bow\s+tie|tiara|crown|diadem|circlet|brooch|sarong'
+    r'(?:dress(?:es)?|gown|apron|cloak|cape|robe|bathrobe|housecoat|suit|shirt|blouse|skirt'
+    r'|trousers?|pants|slacks|jeans|coat|raincoat|overcoat|peacoat|trench(?:coat)?|jacket'
+    r'|uniform|scrubs|armou?r|tunic|vest|sweater|sweatshirt|sweatpants|jumper|hoodie'
+    r'|t-?shirt|tee|tank\s+top|turtleneck|polo|jersey|leotard|onesie|tracksuit'
+    r'|slip|nightgown|nightdress|nightshirt|nightie|pyjamas|pajamas'
+    r'|boots?|shoes?|heels?|sandals?|slippers?|sneakers?|trainers?|loafers?|gloves?|mittens?'
+    r'|hat|cap|beanie|bonnet|helmet|mask|goggles|scarf|shawl|veil|tie|kimono|sari'
+    r'|overalls|dungarees|leggings|shorts|jumpsuit|romper|bodice|corset|petticoat|frock|smock'
+    r'|breeches|doublet|waistcoat|sash|kaftan|caftan|turban|headscarf|towel'
+    r'|cardigan|blazer|parka|anorak|poncho|toga|loincloth|garb|swimsuit|bikini|trunks'
+    r'|briefs|boxers|underwear|lingerie|tuxedo|tux|kilt|cassock|habit|negligee|camisole'
+    r'|stockings|tights|socks?|bowtie|bow\s+tie|tiara|crown|diadem|circlet|brooch|sarong'
     r'|jodhpurs|chemise|kirtle|surcoat|mantle|wrap|gauntlets?'
+    # worn accessories — bundled with outfits via "and/with", so listing them
+    # lets the connector consume "…and expensive watch" instead of leaving a
+    # dangling "and" (ring is deliberately omitted — too many non-jewelry senses)
+    r'|watch|wristwatch|necklace|earrings?|bracelet|pendant|locket|choker|anklet'
+    r'|cuff-?links?|suspenders|belt|glasses|sunglasses|monocle|wristband'
     r'|платье\w*|рубаш\w*|костюм\w*|плащ\w*|пальто|куртк\w*|юбк\w*|брюк\w*'
-    r'|джинс\w*|сапог\w*|туфл\w*|перчатк\w*|шляп\w*|шарф\w*|мундир\w*'
-    r'|форм\w*|фартук\w*|сарафан\w*|пиджак\w*|корон\w*|диадем\w*|брошь\w*)'
+    r'|джинс\w*|сапог\w*|туфл\w*|кроссовк\w*|ботинк\w*|перчатк\w*|шляп\w*|шарф\w*|мундир\w*'
+    r'|форм\w*|фартук\w*|сарафан\w*|пиджак\w*|халат\w*|корон\w*|диадем\w*|брошь\w*|носк\w*)'
 )
 
-# A clothing clause ANYWHERE in the appearance string: an intro cue followed
-# (within the same clause, before the next , ; .) by a concrete garment. Once a
-# clause is known to be wardrobe, consume the REST of that clause — so compound
-# garments ("frock coat"), connected items ("dress with white apron"), and
-# trailing accessories ("gown with an emerald tiara") all go together. The
-# garment-noun gate keeps non-clothing "in …" phrases ("in a wheelchair",
-# "in her thirties", "needle in hand") from matching at all.
+# A clothing clause introduced by a cue ("wearing / in / dressed in / …") and a
+# concrete garment. Extension is CONNECTOR-driven (not greedy-to-clause-end), so
+# it captures compound garments ("frock coat"), connected items ("dress WITH
+# white apron") and trailing accessories ("gown WITH an emerald tiara") WITHOUT
+# swallowing a bundled non-clothing trait ("scrubs WITH her hair tied back" →
+# keeps "her hair tied back"; "red dress AND clearly pregnant" → keeps the
+# pregnancy). The garment gate keeps non-clothing "in …" phrases ("in a
+# wheelchair", "in her thirties", "needle in hand") from matching at all.
 _CLOTHING_CLAUSE_RE = re.compile(
     r'(?:[,;]\s*|\s+|^)'
     r'(?:wearing|dressed\s+in|clad\s+in|sporting|donning|attired\s+in'
     r'|одет\w*\s+в|носит|in|в)\s+'
-    r'(?:(?:a|an|the|her|his|their|its|some|plain|simple|её|его|их)\s+)?'
+    r'(?:(?:a|an|the|her|his|their|its|some|plain|simple|pair\s+of|её|его|их)\s+)?'
     r'[^,;.]*?\b' + _GARMENT_NOUN + r'\b'
-    r'[^,;.]*',
+    r'(?:[ \t\-]+' + _GARMENT_NOUN + r'\b)*'                       # compound garments
+    r'(?:\s+(?:with|and|over|under|featuring|plus|paired\s+with|и|с)\s+'
+    r'[^,;.]*?\b' + _GARMENT_NOUN + r'\b)*',                       # connected garments/accessories
+    flags=re.IGNORECASE,
+)
+
+# A garment clause with NO intro cue — e.g. "practical rubber gloves on her
+# hands", "worn sneakers". The cued regex above can't see these. Bounded by
+# clause delimiters so it removes the whole bare-garment clause, not a fragment.
+_BARE_GARMENT_CLAUSE_RE = re.compile(
+    r'(?:(?<=,)|(?<=;)|(?<=—)|(?<=–)|^)'
+    r'\s*(?:(?:a|an|the|her|his|their|its|some|plain|simple|practical|worn|old|new|pair\s+of)\s+)?'
+    r'(?:[a-zA-Zа-яёА-ЯЁ]+\s+){0,3}'
+    r'\b' + _GARMENT_NOUN + r'\b'
+    r'(?:[ \t\-]+' + _GARMENT_NOUN + r'\b)*'
+    r'(?:\s+(?:on|around|over|under|across)\s+(?:her|his|their|the|its)\s+[a-zA-Zа-яёА-ЯЁ]+)?'
+    r'\s*(?=,|;|—|–|\.|$)',
     flags=re.IGNORECASE,
 )
 
@@ -2034,18 +2061,414 @@ def _strip_concrete_clothing(appearance: str) -> str:
     only the PERSON (face / build / hair / role). Run before appending an
     authoritative outfit description so BINDING never lists two outfits at once
     — the root cause of Seedance rendering a hybrid wardrobe (Elena
-    "grey seamstress dress + black Dark Cloak", Jun 2026; same class as the
-    Claire & Lydia incidents, whose narrow `wearing…$` fix missed the
-    "in a … dress" phrasing). Strips clauses in ANY phrasing, ANYWHERE in the
-    sentence — not just a trailing `wearing …`."""
+    "grey seamstress dress + black Dark Cloak", Jun 2026; Elena-the-nurse
+    "hospital scrubs + black sheath dress" leaking medical scrubs into a date
+    scene, ep3 My_Affair, Jun 2026; same class as the Claire & Lydia incidents
+    whose narrow `wearing…$` fix missed the "in a … dress" phrasing).
+
+    Two passes: cued clothing clauses (wearing/in/dressed in/…) AND bare
+    no-cue garment clauses ("practical rubber gloves on her hands")."""
     if not appearance:
         return appearance
     candidate = _CLOTHING_CLAUSE_RE.sub('', appearance)
-    # Tidy punctuation left behind by removing a mid-sentence clause.
+    candidate = _BARE_GARMENT_CLAUSE_RE.sub('', candidate)
+    # Tidy separators left behind by mid-sentence removals.
     candidate = re.sub(r'\s+', ' ', candidate)
+    candidate = re.sub(r'\s*[—–\-]\s*(?=,|;|\.|$)', '', candidate)      # dangling dash before delim
+    candidate = re.sub(r'(?:^|(?<=[,;]))\s*[—–]\s*', ' ', candidate)    # leading dash after delim/start
     candidate = re.sub(r'\s*,\s*(?=,|\.|;|$)', '', candidate)
+    candidate = re.sub(r',\s*,+', ', ', candidate)
     candidate = candidate.replace(' ,', ',').replace(' .', '.').replace(' ;', ';')
-    return candidate.strip(' ,;.').strip()
+    return candidate.strip(' ,;.—–-').strip()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HAIR / ALTERNATE-IDENTITY support.
+#
+# Root cause of the "disguise still has the old hair" class (Claire goes blonde
+# as "Emma Cross" in ep4 of Pregnant by My Director but renders brunette in ep5):
+#   • a character has ONE `appearance` string that owns face+body+HAIR;
+#   • outfits override only CLOTHING (the clothing-stripper keeps hair);
+#   • the outfit reference image is i2i'd from the base portrait with the
+#     instruction "only the clothing changes" — so hair is hard-locked brunette.
+# There was therefore NO path for hair to change with a look. These helpers add
+# one: a look can declare a HAIR override (explicit `appearance_override` field
+# or a hair phrase detected inside its description); the canonical BINDING then
+# swaps the base hair for the look's hair, and the outfit-image gen unlocks hair.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Colour / style words that, next to "hair"/"волос" (or as a wig), denote a
+# deliberate HAIR look — used to detect that an outfit/disguise changes the hair.
+_HAIR_LOOK_WORDS = (
+    r'platinum|blonde|blond|brunette|jet[-\s]?black|raven|auburn|ginger|redhead'
+    r'|red|copper|chestnut|silver|ash|honey|caramel|strawberry|bleached|dyed|dyes|dye'
+    r'|frosted|highlighted|salt[-\s]?and[-\s]?pepper|black|brown|grey|gray|white'
+    r'|buzz[-\s]?cut|shaved|bald|crew[-\s]?cut|pixie|cropped|braided|cornrows|dreadlocks'
+    r'|блонд\w*|брюнет\w*|рыж\w*|сед\w*|русоволос\w*|темноволос\w*|перекраш\w*|крашен\w*|налысо|лыс\w*'
+)
+# A look/outfit description "changes the hair" if it names a wig OR a
+# hair-colour/style word sits next to the word "hair"/"волос".
+_OUTFIT_HAIR_RE = re.compile(
+    r'\b(?:'
+    r'(?:' + _HAIR_LOOK_WORDS + r')(?:[\s-]+\w+){0,2}?[\s-]+(?:hair|волос\w*)'
+    r'|(?:hair|волос\w*)(?:[\s-]+\w+){0,2}?[\s-]+(?:' + _HAIR_LOOK_WORDS + r')'
+    r'|wig|hairpiece|парик\w*'
+    r')\b',
+    re.IGNORECASE,
+)
+
+# Hair adjectives used to bound the hair NOUN-PHRASE inside a base appearance.
+# Deliberately a CLOSED list (no generic `\w+` fallback) so a substitution can
+# never swallow a neighbouring trait ("dark eyes and pulled-back hair" must keep
+# "dark eyes"; "long brown hair and green eyes" must keep "green eyes").
+_HAIR_ADJ = (
+    r'(?:long|short|shoulder[-\s]?length|mid[-\s]?length|medium|cropped|wavy|curly|straight'
+    r'|sleek|messy|tousled|neat|pulled[-\s]?back|swept[-\s]?back|tied[-\s]?back|loose|fine|thick|thin'
+    r'|dark|light|pale|jet|salt[-\s]?and[-\s]?pepper'
+    r'|platinum|blonde|blond|brunette|raven|auburn|ginger|red|copper|chestnut|silver|grey|gray'
+    r'|white|brown|black|honey|caramel|strawberry|ash|bleached|dyed'
+    r'|длинн\w*|коротк\w*|тёмн\w*|темн\w*|светл\w*|сед\w*|русо\w*|рыж\w*|кудряв\w*|прям\w*)'
+)
+_HAIR_CLAUSE_RE = re.compile(
+    r'(?<![A-Za-zА-Яа-яЁё-])'
+    r'(?:(?:' + _HAIR_ADJ + r')[\s-]+){0,4}'
+    r'(?:hair|волос\w*)'
+    r'(?:\s+(?:tied|pulled|swept|pinned|braided|worn|hanging|falling|cascading|loose|down|up|back'
+    r'|in\s+(?:a\s+)?(?:bun|ponytail|braid|plait|knot|chignon|updo|pixie|bob))'
+    r'(?:\s+[a-zA-Zа-яё]+){0,4})?',
+    flags=re.IGNORECASE,
+)
+
+
+def _outfit_hair_phrase(outfit) -> str:
+    """Authoritative HAIR phrase for a look, if it deliberately changes hair
+    (disguise / dyed / wig). Priority: explicit `appearance_override` field, then
+    a hair phrase detected inside the outfit description. Returns '' when the look
+    keeps the character's natural hair (the common case — most outfits)."""
+    if not outfit:
+        return ''
+    ov = (outfit.get('appearance_override') or '').strip()
+    if ov:
+        return ov
+    m = _OUTFIT_HAIR_RE.search(outfit.get('description') or '')
+    return m.group(0) if m else ''
+
+
+def _override_hair_in_appearance(appearance: str, hair_phrase: str) -> str:
+    """Rewrite the hair clause of a base appearance for an alternate look.
+
+      • hair_phrase non-empty → REPLACE the base hair clause with it (e.g. base
+        "…pulled-back hair…" + "platinum-blonde hair" → "…platinum-blonde hair…").
+        If the appearance has no hair clause, the phrase is appended so the look's
+        hair is still asserted.
+      • hair_phrase empty → STRIP the base hair clause (used when the outfit
+        description ALREADY carries the hair, so BINDING isn't doubled).
+
+    Closed-vocabulary clause regex guarantees neighbouring traits survive."""
+    if not appearance:
+        return appearance
+    repl = (hair_phrase or '').strip()
+    new, n = _HAIR_CLAUSE_RE.subn(repl, appearance, count=1)
+    if n:
+        new = re.sub(r'\s+', ' ', new)
+        if not repl:
+            # collapse connectors orphaned by the removal ("eyes and  and headset"
+            # → "eyes and headset"; dangling trailing "… and ," → "…,").
+            new = re.sub(r'\b(and|with|и|с)\s+(and|with|и|с)\b', r'\2', new, flags=re.IGNORECASE)
+            new = re.sub(r'\b(and|with|и|с)\s*(?=,|;|\.|$)', '', new, flags=re.IGNORECASE)
+            new = re.sub(r'\s*,\s*(?=,|\.|;|$)', '', new)
+            new = re.sub(r',\s*,+', ', ', new)
+            new = new.replace(' ,', ',').replace(' .', '.').replace(' ;', ';')
+            new = re.sub(r'\s+', ' ', new)
+        return new.strip(' ,;.').strip()
+    if repl:
+        return (appearance.rstrip(' .,;') + '; ' + repl).strip()
+    return appearance
+
+
+# ── Narrative identity-shift detection (disguise / new identity / hair change) ──
+# Generalises the disguise problem: parse the SCRIPT for cues that a character
+# changes hair / takes a new identity, so the system can (a) persist that state
+# on the character, (b) feed it to the writer so the disguise look is tagged in
+# every later episode, and (c) surface a compose-time mismatch if a disguised
+# character is about to render with the wrong hair.
+_ID_HAIR_TOKENS = {
+    'blonde': 'blonde', 'blond': 'blonde', 'platinum': 'platinum-blonde',
+    'brunette': 'brunette', 'redhead': 'red', 'red-head': 'red', 'red': 'red',
+    'raven': 'jet-black', 'auburn': 'auburn', 'ginger': 'ginger', 'silver': 'silver',
+    'grey': 'grey', 'gray': 'grey', 'black': 'jet-black', 'brown': 'brown',
+    'блондинк': 'blonde', 'брюнетк': 'brunette', 'рыж': 'red', 'шатенк': 'brown',
+    'седой': 'silver', 'седая': 'silver',
+}
+# A hair-state word appearing in a CHANGE context ("now", "dye", "wig", "new").
+_ID_HAIR_CHANGE_RE = re.compile(
+    r'(?:'
+    r"(?:you(?:'re| are)|she(?:'s| is)|he(?:'s| is)|now|now\s+a|as\s+a|becomes?\s+a)\s+"
+    r'(platinum|blonde|blond|brunette|redhead|red[-\s]?head|raven|auburn|ginger|silver)\b'
+    r'|(?:dye[ds]?|dyed|bleach(?:ed|es)?|colou?rs?|cut)\s+(?:her|his|their|the)?\s*hair'
+    r'|(platinum|blonde|blond|brunette|redhead|raven|auburn|ginger)[-\s]+wig'
+    r'|(?:теперь|стала|стал|стань)\s+(блондинк\w*|брюнетк\w*|рыж\w*|шатенк\w*)'
+    r'|перекрас\w*\s+волос\w*|парик\w*'
+    r')',
+    re.IGNORECASE,
+)
+_ID_HAIR_WORD_RE = re.compile(
+    r'\b(platinum|blonde|blond|brunette|redhead|red[-\s]?head|raven|auburn|ginger|silver|grey|gray'
+    r'|блондинк\w*|брюнетк\w*|рыж\w*|шатенк\w*)\b',
+    re.IGNORECASE,
+)
+_ID_ALIAS_RE = re.compile(
+    r'(?:new\s+name\s+(?:is|:)|go(?:es)?\s+by|name\'?s\s+now|alias(?:\s+is)?|new\s+identity\s+(?:is|:)|'
+    r'новое\s+имя\s*[:—-]?|теперь\s+(?:ты|вы)\s+)\s*'
+    r'([A-ZА-Я][a-zа-я]+(?:\s+[A-ZА-Я][a-zа-я]+){0,2})',
+    re.IGNORECASE,
+)
+# Cues that the disguise ENDS / true identity is restored.
+_ID_RESTORE_RE = re.compile(
+    r'(?:reveals?\s+(?:her|his|their)\s+(?:true|real)\s+identity'
+    r'|(?:her|his|their)\s+(?:true|real)\s+(?:name|identity|self)'
+    r'|removes?\s+(?:the|her|his)\s+wig|takes?\s+off\s+(?:the|her|his)\s+wig'
+    r'|(?:back\s+to|returns?\s+to)\s+(?:her|his)\s+(?:natural|real|own)\s+hair'
+    r'|natural\s+hair\s+again'
+    r'|снимает\s+парик|(?:её|его)\s+настоящее\s+имя|настоящ\w*\s+личност\w*)',
+    re.IGNORECASE,
+)
+
+
+def _norm_hair_token(raw: str) -> str:
+    """Map a detected hair-state word to a canonical EN hair phrase head."""
+    if not raw:
+        return ''
+    low = raw.strip().lower().replace(' ', '-')
+    if low in _ID_HAIR_TOKENS:
+        return _ID_HAIR_TOKENS[low]
+    for k, v in _ID_HAIR_TOKENS.items():
+        if low.startswith(k):
+            return v
+    return ''
+
+
+def _detect_identity_shift(script: str):
+    """Scan a script for a narrative identity/appearance change.
+    Returns {'active': bool, 'hair': '<canonical hair phrase head>', 'alias': str,
+    'cue': '<raw matched text>'} or None when nothing strong is found.
+    `active=False` means a RESTORE cue (disguise ends) was detected.
+
+    Conservative: fires only on a strong signal — an explicit alias, OR a hair
+    word inside a change context (now / dye / wig / new). The cue is series-
+    protagonist-scoped (the caller resolves which character it belongs to)."""
+    if not script:
+        return None
+    if _ID_RESTORE_RE.search(script):
+        return {'active': False, 'hair': '', 'alias': '', 'cue': 'identity restored'}
+    hair = ''
+    cue = ''
+    mh = _ID_HAIR_CHANGE_RE.search(script)
+    if mh:
+        cue = mh.group(0).strip()
+        # pull the hair word from the matched change context
+        mw = _ID_HAIR_WORD_RE.search(mh.group(0)) or _ID_HAIR_WORD_RE.search(script)
+        if mw:
+            hair = _norm_hair_token(mw.group(1))
+    alias = ''
+    ma = _ID_ALIAS_RE.search(script)
+    if ma:
+        alias = re.sub(r'\s+', ' ', ma.group(1).strip()).strip('.,;:')
+        if not cue:
+            cue = ma.group(0).strip()
+    if not hair and not alias:
+        return None
+    return {'active': True, 'hair': hair, 'alias': alias, 'cue': cue[:160]}
+
+
+# Strong cues that a character is staged in an undressed / transitional wardrobe
+# state (post-shower, towel, robe, sleepwear, shirtless). When the script stages
+# this but the character has only a formal outfit, the composer silently defaults
+# to e.g. a business suit and the wardrobe FLIPS between chunks — towel in the
+# beat that mentions it, suit everywhere else (Damien towel→suit, ep3 My_Affair,
+# Jun 2026). There's no code fix that conjures a towel reference image, so we
+# surface the cause loudly instead of shipping a silent contradiction.
+_UNDRESSED_STATE_RE = re.compile(
+    r'\b(?:'
+    r'towel(?:ed)?\s+(?:around|round|about)|wrapped\s+in\s+a\s+towel|in\s+(?:a|his|her)\s+towel'
+    r'|out\s+of\s+the\s+(?:shower|bath)|steps?\s+out\s+of\s+the\s+(?:shower|bath)'
+    r'|fresh\s+from\s+the\s+shower|dripping\s+wet|just\s+showered'
+    r'|shirtless|bare[-\s]chested|bare\s+chest|topless|half[-\s]naked|naked|nude|undressed'
+    r'|in\s+(?:a|his|her)\s+(?:bathrobe|robe|dressing\s+gown)'
+    r'|in\s+(?:her|his)\s+(?:underwear|lingerie|nightgown|nightie|slip|nightdress)'
+    r'|полуголы\w*|голы[йаяе]\w*|без\s+рубашк\w*|в\s+полотенц\w*|из\s+душа|в\s+халате|в\s+нижнем\s+белье'
+    r')\b',
+    re.IGNORECASE,
+)
+# Outfit labels/descriptions that are clearly "fully dressed" — these CONTRADICT
+# an undressed scene state.
+_DRESSED_OUTFIT_RE = re.compile(
+    r'\b(?:suit|tuxedo|business|formal|blazer|gown|dress|uniform|coat|jacket'
+    r'|armou?r|cassock|kimono|sari|costume|scrubs)\b', re.IGNORECASE,
+)
+# Outfit labels/descriptions that ALREADY are an undressed/transitional state —
+# no mismatch to flag.
+_UNDRESSED_OUTFIT_RE = re.compile(
+    r'\b(?:towel|post[-\s]?shower|shower|shirtless|bare|naked|nude|robe|bathrobe'
+    r'|sleepwear|pyjamas|pajamas|nightgown|nightie|lingerie|underwear|swimsuit|bikini|trunks)\b',
+    re.IGNORECASE,
+)
+
+
+def _detect_char_undressed_states(script: str, characters: list) -> dict:
+    """Return {char_id: matched_cue} for characters the script stages in an
+    undressed/transitional wardrobe state. A cue counts only when it appears in
+    the SAME sentence/line as the character's name, so it binds to the right
+    character and doesn't bleed across the scene."""
+    out = {}
+    if not script or not characters:
+        return out
+    units = re.split(r'(?<=[.!?\n])\s+', script)
+    for unit in units:
+        if not _UNDRESSED_STATE_RE.search(unit):
+            continue
+        m = _UNDRESSED_STATE_RE.search(unit)
+        for c in characters:
+            name = (c.get('name') or '').strip()
+            if name and _char_name_in_text(name, unit, c.get('aliases')):
+                out.setdefault(c.get('id'), m.group(0))
+    return out
+
+
+def _undress_state_clothing(cue: str) -> str:
+    """Map a detected undress cue to a concrete wardrobe phrase for BINDING.
+    Used to OVERRIDE a contradicting catalogued outfit (e.g. a business suit) so
+    Seedance renders the transitional state the script staged — and holds it
+    across every chunk of the scene span instead of flipping back to the suit
+    on a dialogue-only chunk (Damien towel→suit, ep3)."""
+    cl = (cue or '').lower()
+    def has(*ws):
+        return any(w in cl for w in ws)
+    if has('towel', 'полотенц', 'shower', 'душ', 'bath', 'dripping', 'showered'):
+        return 'wrapped in a white bath towel around the waist, bare chest, skin still damp, hair wet'
+    if has('robe', 'халат', 'dressing gown', 'gown'):
+        return 'wearing a loose open bathrobe, loosely tied'
+    if has('lingerie', 'underwear', 'бель', 'slip', 'night'):
+        return 'in plain sleepwear'
+    if has('shirtless', 'bare', 'topless', 'chest', 'голы', 'рубашк'):
+        return 'shirtless, bare chest'
+    if has('naked', 'nude', 'undressed'):
+        return 'undressed, bare shoulders (framed modestly above the chest)'
+    return 'in a post-shower state of undress (no formal clothing)'
+
+
+def _binding_desc_with_undress(s, char_id, cue: str) -> str:
+    """Canonical BINDING description for a character the script stages undressed:
+    the PERSON part (face / build / hair, all clothing stripped) + the undress
+    wardrobe phrase. Same shape as `_canonical_char_description` but the clothing
+    is the scene's transient state, not a catalogued outfit. The reference PHOTO
+    still anchors the face; this text drives the wardrobe."""
+    ch = next((c for c in (s.get('characters') or []) if c['id'] == char_id), None)
+    if not ch:
+        return ''
+    app = (ch.get('appearance') or '').strip()
+    app = _strip_vague_clothing_tail(app)
+    app = _strip_concrete_clothing(app)
+    app = re.sub(r'\s+', ' ', app).strip().rstrip('.,;')
+    phrase = _undress_state_clothing(cue)
+    parts = [p for p in (app, phrase) if p]
+    return '; '.join(parts)[:300]
+
+
+# ── Moderation-safe APPEARANCE sanitizer ─────────────────────────────────────
+# A character's `appearance` text is attached to EVERY downstream image/video
+# prompt (see _canonical_char_description → Seedance BINDING, and the inline
+# image-gen prompts). A user regeneration wish like «сделай красивой и
+# сексуальной» — or even «голой» — must influence ONLY the one-off render (it
+# rides in via the separate image_constraints/constraints_clause), and must
+# NEVER leak into the persisted description, otherwise sexualized descriptors
+# ride along into all 70 episodes' prompts and the provider's content filter
+# rejects everything. (Root cause of the «My Boss Wants Me To Sleep With Him…»
+# clone where every shot went to moderation: the clone revision rewrote Emma's
+# appearance to «…чувственными губами; стройная фигура…».)
+#
+# This scrubber is the hard, LLM-independent guarantee. Run it (1) on any
+# user-influenced appearance BEFORE persisting, and (2) at the BINDING
+# chokepoint, so legacy/already-polluted descriptions get cleaned in-flight too.
+# It rewrites sexualizing adjectives to neutral synonyms and strips explicit
+# nudity / sexual-act terms — it never sexualizes, only de-escalates, so a face
+# that's meant to read as attractive still does (via the surviving neutral
+# descriptors), it just stops tripping moderation.
+_APPEARANCE_ADJ_MAP_RU = [
+    (r'сексуальн', 'привлекательн'), (r'чувственн', 'выразительн'),
+    (r'соблазнительн', 'привлекательн'), (r'обольстительн', 'привлекательн'),
+    (r'эротичн', 'элегантн'), (r'эротическ', 'элегантн'), (r'развратн', 'элегантн'),
+    (r'распутн', 'элегантн'), (r'похотлив', 'спокойн'), (r'вызывающ', 'элегантн'),
+    (r'пышногруд', 'стройн'), (r'грудаст', 'стройн'), (r'сладострастн', 'спокойн'),
+    (r'откровенн', 'элегантн'),
+]
+_APPEARANCE_ADJ_MAP_EN = {
+    'sexy': 'attractive', 'sexual': 'elegant', 'seductive': 'graceful', 'sensual': 'soft',
+    'sensuous': 'soft', 'erotic': 'elegant', 'provocative': 'elegant', 'sultry': 'calm',
+    'alluring': 'graceful', 'voluptuous': 'graceful', 'busty': 'slender', 'curvaceous': 'graceful',
+    'raunchy': 'elegant', 'naughty': 'calm', 'kinky': 'calm', 'lustful': 'calm', 'horny': 'calm',
+    'titillating': 'elegant', 'steamy': 'calm', 'skimpy': 'modest', 'revealing': 'modest',
+    'scantily': 'modestly', 'plunging': 'modest',
+}
+_APPEARANCE_NUDE_RE = re.compile(
+    r'\b(?:'
+    r'nude|naked|topless|bottomless|unclothed|undressed|fully\s+exposed|stark\s+naked|'
+    r'bare[\s-]?(?:breast|chest|bosom|butt|behind|ass|skin)s?|'
+    r'exposed\s+(?:breast|chest|bosom|skin|body|flesh)s?|'
+    r'nipples?|areola[e]?|genital(?:s|ia)?|crotch|'
+    r'(?:deep\s+|low[\s-]?cut\s+|plunging\s+)?cleavage|low[\s-]?cut|'
+    r'(?:deep|plunging|low)\s+neckline|d[eé]collet[aá]?ge?|'
+    r'thigh[\s-]?high\s+slit|high\s+slit|see[\s-]?through|sheer\s+(?:top|fabric|dress|blouse)|'
+    r'lingerie|negligee|g[\s-]?string|thong'
+    r')\b',
+    re.IGNORECASE,
+)
+_APPEARANCE_NUDE_RU_RE = re.compile(
+    r'\b(?:'
+    r'гол(?:ая|ый|ую|ым|ом|ой|ою|ые|ых|а|о)|нагая|нагой|нагую|нагие|'
+    r'обнажённ\w*|обнаженн\w*|оголённ\w*|оголенн\w*|раздет\w*|'
+    r'без\s+одежды|топлесс|соски?|сосков|декольте|'
+    r'разрез\s+до\s+бедра|прозрачн\w*\s+(?:ткан\w*|плать\w*|блуз\w*|топ\w*)|'
+    r'нижнее\s+бель[ёе]|стринги|пеньюар\w*'
+    r')\b',
+    re.IGNORECASE,
+)
+_APPEARANCE_SOFTEN = [
+    (re.compile(r'\bbare\s+(shoulders?|legs?|midriff|stomach|thighs?|arms?)\b', re.I), r'\1'),
+    (re.compile(r'\b(?:обнажённ\w*|оголённ\w*)\s+(плеч\w*|ног\w*|живот\w*|бёдр\w*|бедр\w*|рук\w*)', re.I), r'\1'),
+]
+_APPEARANCE_EN_ADJ_RE = re.compile(
+    r'\b(' + '|'.join(_APPEARANCE_ADJ_MAP_EN.keys()) + r')\b', re.IGNORECASE)
+
+
+def _sanitize_appearance_for_moderation(text):
+    """Strip/neutralize sexualizing & NSFW language from a character appearance
+    or BINDING string so it never trips the image/video provider's content
+    filter. De-escalates only — see block comment above. Returns cleaned text;
+    pass-through for empty/non-str."""
+    if not text or not isinstance(text, str):
+        return text
+    out = text
+    # 1) Soften charged body-part phrases first (so the noun survives).
+    for rx, repl in _APPEARANCE_SOFTEN:
+        out = rx.sub(repl, out)
+    # 2) Remove explicit nudity / sexual-act terms.
+    out = _APPEARANCE_NUDE_RE.sub('', out)
+    out = _APPEARANCE_NUDE_RU_RE.sub('', out)
+    # 3) Replace sexualizing adjectives with neutral ones (RU keeps inflection).
+    for stem, repl in _APPEARANCE_ADJ_MAP_RU:
+        out = re.sub(stem + r'([а-яё]*)',
+                     lambda m, r=repl: r + (m.group(1) or ''), out, flags=re.IGNORECASE)
+    out = _APPEARANCE_EN_ADJ_RE.sub(
+        lambda m: _APPEARANCE_ADJ_MAP_EN.get(m.group(0).lower(), m.group(0)), out)
+    # 4) Tidy punctuation left behind by removals.
+    out = re.sub(r'\s+', ' ', out)
+    out = re.sub(r'\s+([,.;])', r'\1', out)
+    out = re.sub(r'([,;])(?=\S)', r'\1 ', out)
+    out = re.sub(r'(?:[,;]\s*){2,}', ', ', out)
+    out = re.sub(r'^[,;\s]+', '', out)
+    out = re.sub(r'[,;\s]+$', '', out).strip()
+    return out
 
 
 def _canonical_char_description(s, char_id, outfit_label):
@@ -2094,11 +2517,13 @@ def _canonical_char_description(s, char_id, outfit_label):
     outfits = char.get('outfits') or []
     is_base_request = (not outfit_label) or outfit_label.lower() in ('base', '')
     using_non_base_outfit = False
+    active_outfit = None
     if outfit_label and not is_base_request:
         chosen = next((o for o in outfits if o.get('label') == outfit_label), None)
         if chosen:
             outfit_desc = (chosen.get('description') or '').strip()
             using_non_base_outfit = True
+            active_outfit = chosen
     if not outfit_desc:
         # Look ONLY for an explicitly-flagged base outfit. Do NOT fall back to
         # `outfits[0]` — that's whichever scene-specific outfit happened to be
@@ -2109,6 +2534,7 @@ def _canonical_char_description(s, char_id, outfit_label):
         base = next((o for o in outfits if o.get('is_base')), None)
         if base:
             outfit_desc = (base.get('description') or '').strip()
+            active_outfit = base
         # If no IS_BASE outfit exists, the appearance text itself usually contains
         # the base outfit description (cast-block parser embeds "wearing X" into
         # appearance when IS_BASE is set without a separate outfit entry). Trust
@@ -2124,6 +2550,46 @@ def _canonical_char_description(s, char_id, outfit_label):
     _ = using_non_base_outfit  # historical flag; clothing strip now keys off outfit_desc
     if outfit_desc and appearance:
         appearance = _strip_concrete_clothing(appearance)
+    # Alternate-identity HAIR: when the ACTIVE look deliberately changes hair
+    # (disguise / dyed / wig), the single base `appearance` would otherwise force
+    # the original hair into BINDING and contradict the look ("…pulled-back
+    # [brunette] hair…; platinum-blonde wig" → Seedance keeps the brunette ref).
+    # Swap it so the look's hair is the only hair stated. Source priority:
+    #   1) explicit outfit `appearance_override` ("platinum-blonde hair") → REPLACE
+    #      the base hair clause with it;
+    #   2) hair words already inside the outfit description → STRIP the base hair
+    #      clause (the description supplies the hair, so BINDING isn't doubled).
+    if appearance:
+        _hair_override = (active_outfit.get('appearance_override') or '').strip() if active_outfit else ''
+        if _hair_override:
+            appearance = _override_hair_in_appearance(appearance, _hair_override)
+        elif outfit_desc and _OUTFIT_HAIR_RE.search(outfit_desc):
+            appearance = _override_hair_in_appearance(appearance, '')
+    # ── BINDING REDUCTION — the reference portrait carries identity ───────────
+    # Seedance is a reference model: the character's portrait (@ImageN) already
+    # encodes face, hair and build. Repeating facial/figure prose ("beautiful …
+    # sensual lips, slim figure") in the BINDING is redundant for likeness AND
+    # it is exactly what the content filter reads — next to intimate/forceful
+    # staging it tips an IDENTICAL scene from "drama" into "sexual content" and
+    # the output gets moderated. (Verified: the «My Boss…» clone failed on the
+    # same kiss/closet beats where the original — whose Emma binding was only
+    # "exhausted woman + wardrobe" — passed. The single difference was the
+    # facial/figure prose in the clone's binding.) So once a ref portrait exists
+    # AND we have an authoritative outfit, drop the appearance prose and let the
+    # IMAGE carry identity; keep only wardrobe + anchors the image can't
+    # disambiguate on its own (anthro species, a disguise wig that differs from
+    # the base ref). The full appearance text is still used verbatim when the
+    # PORTRAIT itself is generated — that path doesn't go through here.
+    has_ref_portrait = bool(char.get('avai_base_url') or char.get('ref_images'))
+    if has_ref_portrait and outfit_desc:
+        anchors = []
+        _species = _detect_animal_species(char.get('name'), char.get('appearance') or '')
+        if _species:
+            anchors.append(f'anthropomorphic {_species.split()[-1]}')
+        _disguise_hair = (active_outfit.get('appearance_override') or '').strip() if active_outfit else ''
+        if _disguise_hair:
+            anchors.append(_disguise_hair)
+        appearance = ', '.join(anchors)
     parts = [p for p in (appearance, outfit_desc) if p]
     full = '; '.join(parts)
     # Strip stray newlines and cap length to keep BINDING manageable
@@ -2137,6 +2603,10 @@ def _canonical_char_description(s, char_id, outfit_label):
                        residual=appearance[:160])
         except Exception:
             pass
+    # Final hard guarantee: scrub sexualizing / NSFW language so no BINDING line
+    # ever trips the provider's content filter — even if a legacy appearance or
+    # an outfit description still carries charged terms. De-escalates only.
+    full = _sanitize_appearance_for_moderation(full)
     return full[:300]
 
 
@@ -2713,6 +3183,67 @@ def _outfit_word_similarity(desc1: str, desc2: str) -> float:
     return len(w1 & w2) / min(len(w1), len(w2))
 
 
+def _series_protagonist(s):
+    """Best-guess lead character for series-level narrative cues (an identity
+    change is virtually always about the protagonist). Prefers an explicit role
+    flag, else the most-dressed character (leads change clothes most), else the
+    first in the roster. Returns the character dict or None."""
+    chars = list(s.get('characters') or [])
+    if not chars:
+        return None
+    for c in chars:
+        if str(c.get('role', '')).lower() in ('lead', 'protagonist', 'main', 'heroine', 'hero'):
+            return c
+    return max(chars, key=lambda c: len(c.get('outfits') or []))
+
+
+def _apply_identity_shift_state(s, script: str) -> bool:
+    """Detect a narrative identity/appearance change in `script` and persist it on
+    the protagonist so it HOLDS across episodes:
+      • active shift  → stamp char['identity_shift'] = {active, hair, alias, cue}
+        and register the alias so name-matching finds the disguised name;
+      • restore cue   → deactivate any existing identity_shift.
+    Mutates `s` in place; returns True if anything changed (caller saves)."""
+    shift = _detect_identity_shift(script)
+    if not shift:
+        return False
+    proto = _series_protagonist(s)
+    if not proto:
+        return False
+    cur = proto.get('identity_shift') or {}
+    changed = False
+    if not shift['active']:
+        if cur.get('active'):
+            cur['active'] = False
+            proto['identity_shift'] = cur
+            changed = True
+            _log_event('INFO', 'identity_shift_restored', char=proto.get('name'))
+        return changed
+    # Active shift — merge (keep an already-known hair/alias if this cue omitted it).
+    new_state = {
+        'active': True,
+        'hair':  shift['hair']  or cur.get('hair', ''),
+        'alias': shift['alias'] or cur.get('alias', ''),
+        'cue':   shift['cue'],
+    }
+    if new_state != cur:
+        proto['identity_shift'] = new_state
+        changed = True
+        _log_event('INFO', 'identity_shift_detected', char=proto.get('name'),
+                   hair=new_state['hair'], alias=new_state['alias'], cue=new_state['cue'])
+    # Register a clean proper-name alias so future scripts that call the character
+    # by the disguised name still resolve to the same refs.
+    alias = (shift['alias'] or '').strip()
+    if alias and re.fullmatch(r'[A-ZА-Я][a-zа-я]+(?:\s+[A-ZА-Я][a-zа-я]+){0,2}', alias):
+        existing_names = {(c.get('name') or '').strip().lower() for c in (s.get('characters') or [])}
+        if alias.lower() not in existing_names:
+            aliases = proto.setdefault('aliases', [])
+            if alias not in aliases:
+                aliases.append(alias)
+                changed = True
+    return changed
+
+
 def _sync_script_outfits(sid: str, script: str) -> list:
     """Parse [BLOCKING] outfit names from the script and reconcile against
     the character's outfit roster. Three-tier match logic:
@@ -2820,6 +3351,14 @@ def _sync_script_outfits(sid: str, script: str) -> list:
             changed = True
             _log_event('INFO', 'outfit_auto_created', sid=sid,
                        char=char.get('name'), label=outfit['label'])
+
+    # Persist any narrative identity/hair change (disguise / new identity) so the
+    # disguised look holds across later episodes (writer-feed + compose guard).
+    try:
+        if _apply_identity_shift_state(s, script):
+            changed = True
+    except Exception as e:
+        _log_event('WARN', 'identity_shift_apply_failed', sid=sid, err=str(e)[:200])
 
     if changed:
         save_series(sid, s)
@@ -3722,6 +4261,102 @@ def build_trajectory_block(s, current_ep):
     return '\n'.join(lines) + '\n\n'
 
 
+# ── Finale awareness — is THIS episode the pinned series finale? ──────────────
+def finale_episode_num(s):
+    """Return the pinned finale episode (chunk) number, or None.
+
+    In batch mode the finale is pinned by chunk number (milestones collapse to
+    chunk numbers — see milestone_episode_numbers), so the value is directly
+    comparable to the `num` passed to generate_episode_script in both modes."""
+    fin = (s or {}).get('finale') or None
+    if not fin or not (fin.get('description') or '').strip():
+        return None
+    try:
+        return int(fin.get('episode', 0)) or None
+    except (TypeError, ValueError):
+        return None
+
+
+def is_finale_episode(s, num):
+    """True iff `num` is the unit (episode or chunk) the user pinned as the finale."""
+    fe = finale_episode_num(s)
+    try:
+        return fe is not None and int(num) == fe
+    except (TypeError, ValueError):
+        return False
+
+
+def build_finale_contract_block(s, num):
+    """LOUD, mandatory FINALE block. Returns '' unless `num` is the pinned finale.
+
+    Root cause this fixes: the base writer system prompt and the per-episode
+    instruction MANDATE a cliffhanger and FORBID any wrap-up — calibrated for
+    mid-season episodes. The finale must do the OPPOSITE: resolve every open
+    thread and end conclusively. Without an explicit override the writer obeys
+    the cliffhanger mandate, leaves threads "for tomorrow", and even writes a
+    "Setup for next episode" line — i.e. the finale does not read as a finale.
+
+    This block is appended LAST in the user prompt so it overrides the earlier
+    cliffhanger mandate (later instructions win — the same principle
+    _build_script_system relies on for the length override)."""
+    if not is_finale_episode(s, num):
+        return ''
+    fin = (s or {}).get('finale') or {}
+    desc = (fin.get('description') or '').strip()
+    batch = is_batch_mode(s)
+    if batch:
+        a, b = chunk_range(s, num)
+        unit_line = (
+            f'║ 🏁  THIS CHUNK CONTAINS THE SERIES FINALE — sub-eps {a}–{b}.            🏁 ║\n'
+        )
+        scope = (
+            f'All sub-episodes BEFORE the last one (sub-ep {b}) still end on their own\n'
+            f'cliffhangers as usual. But the LAST sub-episode (sub-ep {b}) is the SERIES\n'
+            f'FINALE — it must FULLY RESOLVE the series and end conclusively, NOT on a\n'
+            f'cliffhanger. There is no chunk {int(num)+1}.\n'
+        )
+    else:
+        unit_line = (
+            f'║ 🏁🏁🏁  THIS IS THE SERIES FINALE — Ep {int(num)}. THERE IS NO Ep {int(num)+1}.  🏁🏁🏁 ║\n'
+        )
+        scope = (
+            f'This OVERRIDES every "end on a cliffhanger" / "FORBIDDEN: wrap-up" rule\n'
+            f'above (including the HARD CONTRACT and the per-episode instruction). Those\n'
+            f'rules are for mid-season episodes. A cliffhanger here is a HARD FAILURE.\n'
+        )
+    return (
+        '\n\n'
+        '╔══════════════════════════════════════════════════════════════════════╗\n'
+        + unit_line +
+        '╚══════════════════════════════════════════════════════════════════════╝\n'
+        + scope +
+        '\nTHE FINALE CONTRACT — all mandatory:\n'
+        '  1. CLOSE EVERY OPEN THREAD on screen, in THIS episode. No "...promised for\n'
+        '     tomorrow", no "to be addressed", no "reckoning later", no deferred fate.\n'
+        '     Every character the finale touches gets a decided, on-screen outcome.\n'
+        '     The viewer must leave with NO open questions about the main plot.\n'
+        '  2. EXECUTE THE PINNED FINALE EVENTS exactly — the specified characters,\n'
+        '     reconciliations, judgments, reunions and FINAL IMAGE below MUST happen,\n'
+        '     not similar substitutes.\n'
+        '  3. DELIVER CATHARSIS — the emotional payoff the whole series built toward\n'
+        '     (the protagonist\'s definitive triumph / reckoning / reunion). Earned\n'
+        '     resolution is the POINT of a finale, not a "wrap-up" to be avoided.\n'
+        '  4. END ON A CONCLUSIVE FINAL BEAT — a "button" that signals THE END: a\n'
+        '     settled final image and a last line that lands with finality. NOT a new\n'
+        '     arrival, NOT a new threat, NOT a new mystery, NOT a hook into a next\n'
+        '     episode.\n'
+        '  5. FORBIDDEN in the finale: "Setup for next episode", "to be continued",\n'
+        '     any teaser for an episode that does not exist, any NEW unresolved\n'
+        '     question introduced in the closing beat.\n'
+        '  6. In EPISODE NOTES write literally: "Cliffhanger type: NONE — SERIES\n'
+        '     FINALE (full resolution)" and "Setup for next episode: NONE — series\n'
+        '     complete".\n'
+        '\nPINNED FINALE — this is the END STATE you must deliver in full:\n'
+        f'{desc}\n'
+        '════════════════════════════════════════════════════════════════════════\n'
+    )
+
+
 # ── Finale bridge plan — concrete plot bridge from current state to finale ───
 _BRIDGE_CACHE = {}  # in-memory: (sid, finale_ep, finale_hash, last_ep_with_script) -> plan dict
 
@@ -4211,6 +4846,18 @@ def _llm_extract_episode_entities(script_text, known_chars, known_locs, known_it
             f"  synopsis: {(series.get('synopsis') or '')[:600]}\n\n"
             + _anthro_world_block(series)
         )
+    # Casting aesthetics — leads & romance/intimacy roles must read as attractive.
+    # Needs synopsis context, so emit it for every series (anthro or human).
+    casting_block = ''
+    if isinstance(series, dict):
+        if not world_block:
+            casting_block = (
+                f"\n\nSERIES CONTEXT:\n"
+                f"  title: {series.get('title','')}\n"
+                f"  genre: {series.get('genre','')}\n"
+                f"  synopsis: {(series.get('synopsis') or '')[:600]}\n\n"
+            )
+        casting_block += _casting_aesthetics_block(series)
     system = (
         "You extract structured cast/crew data from a single short-drama episode script. "
         "Return STRICT JSON, no prose, no markdown.\n\n"
@@ -4228,10 +4875,11 @@ def _llm_extract_episode_entities(script_text, known_chars, known_locs, known_it
         "- Names: prefer the canonical full-name as it first appears in the script.\n"
         "- If an entity matches an already-known name (case-insensitive), use the EXACT known spelling so dedup works.\n"
         "- Empty arrays are valid. No fields beyond schema.\n"
-        "- If a WORLD CONVENTION block is present in the user message, OBEY it for the 'appearance' field of every character."
+        "- If a WORLD CONVENTION block is present in the user message, OBEY it for the 'appearance' field of every character.\n"
+        "- A CASTING & APPEARANCE AESTHETICS block is present in the user message — OBEY it: cast looks by narrative role; leads and any romance/seduction/intimacy role must read as attractive and age-appropriate."
     )
     raw = claude_ask(
-        f"Episode script:\n\n{script_text[:18000]}{known_section}{world_block}",
+        f"Episode script:\n\n{script_text[:18000]}{known_section}{world_block}{casting_block}",
         system=system, model='', max_tokens=2500,
     )
     try:
@@ -5950,6 +6598,26 @@ def generate_script_batch(sid):
     except Exception:
         _batch_narrative_block = ''
     _beats_block = _series_beats_episode_block(s)
+    # Finale awareness — if the pinned finale falls inside the [first..last] range
+    # this bulk write covers, the finale episode must RESOLVE (no cliffhanger),
+    # overriding the per-episode "обязательно cliffhanger" rule below.
+    _fin_ep = finale_episode_num(s)
+    _finale_in_range = _fin_ep is not None and first_new_num <= _fin_ep <= last_new_num
+    _batch_finale_note = ''
+    if _finale_in_range:
+        _fin_desc = ((s.get('finale') or {}).get('description') or '').strip()
+        _batch_finale_note = (
+            f"\n\n🏁🏁🏁 ВНИМАНИЕ: Эп.{_fin_ep} В ЭТОМ ДИАПАЗОНЕ — ЭТО ФИНАЛ СЕРИАЛА (последняя серия). "
+            f"Эп.{_fin_ep+1} НЕ СУЩЕСТВУЕТ.\n"
+            f"Для Эп.{_fin_ep} правило «обязательный cliffhanger в конце» НЕ ДЕЙСТВУЕТ — наоборот:\n"
+            f"• закрой ВСЕ открытые сюжетные линии прямо на экране — никаких «решится завтра», "
+            f"«to be addressed», «setup for next episode», отложенной расплаты;\n"
+            f"• исполни зафиксированные события финала ТОЧНО (те самые персонажи, развязки, примирения, финальный кадр);\n"
+            f"• дай эмоциональный катарсис и заверши КОНКЛЮЗИВНЫМ финальным битом — НЕ клиффхэнгером, "
+            f"НЕ новой угрозой/загадкой, НЕ заделом на следующую серию.\n"
+            f"Все серии ДО Эп.{_fin_ep} в этом диапазоне заканчиваются клиффхэнгером как обычно.\n"
+            f"ЗАФИКСИРОВАННЫЙ ФИНАЛ (исполни как конечное состояние полностью):\n{_fin_desc}\n"
+        )
     user_msg = (
         f"СЕРИАЛ: «{s.get('title') or 'untitled'}»\n"
         f"Жанр: {s.get('genre') or '?'} · Тон: {s.get('tone') or '?'} · "
@@ -5985,6 +6653,7 @@ def generate_script_batch(sid):
         + f"  ✗ Если в серии МЕНЬШЕ {eff_spoken_floor} произнесённых слов — серия СЛИШКОМ КОРОТКАЯ, ДОПИШИ диалог до ~{eff_spoken_target} "
         + f"(порежется на 2-3 чанка вместо {eff_min_chunks}+). Если больше {eff_spoken_ceiling} — сократи/перенеси.\n"
         + "Эти проверки делай для КАЖДОЙ из серий перед выводом. Не выводи серию, которая хоть одну проверку провалила."
+        + _batch_finale_note   # ← finale override, appended LAST so it wins for the finale episode
     )
     try:
         # Allow up to 24K output for 5+ episodes.
@@ -6336,6 +7005,261 @@ def create_series():
     series_data['_scaffold'] = scaffold_info
     trigger_autogen_if_enabled(sid)
     return jsonify(series_data), 201
+
+
+@app.route('/api/series/clone-from', methods=['POST'])
+def clone_series_from():
+    """Create a NEW series as a revised clone of an existing one.
+
+    Body: {
+      source_sid: str,                # series to clone from (required)
+      title: str,                     # new series title (optional — defaults to «<src> (вариант)»)
+      revision_instructions: str,     # free-text edits, e.g. «главная героиня молодая и красивая»
+      episodes_to_copy: int,          # how many leading episodes to copy (0/absent = all)
+      writer_model: str,              # optional override for the LLM revision pass
+    }
+
+    Behaviour (per the user's spec):
+      • Deep-copies the source bible + assets + first N episode scripts into the new series.
+      • Applies the revision instructions to the BIBLE and CAST immediately (one LLM pass):
+        synopsis/world/tone/arc get rewritten only if the plot changes; each character's
+        look/name/age is updated; changed portraits are wiped so autogen regenerates them
+        with the new (e.g. beautiful) description.
+      • Episode scripts are copied verbatim. We do NOT mass-rewrite them. Renamed characters
+        are fixed in-place with a programmatic find/replace. Episodes that genuinely need a
+        rewrite (the plot changed in them, or an age move could create a timeline
+        contradiction) are queued in revision_plan.pending_episodes for one-by-one rewriting
+        via /episodes/<num>/apply-revisions.
+      • Future script/synopsis generation honours revision_instructions automatically
+        (see _revision_instructions_block).
+    """
+    data = request.json or {}
+    source_sid = (data.get('source_sid') or '').strip()
+    title = (data.get('title') or '').strip()
+    revision_instructions = (data.get('revision_instructions') or '').strip()
+    try:
+        episodes_to_copy = int(data.get('episodes_to_copy'))
+    except (TypeError, ValueError):
+        episodes_to_copy = 0  # 0 / missing → copy all
+    if episodes_to_copy < 0:
+        episodes_to_copy = 0
+
+    if not source_sid:
+        return jsonify({'error': 'source_sid required'}), 400
+    src = load_series(source_sid)
+    if not src:
+        return jsonify({'error': 'source series not found'}), 404
+    if not title:
+        title = f"{src.get('title', 'Series')} (вариант)"
+
+    slug = slugify(title)
+    sid = slug if slug and not (user_root() / slug).exists() else f"{slug}-{str(uuid.uuid4())[:6]}"
+
+    # ── 1) Deep-copy the bible, re-stamp identity, drop instance-specific state.
+    new_series = copy.deepcopy(src)
+    new_series['id'] = sid
+    new_series['title'] = title
+    new_series['created_at'] = datetime.datetime.utcnow().isoformat()
+    new_series['cloned_from'] = source_sid
+    new_series['revision_instructions'] = revision_instructions
+    if (data.get('writer_model') or '').strip().lower():
+        new_series['writer_model'] = data['writer_model'].strip().lower()
+    # Fresh cover (poster reflects the new title / possibly new looks).
+    new_series['cover_image'] = ''
+    new_series['cover_image_url'] = ''
+    new_series['cover_image_version'] = 0
+    for k in ('archived', 'pinned', 'pinned_at', '_scaffold', '_clone'):
+        new_series.pop(k, None)
+
+    save_series(sid, new_series)
+    scaffold_info = scaffold_series_folders(sid, title)
+
+    # ── 2) Copy asset reference images so character/location ref_images resolve.
+    try:
+        src_assets = assets_dir(source_sid)
+        if src_assets.exists():
+            shutil.copytree(str(src_assets), str(assets_dir(sid)), dirs_exist_ok=True)
+    except Exception as e:
+        print(f'[clone] asset copy warning: {e}', flush=True)
+
+    # ── 3) Copy episode scripts (first N, or all). We copy ONLY story content and
+    #       drop ALL generation/render state — seedance_chunks, assembled video,
+    #       music scenes, reteller prompt/project, batch caches, etc. all reference
+    #       rendered media in the source's OUT/VID dirs (which we do NOT copy), so
+    #       carrying them over leaves "generated chunks with empty videos" in the
+    #       clone (the exact bug this guards against). Allowlist (not denylist) so
+    #       any future render field is dropped by default rather than leaking.
+    _EP_CONTENT_KEYS = {
+        'number', 'title', 'synopsis', 'script', 'characters_used', 'locations_used',
+        'items_used', 'notes', 'character_outfits', 'ready', 'status', 'cast_extracted',
+        'created_at', 'plot_devices', 'days_since_previous', 'scene_blocking',
+    }
+    src_eps = sorted(list_episodes(source_sid), key=lambda e: int(e.get('number', 0) or 0))
+    src_total = len(src_eps)
+    if episodes_to_copy > 0:
+        src_eps = [e for e in src_eps if int(e.get('number', 0) or 0) <= episodes_to_copy]
+    copied_numbers = []
+    for ep in src_eps:
+        num = int(ep.get('number', 0) or 0)
+        if num <= 0:
+            continue
+        ep_copy = {k: copy.deepcopy(v) for k, v in ep.items() if k in _EP_CONTENT_KEYS}
+        ep_copy['number'] = num
+        # Fresh, un-generated render state — nothing is assembled yet for the clone.
+        ep_copy['gen_status'] = ''
+        ep_copy['reteller'] = {'project_id': None, 'status': None, 'video_url': None, 'submitted_at': None}
+        save_episode(sid, num, ep_copy)
+        copied_numbers.append(num)
+
+    # ── 4) Apply revisions to the bible + cast (one LLM pass).
+    revision_plan = {
+        'scope': 'character_only',
+        'reason': '',
+        'pending_episodes': [],
+        'renames': [],
+        'applied_at': datetime.datetime.utcnow().isoformat(),
+    }
+    if revision_instructions:
+        result = _llm_apply_revisions_to_bible(new_series, revision_instructions)
+        if result:
+            bible = result.get('bible') or {}
+            for k in ('genre', 'tone', 'world_description', 'synopsis', 'arc'):
+                v = (bible.get(k) or '').strip()
+                if v:
+                    new_series[k] = v
+            char_by_id = {c.get('id'): c for c in new_series.get('characters', [])}
+            renames = []
+            for upd in (result.get('characters') or []):
+                c = char_by_id.get(upd.get('id'))
+                if not c:
+                    continue
+                old_name = c.get('name', '')
+                if upd.get('name_changed') and (upd.get('name') or '').strip():
+                    new_name = upd['name'].strip()
+                    if new_name != old_name:
+                        c['name'] = new_name
+                        renames.append({'old': old_name, 'new': new_name})
+                if upd.get('appearance_changed') and (upd.get('appearance') or '').strip():
+                    # Scrub before persisting — a revision like «героиня должна
+                    # быть очень красивой и сексуальной» must NOT bake sexualized
+                    # wording into the canonical appearance that rides into every
+                    # downstream prompt (this was the moderation bug).
+                    c['appearance'] = _sanitize_appearance_for_moderation(upd['appearance'].strip())
+                    # Wipe portrait + outfit refs so autogen regenerates the new look.
+                    c['ref_images'] = []
+                    for o in (c.get('outfits') or []):
+                        o['ref_images'] = []
+                if (upd.get('gender') or '').strip().lower() in ('male', 'female'):
+                    c['gender'] = upd['gender'].strip().lower()
+                if (upd.get('description') or '').strip():
+                    c['description'] = upd['description'].strip()
+            for r in (result.get('renames') or []):
+                o = (r.get('old') or '').strip()
+                n = (r.get('new') or '').strip()
+                if o and n and o != n and not any(x['old'] == o for x in renames):
+                    renames.append({'old': o, 'new': n})
+            revision_plan['renames'] = renames
+            revision_plan['scope'] = (result.get('revision_scope') or 'character_only').strip().lower()
+            revision_plan['reason'] = (result.get('rewrite_reason') or '').strip()
+
+            # Programmatic name find/replace across copied scripts (word-boundary).
+            if renames and copied_numbers:
+                for num in copied_numbers:
+                    ce = load_episode(sid, num)
+                    if not ce:
+                        continue
+                    sc = ce.get('script') or ''
+                    changed = False
+                    for r in renames:
+                        new_sc, n = re.subn(r'\b' + re.escape(r['old']) + r'\b', r['new'], sc)
+                        if n:
+                            sc, changed = new_sc, True
+                    if changed:
+                        ce['script'] = sc
+                        save_episode(sid, num, ce)
+
+            # Queue episodes for one-by-one rewrite when the plot changed or an age
+            # move risks a timeline contradiction. Pure name/appearance edits → no rewrite.
+            ages_changed = any(u.get('age_changed') for u in (result.get('characters') or []))
+            if (revision_plan['scope'] == 'plot' or ages_changed) and copied_numbers:
+                revision_plan['pending_episodes'] = list(copied_numbers)
+
+    new_series['revision_plan'] = revision_plan
+    save_series(sid, new_series)
+
+    # ── 5) Regenerate wiped portraits with the new descriptions + any missing assets.
+    trigger_autogen_if_enabled(sid)
+
+    new_series['_scaffold'] = scaffold_info
+    new_series['_clone'] = {
+        'source_sid': source_sid,
+        'source_total_episodes': src_total,
+        'copied_episodes': len(copied_numbers),
+        'scope': revision_plan['scope'],
+        'pending_rewrites': len(revision_plan['pending_episodes']),
+        'reason': revision_plan['reason'],
+        'renames': revision_plan['renames'],
+    }
+    return jsonify(new_series), 201
+
+
+@app.route('/api/series/<sid>/episodes/<int:num>/apply-revisions', methods=['POST'])
+def apply_revisions_to_episode(sid, num):
+    """Rewrite ONE already-copied episode script so it obeys the series'
+    revision_instructions (used after clone-from). Revises the EXISTING script in
+    place — same beats / structure / hook / cliffhanger / length — changing only
+    what the revisions (and world-consistency) require. Pops the episode off
+    revision_plan.pending_episodes on success."""
+    s = load_series(sid)
+    if not s:
+        return jsonify({'error': 'not found'}), 404
+    ep = load_episode(sid, num)
+    if not ep:
+        return jsonify({'error': 'episode not found'}), 404
+    ri = (s.get('revision_instructions') or '').strip()
+    if not ri:
+        return jsonify({'error': 'у этого сериала нет правок — перезапись не требуется'}), 400
+    script = (ep.get('script') or '').strip()
+    if not script:
+        return jsonify({'error': 'сценарий пустой — нечего переписывать'}), 400
+
+    cast_block = _build_cast_block(s, ep)
+    system = _build_script_system(s)
+    prompt = (
+        f'Series: "{s["title"]}" | Genre: {s.get("genre","")} | Tone: {s.get("tone","")}\n\n'
+        + _anthro_world_block(s)
+        + _revision_instructions_block(s)
+        + (cast_block + '\n\n' if cast_block else '')
+        + f'═══ EXISTING EPISODE {num} SCRIPT — REVISE IT IN PLACE ═══\n{script}\n'
+        '═══════════════════════════════════════════════\n\n'
+        'Rewrite THIS episode\'s script so it obeys the SERIES REVISION INSTRUCTIONS above. '
+        'Change ONLY what the revisions require, plus whatever is needed to keep the world '
+        'internally consistent (names, ages, timelines, who-met-whom-when). PRESERVE '
+        'everything else: the same scene beats, the same structure, the same opening hook '
+        'and the same closing cliffhanger, roughly the same length, and the existing dialogue '
+        'wherever the revision does not touch it. Keep the [BLOCKING]/[BLOCKING_END] tags and '
+        'scene headings intact. Output ONLY the rewritten script text — no commentary, no JSON.'
+    )
+    try:
+        body = request.get_json(silent=True) or {}
+        new_script = llm_ask(_resolve_writer_model(body, s), prompt, system=system)
+    except Exception as e:
+        return jsonify({'error': f'Не удалось переписать сценарий: {e}'}), 502
+    new_script = _normalize_blocking_tags((new_script or '').strip())
+    if not new_script:
+        return jsonify({'error': 'модель вернула пустой сценарий'}), 502
+
+    ep['script'] = new_script
+    # Cast may have shifted — let the user re-extract characters for this episode.
+    ep['cast_extracted'] = False
+    save_episode(sid, num, ep)
+
+    rp = s.get('revision_plan') or {}
+    rp['pending_episodes'] = [n for n in (rp.get('pending_episodes') or []) if int(n) != int(num)]
+    s['revision_plan'] = rp
+    save_series(sid, s)
+    return jsonify({'ok': True, 'script': new_script, 'pending_episodes': rp['pending_episodes']}), 200
+
 
 @app.route('/api/series/<sid>', methods=['GET'])
 def get_series(sid):
@@ -7271,6 +8195,77 @@ def _modern_document_directive(item) -> str:
     )
 
 
+# Genitive/possessive endings we strip off a cast name so "Виски Маркуса" and
+# "Marcus's whiskey" both collapse to the bare object. Russian genitive +
+# common case endings; English handled separately via the apostrophe form.
+_NAME_INFLECTIONS = (
+    'а', 'я', 'ы', 'и', 'у', 'ю', 'е', 'ом', 'ём', 'ой', 'ей', 'ью',
+    'ах', 'ях', 'ов', 'ев', 'ин', 'ина', 'ум',
+)
+
+def _strip_cast_names_for_visual(text, s):
+    """Remove KNOWN cast names (and their possessive/genitive inflections) from
+    a visual-subject string.
+
+    Root cause of the «надпись на предмете» bug: asset names are possessive
+    labels — «Виски Маркуса», «Квартира Маркуса», «Marcus's whiskey». They are
+    fed as the LEADING subject of the image prompt, and Banana/Gemini/Seedance
+    read a leading noun phrase as a CAPTION and literally stamp it onto the
+    render (a whisky label reading «Виски Маркуса», a nameplate on the building
+    reading «Квартира Маркуса»). Stripping the owner's name leaves the bare
+    object/place — exactly what should be drawn. Targeted to cast names only,
+    so it can't mangle generic descriptions.
+    """
+    if not text:
+        return text
+    names = sorted(
+        ((c.get('name') or '').strip() for c in (s.get('characters') or [])),
+        key=len, reverse=True,
+    )
+    for nm in names:
+        if len(nm) < 3:
+            continue  # too short → false-positive risk inside other words
+        esc = re.escape(nm)
+        # English possessive: Marcus's / Marcus' / Marcus’s
+        text = re.sub(rf"\b{esc}['’]s?\b", '', text, flags=re.IGNORECASE)
+        # Bare name + optional RU genitive/case ending: Маркуса, Маркусу, Marcus
+        endings = '|'.join(sorted(_NAME_INFLECTIONS, key=len, reverse=True))
+        text = re.sub(rf"\b{esc}(?:{endings})?\b", '', text, flags=re.IGNORECASE)
+    # Tidy up the holes left behind ("Виски  ." → "Виски").
+    text = re.sub(r'\s{2,}', ' ', text)
+    text = re.sub(r'\s+([.,;:])', r'\1', text)
+    return text.strip(' .,-—«»"')
+
+
+_TEXT_REQUEST_WORDS = (
+    'text', 'sign', 'signage', 'label', 'lettering', 'word', 'caption',
+    'logo', 'brand', 'plaque', 'banner', 'inscription', 'engrav', 'written',
+    'надпис', 'текст', 'вывеск', 'этикетк', 'логотип', 'буква', 'слов',
+    'табличк', 'баннер', 'гравиров', 'написан',
+)
+
+def _no_caption_text_clause(user_constraints: str = '') -> str:
+    """Hard directive forbidding the image model from stamping the asset's name
+    (or any person's name) onto props / buildings / locations as literal text.
+
+    This is COSMETIC-text suppression, not document suppression — document
+    props that legitimately need printed text get _modern_document_directive
+    instead and must SKIP this clause (see call sites).
+
+    If the user's own constraints explicitly ask for text/signage/a label,
+    return nothing — don't fight an explicit wish."""
+    if user_constraints and any(w in user_constraints.lower() for w in _TEXT_REQUEST_WORDS):
+        return ''
+    return (
+        " NO TEXT ON THE IMAGE — STRICTLY ENFORCE: do not render any text, "
+        "letters, words, names, captions, titles, labels, nameplates, logos, "
+        "brand names, signage or writing anywhere in the frame. Never spell "
+        "out the name of this object / place or any person's name on it. Any "
+        "surface that would normally carry text (a bottle label, a shop sign, "
+        "a door plaque, a banner) must be left blank or show only abstract, "
+        "illegible, non-lettered marks. "
+    )
+
 
 # ── Characters ───────────────────────────────────────────────────────────────
 
@@ -8171,6 +9166,155 @@ def _anthro_world_block(s) -> str:
     )
 
 
+def _casting_aesthetics_block(s) -> str:
+    """Directive injected into EVERY character-appearance generation prompt so the
+    writer casts looks by NARRATIVE ROLE instead of describing people at random.
+
+    The core problem this fixes: short-drama hooks revolve around desire — a boss
+    who pursues the heroine, a forbidden affair, a seduction, an implied bed scene.
+    If the appearance generator hands the heroine a plain/aging look, the viewer
+    has no reason to want the romance, and the whole hook collapses. So any
+    character the plot frames as desirable — and the leads especially — must read
+    as genuinely attractive and age-appropriate to that role.
+
+    Works for human AND anthropomorphic worlds (attractiveness is expressed in
+    species-appropriate terms when the anthro convention is active — it composes
+    with _anthro_world_block, it does not override it). Always on."""
+    anthro = _is_anthro_world(s)
+    species_note = (
+        " Express attractiveness in SPECIES-APPROPRIATE terms (sleek fur, striking "
+        "markings, youthful muzzle, well-groomed) — never with human features.\n"
+        if anthro else "\n"
+    )
+    return (
+        "═══ CASTING & APPEARANCE AESTHETICS (MANDATORY) ═══\n"
+        "Cast each character's LOOK from their ROLE in the story, not at random:\n"
+        "  1. First infer the narrative role of every character from the synopsis, "
+        "genre and the script: protagonist (главный герой/героиня), love interest / "
+        "romantic lead, object of desire or seduction, anyone in or implied to be in "
+        "an intimate / bedroom / flirtation / 'who-they-sleep-with' storyline, "
+        "antagonist, supporting, background.\n"
+        "  2. The PROTAGONIST and any LOVE INTEREST / object of desire / character "
+        "involved in (or implied toward) romance, seduction, intimacy or a bed scene "
+        "MUST be described as genuinely ATTRACTIVE and YOUNG-to-PRIME age for that "
+        "role (typically 20s–early 30s unless the plot explicitly demands otherwise). "
+        "Give them specific flattering, desirable features so the AI image renders "
+        "someone the audience would believe in as a romantic lead — NOT plain, NOT "
+        "frumpy, NOT aged-up. This is the single most important rule: if the plot "
+        "hints that someone is desired, pursued, seduced, or shares a bed, that "
+        "person reads as beautiful/handsome." + species_note +
+        "  3. Lean attractive for MAIN characters in general (this is glossy short "
+        "drama, not gritty realism) while keeping looks grounded and believable — "
+        "specific and real, never plastic caricature or a list of clichés.\n"
+        "  4. Age must be CONSISTENT with the plot: do not make someone 20 if the "
+        "story has them with decades of backstory, an adult child, or a long-ago "
+        "relationship. Pick the youngest attractive age the plot actually allows.\n"
+        "  5. Antagonists, rivals and 'the other woman/man' are usually attractive "
+        "too (the threat is part of the drama) unless the script paints them "
+        "otherwise. Genuinely old/plain/unglamorous looks are reserved for roles the "
+        "plot truly requires them for (an elderly grandparent, a frail patient, a "
+        "comic side character) — never for a romantic lead.\n"
+        "═══════════════════════════════════════════════\n\n"
+    )
+
+
+def _revision_instructions_block(s) -> str:
+    """Directive injected into episode-script + synopsis generation when this
+    series was cloned from another one WITH revision instructions (e.g. «главная
+    героиня молодая и красивая», or a plot change). Empty when the series carries
+    no revision instructions — safe to concat unconditionally."""
+    ri = (s.get('revision_instructions') or '').strip() if isinstance(s, dict) else ''
+    if not ri:
+        return ''
+    src = (s.get('cloned_from') or '').strip()
+    src_clause = f' (this series is a revised clone of «{src}»)' if src else ''
+    return (
+        "═══ SERIES REVISION INSTRUCTIONS — APPLY THROUGHOUT (HIGH PRIORITY) ═══\n"
+        f"The user adapted this series{src_clause} with the following changes. They "
+        "OVERRIDE the inherited synopsis / cast / prior scripts wherever they "
+        "conflict. Honour them in everything you write:\n"
+        f"{ri}\n"
+        "Keep everything else faithful to the original story. Do not let these "
+        "revisions silently drift the plot beyond what they ask for, and keep the "
+        "world internally consistent (ages, timelines, who-knew-whom-when must "
+        "still add up after the change).\n"
+        "═══════════════════════════════════════════════\n\n"
+    )
+
+
+def _llm_apply_revisions_to_bible(s, revision_instructions: str) -> dict:
+    """One LLM pass that rewrites the series bible + cast to apply the user's
+    clone-time revision instructions. Returns a parsed dict (see schema below) or
+    {} on failure. Pure read — caller mutates the series and persists."""
+    ri = (revision_instructions or '').strip()
+    if not ri:
+        return {}
+    cast = []
+    for c in (s.get('characters') or []):
+        cast.append({
+            'id': c.get('id'),
+            'name': c.get('name', ''),
+            'gender': c.get('gender', ''),
+            'appearance': (c.get('appearance') or '')[:400],
+            'description': (c.get('description') or '')[:300],
+        })
+    system = (
+        "You revise a short-drama series bible and its cast to apply the user's "
+        "revision instructions. Return STRICT JSON only — no prose, no markdown.\n\n"
+        "Schema:\n"
+        "{\n"
+        '  "bible": {"genre":"...","tone":"...","world_description":"...","synopsis":"...","arc":"..."},\n'
+        '  "characters": [{"id":"<existing id>","name":"...","name_changed":false,'
+        '"appearance":"<full RU description>","appearance_changed":false,"age_changed":false,'
+        '"gender":"male|female","description":"<RU>"}],\n'
+        '  "revision_scope": "character_only" | "plot",\n'
+        '  "rewrite_reason": "<1 sentence RU: why episode scripts may need rewriting, or \'none\'>",\n'
+        '  "renames": [{"old":"OldName","new":"NewName"}]\n'
+        "}\n\n"
+        "Rules:\n"
+        "- bible: echo each field unchanged UNLESS the instructions require a plot/world/tone change. "
+        "Keep the same language as the source.\n"
+        "- characters: return EVERY character from the cast (keep the same id). Update only what the "
+        "instructions require. Set appearance_changed=true when you rewrote the appearance, "
+        "name_changed=true when you renamed, age_changed=true when the character's age moved.\n"
+        "- A full new `appearance` sentence is required whenever appearance_changed=true (it REPLACES "
+        "the old one — describe the whole look, not just the delta).\n"
+        "- revision_scope: 'character_only' if the changes only touch how characters look / their names / "
+        "ages and nothing in the plotline itself changes; 'plot' if the storyline, relationships or events "
+        "change (then episode scripts will need rewriting).\n"
+        "- renames: one entry per renamed character (old → new exact tokens) so scripts can be updated.\n"
+        "- OBEY the CASTING & APPEARANCE AESTHETICS block: leads and any romance/seduction/intimacy role "
+        "must read as attractive and age-appropriate.\n"
+        "- The `appearance` field is attached to EVERY image/video prompt, so it MUST be moderation-safe: "
+        "convey attractiveness with NEUTRAL words (elegant, graceful, soft features, slim, striking eyes) "
+        "and NEVER use sexual / explicit / nudity wording — no «сексуальная», «чувственная», «соблазнительная», "
+        "«голая», «декольте», no 'sexy', 'sensual', 'seductive', 'cleavage', 'nude', 'lingerie'. If an "
+        "instruction asks to make a character 'sexual'/'nude', render that intent ONLY as tasteful "
+        "attractiveness in this field — the explicit part belongs to image constraints, not the stored description."
+    )
+    anthro_block = _anthro_world_block(s)
+    casting_block = _casting_aesthetics_block(s)
+    user = (
+        f'SERIES TITLE: {s.get("title","")}\n'
+        f'GENRE: {s.get("genre","")}\nTONE: {s.get("tone","")}\n'
+        f'WORLD: {(s.get("world_description") or "")[:1200]}\n'
+        f'SYNOPSIS: {(s.get("synopsis") or "")[:2000]}\n'
+        f'ARC: {(s.get("arc") or "")[:1200]}\n\n'
+        + anthro_block
+        + casting_block
+        + f'CURRENT CAST (JSON):\n{json.dumps(cast, ensure_ascii=False)}\n\n'
+        f'═══ USER REVISION INSTRUCTIONS (apply these) ═══\n{ri}\n'
+        '═══════════════════════════════════════════════\n\n'
+        'Return the JSON described in the system message.'
+    )
+    try:
+        raw = llm_ask(_resolve_writer_model(None, s), user, system=system, max_tokens=4000)
+        return loads_lenient(strip_json(raw)) or {}
+    except Exception as e:
+        print(f'[clone-revise] LLM revision pass failed: {e}', flush=True)
+        return {}
+
+
 def _llm_infer_species_for_char(s, char) -> str:
     """When the series IS anthro but THIS char has no species in name/appearance,
     ask LLM to infer species from synopsis + role. Returns species noun ('rabbit',
@@ -8644,11 +9788,21 @@ def regenerate_character(sid, char_id):
                 "eye color, face shape, distinguishing features, typical clothing; "
                 "(b) NO scene context, NO emotions, NO actions, NO props; "
                 "(c) concrete and specific — 'shoulder-length auburn hair' not 'beautiful hair'; "
-                "(d) 1-3 short sentences, comma-separated descriptors, NO 'she is' opener.\n"
+                "(d) 1-3 short sentences, comma-separated descriptors, NO 'she is' opener; "
+                "(e) MODERATION-SAFE — describe an attractive person with NEUTRAL words "
+                "(elegant, graceful, soft features, slim) but NEVER use sexual / explicit / "
+                "nudity wording (no 'sexy', 'sensual', 'seductive', 'cleavage', 'nude', "
+                "'lingerie', 'sexual', «сексуальная», «чувственные», «голая», «декольте» etc.). "
+                "If the user constraints ask for something sexual or nude, IGNORE that for this "
+                "field — it only affects the rendered image, never the stored description.\n"
                 "Output: the appearance text only, no quotes, no preamble.",
                 system="You write character appearance descriptions for image generation. Plain text only.",
             ).strip().strip('"\'`')
             if rewritten and len(rewritten) > 10:
+                # Hard scrub: the LLM is instructed to stay clean, but never trust
+                # it — the persisted field rides into every future prompt. The
+                # render still gets the raw wish via constraints_clause below.
+                rewritten = _sanitize_appearance_for_moderation(rewritten)
                 appearance_for_prompt = rewritten
                 char['appearance'] = rewritten
                 _log_event('INFO', 'appearance_rewritten',
@@ -8674,6 +9828,7 @@ def regenerate_character(sid, char_id):
             ).strip()
             cleaned = cleaned.strip('"\'`')
             if cleaned and len(cleaned) < len(appearance_raw) * 2 and len(cleaned) > 5:
+                cleaned = _sanitize_appearance_for_moderation(cleaned)
                 appearance_for_prompt = cleaned
                 char['appearance'] = cleaned
                 _log_event('INFO', 'appearance_cleaned',
@@ -8683,6 +9838,14 @@ def regenerate_character(sid, char_id):
         except Exception as e:
             _log_event('WARN', 'appearance_cleanup_failed',
                        char_id=char_id, err=str(e)[:200])
+
+    # Whatever path produced appearance_for_prompt (rewrite, cleanup, or
+    # untouched legacy text), guarantee both the prompt text AND the persisted
+    # description are moderation-clean. The spicy wish still reaches the RENDER
+    # via constraints_clause below — only the stored/BINDING text is scrubbed.
+    appearance_for_prompt = _sanitize_appearance_for_moderation(appearance_for_prompt)
+    if appearance_for_prompt and appearance_for_prompt != (char.get('appearance') or '').strip():
+        char['appearance'] = appearance_for_prompt
 
     constraints_clause = f" IMPORTANT — strictly follow these constraints: {wishes}." if wishes else ""
     style_clause = _series_style_clause(s)
@@ -8974,11 +10137,13 @@ def generate_location_image(sid, loc_id):
     style_clause = _series_style_clause(s)
     constraints = (loc.get('image_constraints') or '').strip()
     constraints_clause = f" IMPORTANT — strictly follow these constraints: {constraints}." if constraints else ""
+    loc_name = _strip_cast_names_for_visual(loc['name'], s)
+    loc_desc = _strip_cast_names_for_visual(loc.get('description', ''), s)
     prompt = (
-        f"{loc['name']}. {loc.get('description', '')}.{constraints_clause} "
+        f"{loc_name}. {loc_desc}.{constraints_clause} "
         f"{_location_crowd_clause(loc)}"
         f"{(tone + ' atmosphere. ') if tone else ''}"
-        f"Cinematic wide establishing shot. Horizontal landscape composition, 16:9 framing. "
+        f"Cinematic wide establishing shot. Horizontal landscape composition, 16:9 framing.{_no_caption_text_clause(constraints)}"
         f"{style_clause}"
     )
     prompt = re.sub(r'\s+', ' ', prompt).strip()
@@ -9016,11 +10181,13 @@ def regenerate_location(sid, loc_id):
     tone = s.get('tone', '')
     style_clause = _series_style_clause(s)
     constraints_clause = f" IMPORTANT — strictly follow these constraints: {wishes}." if wishes else ""
+    loc_name = _strip_cast_names_for_visual(loc['name'], s)
+    loc_desc = _strip_cast_names_for_visual(loc.get('description', ''), s)
     prompt = (
-        f"{loc['name']}. {loc.get('description', '')}.{constraints_clause} "
+        f"{loc_name}. {loc_desc}.{constraints_clause} "
         f"{_location_crowd_clause(loc)}"
         f"{(tone + ' atmosphere. ') if tone else ''}"
-        f"Cinematic wide establishing shot. Horizontal landscape composition, 16:9 framing. "
+        f"Cinematic wide establishing shot. Horizontal landscape composition, 16:9 framing.{_no_caption_text_clause(wishes)}"
         f"{style_clause}"
     )
     prompt = re.sub(r'\s+', ' ', prompt).strip()
@@ -9575,12 +10742,14 @@ def _facade_worker(sid, groups):
             # ── Image generation ──────────────────────────────────────────
             tone = s.get('tone', '')
             style_clause = _series_style_clause(s)
+            fac_name = _strip_cast_names_for_visual(name, s)
+            fac_desc = _strip_cast_names_for_visual(desc, s)
             img_prompt = (
-                f"Exterior facade of {name}. {desc}. "
+                f"Exterior facade of {fac_name}. {fac_desc}. "
                 f"{_location_crowd_clause(None)}"
                 f"{(tone + ' atmosphere. ') if tone else ''}"
                 f"Cinematic wide establishing shot of the building exterior. "
-                f"Vertical 9:16 framing for short-drama. {style_clause}"
+                f"Vertical 9:16 framing for short-drama.{_no_caption_text_clause()}{style_clause}"
             )
             img_prompt = re.sub(r'\s+', ' ', img_prompt).strip()
             img_path = fac_dir / 'facade.jpg'
@@ -10070,8 +11239,12 @@ def generate_item_image(sid, item_id):
     constraints = (item.get('image_constraints') or '').strip()
     constraints_clause = f" IMPORTANT — strictly follow these constraints: {constraints}." if constraints else ""
     modern_doc_clause = _modern_document_directive(item)
+    # Documents legitimately carry printed text → skip the no-text clause for them.
+    no_text_clause = '' if modern_doc_clause else _no_caption_text_clause(constraints)
+    it_name = _strip_cast_names_for_visual(item['name'], s)
+    it_desc = _strip_cast_names_for_visual(item.get('description', ''), s)
     prompt = (
-        f"{item['name']}. {item.get('description', '')}.{constraints_clause}{modern_doc_clause} "
+        f"{it_name}. {it_desc}.{constraints_clause}{modern_doc_clause}{no_text_clause} "
         f"Product-style still-life photo of the object alone. No people, no hands, no characters. "
         f"Centered composition, neutral seamless gray background (#dadada) — flat color field NOT a photo studio set (no lighting rigs, no trusses, no equipment visible), soft even diffused illumination on the subject only, "
         f"subtle shadow on ground, sharp focus on object texture and details. "
@@ -10112,8 +11285,11 @@ def regenerate_item(sid, item_id):
     style_clause = _series_style_clause(s)
     constraints_clause = f" IMPORTANT — strictly follow these constraints: {wishes}." if wishes else ""
     modern_doc_clause = _modern_document_directive(item)
+    no_text_clause = '' if modern_doc_clause else _no_caption_text_clause(wishes)
+    it_name = _strip_cast_names_for_visual(item['name'], s)
+    it_desc = _strip_cast_names_for_visual(item.get('description', ''), s)
     prompt = (
-        f"{item['name']}. {item.get('description', '')}.{constraints_clause}{modern_doc_clause} "
+        f"{it_name}. {it_desc}.{constraints_clause}{modern_doc_clause}{no_text_clause} "
         f"Product-style still-life photo of the object alone. No people, no hands, no characters. "
         f"Centered composition, neutral seamless gray background (#dadada) — flat color field NOT a photo studio set (no lighting rigs, no trusses, no equipment visible), soft even diffused illumination on the subject only, "
         f"subtle shadow on ground, sharp focus on object texture and details. "
@@ -10558,6 +11734,13 @@ def _gen_char_base_inline(s, sid, char):
     constraints = (char.get('image_constraints') or '').strip()
     constraints_clause = f" IMPORTANT — strictly follow these constraints: {constraints}." if constraints else ""
     appearance = (char.get('appearance') or '').strip()
+    # Scrub the canonical appearance at creation time too: it's persisted and
+    # rides into every later prompt/BINDING. The one-off spicy intent stays in
+    # image_constraints (constraints_clause), which is NOT persisted into appearance.
+    _appearance_clean = _sanitize_appearance_for_moderation(appearance)
+    if _appearance_clean != appearance:
+        char['appearance'] = _appearance_clean
+        appearance = _appearance_clean
     description = (char.get('description') or '').strip()
     # Detect anthropomorphic species — check NAME first (catches «Wolf»/
     # «Hyena»/«Fox Woman» where appearance text was written as «a man in
@@ -10673,6 +11856,30 @@ def _gen_outfit_inline(s, sid, char, outfit):
         gender = 'woman' if char.get('gender') == 'female' else 'man'
         same_clause = f'Same {gender} as the reference image. '
         intro_clause = f'Full body portrait of {char["name"]}, a {gender}. {appearance}. '
+    # Alternate-identity HAIR: a disguise look (dyed / wig / new identity) must be
+    # ALLOWED to change the hair. The default i2i instruction below hard-locks hair
+    # to the base portrait ("only the clothing changes"), which is exactly why a
+    # "blonde" disguise rendered brunette. When the look declares a hair override,
+    # keep only the FACE identical and restyle the hair instead.
+    hair_phrase = _outfit_hair_phrase(outfit)
+    changes_hair = bool(hair_phrase) and not is_animal
+    if changes_hair:
+        if reference_url:
+            same_clause = (f'Same {gender} as the reference image — keep the EXACT same face, '
+                           f'facial features and bone structure. ')
+        else:
+            # No base ref: render from appearance, but with the disguised hair.
+            intro_clause = (f'Full body portrait of {char["name"]}, a {gender}. '
+                            f'{_override_hair_in_appearance(appearance, hair_phrase)}. ')
+        hair_change_clause = (
+            f'IMPORTANT — this is a deliberate new look / disguise: the HAIR is now {hair_phrase}. '
+            f'Restyle the hair to {hair_phrase}; do NOT keep the reference hair colour or style. '
+            f'The FACE stays identical — only the hair and wardrobe change. '
+        )
+        clothing_lock_clause = ''
+    else:
+        hair_change_clause = ''
+        clothing_lock_clause = 'Same face, same body — only the clothing changes. ' if reference_url else ''
     style_clause = _series_style_clause(s)
     is_stylised = bool(style_clause and 'strict' in style_clause.lower())
     realism_suffix = '' if is_stylised else ' Photorealistic, cinematic quality.'
@@ -10681,7 +11888,8 @@ def _gen_outfit_inline(s, sid, char, outfit):
         f"{style_prefix}"
         + (same_clause if reference_url else intro_clause)
         + f'Now wearing: {outfit["label"]}. {outfit.get("description", "")}. '
-        + ('Same face, same body — only the clothing changes. ' if reference_url else '')
+        + clothing_lock_clause
+        + hair_change_clause
         + constraints_clause
         + 'Full body, front-facing, slight 3/4 angle. Neutral relaxed pose. '
           'Arms hanging loosely at sides, hands open and empty — no objects held, no props, not in pockets. '
@@ -10704,13 +11912,15 @@ def _gen_loc_inline(s, sid, loc):
     is_stylised = bool(style_clause and 'strict' in style_clause.lower())
     realism_suffix = '' if is_stylised else ' Photorealistic, cinematic quality, high detail.'
     style_prefix = (style_clause + ' ') if style_clause else ''
+    loc_name = _strip_cast_names_for_visual(loc['name'], s)
+    loc_desc = _strip_cast_names_for_visual(loc.get('description', ''), s)
     prompt = (
         f"{style_prefix}"
-        f"{loc['name']}. {loc.get('description', '')}. "
+        f"{loc_name}. {loc_desc}. "
         f"No people, no characters in frame. "
         f"{(tone + ' atmosphere. ') if tone else ''}"
         f"Cinematic wide establishing shot. Horizontal landscape composition, 16:9 framing. "
-        f"Atmospheric lighting."
+        f"Atmospheric lighting.{_no_caption_text_clause()}"
         f"{realism_suffix}"
     )
     prompt = re.sub(r'\s+', ' ', prompt).strip()
@@ -10734,9 +11944,12 @@ def _gen_item_inline(s, sid, item):
     constraints = (item.get('image_constraints') or '').strip()
     constraints_clause = f" IMPORTANT — strictly follow these constraints: {constraints}." if constraints else ""
     modern_doc_clause = _modern_document_directive(item)
+    no_text_clause = '' if modern_doc_clause else _no_caption_text_clause(constraints)
+    it_name = _strip_cast_names_for_visual(item['name'], s)
+    it_desc = _strip_cast_names_for_visual(item.get('description', ''), s)
     prompt = (
         f"{style_prefix}"
-        f"{item['name']}. {item.get('description', '')}.{constraints_clause}{modern_doc_clause} "
+        f"{it_name}. {it_desc}.{constraints_clause}{modern_doc_clause}{no_text_clause} "
         f"Product-style still-life of the object alone. No people, no hands, no characters. "
         f"Centered composition, neutral seamless gray background (#dadada) — flat color field NOT a photo studio set (no lighting rigs, no trusses, no equipment visible), soft even diffused illumination on the subject only, "
         f"subtle shadow on ground, sharp focus on object texture and details. "
@@ -11303,17 +12516,18 @@ def generate_asset_prompt(sid):
         loc = next((l for l in s.get('locations', []) if l['id'] == asset_id), None)
         if not loc:
             return jsonify({'error': 'location not found'}), 404
-        description = loc.get('description', '')
+        description = _strip_cast_names_for_visual(loc.get('description', ''), s)
+        loc_name = _strip_cast_names_for_visual(loc['name'], s)
         context = ' '.join(filter(None, [genre, tone, world]))
         prompt = (
-            f"{loc['name']}. {description}. "
+            f"{loc_name}. {description}. "
             f"Empty scene, no people present. "
             f"{tone + ' atmosphere. ' if tone else ''}"
             f"{style.capitalize()} visual style. "
             f"Cinematic wide establishing shot. "
             f"Photorealistic, high detail, professional cinematography. "
             f"{('World context: ' + world[:100] + '. ') if world else ''}"
-            f"Atmospheric lighting, sharp focus."
+            f"Atmospheric lighting, sharp focus.{_no_caption_text_clause()}"
         )
     else:
         return jsonify({'error': 'unknown type'}), 400
@@ -13429,7 +14643,10 @@ _LOGIC_HOLE_AUDIT_SYSTEM = (
     "6. AMBIGUOUS CLIFFHANGER (type='ambiguous_cliffhanger'): the final line is so vague the viewer "
     "doesn't know what just happened. 'Let's go' / 'Watch this' / 'You'll see' without context. "
     "Cliffhanger should imply a clear next move (release the file, publish, expose, leave) even if "
-    "the resolution is held back. Suggest a sharper alternative.\n"
+    "the resolution is held back. Suggest a sharper alternative. "
+    "EXCEPTION: if the context marks this episode as THE SERIES FINALE, a conclusive resolution with "
+    "NO cliffhanger is CORRECT — do NOT flag ambiguous_cliffhanger or a missing cliffhanger; finale "
+    "closure problems are handled by finale_drift instead.\n"
     "\n"
     "7. PLOT REPETITION (type='plot_repetition'): the script uses a narrative delivery mechanism "
     "(written_message, overheard_dialogue, phone_call_stranger, dream_flashback, confession_direct, "
@@ -13460,12 +14677,15 @@ _LOGIC_HOLE_AUDIT_SYSTEM = (
     "Trigger when the script: (a) kills, exposes, jails, or otherwise neutralizes a character the finale "
     "or an upcoming checkpoint needs in a specific state; (b) resolves a conflict the finale needs "
     "unresolved; (c) introduces a competing climax that steals the finale's moment; (d) when this IS "
-    "the finale episode (distance = 0) — fails to execute the finale's specified events with the "
-    "specified characters; (e) introduces a NEW major villain / culprit / love interest that the user "
-    "finale or checkpoints never reference. "
+    "the finale episode (distance = 0, or the context carries a SERIES FINALE note) — fails to execute "
+    "the finale's specified events with the specified characters, OR ends on a cliffhanger / new threat / "
+    "new mystery / a hook into a non-existent next episode, OR leaves a major thread deferred instead of "
+    "resolving it on screen ('promised for tomorrow', 'to be addressed', 'reckoning later', a 'Setup for "
+    "next episode' note) — a finale must CLOSE every main thread; (e) introduces a NEW major villain / "
+    "culprit / love interest that the user finale or checkpoints never reference. "
     "Severity: 'critical'. Fix: identify which finale/checkpoint constraint is violated and propose "
     "a rewrite (specific lines / actions to change) that keeps the trajectory intact. "
-    "If no STORY TRAJECTORY block is present in the brief — DO NOT flag this type.\n"
+    "If no STORY TRAJECTORY block AND no SERIES FINALE note is present in the context — DO NOT flag this type.\n"
     "\n"
     "Severity rules: 'critical' = breaks viewer's suspension of disbelief (can't follow the story) "
     "OR contradicts the user-pinned trajectory; "
@@ -13525,10 +14745,30 @@ def audit_logic_holes(sid, num, script):
     except Exception:
         audit_devices_block = ''
 
+    # Finale awareness — this auditor does NOT receive the trajectory brief, so
+    # surface the finale flag explicitly. Without it, the conclusive finale
+    # ending gets mis-flagged as ambiguous_cliffhanger and rewritten back into a
+    # hook, and a finale that fails to resolve goes uncaught.
+    finale_block = ''
+    if is_finale_episode(s, num):
+        fin_desc = ((s.get('finale') or {}).get('description') or '').strip()
+        finale_block = (
+            '\n=== ⚠ THIS EPISODE IS THE SERIES FINALE (last episode) ===\n'
+            'A conclusive ending with NO cliffhanger is CORRECT here — do NOT flag '
+            'ambiguous_cliffhanger or a missing cliffhanger. INSTEAD flag finale_drift '
+            '(critical) if the script: ends on a cliffhanger / new threat / new mystery / '
+            'a hook into a non-existent next episode; leaves a major thread deferred '
+            '("promised for tomorrow", "to be addressed", "Setup for next episode"); or '
+            'fails to deliver the pinned finale end-state below.\n'
+            f'PINNED FINALE END-STATE:\n{fin_desc}\n'
+            '=== END FINALE NOTE ===\n\n'
+        )
+
     context = (
         f'Series: "{s.get("title") or ""}" | Genre: {s.get("genre") or ""}\n'
         f'Series arc: {(s.get("arc") or "")[:600]}\n'
         f'Episode {num} synopsis: {ep.get("synopsis") or ""}\n\n'
+        + finale_block
         + (audit_devices_block if audit_devices_block else '')
         + prev_block
         + f'=== SCRIPT TO AUDIT (episode {num}) ===\n{script}\n\n'
@@ -15590,7 +16830,7 @@ def generate_milestones(sid):
     batch = is_batch_mode(s)
     bs = batch_size(s)
     a1, a2, a3 = anchor_chunks(s) if batch else (1, 10, TOTAL_SUB_EPS)
-    cast_pin = _canonical_cast_block(s)
+    cast_pin = _canonical_cast_block(s) + _revision_instructions_block(s)
     series_format_mode = _format_mode_of(s)
     fmt_block = _format_mode_block(s, sections=['title_rule', 'synopsis_rule', 'episode_rule', 'pace_rule'])
     if series_format_mode == 'instagram_series':
@@ -16015,11 +17255,13 @@ def extract_characters_from_script(sid, num):
     )
 
     anthro_block = _anthro_world_block(s)
+    casting_block = _casting_aesthetics_block(s)
     prompt = (
         f'Series: "{s["title"]}" | Genre: {s.get("genre","")} | Tone: {s.get("tone","")}\n'
         f'Series world: {(s.get("world_description") or "")[:600]}\n'
         f'Series synopsis: {(s.get("synopsis") or "")[:600]}\n\n'
         + anthro_block
+        + casting_block
         + f'ALREADY KNOWN CHARACTERS in this series:\n{existing_char_lines}\n\n'
         f'ALREADY KNOWN LOCATIONS in this series:\n{existing_loc_lines}\n\n'
         f'{notes_block}'
@@ -16548,7 +17790,7 @@ def generate_episode_synopses(sid):
     ms = s.get('milestone_synopses', {})
     batch = is_batch_mode(s)
     bs = batch_size(s) if batch else 1
-    cast_pin = _canonical_cast_block(s)
+    cast_pin = _canonical_cast_block(s) + _revision_instructions_block(s)
     if batch:
         # In batch mode, fill all chunks BETWEEN the anchor chunks (e.g. chunks 1..chunk_of(10)).
         # Each chunk synopsis must outline `bs` sub-cliffhangers + the chunk's main reversal.
@@ -17023,6 +18265,7 @@ def generate_episode_script(sid, num):
 
     batch = is_batch_mode(s)
     bs = batch_size(s)
+    _is_finale = is_finale_episode(s, num)
     if batch:
         a, b = chunk_range(s, num)
         unit_label = f'CHUNK {num} (sub-episodes {a}–{b})'
@@ -17212,8 +18455,9 @@ def generate_episode_script(sid, num):
                 + ('Open on a SHARP COLD-OPEN HOOK in the first 3-5 seconds — drop us into action / conflict / line-mid-confrontation. NO setup, NO establishing shot. ' if not prev_script else
                    'Open on a SHARP COLD-OPEN HOOK tied to where the story left off — drop us back in mid-action. A fresh viewer must catch up in 10 seconds through context, NOT exposition. ')
                 + 'Escalate through clipped dialogue — every line reveals, flips, or raises stakes. '
-                + 'End on a HARD CLIFFHANGER on the final line / frame. '
-                + 'Apply ALL 7 rules of the HARD CONTRACT above.'
+                + ('This is the SERIES FINALE — resolve every thread and end on a CONCLUSIVE final beat (see the FINALE CONTRACT below). Do NOT end on a cliffhanger and ignore HARD CONTRACT rule 3. '
+                   if _is_finale else
+                   'End on a HARD CLIFFHANGER on the final line / frame. Apply ALL 7 rules of the HARD CONTRACT above.')
             )
         else:
             # Length budget — series-level target_duration_sec (default 60s).
@@ -17238,7 +18482,7 @@ def generate_episode_script(sid, num):
             instruction = (
                 f'Write the complete script for Episode {num}. '
                 + ('Continue naturally from where Episode {prev} ended.'.format(prev=num-1) if prev_script else 'Hook the viewer immediately.')
-                + ' End on a cliffhanger. '
+                + (' This is the SERIES FINALE — resolve every open thread and end conclusively (see the FINALE CONTRACT below); do NOT end on a cliffhanger. ' if _is_finale else ' End on a cliffhanger. ')
                 + f'\n\n⚠ БЮДЖЕТ ДЛИНЫ — серия ≈ {_target_sec} секунд экрана.\n'
                 + f'\n📣 РЕЧЕВЫЕ СЛОВА (только то, что произносят персонажи — слова после «NAME:» / в кавычках):\n'
                 + f'• ЦЕЛЬ: {_spoken_target} слов. ДИАПАЗОН: {_spoken_floor}–{_spoken_ceiling}.\n'
@@ -17266,6 +18510,7 @@ def generate_episode_script(sid, num):
         f'Series: "{s["title"]}" | Genre: {s.get("genre","")} | Tone: {s.get("tone","")}\n'
         f'Series arc: {s.get("arc","")}\n\n'
         + _anthro_world_block(s)  # ← furry/anthro world directive (empty for human worlds)
+        + _revision_instructions_block(s)  # ← clone-time revisions (empty unless cloned w/ edits)
         + trajectory_block        # ← user-pinned finale + checkpoints, FIRST so it's impossible to miss
         + bridge_block            # ← concrete per-episode plan from current state to finale
         + crowd_block             # ← HARD limit on characters per scene, lifted up front
@@ -17305,6 +18550,9 @@ def generate_episode_script(sid, num):
         + ('The THIS EPISODE\'S BEAT above is the authoritative scene direction — execute it. '
            'If the synopsis or prev_script set up a different subplot, fold it into the beat or park it; '
            'NEVER continue a subplot the bridge plan does not include.' if bridge_this_beat else '')
+        # ← SERIES FINALE override: appended LAST so it trumps the cliffhanger
+        #   mandate above. Empty string for every non-finale episode.
+        + build_finale_contract_block(s, num)
     )
 
     script_system = _build_batch_script_system(s) if batch else _build_script_system(s)
@@ -17381,7 +18629,9 @@ def generate_episode_script(sid, num):
                         f"после «NAME:» или в кавычках; "
                         f"(d) сцена развивается через диалог — добавь обмены репликами, реакции, "
                         f"подколы, угрозы, признания. НЕ через action-описания «он смотрит на неё»; "
-                        f"(e) cliffhanger остаётся, но к нему ведёт больше реплик."
+                        + (f"(e) это ФИНАЛ — концовка остаётся конклюзивной (без клиффхэнгера), но к ней ведёт больше реплик."
+                           if _is_finale else
+                           f"(e) cliffhanger остаётся, но к нему ведёт больше реплик.")
                     )
                 else:
                     fix_msg = (
@@ -17391,8 +18641,10 @@ def generate_episode_script(sid, num):
                         f"(c) action-строк не больше {max(3, round(lv['target_sec']/12))} — убери все 'смотрит / встаёт / делает паузу' если они не двигают сцену; "
                         f"(d) общий лимит: ~{lv['target_words']} спикерских слов, ~{lv['target_lines']} диалоговых строк суммарно; "
                         f"(e) НИКАКИХ time-markers вроде 'в течение двух минут' / 'десять секунд молча' — это раздувает хронометраж; "
-                        f"(f) удали экспозицию и повторы — только живые удары + cliffhanger. "
-                        f"Это короткая драма для TikTok ({lv['target_sec']}с), не полнометражный сценарий."
+                        + (f"(f) удали экспозицию и повторы — только живые удары + конклюзивная развязка ФИНАЛА (без клиффхэнгера). "
+                           if _is_finale else
+                           f"(f) удали экспозицию и повторы — только живые удары + cliffhanger. ")
+                        + f"Это короткая драма для TikTok ({lv['target_sec']}с), не полнометражный сценарий."
                     )
                 length_critical.append({
                     'type': 'script_overlength',
@@ -18190,6 +19442,25 @@ def episode_reteller_prompt(sid, num):
             f'  • {c["name"]} ({c.get("gender","")}) — '
             f'appearance: {c.get("appearance","")} | description: {c.get("description","")}'
         )
+        # Active disguise / new-identity state — HOLDS across episodes until the
+        # story reveals the character. Tell the writer to describe the disguised
+        # hair (not the natural hair) and to tag the disguise outfit every scene,
+        # so the look doesn't flip back mid-arc (Claire→blonde "Emma Cross" bug).
+        _idsh = c.get('identity_shift') or {}
+        if _idsh.get('active'):
+            _alias = _idsh.get('alias') or ''
+            _hair = _idsh.get('hair') or ''
+            char_details.append(
+                f'      ⚠ UNDERCOVER / NEW IDENTITY (HOLDS until story reveals her): '
+                f'{c["name"]} is currently disguised'
+                + (f' as "{_alias}"' if _alias else '')
+                + (f' — HAIR IS {_hair.upper()} in this state (NOT the natural hair above)' if _hair else '')
+                + '. In Block 2 describe '
+                + (_hair + ' hair' if _hair else 'the disguised hair')
+                + ', and tag a dedicated disguise OUTFIT (its OUTFIT_DESC must include the '
+                + (_hair + ' hair / wig' if _hair else 'disguise hair')
+                + ') in EVERY scene — do NOT reuse her pre-disguise looks.'
+            )
         # Wardrobe entries — ONE LINE PER OUTFIT so the AI can\'t miss them.
         # Multi-outfit characters get a hard "CHANGES CLOTHES — N entries" header.
         if len(ep_outfits_objs) >= 2:
@@ -19603,6 +20874,44 @@ def _extract_keyframes_at_cuts(sid, video_relpath, cut_timestamps, max_frames=3,
             continue
     return out_paths
 
+
+def _purge_continuity_sidecars(sid, video_relpath):
+    """Delete the cached continuity-frame sidecars derived from a chunk video:
+    <stem>_lastframe.png and <stem>_cutframe_*.png.
+
+    WHY this exists — production bug: chunk videos are named deterministically
+    `seedance_ep{N}_chunk{IDX}.mp4`, and _extract_last_frame / _extract_keyframes
+    cache their PNGs next to the mp4 keyed by that stem (returning the cached
+    file whenever it already exists). `_next_chunk_idx` reuses idx 0,1,2… after
+    a chunk record is removed, so when the user deletes ALL chunks and re-runs
+    the series, the freshly generated `..._chunk001.mp4` lands on the SAME stem
+    as the deleted one — and continuity extraction returns the PREVIOUS take's
+    stale lastframe/cutframes (old hair colour, wardrobe, characters). Deleting
+    the mp4 alone did not clear these. Call this whenever a chunk video is
+    deleted OR a new video is written to a stem, so a re-generated chunk can
+    never inherit the prior occupant's frames.
+    """
+    if not video_relpath:
+        return
+    try:
+        src = series_path(sid) / video_relpath
+        parent = src.parent
+        stem = src.stem
+    except Exception:
+        return
+    try:
+        victims = [parent / f'{stem}_lastframe.png']
+        victims += list(parent.glob(f'{stem}_cutframe_*.png'))
+        for p in victims:
+            try:
+                if p.exists():
+                    p.unlink()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 # ── AVAI Submit Circuit Breaker ───────────────────────────────────────────
 # Hard physical limit on AVAI submits. Lives inside _avai_seedance_start so
 # EVERY path that sends money to AVAI must pass through these checks. No
@@ -19857,6 +21166,20 @@ def _avai_seedance_start(prompt, ref_urls, duration, resolution, moderation_bypa
     context). Caller must resolve it via _get_user_avai_key() inside the request
     handler and pass it explicitly. Falls back to _get_user_avai_key() only when
     called inline from a request handler (image-style sync calls)."""
+    # FINAL moderation net — scrub sexualizing / NSFW wording out of the FULL
+    # composed prompt right before it leaves for the provider. Catches prompts
+    # that were frozen into episode JSON (seedance_chunks[].prompt) before the
+    # upstream fixes existed, plus anything a fresh compose still let through.
+    # De-escalates only (see _sanitize_appearance_for_moderation); the BINDING
+    # already carries clean descriptions, this just guarantees the submit too.
+    _clean_prompt = _sanitize_appearance_for_moderation(prompt)
+    if _clean_prompt != prompt:
+        try:
+            _log_event('INFO', 'avai_prompt_sanitized',
+                       before=prompt[:200], after=_clean_prompt[:200])
+        except Exception:
+            pass
+        prompt = _clean_prompt
     # Hard rate-limit / circuit-breaker — fires BEFORE any AVAI network call
     # so cost is bounded regardless of caller bugs. Raises AVAICircuitBreakerError
     # if limits exceeded; caller must catch + show user-friendly error.
@@ -23929,8 +25252,29 @@ def seedance_compose(sid, num):
         r'|голос\s+за\s+кадром|закадровый\s+голос)\b',
         re.IGNORECASE,
     )
+    # Snapshot the composer's ORIGINAL ordered refs BEFORE any server-side
+    # filtering. The @ImageN tokens in data['prompt'] are positional against
+    # THIS list. The tag-remap at the end must diff original→final against this
+    # snapshot, NOT against data['refs'] (which the voice-only/strict filter
+    # mutates in place below) — otherwise a char dropped by STRICT_CHAR_FILTER
+    # is invisible to the remap and its `@ImageN=Name` BINDING clause survives
+    # in the prompt with no image + no description. Real bug: «My Wedding Night
+    # Mistake» ep4, Lena named only as "her finger" in chunk_text → strict-
+    # dropped from refs → prompt still said `@Image2=Lena` with no ref/desc.
+    original_refs_for_remap = list(refs)
     dropped_voice_only = []
     dropped_strict = []   # only populated when STRICT_CHAR_FILTER is on
+    # Continuity carry-over: ids of chars who were on-screen in the immediately
+    # preceding chunk. Used to spare a continuing lead from STRICT_CHAR_FILTER
+    # when the chunk_text names them only by pronoun ("he slips it on HER
+    # finger"). A spurious roster over-attach (the «Sophie sits in chair» case
+    # the filter targets) is absent from the previous chunk, so this gate can't
+    # readmit it. Bug: «My Wedding Night Mistake» ep4 ring scene — Lena dropped.
+    prev_chunk_char_ids = {
+        r.get('id') for r in ((prev_neighbour or {}).get('refs') or [])
+        if r.get('kind') == 'char' and r.get('id')
+    }
+    kept_continuity = []  # strict-drop candidates spared by continuity carry-over
     if refs and chunk_text:
         ct_lower = chunk_text.lower()
         filtered = []
@@ -23956,8 +25300,15 @@ def seedance_compose(sid, num):
                     # surfaced in compose_warnings so regression is visible.
                     # Rollback: STRICT_CHAR_FILTER=0 env var, or flip default.
                     elif STRICT_CHAR_FILTER and not name_in_text:
-                        dropped_strict.append({'name': name, 'id': r.get('id')})
-                        continue
+                        # Spare a character who was on-screen in the previous
+                        # chunk — a pronoun-referenced continuing lead, not a
+                        # roster over-attach. Keeps Lena in the ring-exchange
+                        # two-shot even though chunk_text says only "her finger".
+                        if r.get('id') in prev_chunk_char_ids:
+                            kept_continuity.append({'name': name, 'id': r.get('id')})
+                        else:
+                            dropped_strict.append({'name': name, 'id': r.get('id')})
+                            continue
             filtered.append(r)
         if dropped_voice_only or dropped_strict:
             refs = filtered
@@ -24044,13 +25395,25 @@ def seedance_compose(sid, num):
     # @ImageN tokens with no matching reference image and hallucinate a random
     # face for that 'character'. Real bug from production: refs=[Adrian, Lobby]
     # but prompt said @Image2=Vivian, @Image3=Sophie, @Image4=Clara → garbage.
-    _tag_remap = _build_image_tag_remap(data.get('refs') or [], ref_meta)
+    # Diff the composer's ORIGINAL refs (pre-filter snapshot) against the
+    # final resolved refs so @ImageN bindings for chars dropped by the voice-
+    # only / strict filter are stripped/renumbered too — not just close-up /
+    # dedup / unresolved drops.
+    _tag_remap = _build_image_tag_remap(original_refs_for_remap, ref_meta)
     if any(v is None for v in _tag_remap.values()) or any(k != v for k, v in _tag_remap.items() if v is not None):
         data['prompt'] = _remap_image_tags(data.get('prompt') or '', _tag_remap)
 
     # CANONICAL char description for BINDING — uses the SAME text that was fed
     # to the image generator (appearance + outfit description). Visual ref and
     # textual description are guaranteed aligned.
+    # Detect transient undress states (towel / post-shower / robe / shirtless)
+    # ONCE here so the BINDING builder below can OVERRIDE a contradicting outfit,
+    # and the wardrobe_state_mismatch guard further down can reuse the same map.
+    try:
+        _undressed = _detect_char_undressed_states(ep.get('script') or '', s.get('characters') or [])
+    except Exception:
+        _undressed = {}
+    _undress_overridden = {}   # char_id -> cue, for accurate guard messaging
     name_to_clothing = {}   # keyed by full name AND first name for prompt lookup
     for r in ref_meta:
         if r.get('kind') != 'char':
@@ -24058,6 +25421,29 @@ def seedance_compose(sid, num):
         desc = _canonical_char_description(s, r.get('id'), r.get('outfit'))
         if not desc:
             continue
+        # Transient wardrobe state: the script stages this character undressed
+        # (towel/post-shower/robe/…) but the chunk assigns a DRESSED outfit (or
+        # base, which is dressed). The catalogued desc ("charcoal gray suit")
+        # then contradicts the scene and Seedance flips wardrobe between chunks.
+        # OVERRIDE the BINDING with the undress state so it holds across the whole
+        # span. The reference PHOTO still anchors the face; clothing is text-driven
+        # (same lever as the disguise-hair fix). A dedicated undress outfit, if one
+        # exists, is detected as already-undress below and left untouched.
+        _cue = _undressed.get(r.get('id'))
+        if _cue:
+            _label = r.get('outfit') or ''
+            _ch0 = next((c for c in (s.get('characters') or []) if c['id'] == r.get('id')), None)
+            _odesc = ''
+            if _ch0 and _label:
+                _o = next((o for o in (_ch0.get('outfits') or []) if o.get('label') == _label), None)
+                _odesc = (_o.get('description') or '') if _o else ''
+            _hay = f'{_label} {_odesc}'
+            _already_undress = bool(_UNDRESSED_OUTFIT_RE.search(_hay))
+            if (not _already_undress) and ((not _label) or _DRESSED_OUTFIT_RE.search(_hay)):
+                _ov = _binding_desc_with_undress(s, r.get('id'), _cue)
+                if _ov:
+                    desc = _ov
+                    _undress_overridden[r.get('id')] = _cue
         ch = next((c for c in (s.get('characters') or []) if c['id'] == r.get('id')), None)
         if ch:
             full_name = ch['name']
@@ -24709,6 +26095,16 @@ def seedance_compose(sid, num):
             ),
             'dropped_chars': dropped_strict,
         })
+    if kept_continuity:
+        compose_warnings.append({
+            'kind': 'strict_filter_continuity_kept',
+            'detail': (
+                'STRICT_CHAR_FILTER оставил персонажей, которых нет по имени в '
+                'chunk_text, но они были в кадре предыдущего чанка (continuity): '
+                f'{", ".join(c["name"] for c in kept_continuity)}.'
+            ),
+            'kept_chars': kept_continuity,
+        })
     # 2) prev_neighbour from a different scene than current chunk.
     if debug_prev and debug_prev.get('same_scene') is False:
         compose_warnings.append({
@@ -24827,6 +26223,102 @@ def seedance_compose(sid, num):
                     ),
                     'auto_added': actually_added,
                 })
+    # 6) Wardrobe-state mismatch: the script stages a character undressed
+    #    (towel / post-shower / robe / sleepwear / shirtless) but this chunk
+    #    assigns a fully-dressed outfit (or base, which is dressed). The composer
+    #    can only pick from defined outfits, so without a dedicated state outfit
+    #    it defaults to e.g. the business suit → the render flips between chunks
+    #    (Damien towel→suit, ep3). The BINDING builder above now AUTO-OVERRIDES the
+    #    clothing for this chunk so the render holds the undress state; we still
+    #    surface the cause so the user creates a dedicated outfit (with a real
+    #    reference photo) for best fidelity. `_undressed` was computed above.
+    for r in ref_meta:
+        if r.get('kind') != 'char':
+            continue
+        cue = _undressed.get(r.get('id'))
+        if not cue:
+            continue
+        label = r.get('outfit') or ''
+        ch = next((c for c in (s.get('characters') or []) if c['id'] == r.get('id')), None)
+        odesc = ''
+        if ch and label:
+            o = next((o for o in (ch.get('outfits') or []) if o.get('label') == label), None)
+            odesc = (o.get('description') or '') if o else ''
+        haystack = f'{label} {odesc}'
+        if _UNDRESSED_OUTFIT_RE.search(haystack):
+            continue   # outfit already matches the undressed state — no conflict
+        if label and not _DRESSED_OUTFIT_RE.search(haystack):
+            continue   # neutral label, don't assume a conflict
+        _was_overridden = r.get('id') in _undress_overridden
+        if _was_overridden:
+            detail = (
+                f'{ch["name"] if ch else r.get("id")} по сценарию в раздетом/переходном состоянии '
+                f'(«{cue}»), а назначенный образ "{label or "base"}" этому противоречил — '
+                f'BINDING для этого чанка АВТО-ПЕРЕОПРЕДЕЛЁН на «{_undress_state_clothing(cue)}», '
+                f'чтобы гардероб держался по всей сцене. Для максимальной точности заведи отдельный '
+                f'образ (напр. "Post-Shower"/"Towel") с настоящим референс-фото и назначь на ВСЕ чанки сцены.'
+            )
+        else:
+            detail = (
+                f'{ch["name"] if ch else r.get("id")} по сценарию в раздетом/переходном состоянии '
+                f'(«{cue}»), но в этом чанке назначен образ "{label or "base"}", который этому '
+                f'противоречит. Заведи отдельный образ (напр. "Post-Shower" / "Towel": towel around '
+                f'waist, bare chest, wet hair) и назначь его на ВСЕ чанки этой сцены — иначе '
+                f'гардероб будет прыгать между чанками (towel ↔ костюм).'
+            )
+        compose_warnings.append({
+            'kind': 'wardrobe_state_mismatch',
+            'detail': detail,
+            'char_id': r.get('id'),
+            'cue': cue,
+            'assigned_outfit': label or 'base',
+            'binding_auto_overridden': _was_overridden,
+        })
+    # 7) Identity / disguise HAIR mismatch: the character is in an ACTIVE narrative
+    #    disguise persisted from an earlier episode (char['identity_shift'] — e.g.
+    #    Claire went blonde as "Emma Cross" in ep4) but THIS chunk's outfit doesn't
+    #    carry the disguised hair, so the render reverts to the natural hair (the
+    #    ep5 brunette regression). Surface it so a dedicated disguise look gets made
+    #    and assigned across the whole span instead of silently flipping hair.
+    for r in ref_meta:
+        if r.get('kind') != 'char':
+            continue
+        ch = next((c for c in (s.get('characters') or []) if c['id'] == r.get('id')), None)
+        idsh = (ch.get('identity_shift') or {}) if ch else {}
+        if not idsh.get('active') or not idsh.get('hair'):
+            continue
+        hair = idsh['hair']
+        label = r.get('outfit') or ''
+        outfit_obj = None
+        if ch and label:
+            outfit_obj = next((o for o in (ch.get('outfits') or []) if o.get('label') == label), None)
+        haystack = ' '.join(filter(None, [
+            label,
+            (outfit_obj.get('description') if outfit_obj else '') or '',
+            (outfit_obj.get('appearance_override') if outfit_obj else '') or '',
+            (ch.get('appearance') if ch else '') or '',
+        ])).lower()
+        hair_tokens = [t for t in re.split(r'[^a-zа-яё]+', hair.lower()) if len(t) > 2]
+        if any(t in haystack for t in hair_tokens):
+            continue   # assigned look already carries the disguised hair — OK
+        alias = idsh.get('alias') or ''
+        compose_warnings.append({
+            'kind': 'identity_appearance_mismatch',
+            'detail': (
+                f'{ch["name"] if ch else r.get("id")} по сюжету сейчас в изменённом образе'
+                + (f' («{alias}»)' if alias else '')
+                + f' — волосы должны быть {hair.upper()}, но назначенный образ "{label or "base"}" '
+                f'этого не отражает, поэтому отрисуется исходный цвет волос. Заведи отдельный '
+                f'образ для этой личности (напр. "{alias or "Disguise"}" с OUTFIT_DESC, включающим '
+                f'"{hair} hair / wig" + одежду личности; либо задай образу '
+                f'appearance_override="{hair} hair") и назначь его на ВСЕ чанки всего отрезка, пока '
+                f'персонаж в этом образе — иначе волосы будут прыгать {hair}↔natural по сериалу.'
+            ),
+            'char_id': r.get('id'),
+            'required_hair': hair,
+            'alias': alias,
+            'assigned_outfit': label or 'base',
+        })
     if compose_warnings:
         _log_event('INFO', 'compose_warnings', sid=sid, ep_num=num,
                    warnings=compose_warnings)
@@ -24877,6 +26369,20 @@ def seedance_start(sid, num):
     prompt = (body.get('prompt') or '').strip()
     if not prompt:
         return jsonify({'error': 'prompt required'}), 400
+    # Scrub sexualizing / NSFW wording out of the incoming composed prompt
+    # BEFORE anything else — the pre-flight moderation gate (_seedance_moderation_
+    # precheck) and the stored chunk both need the cleaned text, otherwise a
+    # prompt the client composed from a charged appearance/script still gets
+    # flagged here even though _avai_seedance_start would have scrubbed it at
+    # submit. De-escalates only (see _sanitize_appearance_for_moderation).
+    _clean = _sanitize_appearance_for_moderation(prompt)
+    if _clean != prompt:
+        try:
+            _log_event('INFO', 'seedance_start_prompt_sanitized', sid=sid, ep=num,
+                       before=prompt[:200], after=_clean[:200])
+        except Exception:
+            pass
+        prompt = _clean
     ref_urls = body.get('ref_urls') or []
     # accept ref descriptors {kind,id,outfit} too
     if not ref_urls and body.get('refs'):
@@ -25213,9 +26719,19 @@ def seedance_poll(sid, num):
                     continue
                 try:
                     vid_local = vid_dir(sid) / f'seedance_ep{int(num):03d}_chunk{c["idx"]:03d}.mp4'
+                    new_video_path = str(vid_local.relative_to(series_path(sid)))
+                    # This stem may have been occupied by a previous take (idx is
+                    # reused after a delete-all + regen). Purge any continuity-frame
+                    # sidecars cached against it AND drop the record's cached frame
+                    # refs, so the next chunk's compose extracts THIS video's frames
+                    # instead of serving the deleted take's (stale hair/wardrobe).
+                    _purge_continuity_sidecars(sid, new_video_path)
+                    for _stale in ('lastframe_avai_url', 'cutframes_avai_urls',
+                                   'cuts_detected', 'frame_state_analysis'):
+                        c.pop(_stale, None)
                     _download_video(vurl, vid_local)
                     c['video_url'] = vurl
-                    c['video_path'] = str(vid_local.relative_to(series_path(sid)))
+                    c['video_path'] = new_video_path
                     # Successful render — wipe any stale error field carried over
                     # from a previous transient failure (e.g. AVAI 401 on a tick
                     # before the user fixed the key, then chunk eventually
@@ -25419,12 +26935,16 @@ def seedance_delete(sid, num, idx):
         chunk = next((c for c in chunks if c.get('idx') == idx), None)
         if not chunk:
             return jsonify({'error': 'chunk not found'}), 404
-        # Delete local mp4 if exists
+        # Delete local mp4 if exists — plus the continuity-frame sidecars
+        # (<stem>_lastframe.png / <stem>_cutframe_*.png). Leaving the sidecars
+        # behind let a re-generated chunk that reuses this idx/stem inherit the
+        # deleted take's frames as continuity refs (old hair/wardrobe bug).
         if chunk.get('video_path'):
             p = series_path(sid) / chunk['video_path']
             try:
                 if p.exists(): p.unlink()
             except Exception: pass
+            _purge_continuity_sidecars(sid, chunk['video_path'])
         chunks[:] = [c for c in chunks if c.get('idx') != idx]
         save_episode(sid, num, ep)
         return jsonify({'ok': True})
