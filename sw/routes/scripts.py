@@ -39,20 +39,14 @@ from sw.story_writer import _build_batch_script_system, _build_script_system
 
 
 def _series_beats_episode_block(s):
-    # lazy proxy: scenario-constructor helper still lives higher up
-    try:
-        from sw.routes.scenario import _series_beats_episode_block as f
-    except ImportError:
-        from app import _series_beats_episode_block as f
+    # lazy proxy: beats helper lives in sw.routes.ideas (no cycle at call time)
+    from sw.routes.ideas import _series_beats_episode_block as f
     return f(s)
 
 
 def trigger_autogen_if_enabled(sid):
-    # lazy proxy: autogen sweep still lives higher up
-    try:
-        from sw.autogen import trigger_autogen_if_enabled as f
-    except ImportError:
-        from app import trigger_autogen_if_enabled as f
+    # lazy proxy: avoids module-level routes->autogen import
+    from sw.autogen import trigger_autogen_if_enabled as f
     return f(sid)
 
 # Generate-to-landmark — convergence-mode generation
