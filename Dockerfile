@@ -16,6 +16,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # App source.
 COPY app.py gunicorn.conf.py ./
+COPY sw ./sw
 COPY static ./static
 COPY templates ./templates
 COPY services ./services
