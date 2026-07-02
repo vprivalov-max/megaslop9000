@@ -1,5 +1,6 @@
 """AVAI image-generation API: call helper, provider resolution, config save."""
 import json
+from pathlib import Path
 
 import requests
 
