@@ -239,20 +239,11 @@ from sw.config import (
     STRICT_CHAR_FILTER,
 )
 
-# ── Render queue ─────────────────────────────────────────────────────────────
-# Cap concurrent ffmpeg renders so N users don't all pin the CPU at once.
-# Each render takes 5–30s of pure CPU; serializing past 2 prevents stalls and
-# OOM. Configurable via env.
-_RENDER_CONCURRENCY = max(1, int(os.environ.get('RENDER_CONCURRENCY', '2')))
-RENDER_SEMAPHORE = threading.BoundedSemaphore(_RENDER_CONCURRENCY)
-
-def _render_queue_depth():
-    """Approximate number of waiters. Bounded semaphores don't expose this
-    directly, so we just report whether the queue is saturated."""
-    # _value is the number of free slots (CPython internal).
-    free = getattr(RENDER_SEMAPHORE, '_value', _RENDER_CONCURRENCY)
-    return {'concurrency': _RENDER_CONCURRENCY, 'free': free, 'busy': _RENDER_CONCURRENCY - free}
-
+from sw.state import (
+    _RENDER_CONCURRENCY,
+    RENDER_SEMAPHORE,
+    _render_queue_depth,
+)
 # ── Startup recovery ─────────────────────────────────────────────────────────
 # When the server is killed mid-Seedance-submission, chunks can be stranded:
 #   • status='submitting' without job_id  → submit thread died, mark failed
@@ -310,7 +301,7 @@ def _recover_inflight_chunks():
                         print(f'[recover] failed to save {ep_file}: {e}')
     if scanned:
         print(f'[recover] scanned {scanned} chunks, cleaned {cleaned} stranded submissions')
-ALLOWED_EXTENSIONS = {'jpg', 'jpeg', 'png', 'webp'}
+from sw.state import ALLOWED_EXTENSIONS
 
 
 # ── Auth (Google OAuth, restricted to a single Workspace domain) ─────────────
@@ -558,59 +549,11 @@ def admin_logs():
 # Retention period for per-user JSONL log files. Configurable via env var.
 # Default 7 days — small files (a few KB/day per active user) but enough for
 # debugging recent issues. Set LOG_RETENTION_DAYS=0 to disable cleanup.
-_LOG_RETENTION_DAYS = int(os.environ.get('LOG_RETENTION_DAYS', '7'))
-
-def _cleanup_old_logs():
-    """Walks every <DATA_ROOT>/<user>/_logs/ folder and deletes JSONL files
-    older than _LOG_RETENTION_DAYS. Best-effort — failures swallowed.
-    Runs at startup and once per day via _LOG_CLEANUP_TIMER."""
-    if _LOG_RETENTION_DAYS <= 0:
-        return
-    if not DATA_ROOT.exists():
-        return
-    cutoff = datetime.datetime.utcnow() - datetime.timedelta(days=_LOG_RETENTION_DAYS)
-    deleted = 0
-    scanned = 0
-    for user_dir in DATA_ROOT.iterdir():
-        log_dir = user_dir / '_logs'
-        if not log_dir.is_dir():
-            continue
-        for log_file in log_dir.glob('*.jsonl'):
-            # Skip macOS AppleDouble (._*) sidecars — not real log files.
-            if log_file.name.startswith('._'):
-                continue
-            scanned += 1
-            try:
-                # Filename is YYYY-MM-DD.jsonl — fast path: parse the date.
-                stem = log_file.stem
-                try:
-                    file_date = datetime.datetime.strptime(stem, '%Y-%m-%d')
-                except ValueError:
-                    # Fallback to mtime if filename isn't ISO-date
-                    file_date = datetime.datetime.utcfromtimestamp(log_file.stat().st_mtime)
-                if file_date < cutoff:
-                    log_file.unlink()
-                    deleted += 1
-            except Exception:
-                pass
-    if scanned:
-        print(f'[log-cleanup] scanned {scanned} files, deleted {deleted} older than {_LOG_RETENTION_DAYS}d', flush=True)
-
-def _start_log_cleanup_loop():
-    """Spawns a daemon thread that runs cleanup once now + every 24h after."""
-    if _LOG_RETENTION_DAYS <= 0:
-        return
-    def _loop():
-        while True:
-            try:
-                _cleanup_old_logs()
-            except Exception as e:
-                print(f'[log-cleanup] loop tick failed: {e}', flush=True)
-            time.sleep(24 * 60 * 60)  # 24h
-    t = threading.Thread(target=_loop, daemon=True)
-    t.start()
-
-
+from sw.logging_utils import (
+    _LOG_RETENTION_DAYS,
+    _cleanup_old_logs,
+    _start_log_cleanup_loop,
+)
 @app.route('/api/admin/users')
 def admin_users():
     """List users that have any data on the server (so primary operator can
