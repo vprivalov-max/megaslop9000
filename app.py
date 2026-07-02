@@ -28677,5 +28677,7 @@ if __name__ == '__main__':
 else:
     # Production: gunicorn imports this module. Run recovery + start log
     # cleanup loop once on boot.
-    _recover_inflight_chunks()
-    _start_log_cleanup_loop()
+    # SW_SKIP_BOOT=1 imports the module without side effects (route-map checks).
+    if os.environ.get('SW_SKIP_BOOT') != '1':
+        _recover_inflight_chunks()
+        _start_log_cleanup_loop()
