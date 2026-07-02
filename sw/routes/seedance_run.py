@@ -18,7 +18,7 @@ from sw.logging_utils import _start_log_cleanup_loop
 from sw.seedance import (SEEDANCE_PRECHECK_ENABLED, AVAICircuitBreakerError,
                          _AVAI_KILL_SWITCH, _avai_kill_switch_status,
                          _avai_seedance_start, _avai_seedance_status,
-                         _download_video, _purge_continuity_sidecars,
+                         _download_video, _next_chunk_idx, _purge_continuity_sidecars,
                          _qc_run_chunk, _resolve_ref_url, _seedance_chunks,
                          _seedance_moderation_precheck)
 from sw.storage import (list_episodes, load_episode, load_series, save_episode,

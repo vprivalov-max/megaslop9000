@@ -15,6 +15,8 @@ from sw.logging_utils import _log_event
 # routes->routes: landmarks hosts the trajectory/bridge builders used by
 # writer prompts; no import cycle (landmarks never imports story_gen).
 from sw.routes.landmarks import build_finale_bridge_plan, build_trajectory_block
+# routes->routes: ideas hosts the beats-episode-block builder (no import cycle).
+from sw.routes.ideas import _series_beats_episode_block
 from sw.storage import (TOTAL_SUB_EPS, _extract_end_position,
                         _sync_script_outfits, anchor_chunks, batch_size,
                         chunk_count, chunk_range, is_batch_mode, list_episodes,

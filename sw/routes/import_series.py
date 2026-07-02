@@ -31,7 +31,7 @@ from sw.canon_index import (_build_plot_device_history,
 from sw.config import BASE, DATA_ROOT
 from sw.core import app
 from sw.era import _ERA_GUIDES, _ERA_LABELS, _detect_series_era
-from sw.jsonutils import strip_json
+from sw.jsonutils import loads_lenient, strip_json
 from sw.llm import (WRITER_MODEL_DEFAULT, WRITER_MODEL_WHITELIST,
                     _resolve_writer_model, claude_ask, llm_ask)
 from sw.logging_utils import _log_event
@@ -48,7 +48,8 @@ from sw.storage import (_extract_end_position, _normalize_blocking_tags,
                         scaffold_series_folders, series_path, user_root)
 from sw.story_logic import (_build_narrative_state_block,
                             _script_runtime_metrics, audit_script,
-                            build_logic_brief, extract_canon_updates)
+                            build_logic_brief, extract_canon_updates,
+                            rollback_canon_for_episode)
 from sw.story_prompts import _build_cast_block
 from sw.story_writer import _build_script_system
 from sw.style import _VISUAL_STYLE_PRESETS
@@ -373,6 +374,9 @@ def _import_worker(sid, episode_records, create_chars=True, create_locs=True, cr
                     desc = (it.get('description') or '').strip()
                     if not name:
                         continue
+                    # lazy: lives in sw.routes.images_items (module-level import
+                    # would shift its route-registration order)
+                    from sw.routes.images_items import _fuzzy_find_item
                     existing = _fuzzy_find_item(s['items'], name, desc)
                     if existing:
                         ep_item_ids.append(existing['id'])
@@ -1742,6 +1746,9 @@ def generate_script_batch(sid):
     # Finale awareness — if the pinned finale falls inside the [first..last] range
     # this bulk write covers, the finale episode must RESOLVE (no cliffhanger),
     # overriding the per-episode "обязательно cliffhanger" rule below.
+    # lazy: lives in sw.routes.landmarks (module-level import would shift
+    # its route-registration order)
+    from sw.routes.landmarks import finale_episode_num
     _fin_ep = finale_episode_num(s)
     _finale_in_range = _fin_ep is not None and first_new_num <= _fin_ep <= last_new_num
     _batch_finale_note = ''
@@ -2527,6 +2534,8 @@ def get_series(sid):
             # Default True for legacy episodes (they were already extracted before this gate).
             if ep.get('cast_extracted', True) is False:
                 continue
+            # lazy: lives in sw.routes.scripts (same pattern as sw.autogen)
+            from sw.routes.scripts import sync_episode_with_cast_block
             sync_episode_with_cast_block(sid, ep['number'])
     except Exception as e:
         print(f'[get_series {sid}] heal failed: {e}')

@@ -3,6 +3,8 @@ import datetime
 import json
 import re
 import shutil
+import subprocess
+import sys
 import time
 import uuid
 
@@ -14,6 +16,7 @@ from sw.avai import _series_image_provider, avai_generate, rtl_headers
 from sw.config import RETELLER_API
 from sw.core import app
 from sw.era import _no_caption_text_clause, _strip_cast_names_for_visual
+from sw.jsonutils import strip_json
 from sw.llm import claude_ask
 from sw.logging_utils import _log_event
 from sw.seedance import _avai_seedance_start, _avai_seedance_status
