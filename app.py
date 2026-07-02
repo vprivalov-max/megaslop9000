@@ -531,6 +531,9 @@ from sw.routes.seedance_run import (
 )
 
 
+from sw.logging_utils import _start_log_cleanup_loop
+from sw.recovery import _recover_inflight_chunks
+
 if __name__ == '__main__':
     # Dev mode entrypoint. In production we run under gunicorn (see Dockerfile),
     # which hits the `else` branch below.
