@@ -55,6 +55,15 @@
       <button class="btn-primary" onclick="openCreateSeries()" data-mlg-action="gunshot">+ Новый сериал</button>
     </div>
   </div>
+  <details id="top-dramas-panel" style="margin:0 0 16px;background:rgba(255,107,53,0.05);border:1px solid rgba(255,107,53,0.2);border-radius:12px;padding:10px 16px">
+    <summary style="cursor:pointer;font-size:1.02rem;font-weight:600;color:#ff922b;user-select:none;display:flex;align-items:center;gap:10px">
+      🔥 Топовые шортдраммы
+      <span id="top-dramas-meta" style="font-size:0.72rem;color:var(--muted);font-weight:400"></span>
+      <button onclick="event.preventDefault();refreshTopDramas()" id="btn-refresh-top-dramas" style="margin-left:auto;padding:6px 12px;border:none;border-radius:8px;background:linear-gradient(135deg,#ff6b35,#f7931e);color:#fff;font-weight:600;cursor:pointer;font-size:0.82rem">🔄 Обновить список</button>
+    </summary>
+    <div id="top-dramas-status" style="font-size:0.82rem;color:var(--muted);margin:8px 0"></div>
+    <div id="top-dramas-board" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px;margin-top:10px"></div>
+  </details>
   <div class="projects-filterbar" id="projects-filterbar">
     <div class="filter-group">
       <span class="filter-label">Цвет:</span>
@@ -448,6 +457,7 @@
               <button class="ep-script-btn ready" id="ep-accept-script-btn" onclick="acceptScript()" title="Сохранить сценарий, найти новых персонажей/локации/предметы, при необходимости показать модалку для drag-drop фоток, потом перейти в режим сцен и запустить автоген"
                       style="background:linear-gradient(135deg,#10b981,#059669);color:#fff;font-weight:700">✅ Принять сценарий</button>
               <button class="btn-ghost btn-sm" id="ep-reanalyze-btn" onclick="acceptScript({force:true})" title="Перепроанализировать сценарий (если добавил новые персонажей/предметы вручную или изменил текст)" style="display:none">🔄 Перепроанализировать</button>
+              <button class="btn-ghost btn-sm" id="ep-apply-revisions-btn" onclick="applyEpisodeRevisions()" title="Переписать ЭТОТ сценарий под правки сериала (сохраняя хук, структуру и клиффхэнгер). Появляется только у сериалов, созданных «на основе существующего + правки»." style="display:none;border:1px solid rgba(132,94,247,0.5);color:#a98bf5">🧬 Применить правки к серии</button>
                     </div>
           </div>
           <textarea id="ep-script" class="script-area" placeholder="Screenplay / Script..."></textarea>
@@ -887,6 +897,46 @@
           📜 Из готового сценария
           <div style="font-size:0.74rem;color:var(--muted);font-weight:400;margin-top:2px">Загрузить .txt / paste — серии и персонажи извлекутся сами</div>
         </button>
+        <button type="button" class="btn-mode-pill" id="series-mode-clone-btn" onclick="setSeriesCreateMode('clone')">
+          🧬 На основе существующего
+          <div style="font-size:0.74rem;color:var(--muted);font-weight:400;margin-top:2px">Взять сюжет другого сериала + вписать правки (напр. «героиня молодая и красивая»)</div>
+        </button>
+      </div>
+
+      <!-- ─── CLONE MODE ─── (hidden by default; toggled by setSeriesCreateMode) -->
+      <div id="series-clone-block" style="display:none">
+        <div class="field-group">
+          <label>Сериал-источник *</label>
+          <select id="clone-source-sid" style="width:100%;padding:7px 8px;font-size:0.9rem;background:#1a1a1f;border:1px solid #333;border-radius:6px;color:#eee">
+            <option value="">— загрузка списка… —</option>
+          </select>
+          <div id="clone-source-info" style="font-size:0.76rem;color:var(--muted);margin-top:4px"></div>
+        </div>
+        <div class="field-group">
+          <label>Название нового сериала *</label>
+          <input id="clone-new-title" type="text" placeholder="Например: тот же сюжет, но героиня молодая и красивая">
+        </div>
+        <div class="field-group">
+          <label>Сколько серий скопировать</label>
+          <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+            <input id="clone-episodes-count" type="number" min="0" step="1" value="0"
+                   style="max-width:110px;padding:7px 8px;background:#1a1a1f;border:1px solid #333;border-radius:6px;color:#eee"
+                   title="0 = скопировать все серии источника. Например 5 — скопируются только первые 5, остальные не трогаются.">
+            <span style="font-size:0.78rem;color:var(--muted)">0 = все серии. Например <b>5</b> — только первые 5, остальные не копируются.</span>
+          </div>
+        </div>
+        <div class="field-group">
+          <label>Правки к сюжету / персонажам</label>
+          <textarea id="clone-revision-instructions" rows="5"
+            placeholder="Свободным текстом, по-русски. Примеры:&#10;• Главная героиня молодая (24) и очень красивая.&#10;• Босс не женат, а вдовец.&#10;• Перенести действие в Сеул.&#10;&#10;Правки применятся СРАЗУ к библии и персонажам (внешность героини перегенерируется). Серии перепишутся только если меняется их сюжет — поштучно, кнопкой внутри сериала."></textarea>
+          <div style="font-size:0.74rem;color:var(--muted);margin-top:4px">
+            Если правка только про внешность/имя — сценарии серий не переписываются (имена правятся автоматически). Если меняется сюжет или возраст персонажа — затронутые серии попадут в очередь на перезапись.
+          </div>
+        </div>
+        <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:14px">
+          <button class="btn-primary" onclick="cloneCreateSeries()" id="clone-create-btn" style="background:linear-gradient(135deg,#845ef7,#6741d9)">🧬 Создать вариант</button>
+        </div>
+        <div id="clone-create-status" style="font-size:0.82rem;color:var(--muted);margin-top:8px"></div>
       </div>
 
       <!-- ─── IMPORT MODE ─── (hidden by default; toggled by setSeriesCreateMode) -->
@@ -1099,6 +1149,9 @@
           <span class="idea-gen-sep">или</span>
           <button class="btn-idea-random" id="btn-gen-ideas" onclick="generateSeriesIdeas()">💡 5 идей на выбор</button>
         </div>
+        <div class="idea-gen-actions" style="margin-top:8px">
+          <button class="btn-idea-random" id="btn-find-top-dramas" onclick="findTopDramas()" style="background:linear-gradient(135deg,#ff6b35,#f7931e);color:#fff">🔥 Найти топовые шортдраммы</button>
+        </div>
         <details style="margin:8px 0;background:rgba(132,94,247,0.04);border:1px solid rgba(132,94,247,0.15);border-radius:8px;padding:6px 12px">
           <summary style="cursor:pointer;font-size:0.82rem;color:var(--muted);user-select:none">🚫 Не предлагать (тропы / роли которые надоели)</summary>
           <textarea id="series-ideas-avoid" rows="2"
@@ -1109,6 +1162,7 @@
           <div style="font-size:0.72rem;color:var(--muted);margin-top:4px">Claude распознаёт синонимы и переводы: указал «pastor» — заблокированы priest / preacher / cleric / cult founder. Указал «близнецы» — заблокированы twin / doppelganger / mirror sibling.</div>
         </details>
         <div id="series-ideas-list" class="series-ideas-list hidden"></div>
+        <div id="top-dramas-list" class="series-ideas-list hidden"></div>
         <div id="series-gen-status" class="series-gen-status"></div>
       </div>
 

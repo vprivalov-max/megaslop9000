@@ -1207,6 +1207,57 @@ def claude_ask_quality(prompt: str, system: str = '') -> str:
     """Sonnet — creative tasks (scripts, synopses, ideas)."""
     return claude_ask(prompt, system=system, model='sonnet', max_tokens=8192)
 
+def claude_web_research(prompt: str, system: str = '', max_uses: int = 5,
+                        model: str = 'sonnet', max_tokens: int = 4096) -> str:
+    """Anthropic call with the native server-side web_search tool enabled.
+
+    Web search is an Anthropic-only server tool: the search round-trips happen
+    INSIDE a single messages.create call (no client-side tool loop), so we just
+    read the text blocks of the final message — same as claude_ask. Used by the
+    ideas pipeline (research stage) to ground 5-idea generation in what is
+    actually trending in vertical short drama right now.
+
+    Raises on failure (the caller is expected to fall back to a no-web
+    model-knowledge digest). Retries transient errors like claude_ask."""
+    sdk_model = _MODEL_ALIAS.get(model, model) if model else 'claude-sonnet-4-5'
+    client = _get_anthropic_client()
+    kwargs = {
+        'model': sdk_model,
+        'max_tokens': max_tokens,
+        'messages': [{'role': 'user', 'content': prompt}],
+        'tools': [{'type': 'web_search_20250305', 'name': 'web_search', 'max_uses': max_uses}],
+    }
+    if system:
+        kwargs['system'] = system
+    t0 = time.time()
+    last_err = None
+    for attempt in range(4):
+        try:
+            msg = client.messages.create(**kwargs)
+            text = ''.join(b.text for b in msg.content if getattr(b, 'type', '') == 'text').strip()
+            searches = sum(1 for b in msg.content if getattr(b, 'type', '') == 'server_tool_use')
+            print(f'[claude_web_research] done in {time.time()-t0:.1f}s '
+                  f'({searches} searches, {len(text)} chars, try={attempt+1})', flush=True)
+            return text
+        except Exception as e:
+            last_err = e
+            sc = getattr(e, 'status_code', None) or (e.response.status_code if hasattr(e, 'response') and hasattr(e.response, 'status_code') else None)
+            err_name = e.__class__.__name__
+            retryable = sc in (408, 429, 500, 502, 503, 504, 529) or err_name in (
+                'RateLimitError', 'APIConnectionError', 'APITimeoutError',
+                'InternalServerError', 'OverloadedError', 'APIStatusError',
+            )
+            if not retryable or attempt == 3:
+                print(f'[claude_web_research] FAIL after {attempt+1} tries ({time.time()-t0:.1f}s): {err_name}: {str(e)[:200]}', flush=True)
+                raise
+            delay = (2 ** attempt) * 2 + (random.random() * 1.5)
+            print(f'[claude_web_research] retry {attempt+1}/3 after {delay:.1f}s ({err_name})', flush=True)
+            time.sleep(delay)
+    if last_err:
+        raise last_err
+    raise RuntimeError('claude_web_research: exhausted retries with no error captured')
+
+
 
 def claude_ask_vision(prompt: str, image_urls, system: str = '',
                       model: str = 'haiku', max_tokens: int = 2048) -> str:
@@ -2583,7 +2634,7 @@ def _canonical_char_description(s, char_id, outfit_label):
     has_ref_portrait = bool(char.get('avai_base_url') or char.get('ref_images'))
     if has_ref_portrait and outfit_desc:
         anchors = []
-        _species = _detect_animal_species(char.get('name'), char.get('appearance') or '')
+        _species = _detect_animal_species(char.get('name'), char.get('appearance') or '', series=s)
         if _species:
             anchors.append(f'anthropomorphic {_species.split()[-1]}')
         _disguise_hair = (active_outfit.get('appearance_override') or '').strip() if active_outfit else ''
@@ -3000,6 +3051,19 @@ def load_episode(sid, num):
 
 def save_episode(sid, num, data):
     episodes_dir(sid).mkdir(exist_ok=True)
+    # New series use a DETERMINISTIC episode title: `<Series_Title>_E<N>`
+    # (e.g. `Claimed_by_Two_Alphas_E1`) instead of the writer's creative
+    # per-episode title. Gated per-series via `episode_title_format` so
+    # existing series keep their writer-given titles untouched.
+    try:
+        if isinstance(data, dict):
+            s = load_series(sid)
+            if s and s.get('episode_title_format') == 'series_indexed':
+                safe = re.sub(r'[^\w]+', '_', (s.get('title') or sid), flags=re.UNICODE).strip('_') or sid
+                data = dict(data)
+                data['title'] = f'{safe}_E{int(num)}'
+    except Exception:
+        pass
     _atomic_write_json(episodes_dir(sid) / f'{int(num):03d}.json', data)
 
 
@@ -5988,6 +6052,8 @@ def import_from_script():
         visual_style_value = _VISUAL_STYLE_PRESETS[style_type].get('desc', '') or ''
     series_data = {
         'id': sid, 'title': title,
+        # Deterministic episode titles `<Series_Title>_E<N>` for all new series.
+        'episode_title_format': 'series_indexed',
         'genre': '', 'tone': '', 'target_audience': '', 'world_description': '',
         'synopsis': synopsis,
         'auto_generate_assets': True, 'batch_mode': False, 'batch_size': 1,
@@ -6598,6 +6664,7 @@ def generate_script_batch(sid):
     except Exception:
         _batch_narrative_block = ''
     _beats_block = _series_beats_episode_block(s)
+    _source_outline_block = _source_outline_episode_block(s, first_new_num, last_new_num)
     # Finale awareness — if the pinned finale falls inside the [first..last] range
     # this bulk write covers, the finale episode must RESOLVE (no cliffhanger),
     # overriding the per-episode "обязательно cliffhanger" rule below.
@@ -6627,6 +6694,7 @@ def generate_script_batch(sid):
         f"ROSTER ЛОКАЦИЙ:    {locs_list or '(пусто — придумай простые)' if from_scratch else (locs_list or '(пусто)')}\n"
         f"СЮЖЕТНЫЕ ПРЕДМЕТЫ: {items_list or '(пусто)'}\n"
         f"{_beats_block}\n"
+        f"{_source_outline_block}"
         f"{earlier_block}"
         + (f"ПОСЛЕДНИЕ {len(verbatim_window)} СЕРИЙ (verbatim, для тонкой калибровки стиля и continuity):\n```\n{verbatim_block}\n```\n\n"
            if verbatim_block else '')
@@ -6914,6 +6982,8 @@ def create_series():
     series_data = {
         'id': sid,
         'title': data['title'],
+        # Deterministic episode titles `<Series_Title>_E<N>` for all new series.
+        'episode_title_format': 'series_indexed',
         'genre': data.get('genre', ''),
         'tone': data.get('tone', ''),
         'target_audience': data.get('target_audience', ''),
@@ -6925,6 +6995,10 @@ def create_series():
         # free-text beats) so episode generators replay it in order — see
         # _series_beats_episode_block. Order is significant.
         'beat_sequence': _resolve_beats(data.get('beats') or []),
+        # Per-episode outline carried in from a deep-analyzed top drama: the
+        # first episodes are written to these beats, with THIS series' own cast
+        # (the source names in the beats are placeholders). See _source_outline_episode_block.
+        'source_episode_outline': [str(x).strip() for x in (data.get('source_episode_outline') or []) if str(x).strip()][:5],
         # Creative-writing model selector (ideas + episode scripts). Set at
         # creation time, can be overridden per-call from UI. Whitelist enforced
         # in _resolve_writer_model. Unknown / missing → default Claude.
@@ -7059,6 +7133,9 @@ def clone_series_from():
     new_series = copy.deepcopy(src)
     new_series['id'] = sid
     new_series['title'] = title
+    # Deterministic episode titles `<Series_Title>_E<N>` for all new series
+    # (clones included — copied episodes get re-titled to the new series name).
+    new_series['episode_title_format'] = 'series_indexed'
     new_series['created_at'] = datetime.datetime.utcnow().isoformat()
     new_series['cloned_from'] = source_sid
     new_series['revision_instructions'] = revision_instructions
@@ -7408,8 +7485,17 @@ def get_series(sid):
     # secondary characters.
     try:
         _anthro_raw = _detect_anthro_world_raw(s)
-        s['_anthro_detected'] = bool(_anthro_raw['anthro'])
-        s['_anthro_evidence'] = _anthro_raw['evidence']
+        # Per-character pending: ANY character that trips the raw non-human
+        # detector while the series is still undecided also surfaces the
+        # banner (catches single-char misfires like «doe eyes» / «wolf
+        # spirit» that the world-level detector alone would miss).
+        _nd_pre, _fl_pre = _anthro_preflight(s, s.get('characters') or [])
+        s['_anthro_detected'] = bool(_anthro_raw['anthro']) or bool(_nd_pre)
+        s['_anthro_flagged_chars'] = _fl_pre
+        _ev = list(_anthro_raw['evidence'] or [])
+        if _nd_pre and _fl_pre:
+            _ev.append('возможные не-люди: ' + ', '.join(_fl_pre))
+        s['_anthro_evidence'] = _ev
         s['_anthro_choice'] = (s.get('anthro_choice') or 'auto')
         s['_anthro_confirmed'] = bool(s.get('anthro_confirmed'))
     except Exception as e:
@@ -8308,7 +8394,7 @@ def fix_anthro_species(sid):
         })
     patched = []
     for char in (s.get('characters') or []):
-        existing_species = _detect_animal_species(char.get('name'), char.get('appearance'))
+        existing_species = _detect_animal_species_raw(char.get('name'), char.get('appearance'))
         if existing_species:
             continue  # already species-coded — skip
         inferred = _llm_infer_species_for_char(s, char)
@@ -8664,6 +8750,10 @@ def generate_outfit_image(sid, char_id, outfit_id):
     outfit = get_outfit(char, outfit_id)
     if not outfit:
         return jsonify({'error': 'outfit not found'}), 404
+    _nd_anthro, _fl_anthro = _anthro_preflight(s, [char])
+    if _nd_anthro:
+        return jsonify({'needs_anthro_decision': True, 'flagged_chars': _fl_anthro,
+                        'message': 'Похоже, в этом сериале есть НЕ-люди (' + ', '.join(_fl_anthro) + '). Подтвердите тип мира, прежде чем генерировать.'}), 409
     if not char.get('ref_images'):
         # Auto-generate the base portrait first — the user shouldn't have to chase a "load base"
         # error when we have the appearance text and can produce one inline.
@@ -8971,7 +9061,7 @@ def _is_nonanatomical_marker_context(low, start, end, term):
     return False
 
 
-def _detect_animal_species(name, appearance=None):
+def _detect_animal_species_raw(name, appearance=None):
     """Detect anthropomorphic species from a character's name (and as a
     secondary signal, from appearance keywords). Returns the species hint
     string (e.g. "anthropomorphic fox") or '' if the character is human.
@@ -9032,6 +9122,61 @@ def _detect_animal_species(name, appearance=None):
     return ''
 
 
+
+
+class AnthroPermissionRequired(Exception):
+    """A generation would render a NON-human character in a series that has not
+    granted non-human rendering. Carries the flagged character names."""
+    def __init__(self, chars):
+        self.chars = list(chars or [])
+        super().__init__('anthro permission required for: ' + ', '.join(self.chars))
+
+
+def _anthro_unlocked(series) -> bool:
+    """True iff the user EXPLICITLY granted non-human (anthro/furry) rendering
+    for this series (anthro_choice == 'anthro'). This is the ONLY state in which
+    a species hint may enter a generation prompt. Everything else is default-deny."""
+    return isinstance(series, dict) and (series.get('anthro_choice') or '').strip().lower() == 'anthro'
+
+
+def _anthro_decided(series) -> bool:
+    """True iff the user made an explicit per-series decision either way:
+    'human'/'none' (humans only) or 'anthro' (non-humans allowed). 'auto'/unset
+    is UNDECIDED — we must ask before rendering any non-human."""
+    if not isinstance(series, dict):
+        return False
+    choice = (series.get('anthro_choice') or 'auto').strip().lower()
+    return choice in ('human', 'none', 'anthro')
+
+
+def _detect_animal_species(name, appearance=None, series=None):
+    """GATED species detector — the single chokepoint deciding whether a
+    non-human species hint may enter a generation prompt.
+
+    Hard rule: a non-human renders ONLY when the series explicitly granted it
+    (anthro_choice == 'anthro'). Undecided, 'human', or no series context at all
+    -> returns '' so the character renders as a HUMAN. The fail-safe direction is
+    always "human", never an unauthorized animal. The raw, ungated signal lives in
+    `_detect_animal_species_raw` and is used only to decide whether to ASK the user."""
+    raw = _detect_animal_species_raw(name, appearance)
+    if not raw:
+        return ''
+    return raw if _anthro_unlocked(series) else ''
+
+
+def _anthro_preflight(series, chars):
+    """Pre-flight gate for generation entry points. Returns (needs_decision,
+    flagged_names). needs_decision is True when >=1 character trips the raw
+    non-human detector AND the series is still undecided — caller must STOP and
+    ask. Once the user has chosen (human or anthro) it returns False and never
+    blocks again."""
+    flagged = [(c.get('name') or c.get('id') or '?')
+               for c in (chars or [])
+               if _detect_animal_species_raw(c.get('name'), c.get('appearance'))]
+    if _anthro_decided(series):
+        return (False, flagged)
+    return (bool(flagged), flagged)
+
 # ── Anthro-world detection (series-level) ──────────────────────────────────
 # Real bug: series "The Landlord's Daughter" — synopsis explicitly described
 # a furry world ("seamstress rabbit Sofia... panther property manager") but
@@ -9076,7 +9221,7 @@ def _detect_anthro_world_raw(s) -> dict:
             break
     char_hits = []
     for c in (s.get('characters') or []):
-        sp = _detect_animal_species(c.get('name'), c.get('appearance'))
+        sp = _detect_animal_species_raw(c.get('name'), c.get('appearance'))
         if sp:
             out['char_species_count'] += 1
             if len(char_hits) < 3:
@@ -9137,7 +9282,7 @@ def _anthro_world_block(s) -> str:
         return ''
     known = []
     for c in (s.get('characters') or []):
-        sp = _detect_animal_species(c.get('name'), c.get('appearance'))
+        sp = _detect_animal_species_raw(c.get('name'), c.get('appearance'))
         if sp:
             known.append(f"{c.get('name','')} = {sp}")
     known_clause = (
@@ -9324,11 +9469,11 @@ def _llm_infer_species_for_char(s, char) -> str:
     name = (char.get('name') or '').strip()
     if not name:
         return ''
-    if _detect_animal_species(name, char.get('appearance')):
+    if _detect_animal_species_raw(name, char.get('appearance')):
         return ''
     known_lines = []
     for c in (s.get('characters') or []):
-        sp = _detect_animal_species(c.get('name'), c.get('appearance'))
+        sp = _detect_animal_species_raw(c.get('name'), c.get('appearance'))
         if sp:
             known_lines.append(f"  - {c.get('name','')}: {sp}")
     known_block = ('Already-assigned species in this world:\n' + '\n'.join(known_lines) + '\n\n') if known_lines else ''
@@ -9606,12 +9751,16 @@ def generate_character_image(sid, char_id):
     if not char:
         return jsonify({'error': 'not found'}), 404
 
+    _nd_anthro, _fl_anthro = _anthro_preflight(s, [char])
+    if _nd_anthro:
+        return jsonify({'needs_anthro_decision': True, 'flagged_chars': _fl_anthro,
+                        'message': 'Похоже, в этом сериале есть НЕ-люди (' + ', '.join(_fl_anthro) + '). Подтвердите тип мира, прежде чем генерировать.'}), 409
     style_clause = _series_style_clause(s)
     era_clause = _series_era_hint(s)
     _appearance = char.get('appearance', '')
     _desc = char.get('description', '')
     # Species-aware framing — see _detect_animal_species docstring for context.
-    species_hint = _detect_animal_species(char.get('name'), _appearance)
+    species_hint = _detect_animal_species(char.get('name'), _appearance, series=s)
     # Self-heal for anthro worlds: if the SERIES is anthropomorphic but THIS
     # character has no species in name/appearance, infer the species from the
     # series synopsis (one short LLM call) and patch the appearance so future
@@ -9627,7 +9776,7 @@ def generate_character_image(sid, char_id):
                 _appearance = patched
                 save_series(sid, s)
                 print(f'[anthro-heal] char {char.get("name")} → species={inferred}; appearance patched', flush=True)
-            species_hint = _detect_animal_species(char.get('name'), _appearance)
+            species_hint = _detect_animal_species(char.get('name'), _appearance, series=s)
     if species_hint:
         gender_word = 'female' if char.get('gender') == 'female' else 'male'
         kind_label = f', a {gender_word} {species_hint}'
@@ -9688,6 +9837,10 @@ def regenerate_character(sid, char_id):
     if not char:
         return jsonify({'error': 'character not found'}), 404
 
+    _nd_anthro, _fl_anthro = _anthro_preflight(s, [char])
+    if _nd_anthro:
+        return jsonify({'needs_anthro_decision': True, 'flagged_chars': _fl_anthro,
+                        'message': 'Похоже, в этом сериале есть НЕ-люди (' + ', '.join(_fl_anthro) + '). Подтвердите тип мира, прежде чем генерировать.'}), 409
     body = request.get_json(silent=True) or {}
     wishes = (body.get('wishes') or '').strip()
     regen_outfits = bool(body.get('regenerate_outfits', True))
@@ -9710,7 +9863,7 @@ def regenerate_character(sid, char_id):
     # reads "A man holding interview papers" → Seedance keeps drawing a man
     # even when the ref portrait is now an anthropomorphic hyena. Bug case:
     # «The Fox CEO's Trap» — user clicked regenerate, got a Pixar man back.
-    species_hint_pre = _detect_animal_species(char.get('name'), char.get('appearance'))
+    species_hint_pre = _detect_animal_species(char.get('name'), char.get('appearance'), series=s)
     # Self-heal for anthro worlds: char has no species but series IS anthro.
     # Infer species from synopsis, patch appearance, and proceed as if the
     # species had been there all along. Without this the regenerate flow
@@ -9722,7 +9875,7 @@ def regenerate_character(sid, char_id):
             if patched and patched != char.get('appearance'):
                 char['appearance'] = patched
                 print(f'[anthro-heal] regenerate: char {char.get("name")} → species={inferred}', flush=True)
-            species_hint_pre = _detect_animal_species(char.get('name'), char.get('appearance'))
+            species_hint_pre = _detect_animal_species(char.get('name'), char.get('appearance'), series=s)
     if species_hint_pre:
         appearance_raw_check = (char.get('appearance') or '').lower()
         species_word = species_hint_pre.split()[-1].lower()
@@ -9854,7 +10007,7 @@ def regenerate_character(sid, char_id):
     # Species-aware framing — same logic as generate_character_image. Without
     # this, regenerate_character would re-render a Wolf/Hyena/Fox as a human
     # because the hardcoded ", a man/woman" prefix overpowers any anthro hint.
-    species_hint = _detect_animal_species(char.get('name'), appearance_for_prompt)
+    species_hint = _detect_animal_species(char.get('name'), appearance_for_prompt, series=s)
     if species_hint:
         gender_word = 'female' if char.get('gender') == 'female' else 'male'
         kind_label = f', a {gender_word} {species_hint}'
@@ -10555,6 +10708,10 @@ def generate_series_cover(sid):
     s = load_series(sid)
     if not s:
         return jsonify({'error': 'not found'}), 404
+    _nd_anthro, _fl_anthro = _anthro_preflight(s, s.get('characters') or [])
+    if _nd_anthro:
+        return jsonify({'needs_anthro_decision': True, 'flagged_chars': _fl_anthro,
+                        'message': 'Похоже, в этом сериале есть НЕ-люди (' + ', '.join(_fl_anthro) + '). Подтвердите тип мира, прежде чем генерировать.'}), 409
     body = request.get_json(silent=True) or {}
     wishes = (body.get('wishes') or '').strip()
 
@@ -11746,7 +11903,7 @@ def _gen_char_base_inline(s, sid, char):
     # «Hyena»/«Fox Woman» where appearance text was written as «a man in
     # worn-out clothes»), fall back to appearance keywords for human-named
     # chars described with fur/muzzle markers.
-    species_hint = _detect_animal_species(char.get('name'), appearance)
+    species_hint = _detect_animal_species(char.get('name'), appearance, series=s)
     # Self-heal for anthro worlds — same logic as generate_character_image.
     # Catches the auto_generate_assets path where chars came from extractors
     # without species in appearance.
@@ -11758,7 +11915,7 @@ def _gen_char_base_inline(s, sid, char):
                 char['appearance'] = patched
                 appearance = patched
                 print(f'[anthro-heal] inline: char {char.get("name")} → species={inferred}', flush=True)
-            species_hint = _detect_animal_species(char.get('name'), appearance)
+            species_hint = _detect_animal_species(char.get('name'), appearance, series=s)
     is_animal = bool(species_hint)
     species_override = ''
     if is_animal:
@@ -12289,6 +12446,11 @@ def toggle_auto_generate(sid):
     if not s: return jsonify({'error': 'not found'}), 404
     data = request.json or {}
     enabled = bool(data.get('enabled', True))
+    if enabled:
+        _nd_anthro, _fl_anthro = _anthro_preflight(s, s.get('characters') or [])
+        if _nd_anthro:
+            return jsonify({'needs_anthro_decision': True, 'flagged_chars': _fl_anthro,
+                            'message': 'Похоже, в этом сериале есть НЕ-люди (' + ', '.join(_fl_anthro) + '). Подтвердите тип мира, прежде чем генерировать.'}), 409
     s['auto_generate_assets'] = enabled
     save_series(sid, s)
     started = False
@@ -12330,6 +12492,10 @@ def trigger_autogen_sweep(sid):
     if not s.get('auto_generate_assets'):
         s['auto_generate_assets'] = True
         save_series(sid, s)
+    _nd_anthro, _fl_anthro = _anthro_preflight(s, s.get('characters') or [])
+    if _nd_anthro:
+        return jsonify({'needs_anthro_decision': True, 'flagged_chars': _fl_anthro,
+                        'message': 'Похоже, в этом сериале есть НЕ-люди (' + ', '.join(_fl_anthro) + '). Подтвердите тип мира, прежде чем генерировать.'}), 409
     _spawn_with_keys(auto_generate_missing_assets, sid)
     return jsonify({'started': True, 'status': _autogen_status(sid)})
 
@@ -12785,6 +12951,669 @@ _IDEAS_SCHEMA = """{
     }
   ]
 }"""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# IDEAS V2 — 3-stage pipeline (research → 5 diverse ideas → logic-check).
+# Replaces the single mega-prompt that produced stiff "fact-stack" synopses
+# («she works as X, she is N months pregnant…»). Toggle IDEAS_V2 = False to
+# fall back to the legacy _IDEAS_SYSTEM single call.
+# ─────────────────────────────────────────────────────────────────────────────
+IDEAS_V2 = True
+
+_IDEAS_SYSTEM_V2 = """You write series concepts for vertical mobile short drama (ReelShort / DramaBox style): 1-minute episodes, binge-y seasons. You pitch 5 SERIES CONCEPTS, not full scripts.
+
+You are given a list of the ACTUAL top-performing short dramas right now. Study what makes those proven hits work, then write 5 FRESH concepts in the same vein — same energy and pull, brand-new stories. Never copy a real title or plot; be inspired by them.
+
+WHAT TO FOLLOW (in priority order):
+1. The creator's chosen GENRE, preferences and era/world — EXACTLY. If they picked \u00abMafia\u00bb, all 5 are mafia-world dramas. If they gave a hint, honour it. If they chose nothing, draw on the strongest overall hits across all genres.
+2. The researched hits — let the real RANGE of what is winning shape your spread, so the 5 are genuinely different from one another (different premise, lead, hook). Do NOT funnel everything into one repeated template.
+3. Each concept = ONE clean premise, picturable in a single breath, on whatever strong emotional engine the hits show works (betrayal, love, revenge, secrets, danger, family, power, ambition…). It must survive one obvious question.
+
+VOICE & LENGTH:
+- Write each synopsis like a person excitedly describing a show to a friend — natural, propulsive, present tense. NOT a checklist of facts.
+- 1-2 short sentences, ~40 words MAX. Give the HOOK and stop. No multi-beat plot recaps.
+
+REGISTER (mandatory): mainstream melodrama, not erotica — restraint like a TV trailer (\'kisses\', \'in his arms\', \'catches them together\', \'spends the night with\'). NEVER vulgar sexual verbs in any language (no \'fucking\' / \'screwing\'; in Russian never \u00abтрахается / трахаются / трахал\u00bb — use \u00abцелует\u00bb, \u00abв объятиях\u00bb, \u00abзастаёт с\u00bb, \u00abпроводит ночь с\u00bb, \u00abспит с\u00bb). PG-13 wording.
+
+Titles in English, short and punchy (max 8 words). All English fields in English; synopsis_ru in natural Russian. Return ONLY valid JSON for the given schema — no prose around it."""
+
+_IDEAS_RESEARCH_SYSTEM = """You are a researcher who monitors the vertical short-drama market (ReelShort, DramaBox, GoodShort, ShortMax, NetShort, MoboReels, and viral verticals on YouTube / TikTok). Your job: surface the ACTUAL top-performing short dramas right now — the ones with the highest ratings, the most views, the strongest charts and buzz. Report real shows with their real premises. No theory, no padding, no invented formula — just what is genuinely winning."""
+
+_IDEAS_RESEARCH_TAIL = """Return a ranked list of 8-12 of the BEST-performing short dramas that fit the brief — prioritise the highest ratings / most views / strongest charts you can find. For EACH:
+- Title
+- One-line premise (the hook, plainly)
+- Genre / tone
+- Why it hooks viewers (one short phrase)
+- Popularity signal if known (views, rating, \u00abtop of DramaBox\u00bb, etc.)
+List ACTUAL shows, as concrete as possible. If the brief names a genre or preferences, EVERY entry must fit them. Do NOT invent a formula or flatten into generic \u00abpatterns\u00bb — give the real titles and premises so a writer can study what is winning and write fresh series in the same vein."""
+
+_IDEAS_LOGIC_SYSTEM = """You are a sharp but constructive story editor for vertical short drama. You take draft concepts and make them tighter: fix logic holes, kill fact-stacking, enforce a natural describing-it-to-a-friend voice, scrub any vulgar/graphic sexual wording (NEVER 'fucking' in English; NEVER «трахается/трахаются/трахал» in Russian — replace with restrained wording like «целует», «в объятиях», «застаёт с», «проводит ночь с», «спит с», keeping it PG-13 in register), and make sure the 5 concepts are genuinely distinct. Preserve what works; only rewrite what fails. Return ONLY valid JSON in the same schema — no prose around it."""
+
+_IDEAS_SCHEMA_V2 = '''{
+  "ideas": [
+    {
+      "title": "Short punchy hook title, max 8 words",
+      "genre": "Genre blend (e.g. Revenge / CEO Romance)",
+      "tone": "Emotional tone (e.g. Addictive, Dark & Satisfying)",
+      "target_audience": "Target audience",
+      "world_description": "1-2 sentences: where it happens, who holds power, what is at stake",
+      "synopsis": "Natural premise (2-4 sentences) OR a punchy logline plus one hook line. English.",
+      "synopsis_ru": "То же на естественном русском — энергия как в описании другу, без канцелярита",
+      "style": "premise | logline"
+    }
+  ]
+}'''
+
+
+# Commercial core of vertical short drama — what actually tops ReelShort/DramaBox.
+# The V2 diversity lanes are sampled ONLY from these so concepts stay inside the
+# proven wealth-and-power formula instead of drifting into quirky-profession land
+# (circus / mortician / vet / diner). These pools are V2-only; the legacy _IDEA_*
+# arrays are left untouched for the fallback path.
+_IDEA_CORE_ENGINES = [
+    'wronged pregnant wife is thrown out, returns untouchable',
+    'wife catches her billionaire husband cheating and burns it all down',
+    'contract / arranged marriage to a cold tycoon slowly turns real',
+    'secretly the richest / most powerful person, hiding in plain sight',
+    'humiliated Cinderella rises and makes them all pay',
+    'divorced and discarded, comes back a bigger force than him',
+    'secret heir / hidden heiress reclaims the family empire',
+    'fake marriage of convenience neither expected to mean',
+    'second-chance reunion with the ex who became a billionaire',
+    'substitute bride / married the wrong powerful brother',
+    'paternity / secret-baby reveal forces a ruthless reunion',
+    'devoted partner betrayed, plots an ice-cold revenge glow-up',
+    'mistaken for a nobody, actually the heiress they mocked',
+    'forced under a tycoon\'s roof by a debt or a deal',
+]
+_IDEA_CORE_LEADS = [
+    'wronged wife, pregnant and cast out',
+    'cold ruthless billionaire CEO husband',
+    'humiliated Cinderella who quietly rises',
+    'heiress hiding as an ordinary working woman',
+    'divorced woman who returns richer and untouchable',
+    'devoted woman betrayed by a cheating tycoon',
+    'self-made magnate with a buried soft spot',
+    'overlooked assistant the powerful man underestimates',
+    'disgraced heir clawing the empire back',
+    'proud single mother nobody knew was somebody',
+]
+_IDEA_CORE_WORLDS = [
+    'billionaire penthouse and private estate',
+    'family conglomerate boardroom power-struggle',
+    'lavish society wedding and charity-gala circuit',
+    'old-money dynasty mansion',
+    'glittering corporate empire headquarters',
+    'luxury hotel or private island the family owns',
+    'high-society marriage that is really a battlefield',
+    'elite city where everyone knows the family name',
+]
+
+_IDEA_CORE_TWISTS = [
+    'a secret / paternity reveal detonates at the worst moment',
+    'a hostile takeover or inheritance war for control of an empire',
+    'a forced proximity (one roof, one contract, one bed) neither can escape',
+    'a public humiliation that demands a reckoning',
+    'a hidden identity nobody has figured out yet',
+    'a buried betrayal surfaces and rewrites who owes whom',
+    'a debt or blackmail that hands one person power over another',
+    'a fake relationship that has to survive one real test',
+    'a return from the dead or from exile that upends the board',
+    'a love rival or scheming relative weaponises the truth',
+    'a deception or con that must hold under mounting pressure',
+    'a custody or guardianship fight over a child',
+    'a rivalry between two equals neither will concede',
+    'a forbidden attraction that risks everything for both',
+]
+
+
+_IDEA_ENGINE_FAMILIES = [
+    'wealth-and-power romance (billionaire / CEO / tycoon / heir and the woman entangled with him)',
+    'revenge & reckoning (a betrayal or injustice that demands payback — by OR against the lead)',
+    'family melodrama (cruel in-laws, sibling rivalry, an inheritance war, a swapped or abandoned child)',
+    'forbidden or second-chance love (wrong family, wrong time, or an ex who came back changed)',
+    'hidden identity / a dangerous secret (someone is not who they appear to be — by birth, fortune or design)',
+    'rags-to-power / status clash (two worlds collide across a hard class or money line)',
+    'motherhood & children (a custody fight, a secret baby, a child in danger, a mother under fire)',
+    'marriage under pressure (a union tested by a secret, an affair, a deal or a betrayal)',
+]
+
+# The axis that was MISSING — and the real reason every batch felt identical.
+# All 8 families above were being rendered as ONE arc: a wronged woman who turns
+# out to be secretly powerful. This forces the 5 ideas onto DIFFERENT starting
+# stances + emotional drives. "Wronged -> rises" is allowed at most once (sampling
+# 5 of 6 without replacement guarantees it). Lead stays female by default (genre
+# audience); the ARC is what varies.
+_IDEA_PROTAG_ARCS = [
+    'WRONGED -> RISES: starts betrayed / discarded / underestimated and turns the tables (the OVERUSED default — at most ONE of the five may use it)',
+    'ALREADY POWERFUL, UNDER SIEGE: she begins at the top (heiress, CEO, matriarch, reigning wife) and fights to KEEP it against a rising threat — defending, not climbing',
+    'THE PURSUER: she actively wants someone or something and goes after it — driven by desire or ambition, NOT by a wrong done to her',
+    'THE SECRET-KEEPER / DECEIVER: she is the one hiding something or running a deception (undercover, false identity, a lie to protect someone) — tension is the lie holding, not justice owed to her',
+    'IMPOSSIBLE LOVE, NO VILLAIN: the obstacle is circumstance, family, duty or status — nobody wronged her; the engine is a romance that simply cannot be',
+    'THE FLAWED LEAD REDEEMED: she begins cold, guilty, scheming or complicit and must change or earn her way — the arc is transformation, not a power flip',
+]
+
+
+def _ideas_diversity_lanes():
+    """Lane spine = protagonist ARC — the axis that was collapsing (every family
+    was being rendered as 'wronged woman turns out powerful'). The 5 lanes carry 5
+    DIFFERENT arcs (wronged->rises capped at one by sampling 5 of 6 without
+    replacement), each with a distinct conflict mechanic, over a spread of engine
+    families (wealth-and-power recurs ~twice as the backbone). Lead stays female by
+    default; the ARC + mechanic force genuinely different shapes.
+    (_IDEA_CORE_ENGINES/_LEADS/_WORLDS kept defined for reference/rollback.)"""
+    arcs   = random.sample(_IDEA_PROTAG_ARCS, 5)
+    twists = random.sample(_IDEA_CORE_TWISTS, 5)
+    wealth = _IDEA_ENGINE_FAMILIES[0]
+    others = random.sample(_IDEA_ENGINE_FAMILIES[1:], 3)
+    families = [wealth, wealth] + others
+    random.shuffle(families)
+    return '\n'.join(
+        f'{i+1}. protagonist arc ~ {arcs[i]} | engine family ~ {families[i]} | mechanic ~ {twists[i]}'
+        for i in range(5)
+    )
+
+
+_IDEAS_HISTORY_MAX = 40
+
+def _ideas_history_path():
+    return DATA_ROOT / 'ideas_history.json'
+
+def _load_ideas_history():
+    try:
+        p = _ideas_history_path()
+        if p.exists():
+            data = json.loads(p.read_text(encoding='utf-8'))
+            if isinstance(data, list):
+                return [str(x) for x in data if x]
+    except Exception as e:
+        print(f'[ideas] history load failed ({e.__class__.__name__})', flush=True)
+    return []
+
+def _ideas_signature(idea):
+    if not isinstance(idea, dict):
+        return ''
+    title = (idea.get('title') or '').strip()
+    hook = (idea.get('synopsis') or idea.get('world_description') or '').strip()
+    hook = ' '.join(hook.split())[:90]
+    sig = f'{title} - {hook}' if hook else title
+    return sig.strip(' -')
+
+def _save_ideas_history(ideas):
+    try:
+        sigs = [s for s in (_ideas_signature(i) for i in (ideas or [])) if s]
+        if not sigs:
+            return
+        hist = _load_ideas_history()
+        hist.extend(sigs)
+        hist = hist[-_IDEAS_HISTORY_MAX:]
+        _ideas_history_path().write_text(json.dumps(hist, ensure_ascii=False, indent=0), encoding='utf-8')
+    except Exception as e:
+        print(f'[ideas] history save failed ({e.__class__.__name__})', flush=True)
+
+def _ideas_avoid_recent_block():
+    hist = _load_ideas_history()
+    if not hist:
+        return ''
+    recent = hist[-18:]
+    lines = '\n'.join(f'- {s}' for s in recent)
+    return (
+        "RECENTLY SHOWN - DO NOT REPEAT (hard): the user has already seen these concepts in "
+        "previous batches. Every one of your 5 ideas must be clearly distinct from ALL of them - "
+        "different title, different hook, different mechanic. Do not reflavour or rename any of these:\n"
+        f"{lines}\n\n"
+    )
+
+
+def _ideas_research_digest(brief):
+    """Stage 1: trend digest. Tries live web search (Anthropic web_search),
+    falls back silently to model knowledge. Always returns a string."""
+    research_prompt = (
+        "Find the BEST-performing vertical short dramas right now for this brief:\n"
+        f"{brief}\n\n"
+        "Search the live web for current TOP-RATED and MOST-VIEWED titles across ReelShort, DramaBox, "
+        "GoodShort, ShortMax, NetShort and viral verticals on YouTube / TikTok. "
+        + _IDEAS_RESEARCH_TAIL
+    )
+    try:
+        digest = claude_web_research(research_prompt, system=_IDEAS_RESEARCH_SYSTEM, max_uses=5)
+        if digest and len(digest.strip()) > 40:
+            print('[ideas] research: web', flush=True)
+            return digest.strip()
+        print('[ideas] research: web returned thin result -> fallback', flush=True)
+    except Exception as e:
+        print(f'[ideas] research: web failed ({e.__class__.__name__}) -> fallback', flush=True)
+    fb_prompt = (
+        "From your own knowledge of the best-performing vertical short dramas (ReelShort / DramaBox / "
+        f"GoodShort style), for this brief:\n{brief}\n\n"
+        + _IDEAS_RESEARCH_TAIL
+    )
+    digest = claude_ask_quality(fb_prompt, system=_IDEAS_RESEARCH_SYSTEM)
+    print('[ideas] research: fallback', flush=True)
+    return (digest or '').strip()
+
+
+def _run_ideas_pipeline_v2(writer_model, user_controls, genres, idea_hint,
+                           era_world_override=False, avoid_rule=''):
+    """3-stage idea generation. Returns a list of <=5 idea dicts (legacy schema
+    fields preserved). Raises on hard failure so the caller can fall back to the
+    legacy single-call path."""
+    # Stage 0 — research brief from user controls.
+    bits = []
+    if genres:
+        bits.append('genres: ' + ', '.join(genres))
+    if idea_hint:
+        bits.append('creator hint: ' + idea_hint)
+    if era_world_override:
+        bits.append('a non-modern era/world is set — surface period/world-appropriate hits')
+    brief = '; '.join(bits) if bits else 'the overall most popular, highest-rated and most-viewed vertical short dramas right now, across all genres'
+
+    # Stage 1 — trend digest (web -> fallback).
+    digest = _ideas_research_digest(brief)
+
+    # Stage 2 — generate 5 diverse ideas.
+    gen_prompt = (
+        "Generate exactly 5 short-drama series concepts for vertical mobile video.\n\n"
+        + user_controls
+        + "TOP-PERFORMING SHORT DRAMAS RIGHT NOW (researched live from the market — study what makes these "
+          "win, then write FRESH concepts in the same vein; never copy a title or plot):\n"
+        + digest + "\n\n"
+        + _ideas_avoid_recent_block()
+        + "Build the 5 so each is inspired by a DIFFERENT one of the hits above — mirror the real RANGE that is "
+          "winning, do NOT funnel them into one repeated template. Follow the creator's chosen genre / preferences "
+          "/ era EXACTLY (above). Each must be a clearly different story: different premise, lead and hook.\n\n"
+        + "Each synopsis = the HOOK only, 1-2 short sentences, ~40 words MAX — a punchy logline a viewer "
+          "grasps in three seconds, NOT a plot recap. Lead with the gut-punch and stop. Set the \"style\" field to \"logline\".\n\n"
+        + "JSON SAFETY: output strict valid JSON. Do NOT use the double-quote character inside any "
+          "field value — if someone speaks, paraphrase or use single quotes. No line breaks inside values.\n\n"
+        + f"Return JSON matching this schema:\n{_IDEAS_SCHEMA_V2}"
+    )
+    ideas = loads_lenient(strip_json(llm_ask(writer_model, gen_prompt, system=_IDEAS_SYSTEM_V2)))
+    ideas = ideas.get('ideas', ideas) if isinstance(ideas, dict) else ideas
+    if not isinstance(ideas, list) or not ideas:
+        raise ValueError('ideas stage-2 returned no list')
+    print(f'[ideas] stage-2 generated {len(ideas)} ideas', flush=True)
+
+    # Stage 3 — logic-check + polish (honors writer_model).
+    era_note = ''
+    if era_world_override:
+        era_note = (
+            "- ERA/WORLD: a non-modern era/world is in play (see directive at top of the "
+            "original brief). Any idea that reads like a present-day realistic story, or uses a "
+            "prop/role/event impossible in that era/world, must be rewritten so the era/world is "
+            "unmistakable in the first sentence.\n"
+        )
+    genre_note = ''
+    if genres:
+        genre_note = "- GENRES: " + ', '.join(genres) + " must genuinely be present in every idea.\n"
+    avoid_note = ''
+    if avoid_rule:
+        _ban = " ".join(avoid_rule.split())[:700]
+        avoid_note = ("- BAN LIST (hard, includes synonyms/translations): " + _ban + " If ANY idea contains a banned concept — even in subtext — rewrite that idea onto a completely different premise.\n")
+    check_prompt = (
+        "Here are 5 short-drama concepts as JSON. Audit and polish them.\n\n"
+        + json.dumps({'ideas': ideas}, ensure_ascii=False)
+        + "\n\nFor EACH idea, verify and FIX in place:\n"
+          "- LOGIC: timeline holds, who-knows-what is consistent, the premise does not collapse "
+          "under one obvious question. If it breaks, rewrite the idea so it holds.\n"
+          "- SIMPLICITY: one clear premise a person can picture; no fact-stacking, no piled-on "
+          "jobs or backstories.\n"
+          "- VOICE: the synopsis must read like a person describing a show to a friend, NOT a "
+          "checklist of answers («she works as X, she is N months pregnant»). Rewrite stiff/listy "
+          "synopses into natural, propulsive prose.\n"
+          "- DISTINCTNESS: if two ideas are reflavoured copies, rewrite one onto a different engine.\n"
+          "- LENGTH (HARD): every synopsis MUST be 1-2 short sentences, ~40 words MAX. If a draft runs longer, "
+          "or chains morning-after / weeks-later / years-later beats, CUT it down to the single gut-punch hook. "
+          "Aggressively shorten — short and primal beats long and clever.\n"
+          "- ON-BRIEF: every idea must fit the creator's chosen genre / preferences / era (see below). If an "
+          "idea drifts off the chosen genre, rewrite it to fit. If nothing was chosen, keep it in the vein of the "
+          "proven hits the writer was given.\n"
+          "- VARIETY: the 5 must mirror the real range of what is winning — do NOT let them collapse into one "
+          "repeated template (e.g. every lead a wronged woman who turns out to be secretly powerful). If they bunch "
+          "up, rewrite the duplicates into genuinely different stories.\n"
+        + era_note
+        + genre_note
+        + avoid_note
+        + "\nKeep exactly 5 ideas. Return JSON in the SAME schema (title, genre, tone, "
+          "target_audience, world_description, synopsis, synopsis_ru; style optional). Output strict valid JSON — never use the double-quote character inside a field value; use single quotes for any spoken line."
+    )
+    try:
+        checked = loads_lenient(strip_json(llm_ask(writer_model, check_prompt, system=_IDEAS_LOGIC_SYSTEM)))
+        checked = checked.get('ideas', checked) if isinstance(checked, dict) else checked
+        if isinstance(checked, list) and checked:
+            print(f'[ideas] stage-3 logic-check returned {len(checked)} ideas', flush=True)
+            return checked
+        print('[ideas] stage-3 returned empty -> keeping stage-2 ideas', flush=True)
+    except Exception as e:
+        print(f'[ideas] stage-3 logic-check failed ({e.__class__.__name__}) -> keeping stage-2 ideas', flush=True)
+    return ideas
+
+
+_TOP_DRAMAS_SCHEMA = """{
+  "dramas": [
+    {
+      "title": "Real show title",
+      "premise": "One-line hook/premise in English",
+      "premise_ru": "То же по-русски, живо",
+      "genre": "Genre / tone",
+      "why_hook": "Why it hooks viewers (short phrase)",
+      "popularity": "Views / rating / chart signal if known, else empty string"
+    }
+  ]
+}"""
+
+
+def _research_top_dramas(genres=None, idea_hint='', era_hint='', n=10):
+    """Live-web research of the ACTUAL top-performing short dramas, returned as a
+    structured list (powers the 'Find top short dramas' button). Genre / hint /
+    era filter the search when given; otherwise the overall best across genres."""
+    bits = []
+    if genres:
+        bits.append('genres: ' + ', '.join(genres))
+    if idea_hint:
+        bits.append('creator hint: ' + idea_hint)
+    if era_hint:
+        bits.append(era_hint)
+    brief = '; '.join(bits) if bits else 'the overall most popular, highest-rated and most-viewed vertical short dramas right now, across all genres'
+    # Step 1 — live web research returns a PROSE list of real shows (the search
+    # tool wraps output in commentary, so we do NOT ask it for JSON here).
+    research_prompt = (
+        "Find the BEST-performing vertical short dramas right now for this brief:\n"
+        f"{brief}\n\n"
+        "Search the live web for current TOP-RATED and MOST-VIEWED titles across ReelShort, DramaBox, "
+        "GoodShort, ShortMax, NetShort and viral verticals on YouTube / TikTok. List 8-12 of the strongest "
+        "REAL shows; for each give: title, one-line premise, genre/tone, why it hooks viewers, and any "
+        "popularity signal (views / rating / chart position) you can find. Be concrete with real titles."
+    )
+    digest = ''
+    try:
+        digest = claude_web_research(research_prompt, system=_IDEAS_RESEARCH_SYSTEM, max_uses=6)
+        if digest and len(digest.strip()) > 40:
+            print('[top-dramas] research: web', flush=True)
+        else:
+            digest = ''
+    except Exception as e:
+        print(f'[top-dramas] web failed ({e.__class__.__name__}) -> fallback', flush=True)
+        digest = ''
+    if not digest:
+        digest = claude_ask_quality(research_prompt, system=_IDEAS_RESEARCH_SYSTEM) or ''
+        print('[top-dramas] research: fallback', flush=True)
+    # Step 2 — structure the prose into strict JSON with a plain (no-tool) call.
+    fmt_prompt = (
+        "Here is research on the current top-performing vertical short dramas:\n\n"
+        f"{digest}\n\n"
+        f"Convert it into STRICT valid JSON, {n}-12 entries, matching this schema. Output ONLY the JSON "
+        f"(no prose, no code fences) and do NOT use the double-quote character inside any value:\n{_TOP_DRAMAS_SCHEMA}"
+    )
+    raw = claude_ask_quality(fmt_prompt, system='You output ONLY strict valid JSON — no prose, no code fences, no commentary.') or ''
+    data = loads_lenient(strip_json(raw))
+    dramas = data.get('dramas', data) if isinstance(data, dict) else data
+    if not isinstance(dramas, list):
+        raise ValueError('top-dramas: no list parsed')
+    out = []
+    for d in dramas:
+        if not isinstance(d, dict):
+            continue
+        title = (d.get('title') or '').strip()
+        if not title:
+            continue
+        out.append({
+            'title': title,
+            'premise': (d.get('premise') or '').strip(),
+            'premise_ru': (d.get('premise_ru') or '').strip(),
+            'genre': (d.get('genre') or '').strip(),
+            'why_hook': (d.get('why_hook') or d.get('why') or '').strip(),
+            'popularity': (d.get('popularity') or '').strip(),
+        })
+    return out
+
+
+@app.route('/api/research-top-dramas', methods=['POST'])
+def research_top_dramas():
+    """Return a structured list of the current top short dramas for the picker."""
+    data_in = request.json or {}
+    genres = data_in.get('genres') or []
+    idea_hint = (data_in.get('idea') or '').strip()
+    era_dir = _era_setting_block(
+        data_in.get('era'), data_in.get('era_custom'),
+        data_in.get('world_setting'), data_in.get('world_custom'),
+    )
+    era_hint = 'a non-modern era/world is set — surface period/world-appropriate hits' if era_dir else ''
+    try:
+        dramas = _research_top_dramas(genres=genres, idea_hint=idea_hint, era_hint=era_hint)
+        print(f'[top-dramas] returned {len(dramas)} dramas', flush=True)
+        return jsonify({'dramas': dramas})
+    except Exception as e:
+        _log_event('WARN', 'top_dramas_fail', err=str(e)[:200])
+        return jsonify({'error': str(e)}), 500
+
+
+
+_IDEAS_SIMILAR_SYSTEM = """You convert a proven short-drama HIT into a ready-to-use series concept for our app, keeping the hit's premise EXACTLY — 1 to 1.
+
+ABSOLUTE RULE: do NOT reinterpret, do NOT invent a new profession, company, setting or twist that is not in the given premise, and do NOT change who hides what or who discovers what. The concept must describe the SAME story as the hit, in the same shape. If the hit is «a wife discovers her humble husband is secretly a billionaire», the synopsis is exactly that — a wife discovers her ordinary husband is secretly a billionaire — NOT a janitor, NOT a taxi driver, NOT a new twist. Keep it that clean and that faithful.
+
+The ONLY new things you create: an original short English title (do NOT reuse the hit's own title) and the genre / tone / target_audience / world_description fields. Voice natural and short, PG-13 register, never vulgar sexual verbs in any language. synopsis in English and synopsis_ru in natural Russian, BOTH stating the premise 1-to-1. Return ONLY valid JSON for the given schema."""
+
+
+def _ideas_from_drama(drama, genres=None, era_hint='', writer_model=''):
+    """Turn ONE chosen hit into a ready-to-use series concept that keeps its premise
+    1-TO-1 (powers the per-card 'Сделать подобный сериал' button). No reinterpretation,
+    no invented specifics — the output IS the chosen drama's idea, just retitled."""
+    title   = (drama.get('title') or '').strip()
+    premise = (drama.get('premise_ru') or drama.get('premise') or '').strip()
+    genre   = (drama.get('genre') or '').strip()
+    controls = []
+    if genres:
+        controls.append('Chosen genres (must fit): ' + ', '.join(genres))
+    if era_hint:
+        controls.append(era_hint)
+    controls_s = ('\n'.join(controls) + '\n\n') if controls else ''
+    prompt = (
+        "The proven HIT to turn into a series, KEEPING ITS PREMISE 1-TO-1:\n"
+        f"TITLE: {title}\nGENRE: {genre}\nPREMISE: {premise}\n\n"
+        + controls_s
+        + "Produce exactly 1 series concept whose premise is the SAME as this hit — identical setup, roles and "
+          "reveal. Do NOT reinterpret it, do NOT invent a profession / company / setting / twist that is not in "
+          "the premise above, do NOT change who hides what or who discovers what. Keep it as clean and general as "
+          "the premise itself. Create only an original short title plus genre / tone / target_audience / "
+          "world_description.\n\n"
+        + "synopsis + synopsis_ru = 1-2 short sentences stating that EXACT premise (the same story as the hit). "
+          "Set the \"style\" field to \"logline\".\n\n"
+        + "JSON SAFETY: strict valid JSON; no double-quote character inside any value; no line breaks inside values.\n\n"
+        + f"Return JSON matching this schema (a single idea inside the ideas array):\n{_IDEAS_SCHEMA_V2}"
+    )
+    ideas = loads_lenient(strip_json(llm_ask(writer_model, prompt, system=_IDEAS_SIMILAR_SYSTEM)))
+    ideas = ideas.get('ideas', ideas) if isinstance(ideas, dict) else ideas
+    if not isinstance(ideas, list) or not ideas:
+        raise ValueError('ideas-from-drama: no list parsed')
+    print(f'[ideas-from-drama] 1-to-1 concept from {title!r}', flush=True)
+    return ideas
+
+
+@app.route('/api/ideas-from-drama', methods=['POST'])
+def ideas_from_drama():
+    """Generate 5 concepts in the vein of ONE chosen top drama."""
+    data_in = request.json or {}
+    drama = data_in.get('drama') or {}
+    if not isinstance(drama, dict) or not (drama.get('title') or drama.get('premise') or drama.get('premise_ru')):
+        return jsonify({'error': 'no drama provided'}), 400
+    genres = data_in.get('genres') or []
+    writer_model = _resolve_writer_model(data_in)
+    era_dir = _era_setting_block(
+        data_in.get('era'), data_in.get('era_custom'),
+        data_in.get('world_setting'), data_in.get('world_custom'),
+    )
+    era_hint = 'a non-modern era/world is set — keep every idea in that period/world' if era_dir else ''
+    try:
+        ideas = _ideas_from_drama(drama, genres=genres, era_hint=era_hint, writer_model=writer_model)
+        return jsonify(ideas)
+    except Exception as e:
+        _log_event('WARN', 'ideas_from_drama_fail', err=str(e)[:200])
+        return jsonify({'error': str(e)}), 500
+
+
+_DRAMA_ANALYSIS_SCHEMA = """{
+  "title": "The show title",
+  "detailed_synopsis": "4-6 sentence rich English synopsis — detailed enough to build the first 5 episodes from",
+  "detailed_synopsis_ru": "То же по-русски, подробно и живо",
+  "main_characters": ["Name — who they are and what they want", "..."],
+  "central_conflict": "1-2 sentences on the core conflict",
+  "hook": "why viewers binge it",
+  "setting": "where / when it takes place",
+  "first_5_episodes": ["Серия 1: что происходит + клиффхэнгер", "Серия 2: ...", "Серия 3: ...", "Серия 4: ...", "Серия 5: ..."]
+}"""
+
+
+def _top_dramas_path():
+    return DATA_ROOT / 'top_dramas.json'
+
+
+def _load_top_dramas():
+    try:
+        p = _top_dramas_path()
+        if p.exists():
+            d = json.loads(p.read_text(encoding='utf-8'))
+            if isinstance(d, dict):
+                return d
+    except Exception as e:
+        print(f'[top-dramas] load failed ({e.__class__.__name__})', flush=True)
+    return {'scanned_at': '', 'genres': [], 'dramas': []}
+
+
+def _save_top_dramas(store):
+    try:
+        _top_dramas_path().write_text(json.dumps(store, ensure_ascii=False, indent=1), encoding='utf-8')
+    except Exception as e:
+        print(f'[top-dramas] save failed ({e.__class__.__name__})', flush=True)
+
+
+def _drama_slug(title, i):
+    import re as _re
+    base = _re.sub(r'[^a-z0-9]+', '-', (title or '').lower()).strip('-')[:40]
+    return base or f'drama-{i}'
+
+
+def _analyze_drama(drama):
+    """Deep two-step study of ONE real show -> detailed synopsis + first-5-episode
+    setup (powers the per-card 'Изучить подробнее')."""
+    title   = (drama.get('title') or '').strip()
+    premise = (drama.get('premise_ru') or drama.get('premise') or '').strip()
+    genre   = (drama.get('genre') or '').strip()
+    research_prompt = (
+        f'Study the vertical short drama "{title}" ({genre}) as thoroughly as possible.\n'
+        f'Known premise: {premise}\n\n'
+        'Search the live web for everything about THIS specific show: its full plot and premise, the main '
+        'characters and what each of them wants, the central conflict, the hook that makes viewers binge, the '
+        'setting, and how the opening episodes actually unfold. Be concrete and detailed.'
+    )
+    digest = ''
+    try:
+        digest = claude_web_research(research_prompt, system=_IDEAS_RESEARCH_SYSTEM, max_uses=6)
+        if digest and len(digest.strip()) > 40:
+            print(f'[analyze-drama] web ok for {title!r}', flush=True)
+        else:
+            digest = ''
+    except Exception as e:
+        print(f'[analyze-drama] web failed ({e.__class__.__name__})', flush=True)
+        digest = ''
+    if not digest:
+        digest = claude_ask_quality(research_prompt, system=_IDEAS_RESEARCH_SYSTEM) or ''
+        print(f'[analyze-drama] fallback for {title!r}', flush=True)
+    fmt_prompt = (
+        f'Here is research about the short drama "{title}":\n\n{digest}\n\n'
+        'Produce a DETAILED breakdown as STRICT JSON. detailed_synopsis must be rich (4-6 sentences) and '
+        'concrete enough to build the SETUP across the first 5 episodes from it. first_5_episodes = exactly 5 '
+        'entries, one per episode, each a concrete beat ending on a cliffhanger. Output ONLY the JSON, no prose, '
+        f'and do NOT use the double-quote character inside any value:\n{_DRAMA_ANALYSIS_SCHEMA}'
+    )
+    raw = claude_ask_quality(fmt_prompt, system='You output ONLY strict valid JSON — no prose, no code fences, no commentary.') or ''
+    data = loads_lenient(strip_json(raw))
+    if isinstance(data, list) and data:
+        data = data[0]
+    if not isinstance(data, dict):
+        raise ValueError('analyze-drama: no object parsed')
+    eps = data.get('first_5_episodes') or []
+    if not isinstance(eps, list):
+        eps = []
+    chars = data.get('main_characters') or []
+    if not isinstance(chars, list):
+        chars = []
+    return {
+        'title': (data.get('title') or title).strip(),
+        'detailed_synopsis': (data.get('detailed_synopsis') or '').strip(),
+        'detailed_synopsis_ru': (data.get('detailed_synopsis_ru') or '').strip(),
+        'main_characters': [str(c).strip() for c in chars if str(c).strip()],
+        'central_conflict': (data.get('central_conflict') or '').strip(),
+        'hook': (data.get('hook') or '').strip(),
+        'setting': (data.get('setting') or '').strip(),
+        'first_5_episodes': [str(e).strip() for e in eps if str(e).strip()],
+    }
+
+
+@app.route('/api/top-dramas', methods=['GET'])
+def top_dramas_get():
+    """Return the persisted top-dramas board (survives page reload)."""
+    return jsonify(_load_top_dramas())
+
+
+@app.route('/api/top-dramas/scan', methods=['POST'])
+def top_dramas_scan():
+    """Re-scan the live market for top short dramas and persist the result."""
+    data_in = request.json or {}
+    genres = data_in.get('genres') or []
+    era_dir = _era_setting_block(
+        data_in.get('era'), data_in.get('era_custom'),
+        data_in.get('world_setting'), data_in.get('world_custom'),
+    )
+    era_hint = 'a non-modern era/world is set — surface period/world-appropriate hits' if era_dir else ''
+    try:
+        dramas = _research_top_dramas(genres=genres, idea_hint=(data_in.get('idea') or '').strip(), era_hint=era_hint)
+    except Exception as e:
+        _log_event('WARN', 'top_dramas_scan_fail', err=str(e)[:200])
+        return jsonify({'error': str(e)}), 500
+    for i, d in enumerate(dramas):
+        d['id'] = _drama_slug(d.get('title'), i)
+    store = {
+        'scanned_at': datetime.datetime.utcnow().isoformat() + 'Z',
+        'genres': genres,
+        'dramas': dramas,
+    }
+    _save_top_dramas(store)
+    print(f'[top-dramas] scanned + saved {len(dramas)}', flush=True)
+    return jsonify(store)
+
+
+@app.route('/api/top-dramas/analyze', methods=['POST'])
+def top_dramas_analyze():
+    """Deep-analyze one drama (by stored id or by inline drama) and persist it."""
+    data_in = request.json or {}
+    did = (data_in.get('id') or '').strip()
+    drama = data_in.get('drama') or {}
+    store = _load_top_dramas()
+    target = None
+    if did:
+        for d in store.get('dramas', []):
+            if d.get('id') == did:
+                target = d
+                break
+    if target is None and isinstance(drama, dict) and (drama.get('title') or drama.get('premise')):
+        target = drama
+    if not target:
+        return jsonify({'error': 'drama not found'}), 404
+    try:
+        analysis = _analyze_drama(target)
+    except Exception as e:
+        _log_event('WARN', 'top_dramas_analyze_fail', err=str(e)[:200])
+        return jsonify({'error': str(e)}), 500
+    if did:
+        for d in store.get('dramas', []):
+            if d.get('id') == did:
+                d['analysis'] = analysis
+                break
+        _save_top_dramas(store)
+    return jsonify({'analysis': analysis})
+
 
 _IDEA_SETTINGS = [
     # Elite / luxury (kept — but we WILL force diversity to non-elite below)
@@ -13310,6 +14139,31 @@ def _beats_ideas_block(tokens):
         f"Each synopsis must clearly set up beat 1 («{first}») as the opening hook and gesture at the "
         "escalation to come. Vary setting / protagonist / world across the 5, but every idea rides the "
         "SAME beat order. Honor any era/world/genre constraints above at the same time.\n\n"
+    )
+
+
+def _source_outline_episode_block(s, first_new_num, last_new_num):
+    """If the series was created from a deep-analyzed top drama, emit the per-episode
+    outline for episodes in [first_new_num, last_new_num], with a hard rename rule so
+    the result is an ORIGINAL adaptation (own cast/details), not a copy of the source."""
+    outline = s.get('source_episode_outline') or []
+    if not isinstance(outline, list) or not outline:
+        return ''
+    lines = []
+    for i, beat in enumerate(outline):
+        ep = i + 1
+        if not beat or ep < first_new_num or ep > last_new_num:
+            continue
+        lines.append(f"Эп.{ep}: {beat}")
+    if not lines:
+        return ''
+    return (
+        "\n📋 ПЛАН-ЗАВЯЗКА ПО СЕРИЯМ (адаптация успешной шорт-драммы — следуй сюжетным битам как ОСНОВЕ каждой серии):\n"
+        + "\n".join(lines) + "\n"
+        "⚠ ЭТО ОРИГИНАЛЬНАЯ АДАПТАЦИЯ, НЕ КОПИЯ:\n"
+        "• Имена персонажей в плане выше — ПЛЕЙСХОЛДЕРЫ исходника. Используй ТОЛЬКО имена из РОСТЕРА ПЕРСОНАЖЕЙ этого сериала (или придумай свои) — НИКОГДА не переноси имена из плана.\n"
+        "• Сохраняй сюжетные биты, повороты и клиффхэнгер каждой серии, но меняй мелкие конкретные детали (места, бренды, обстоятельства), чтобы это была своя история, а не пересказ.\n"
+        "• Каждая из этих серий ОБЯЗАНА реализовать свой бит плана в правильном порядке.\n\n"
     )
 
 
@@ -13988,6 +14842,36 @@ def generate_series_ideas():
             "ignore what overcomplicates):\n"
             f"{constraints}\n\n"
         )
+
+    # ── IDEAS V2: 3-stage pipeline (research → 5 diverse ideas → logic-check) ──
+    # Reuses every context block computed above so all user controls still steer.
+    # On any failure, falls through to the legacy single mega-prompt below.
+    if IDEAS_V2:
+        _user_controls = (
+            format_block
+            + f"FORMAT-SPECIFIC DIRECTIVE: {format_ideas_directive}\n\n"
+            + era_setting_directive
+            + beats_directive
+            + genre_rule
+            + avoid_rule
+            + seeds_section
+        )
+        try:
+            _ideas = _run_ideas_pipeline_v2(
+                writer_model=writer_model,
+                user_controls=_user_controls,
+                genres=genres,
+                idea_hint=idea_hint,
+                era_world_override=_era_world_override,
+                avoid_rule=avoid_rule,
+            )
+            try:
+                _save_ideas_history(_ideas)
+            except Exception:
+                pass
+            return jsonify(_ideas)
+        except Exception as _e:
+            print(f'[ideas] V2 pipeline failed -> legacy single-call fallback: {_e}', flush=True)
 
     prompt = (
         "Generate exactly 5 series concepts for short-form vertical video.\n\n"
@@ -16011,7 +16895,8 @@ Wrong (FORBIDDEN — this is a generation failure):
 Rules for the scene heading:
 - Location name MUST be in ENGLISH (e.g. FATHER'S STUDY, HOTEL SUITE, STORAGE UNIT, ROOFTOP, HOSPITAL CORRIDOR)
 - FORBIDDEN Russian location names: КАБИНЕТ, СКЛАД, ОФИС, ГОСТИНАЯ, etc. — always translate to English
-- AVOID legal/courtroom locations as primary scene (COURTROOM, LAW FIRM, JUDGE'S CHAMBERS, DEPOSITION ROOM, EVIDENCE LOCKER, PROSECUTOR'S OFFICE, PRISON VISITING ROOM as repeat setting) — drama lives in homes, bedrooms, kitchens, hallways, hotel rooms, cars, rooftops, hospitals, NOT in courthouses
+- AVOID legal/courtroom locations as primary scene (COURTROOM, LAW FIRM, JUDGE'S CHAMBERS, DEPOSITION ROOM, EVIDENCE LOCKER, PROSECUTOR'S OFFICE, PRISON VISITING ROOM as repeat setting) — drama lives in homes, bedrooms, kitchens, hallways, hotel rooms, rooftops, hospitals, NOT in courthouses
+- FORBIDDEN: scenes set INSIDE a moving or parked vehicle (CAR INTERIOR, BACKSEAT, TAXI, LIMO, TRAIN COMPARTMENT, CARRIAGE, COCKPIT, etc.) — Seedance renders vehicle interiors badly. If characters must travel, stage the scene as they get IN or OUT of the vehicle (EXT. on the street/driveway) or relocate the beat to a room. Never write dialogue happening while seated inside a vehicle.
 - Format: ИНТА. ENGLISH LOCATION NAME — ВРЕМЯ
 - Even if the scene CONTINUES from the same location as the previous episode — write the heading again
 - Every new scene within the episode also gets its own heading
@@ -16568,7 +17453,8 @@ THE VERY FIRST LINE OF EVERY SUB-EPISODE AND EVERY NEW SCENE = SCENE HEADING. NO
 Format: ИНТА. ENGLISH LOCATION NAME — ВРЕМЯ
 Location name MUST be in English (e.g. STORAGE UNIT, FATHER'S STUDY, HOTEL SUITE, ROOFTOP, HOSPITAL CORRIDOR).
 Russian location names (КАБИНЕТ, СКЛАД, ОФИС etc.) are FORBIDDEN in headings.
-AVOID legal/courtroom locations as primary scene (COURTROOM, LAW FIRM, JUDGE'S CHAMBERS, DEPOSITION ROOM, PROSECUTOR'S OFFICE, PRISON VISITING ROOM, EVIDENCE LOCKER as recurring setting) — drama lives in living rooms, bedrooms, kitchens, hallways, hotel rooms, cars, rooftops, hospitals, NOT in courthouses.
+AVOID legal/courtroom locations as primary scene (COURTROOM, LAW FIRM, JUDGE'S CHAMBERS, DEPOSITION ROOM, PROSECUTOR'S OFFICE, PRISON VISITING ROOM, EVIDENCE LOCKER as recurring setting) — drama lives in living rooms, bedrooms, kitchens, hallways, hotel rooms, rooftops, hospitals, NOT in courthouses.
+FORBIDDEN: scenes set INSIDE a moving or parked vehicle (CAR INTERIOR, BACKSEAT, TAXI, LIMO, TRAIN COMPARTMENT, CARRIAGE, COCKPIT, etc.) — Seedance renders vehicle interiors badly. If travel is needed, stage it as characters get IN/OUT of the vehicle (EXT. on the street/driveway) or move the beat into a room. Never write dialogue happening while seated inside a vehicle.
 Starting with dialogue or action WITHOUT a scene heading = GENERATION FAILURE.
 
 ═══════════════════════════════════════
@@ -21660,8 +22546,9 @@ def _qc_run_chunk(sid, num, idx):
             v_res = _qc_vision_grid_and_subs(avai_urls, used_labels)
             details['vision'] = v_res
             for lbl, info in (v_res.get('frames') or {}).items():
-                if info.get('grid'):
-                    fails.append(f'grid:{lbl}')
+                # grid QC gate disabled — bypass moderation no longer
+                # leaves residual grid lines, so info.get('grid') is
+                # recorded in details but never fails the chunk.
                 if info.get('subs'):
                     fails.append(f'subs:{lbl}')
         else:
@@ -22408,6 +23295,12 @@ from services import elevenlabs_music as _el_music
 from services import music_builder as _music_builder
 from services import music_postprocess as _music_post
 
+# ONE track per episode at a fixed length (1:10 = 70s). The legacy per-scene
+# pipeline is kept intact behind this flag — flip to False to restore it.
+MUSIC_SINGLE_TRACK = True
+MUSIC_TRACK_DURATION_MS = 70_000        # 1:10
+MUSIC_SINGLE_SCENE_IDX = 0              # the whole episode lives at sceneIdx=0
+
 _MUSIC_LOCKS = {}
 _MUSIC_LOCKS_GUARD = threading.Lock()
 
@@ -22601,29 +23494,45 @@ def _generate_scene_music_worker(sid, num, scene_idx, user_hint, force, attempts
         if not ep or not s:
             raise RuntimeError('series or episode disappeared during music gen')
 
-        groups = _group_chunks_by_scene(_seedance_chunks(ep))
-        grp = next((g for g in groups if g['sceneIdx'] == int(scene_idx)), None)
-
-        if grp:
-            target_sec = max(5.0, grp['total_sec'] * 0.9)
-            target_ms = int(round(target_sec * 1000))
-            chunk_texts = [c.get('chunk_text') or '' for c in grp['chunks']]
-        elif target_duration_ms_override:
-            # Early-fire path: music kicked before video generation starts.
-            # Duration comes from the script-based duration estimate on the client.
-            target_ms = int(target_duration_ms_override)
-            chunk_texts = []  # no video chunks yet; script context is still used below
+        if MUSIC_SINGLE_TRACK:
+            # ONE track for the whole episode, fixed length. No per-scene sizing,
+            # no early-fire duration override — the length is constant.
+            target_ms = MUSIC_TRACK_DURATION_MS
+            all_chunks = [c for c in _seedance_chunks(ep) if c.get('status') == 'completed']
+            all_chunks.sort(key=lambda c: (
+                c.get('script_order') if c.get('script_order') is not None else 999,
+                c.get('idx') or 0,
+            ))
+            chunk_texts = [c.get('chunk_text') or '' for c in all_chunks]
+            # Whole script is the context; no neighbouring-scene snippets.
+            scene_text = ep.get('script') or ''
+            prev_tail = ''
+            next_head = ''
         else:
-            raise RuntimeError(f'no completed chunks for sceneIdx={scene_idx}')
+            groups = _group_chunks_by_scene(_seedance_chunks(ep))
+            grp = next((g for g in groups if g['sceneIdx'] == int(scene_idx)), None)
+
+            if grp:
+                target_sec = max(5.0, grp['total_sec'] * 0.9)
+                target_ms = int(round(target_sec * 1000))
+                chunk_texts = [c.get('chunk_text') or '' for c in grp['chunks']]
+            elif target_duration_ms_override:
+                # Early-fire path: music kicked before video generation starts.
+                # Duration comes from the script-based duration estimate on the client.
+                target_ms = int(target_duration_ms_override)
+                chunk_texts = []  # no video chunks yet; script context is still used below
+            else:
+                raise RuntimeError(f'no completed chunks for sceneIdx={scene_idx}')
+
+            # Build context.
+            scene_blocks = _split_script_by_scenes(ep.get('script') or '')
+            scene_text = scene_blocks[int(scene_idx)] if 0 <= int(scene_idx) < len(scene_blocks) else (ep.get('script') or '')
+            prev_tail = scene_blocks[int(scene_idx) - 1][-400:] if int(scene_idx) - 1 >= 0 and int(scene_idx) - 1 < len(scene_blocks) else ''
+            next_head = scene_blocks[int(scene_idx) + 1][:400] if int(scene_idx) + 1 < len(scene_blocks) else ''
 
         # ElevenLabs hard bound: sections in [8s, 18s] each, 4..6 sections → 32s..108s
         target_ms = max(32_000, min(target_ms, 110_000))
 
-        # Build context.
-        scene_blocks = _split_script_by_scenes(ep.get('script') or '')
-        scene_text = scene_blocks[int(scene_idx)] if 0 <= int(scene_idx) < len(scene_blocks) else (ep.get('script') or '')
-        prev_tail = scene_blocks[int(scene_idx) - 1][-400:] if int(scene_idx) - 1 >= 0 and int(scene_idx) - 1 < len(scene_blocks) else ''
-        next_head = scene_blocks[int(scene_idx) + 1][:400] if int(scene_idx) + 1 < len(scene_blocks) else ''
         episode_blocking = (ep.get('batch_episode_blocking') or ep.get('scene_blocking') or '')
 
         ffmpeg_bin = shutil.which('ffmpeg')
@@ -22795,6 +23704,12 @@ def music_generate(sid, num):
     force = bool(body.get('force'))
     requested = body.get('scene_indices')
 
+    # Single-track mode: one episode-level track at sceneIdx=0, fixed duration.
+    # scene_indices / scenes_plan from the client are intentionally ignored.
+    if MUSIC_SINGLE_TRACK:
+        started = _kick_music_generation(sid, num, [MUSIC_SINGLE_SCENE_IDX], user_hint, force)
+        return jsonify({'ok': True, 'scenes': started, 'total_scenes': 1})
+
     # Backfill scene metadata on legacy chunks (pre-music release) from
     # batch_prompts. Persists the patched chunks so subsequent polls see it.
     with _episode_lock(sid, num):
@@ -22847,10 +23762,13 @@ def music_regenerate(sid, num):
     if not s or not ep:
         return jsonify({'error': 'not found'}), 404
     body = request.json or {}
-    try:
-        scene_idx = int(body.get('sceneIdx'))
-    except (TypeError, ValueError):
-        return jsonify({'error': 'sceneIdx required'}), 400
+    if MUSIC_SINGLE_TRACK:
+        scene_idx = MUSIC_SINGLE_SCENE_IDX
+    else:
+        try:
+            scene_idx = int(body.get('sceneIdx'))
+        except (TypeError, ValueError):
+            return jsonify({'error': 'sceneIdx required'}), 400
     user_hint = (body.get('user_hint') or '').strip()
     started = _kick_music_generation(sid, num, [scene_idx], user_hint, force=True)
     return jsonify({'ok': True, 'scenes': started})
@@ -22895,8 +23813,15 @@ def music_poll(sid, num):
 
     groups = _group_chunks_by_scene(_seedance_chunks(ep))
 
-    # 2) Auto-kick: episode has completed chunks but zero music_scenes → missed trigger.
-    if (groups and not _music_scenes(ep)
+    # 2) Auto-kick: completed chunks exist but no music record yet → missed trigger.
+    if MUSIC_SINGLE_TRACK:
+        has_completed = any(c.get('status') == 'completed' for c in _seedance_chunks(ep))
+        if (has_completed and not _music_scenes(ep)
+                and (ep.get('script') or '').strip() and ELEVENLABS_KEY):
+            _kick_music_generation(sid, num, [MUSIC_SINGLE_SCENE_IDX], '', force=False)
+            with _episode_lock(sid, num):
+                ep = load_episode(sid, num) or ep
+    elif (groups and not _music_scenes(ep)
             and (ep.get('script') or '').strip() and ELEVENLABS_KEY):
         _kick_music_generation(sid, num, [g['sceneIdx'] for g in groups], '', force=False)
         with _episode_lock(sid, num):
@@ -22910,8 +23835,19 @@ def music_poll(sid, num):
         with _episode_lock(sid, num):
             ep = load_episode(sid, num) or ep
 
-    scenes_meta = [{'sceneIdx': g['sceneIdx'], 'total_sec': g['total_sec'],
-                    'chunks': len(g['chunks'])} for g in groups]
+    if MUSIC_SINGLE_TRACK:
+        n_chunks = sum(1 for c in _seedance_chunks(ep) if c.get('status') == 'completed')
+        # One synthetic episode-level track; expose it once music exists or any
+        # chunk is ready, so the UI shows the single 1/1 track row.
+        if _music_scenes(ep) or n_chunks:
+            scenes_meta = [{'sceneIdx': MUSIC_SINGLE_SCENE_IDX,
+                            'total_sec': MUSIC_TRACK_DURATION_MS / 1000.0,
+                            'chunks': n_chunks}]
+        else:
+            scenes_meta = []
+    else:
+        scenes_meta = [{'sceneIdx': g['sceneIdx'], 'total_sec': g['total_sec'],
+                        'chunks': len(g['chunks'])} for g in groups]
     return jsonify({
         'music_scenes': _music_scenes(ep),
         'available_scenes': scenes_meta,
@@ -22929,6 +23865,20 @@ def music_download(sid, num):
     ep = load_episode(sid, num)
     if not s or not ep:
         return jsonify({'error': 'not found'}), 404
+    base = series_path(sid)
+    safe = _safe_series_filename(s.get('title') or s.get('name') or 'Series')
+    out_name = f'MUS_{safe}_{int(num)}.wav'
+
+    # Single-track mode: one file, stream it directly (no concat needed).
+    if MUSIC_SINGLE_TRACK:
+        rec = _music_scene_record(ep, MUSIC_SINGLE_SCENE_IDX)
+        if rec and rec.get('status') == 'completed' and rec.get('audio_path'):
+            p = base / rec['audio_path']
+            if p.exists():
+                return send_file(str(p), mimetype='audio/wav',
+                                 as_attachment=True, download_name=out_name)
+        return jsonify({'error': 'музыка ещё не готова'}), 404
+
     ffmpeg_bin = shutil.which('ffmpeg')
     if not ffmpeg_bin:
         return jsonify({'error': 'ffmpeg не установлен'}), 500
@@ -26437,7 +27387,7 @@ def seedance_start(sid, num):
         resolution = '720p'
     mod = body.get('moderation_bypass') or 'off'
     if mod not in ('off', 'grid', 'collage_grid', 'cartoon'):
-        mod = 'collage_grid'
+        mod = 'off'
     model_tier = body.get('model') or 'reference-fast'
     if model_tier not in ('reference-pro', 'reference-fast'):
         model_tier = 'reference-fast'

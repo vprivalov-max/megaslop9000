@@ -79,7 +79,8 @@ const api = {
     if (!r.ok) throw await parseApiError(r);
     return r.json();
   },
-  async post(url, body, { timeoutMs, idempotencyKey } = {}) {
+  async post(url, body, callOpts = {}) {
+    const { timeoutMs, idempotencyKey, _anthroRetried } = callOpts;
     const headers = { 'Content-Type': 'application/json' };
     if (idempotencyKey) headers['Idempotency-Key'] = idempotencyKey;
     const opts = { method: 'POST', headers, body: JSON.stringify(body) };
@@ -87,7 +88,21 @@ const api = {
     let r;
     try { r = await fetch(url, opts); }
     catch (e) { throw new Error(e.name === 'TimeoutError' ? `Таймаут (${Math.round(timeoutMs/1000)}с) — сервер не ответил` : e.message); }
-    if (!r.ok) throw await parseApiError(r);
+    if (!r.ok) {
+      // Anthro gate (HTTP 409): a generation would render a NON-human in a
+      // series that hasn't decided its world type yet. Ask the user ONCE, then
+      // retry the original request. Granting is per-series and never re-asks.
+      if (r.status === 409 && !_anthroRetried) {
+        let data = null;
+        try { data = await r.clone().json(); } catch {}
+        if (data && data.needs_anthro_decision) {
+          const decided = await resolveAnthroGate(url, data);
+          if (decided) return api.post(url, body, { ...callOpts, _anthroRetried: true });
+          throw new Error('Генерация отменена — не выбран тип мира сериала.');
+        }
+      }
+      throw await parseApiError(r);
+    }
     return r.json();
   },
   async put(url, body) {
@@ -798,6 +813,7 @@ async function loadProjects() {
   _allProjects = await api.get('/api/series');
   applyProjectFilters();
   loadBalance();
+  loadTopDramas();
 }
 
 function _projectCreatedTs(s) {
@@ -1322,6 +1338,7 @@ async function confirmDeleteSeries(sid, title) {
 }
 
 function openCreateSeries() {
+  window._pendingSeriesOutline = null;
   clearFields(['series-idea-input','new-series-title','new-series-genre','new-series-tone','new-series-audience','new-series-world','new-series-synopsis']);
   document.getElementById('series-ideas-list').classList.add('hidden');
   document.getElementById('series-ideas-list').innerHTML = '';
@@ -1341,6 +1358,13 @@ function openCreateSeries() {
   }
   try { _importResetPickedFiles(); } catch (_) {}
   try { _hydrateImportStylePicker(); } catch (_) {}
+  // Reset clone-mode fields so a previous session's edits don't leak in.
+  for (const id of ['clone-new-title','clone-revision-instructions']) {
+    const el = document.getElementById(id); if (el) el.value = '';
+  }
+  const cloneCount = document.getElementById('clone-episodes-count'); if (cloneCount) cloneCount.value = '0';
+  const cloneInfo = document.getElementById('clone-source-info'); if (cloneInfo) cloneInfo.textContent = '';
+  const cloneStatus = document.getElementById('clone-create-status'); if (cloneStatus) cloneStatus.textContent = '';
   setSeriesCreateMode('generate');
   // Hydrate the «🚫 Не предлагать» field from localStorage so user sees their
   // persisted blocked-tropes list immediately on modal open (no need to
@@ -1370,18 +1394,100 @@ function openCreateSeries() {
 //              chars/locs/items in the background
 // Each mode shows its own block + footer button; the unused parts are hidden.
 function setSeriesCreateMode(mode) {
-  const isImport = mode === 'import';
+  // Three modes: 'generate' (AI from scratch), 'import' (paste a script),
+  // 'clone' (base on an existing series + revision instructions).
+  if (mode !== 'import' && mode !== 'clone') mode = 'generate';
   const genBlock = document.getElementById('series-generate-block');
   const impBlock = document.getElementById('series-import-block');
-  if (genBlock) genBlock.style.display = isImport ? 'none' : '';
-  if (impBlock) impBlock.style.display = isImport ? '' : 'none';
+  const cloBlock = document.getElementById('series-clone-block');
+  if (genBlock) genBlock.style.display = mode === 'generate' ? '' : 'none';
+  if (impBlock) impBlock.style.display = mode === 'import' ? '' : 'none';
+  if (cloBlock) cloBlock.style.display = mode === 'clone' ? '' : 'none';
   const genBtn = document.getElementById('series-mode-generate-btn');
   const impBtn = document.getElementById('series-mode-import-btn');
-  if (genBtn) genBtn.classList.toggle('active', !isImport);
-  if (impBtn) impBtn.classList.toggle('active', isImport);
-  // Footer "Создать" only relevant in generate mode (import has its own button).
+  const cloBtn = document.getElementById('series-mode-clone-btn');
+  if (genBtn) genBtn.classList.toggle('active', mode === 'generate');
+  if (impBtn) impBtn.classList.toggle('active', mode === 'import');
+  if (cloBtn) cloBtn.classList.toggle('active', mode === 'clone');
+  // Footer "Создать" only drives generate mode (import & clone have own buttons).
   const footerCreateBtn = document.getElementById('series-generate-create-btn');
-  if (footerCreateBtn) footerCreateBtn.style.display = isImport ? 'none' : '';
+  if (footerCreateBtn) footerCreateBtn.style.display = mode === 'generate' ? '' : 'none';
+  // Lazily populate the clone source dropdown when entering clone mode.
+  if (mode === 'clone') _populateCloneSources();
+}
+
+// ── Clone-from-existing flow ─────────────────────────────────────────────────
+async function _populateCloneSources() {
+  const sel = document.getElementById('clone-source-sid');
+  if (!sel) return;
+  // Keep the user's current pick across re-entries if still valid.
+  const prev = sel.value;
+  try {
+    const list = await api.get('/api/series');
+    const series = Array.isArray(list) ? list : (list.series || list.items || []);
+    if (!series.length) {
+      sel.innerHTML = '<option value="">— нет сериалов для клонирования —</option>';
+      return;
+    }
+    sel.innerHTML = '<option value="">— выбери сериал —</option>' + series.map(s => {
+      const eps = (s._episode_total != null ? s._episode_total : '?');
+      const title = (s.title || s.id || '').replace(/</g, '&lt;');
+      return `<option value="${s.id}">${title} · ${eps} сер.</option>`;
+    }).join('');
+    if (prev && series.some(s => s.id === prev)) sel.value = prev;
+    _cloneOnSourceChange();
+  } catch (e) {
+    sel.innerHTML = '<option value="">— ошибка загрузки списка —</option>';
+  }
+  if (!sel._cloneWired) {
+    sel.addEventListener('change', _cloneOnSourceChange);
+    sel._cloneWired = true;
+  }
+}
+
+function _cloneOnSourceChange() {
+  const sel = document.getElementById('clone-source-sid');
+  const info = document.getElementById('clone-source-info');
+  const titleEl = document.getElementById('clone-new-title');
+  if (!sel) return;
+  const opt = sel.options[sel.selectedIndex];
+  if (info) info.textContent = opt && sel.value ? `Будет скопирован сюжет, библия, персонажи и серии из «${opt.text}».` : '';
+  // Suggest a title if the user hasn't typed one yet.
+  if (titleEl && !titleEl.value.trim() && opt && sel.value) {
+    const base = opt.text.split(' · ')[0];
+    titleEl.value = `${base} (вариант)`;
+  }
+}
+
+async function cloneCreateSeries() {
+  const source_sid = val('clone-source-sid');
+  if (!source_sid) return alert('Выбери сериал-источник');
+  const title = val('clone-new-title');
+  if (!title) return alert('Введи название нового сериала');
+  const revision_instructions = val('clone-revision-instructions');
+  const _epsRaw = val('clone-episodes-count');
+  const episodes_to_copy = _epsRaw ? Math.max(0, parseInt(_epsRaw, 10) || 0) : 0;
+  const btn = document.getElementById('clone-create-btn');
+  const statusEl = document.getElementById('clone-create-status');
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ Создаю и применяю правки…'; }
+  if (statusEl) statusEl.textContent = 'Копирую сюжет и серии, переписываю библию и персонажей под правки — это может занять до минуты.';
+  try {
+    const data = await api.post('/api/series/clone-from', {
+      source_sid, title, revision_instructions, episodes_to_copy,
+    });
+    closeModal('modal-create-series');
+    const c = data._clone || {};
+    let msg = `🧬 Создан «${data.title}»: скопировано серий — ${c.copied_episodes ?? 0}.`;
+    if (c.pending_rewrites) msg += ` Требуют перезаписи под правки: ${c.pending_rewrites} (внутри сериала, поштучно).`;
+    else if (revision_instructions) msg += ' Правки применены к библии и персонажам; сценарии серий перезаписывать не нужно.';
+    showToast(msg);
+    navigate('series', { seriesId: data.id });
+  } catch (e) {
+    if (statusEl) statusEl.textContent = '';
+    showToast('Ошибка: ' + e.message);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '🧬 Создать вариант'; }
+  }
 }
 
 // ── Import-from-script flow ─────────────────────────────────────────────────
@@ -3769,6 +3875,193 @@ function fillSeriesForm(data) {
   if (data.synopsis)         setVal('new-series-synopsis', data.synopsis);
 }
 
+async function findTopDramas() {
+  const btn = document.getElementById('btn-find-top-dramas');
+  const status = document.getElementById('series-gen-status');
+  const wrap = document.getElementById('top-dramas-list');
+  const ideasList = document.getElementById('series-ideas-list');
+  const genres = getSelectedGenres();
+  const idea = (val('series-idea-input') || '').trim();
+  const orig = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span> Ищем топ...';
+  status.textContent = '';
+  if (ideasList) ideasList.classList.add('hidden');
+  wrap.classList.add('hidden');
+  wrap.innerHTML = '';
+  try {
+    const res = await api.post('/api/research-top-dramas', { genres, idea, ...getEraSetting() });
+    const dramas = (res && res.dramas) || [];
+    if (!dramas.length) {
+      status.textContent = 'Ничего не нашлось — попробуй ещё раз';
+      status.style.color = 'var(--danger)';
+      return;
+    }
+    wrap.innerHTML = dramas.map((d, i) => `
+      <div class="idea-card">
+        <div class="idea-card-title">${esc(d.title)}${d.popularity ? ` <span style="font-size:0.72rem;color:#ff922b;font-weight:600">${esc(d.popularity)}</span>` : ''}</div>
+        <div class="idea-card-meta">${esc(d.genre)}${d.why_hook ? ' · ' + esc(d.why_hook) : ''}</div>
+        <div class="idea-card-synopsis">${esc(d.premise_ru || d.premise)}</div>
+        <button onclick="makeSimilarFromDrama(${i})" style="margin-top:10px;width:100%;padding:8px;border:none;border-radius:8px;background:linear-gradient(135deg,#845ef7,#5c7cfa);color:#fff;font-weight:600;cursor:pointer">🎬 Сделать подобный сериал</button>
+      </div>
+    `).join('');
+    wrap._dramas = dramas;
+    wrap.classList.remove('hidden');
+    status.textContent = 'Выбери драму — сгенерируем 5 идей в её духе';
+    status.style.color = 'var(--muted)';
+  } catch (e) {
+    status.textContent = 'Ошибка: ' + e.message;
+    status.style.color = 'var(--danger)';
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = orig;
+  }
+}
+
+async function makeSimilarFromDrama(index) {
+  const wrap = document.getElementById('top-dramas-list');
+  const d = wrap._dramas?.[index];
+  if (!d) return;
+  const status = document.getElementById('series-gen-status');
+  const list = document.getElementById('series-ideas-list');
+  wrap.classList.add('hidden');
+  list.classList.add('hidden');
+  list.innerHTML = '';
+  // 1-TO-1: take the chosen hit's premise verbatim, retitle it, fill the form.
+  status.innerHTML = '<span class="spinner"></span> Готовим идею «' + esc(d.title) + '» 1-в-1...';
+  status.style.color = 'var(--muted)';
+  try {
+    const genres = getSelectedGenres();
+    const model = _selectedWriterModel('writer-model-create');
+    const ideas = await api.post('/api/ideas-from-drama', { drama: d, genres, model, ...getEraSetting() });
+    const idea = Array.isArray(ideas) ? ideas[0] : ideas;
+    if (!idea) throw new Error('пустой ответ');
+    fillSeriesForm(idea);
+    status.textContent = '✓ Идея «' + d.title + '» загружена 1-в-1 — проверь поля и жми «Создать сериал»';
+    status.style.color = 'var(--success)';
+  } catch (e) {
+    status.textContent = 'Ошибка: ' + e.message;
+    status.style.color = 'var(--danger)';
+  }
+}
+
+// ── Persistent top-dramas board (main page) ───────────────────────────────
+async function loadTopDramas() {
+  const board = document.getElementById('top-dramas-board');
+  if (!board) return;
+  try {
+    const store = await api.get('/api/top-dramas');
+    renderTopDramasBoard(store);
+  } catch (e) { /* silent on load */ }
+}
+
+function renderTopDramasBoard(store) {
+  const board = document.getElementById('top-dramas-board');
+  const meta = document.getElementById('top-dramas-meta');
+  if (!board) return;
+  const dramas = (store && store.dramas) || [];
+  window._topDramas = dramas;
+  if (meta) {
+    if (store && store.scanned_at) {
+      const dt = new Date(store.scanned_at);
+      meta.textContent = isNaN(dt) ? '' : '· обновлено ' + dt.toLocaleString('ru-RU');
+    } else meta.textContent = '';
+  }
+  if (!dramas.length) {
+    board.innerHTML = '<div style="color:var(--muted);font-size:0.85rem;grid-column:1/-1">Список пуст — нажми «Обновить список», чтобы найти топовые шортдраммы.</div>';
+    return;
+  }
+  board.innerHTML = dramas.map((d, i) => `
+    <div class="idea-card" style="display:flex;flex-direction:column;gap:6px">
+      <div class="idea-card-title">${esc(d.title)}${d.popularity ? ` <span style="font-size:0.7rem;color:#ff922b;font-weight:600">${esc(d.popularity)}</span>` : ''}</div>
+      <div class="idea-card-meta">${esc(d.genre)}${d.why_hook ? ' · ' + esc(d.why_hook) : ''}</div>
+      <div class="idea-card-synopsis">${esc(d.premise_ru || d.premise)}</div>
+      <div id="topdrama-analysis-${i}"></div>
+      <div style="display:flex;gap:8px;margin-top:6px">
+        <button onclick="analyzeTopDrama(${i})" style="flex:1;padding:7px;border:1px solid #845ef7;border-radius:8px;background:transparent;color:#b39df5;font-weight:600;cursor:pointer;font-size:0.8rem">🔍 Изучить подробнее</button>
+        <button onclick="makeSeriesFromTopDrama(${i})" style="flex:1;padding:7px;border:none;border-radius:8px;background:linear-gradient(135deg,#845ef7,#5c7cfa);color:#fff;font-weight:600;cursor:pointer;font-size:0.8rem">🎬 Сделать сериал</button>
+      </div>
+    </div>
+  `).join('');
+  dramas.forEach((d, i) => { if (d.analysis) _renderDramaAnalysis(i, d.analysis); });
+}
+
+async function refreshTopDramas() {
+  const btn = document.getElementById('btn-refresh-top-dramas');
+  const status = document.getElementById('top-dramas-status');
+  const orig = btn ? btn.innerHTML : '';
+  if (btn) { btn.disabled = true; btn.innerHTML = '⏳ Ищем...'; }
+  if (status) { status.textContent = 'Сканируем рынок топовых шортдрамм (~1 мин)...'; status.style.color = 'var(--muted)'; }
+  try {
+    const store = await api.post('/api/top-dramas/scan', {});
+    renderTopDramasBoard(store);
+    if (status) status.textContent = 'Готово — найдено ' + ((store.dramas || []).length) + ' шортдрамм.';
+  } catch (e) {
+    if (status) { status.textContent = 'Ошибка: ' + e.message; status.style.color = 'var(--danger)'; }
+  } finally {
+    if (btn) { btn.disabled = false; btn.innerHTML = orig; }
+  }
+}
+
+async function analyzeTopDrama(index) {
+  const d = (window._topDramas || [])[index];
+  if (!d) return;
+  const panel = document.getElementById('topdrama-analysis-' + index);
+  if (d.analysis) { _renderDramaAnalysis(index, d.analysis); return; }
+  if (panel) panel.innerHTML = '<div style="color:var(--muted);font-size:0.8rem;padding:6px 0">🔍 Изучаем драму подробно (~1 мин)...</div>';
+  try {
+    const res = await api.post('/api/top-dramas/analyze', { id: d.id, drama: d });
+    d.analysis = res.analysis;
+    _renderDramaAnalysis(index, res.analysis);
+  } catch (e) {
+    if (panel) panel.innerHTML = '<div style="color:var(--danger);font-size:0.8rem">Ошибка: ' + esc(e.message) + '</div>';
+  }
+}
+
+function _renderDramaAnalysis(index, a) {
+  const panel = document.getElementById('topdrama-analysis-' + index);
+  if (!panel || !a) return;
+  const eps = (a.first_5_episodes || []).map(e => `<li>${esc(e)}</li>`).join('');
+  const chars = (a.main_characters || []).map(c => `<li>${esc(c)}</li>`).join('');
+  panel.innerHTML = `
+    <div style="margin-top:8px;padding:10px;background:rgba(132,94,247,0.06);border-radius:8px;font-size:0.82rem;line-height:1.5">
+      <div style="font-weight:600;color:#b39df5;margin-bottom:4px">Детальный синопсис</div>
+      <div style="margin-bottom:8px">${esc(a.detailed_synopsis_ru || a.detailed_synopsis)}</div>
+      ${a.central_conflict ? `<div><b>Конфликт:</b> ${esc(a.central_conflict)}</div>` : ''}
+      ${chars ? `<div style="margin-top:6px"><b>Персонажи:</b><ul style="margin:4px 0 0 16px;padding:0">${chars}</ul></div>` : ''}
+      ${eps ? `<div style="margin-top:6px"><b>Завязка (первые 5 серий):</b><ol style="margin:4px 0 0 16px;padding:0">${eps}</ol></div>` : ''}
+    </div>`;
+}
+
+async function makeSeriesFromTopDrama(index) {
+  const d = (window._topDramas || [])[index];
+  if (!d) return;
+  const a = d.analysis;
+  const premise = a ? (a.detailed_synopsis || d.premise || '') : (d.premise || '');
+  const premise_ru = a ? (a.detailed_synopsis_ru || d.premise_ru || '') : (d.premise_ru || '');
+  const status = document.getElementById('top-dramas-status');
+  if (status) { status.textContent = 'Готовим сериал на основе «' + d.title + '»...'; status.style.color = 'var(--muted)'; }
+  try {
+    const ideas = await api.post('/api/ideas-from-drama', { drama: { title: d.title, genre: d.genre, premise, premise_ru } });
+    const idea = Array.isArray(ideas) ? ideas[0] : ideas;
+    if (!idea) throw new Error('пустой ответ');
+    openCreateSeries();
+    fillSeriesForm(idea);
+    const outline = (a && Array.isArray(a.first_5_episodes) && a.first_5_episodes.length) ? a.first_5_episodes : null;
+    window._pendingSeriesOutline = outline;
+    if (status) status.textContent = '';
+    const gs = document.getElementById('series-gen-status');
+    if (gs) {
+      gs.textContent = outline
+        ? '✓ Идея «' + d.title + '» загружена. Первые ' + outline.length + ' серий напишутся по разбору (с новыми именами) — жми «Создать сериал»'
+        : '✓ Идея «' + d.title + '» загружена — проверь поля и жми «Создать сериал»';
+      gs.style.color = 'var(--success)';
+    }
+  } catch (e) {
+    if (status) { status.textContent = 'Ошибка: ' + e.message; status.style.color = 'var(--danger)'; }
+  }
+}
+
 // Format mode picker — short_drama (TikTok serial) vs instagram_series (sitcom-style).
 // Sets the hidden input + visually toggles the two pill buttons. Read by createSeries,
 // generateFromIdea, generateSeriesIdeas so the chosen mode flows into all backend generators.
@@ -3813,6 +4106,21 @@ function getEraSetting() {
   };
 }
 
+function _autoWriteFirstEpisodes(n, tries) {
+  tries = tries || 0;
+  const btn = document.getElementById('append-gen-start-btn');
+  const cnt = document.getElementById('append-gen-count');
+  // Series view loads async — poll until the append panel exists (max ~12s).
+  if (!btn || !cnt) {
+    if (tries < 40) { setTimeout(() => _autoWriteFirstEpisodes(n, tries + 1), 300); }
+    return;
+  }
+  cnt.value = String(n);
+  try { btn.scrollIntoView({ behavior: 'smooth', block: 'center' }); } catch (_) {}
+  // appendGenerateScript no-confirms on an empty textarea (brand-new series).
+  appendGenerateScript(btn);
+}
+
 async function createSeries() {
   const title = val('new-series-title');
   if (!title) return alert('Введи название');
@@ -3839,13 +4147,18 @@ async function createSeries() {
       batch_size: 1,
       writer_model: _selectedWriterModel('writer-model-create'),
       target_duration_sec,
+      source_episode_outline: window._pendingSeriesOutline || null,
     });
+    const _autoOutlineN = (window._pendingSeriesOutline || []).length;
+    window._pendingSeriesOutline = null;
     closeModal('modal-create-series');
     _createSeriesDraftClear();
     if (data?._scaffold?.prproj_warning) {
       showToast('⚠ ' + data._scaffold.prproj_warning + ' (templates/empty.prproj)');
     }
     navigate('series', { seriesId: data.id });
+    // Created from a deep-analyzed drama → auto-write the first episodes to its outline.
+    if (_autoOutlineN) _autoWriteFirstEpisodes(_autoOutlineN);
     // Same first-time style prompt as the import flow.
     setTimeout(() => maybePromptForStyle(true), 900);
   } catch(e) {
@@ -5209,6 +5522,36 @@ function renderAnthroBanner(s) {
     `;
   }
   return '';
+}
+
+// Hard-pause anthro gate: invoked when a generation request is blocked with
+// 409 needs_anthro_decision. Asks the user once whether this series contains
+// NON-humans, persists the choice, and returns true if generation may proceed.
+async function resolveAnthroGate(url, data) {
+  const m = (url || '').match(/\/api\/series\/([^\/]+)/);
+  const sid = (m && m[1]) || (typeof S !== 'undefined' && S.seriesId);
+  if (!sid) return false;
+  const names = (data.flagged_chars || []).join(', ');
+  const yes = confirm(
+    `Стоп — генерация НЕ-людей запрещена без подтверждения.\n\n` +
+    `Похоже, в этом сериале есть НЕ-люди: ${names || '—'}.\n\n` +
+    `Это мир НЕ-людей (звери / фурри / мифические существа)?\n\n` +
+    `OK — ДА, разрешить генерацию НЕ-людей в этом сериале (спросим только один раз).\n` +
+    `Отмена — НЕТ, это люди (звериные черты будут убраны, персонажи сгенерятся людьми).`
+  );
+  const choice = yes ? 'anthro' : 'human';
+  try {
+    await api.post(`/api/series/${sid}/anthro`,
+      { choice, strip_species: (choice === 'human'), clear_portraits: false },
+      { _anthroRetried: true });
+    if (typeof S !== 'undefined' && S.seriesId === sid) {
+      try { S.series = await api.get(`/api/series/${sid}`); renderSeriesView && renderSeriesView(); } catch {}
+    }
+    return true;
+  } catch (e) {
+    alert('Не удалось сохранить выбор мира: ' + (e?.message || e));
+    return false;
+  }
 }
 
 async function confirmAnthro(choice) {
@@ -8011,6 +8354,46 @@ function updateGenScriptBtn() {
   const hasScript = !!(val('ep-script'));
   btn.textContent = hasScript ? '↻ Перегенерировать сценарий' : '⚡ Сгенерировать сценарий';
   btn.className = `ep-script-btn ${hasScript ? 'done' : 'ready'}`;
+  updateApplyRevisionsBtn();
+}
+
+// Show the «Применить правки к серии» button only for cloned-with-edits series.
+// Pending episodes (plot/age changes) get a 🔴 marker; pure name/look edits
+// don't queue, so the button stays available but un-marked (optional rewrite).
+function updateApplyRevisionsBtn() {
+  const btn = document.getElementById('ep-apply-revisions-btn');
+  if (!btn) return;
+  const ri = (S.series && (S.series.revision_instructions || '').trim()) || '';
+  const hasScript = !!(val('ep-script'));
+  if (!ri || !hasScript) { btn.style.display = 'none'; return; }
+  btn.style.display = '';
+  const pending = (S.series.revision_plan && S.series.revision_plan.pending_episodes) || [];
+  const isPending = pending.map(Number).includes(Number(S.episodeNum));
+  btn.textContent = isPending ? '🔴 Переписать серию под правки' : '🧬 Применить правки к серии';
+}
+
+async function applyEpisodeRevisions() {
+  if (!S.seriesId || !S.episodeNum) { alert('Сначала открой эпизод'); return; }
+  if (!confirm(`Переписать сценарий серии ${S.episodeNum} под правки сериала?\n\nХук, структура, клиффхэнгер и длина сохранятся — изменится только то, что требуют правки и логика мира. Текущий текст будет заменён.`)) return;
+  const btn = document.getElementById('ep-apply-revisions-btn');
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ Переписываю…'; }
+  try {
+    const r = await api.post(`/api/series/${S.seriesId}/episodes/${S.episodeNum}/apply-revisions`, {});
+    if (r && r.script != null) {
+      setVal('ep-script', r.script);
+      if (S.episode) { S.episode.script = r.script; S.episode.cast_extracted = false; }
+      // Keep local series copy's pending list in sync so the marker clears.
+      if (S.series && S.series.revision_plan) S.series.revision_plan.pending_episodes = r.pending_episodes || [];
+      updateGenScriptBtn();
+      showToast('🧬 Сценарий серии переписан под правки. Проверь и «Прими сценарий», чтобы пере-извлечь персонажей.');
+    } else {
+      showToast('Готово, но ответ без сценария — обнови страницу.');
+    }
+  } catch (e) {
+    showToast('Ошибка: ' + e.message);
+  } finally {
+    if (btn) { btn.disabled = false; updateApplyRevisionsBtn(); }
+  }
 }
 
 async function openScriptHistory() {
@@ -8493,7 +8876,12 @@ function _parseScriptScenes(scriptText, overrides) {
   //            Still respected so old projects don't lose their tweaks.
   const overridePairMap = new Map();   // 's0a3' → 'merge'|'break'
   const overrideAnchorMap = new Map(); // 'Ethan:' → 'merge'|'break'  (legacy)
-  for (const o of (overrides || [])) {
+  // Defensive: callers must pass an ARRAY of override entries. Some headless
+  // paths (standalone parallel runner, music kick-off) historically passed `{}`
+  // meaning "no overrides" — but `{}` is truthy and NOT iterable, so the for-of
+  // below threw «(overrides || []) is not iterable» and crashed the whole run.
+  // Coerce any non-array (incl. {} / null / undefined) to an empty list.
+  for (const o of (Array.isArray(overrides) ? overrides : [])) {
     if (!o || !(o.action === 'break' || o.action === 'merge')) continue;
     if (typeof o.sceneIdx === 'number' && typeof o.autoSeg === 'number') {
       overridePairMap.set(`s${o.sceneIdx}a${o.autoSeg}`, o.action);
@@ -9149,8 +9537,11 @@ function _renderScenesHTML(scenes, coverage = []) {
     else if (r.status === 'failed') stats.failed++;
     else stats.pending++;
   }
-  // Auto-mode state for the button label
-  const autoActive = (typeof AUTO !== 'undefined') && AUTO.active;
+  // Auto-mode state for the button label — per-episode aware so the button on
+  // episode N reflects N's own run, even when other episodes run in parallel.
+  const autoActive = (typeof _autoRunForEpisode === 'function')
+    ? !!_autoRunForEpisode(S?.seriesId, S?.episode?.number)
+    : ((typeof AUTO !== 'undefined') && AUTO.active);
   const autoErr    = (localStorage.getItem('auto_error_mode') || 'heal');  // 'heal' | 'stop'
   const autoMode   = (localStorage.getItem('auto_mode_kind')  || 'sequential'); // 'sequential' | 'turbo'
   const seqTip = 'ПОСЛЕДОВАТЕЛЬНО — каждый чанк ждёт предыдущий, ему передаётся last frame видео + кадры перед склейками для непрерывности. Дольше, но качество и консистентность мизансцены лучше. Галочки lastframe/cutframes в Seedance-панели игнорируются — режим всегда включён.';
@@ -10093,6 +10484,76 @@ function _autoAllRuns() {
   return out;
 }
 
+// ── Manual parallel auto-mode — up to 3 episodes at once ───────────────────
+// The user can launch Auto-mode on several episodes of the same series
+// simultaneously (e.g. open ep.1 → ▶, open ep.2 → ▶). The PRIMARY run keeps
+// using the global AUTO singleton (full turbo / skip-filter / confirm path);
+// each ADDITIONAL run on another episode spins up as a self-contained
+// standalone run (`_runEpisodeAutoStandalone`) registered in AUTO_RUNS — the
+// same engine range-gen uses, so the backend is already proven safe with up to
+// 3 concurrent per-episode pipelines of one series. The ceiling matches the
+// range-gen concurrency cap.
+const MAX_CONCURRENT_AUTO = 3;
+
+// The live (non-suspended) run targeting a specific episode, or null. Makes the
+// toolbar button per-episode aware (start vs stop THIS episode) and refuses
+// double-launching the same episode.
+function _autoRunForEpisode(sid, num) {
+  if (!sid || num == null) return null;
+  if (AUTO.active && AUTO._epSid === sid && AUTO._epNumber === num) return AUTO;
+  const r = AUTO_RUNS.get(`${sid}:${num}`);
+  if (r && r.active && !r.suspended && r !== AUTO) return r;
+  return null;
+}
+
+// Count of live (non-suspended) auto-mode runs across the whole app — primary
+// AUTO + every standalone run (manual-parallel and range-gen). Gates the cap.
+function _autoActiveRunCount() {
+  return _autoAllRuns().filter(r => !r.suspended).length;
+}
+
+// Stop just ONE episode's run (per-episode toolbar / widget button). Other
+// parallel runs keep going. Returns true if a run was found and signalled.
+function _stopAutoRunForEpisode(sid, num) {
+  const r = _autoRunForEpisode(sid, num);
+  if (!r) return false;
+  r.cancelRequested = true;
+  showToast(`⏸ Auto-mode эп.${num} остановится после текущего шага…`, 3000);
+  _autoUpdateStatusUI();
+  return true;
+}
+
+// Refresh the in-episode toolbar button + inline status so they reflect the
+// CURRENTLY-OPEN episode's run (not the global singleton). Called from the
+// floating-widget update so it stays in sync for both primary and standalone
+// runs, including after navigation between episodes.
+function _autoRefreshToolbarBtn() {
+  const sid = (typeof S !== 'undefined' && S) ? S.seriesId : null;
+  const num = (typeof S !== 'undefined' && S && S.episode) ? S.episode.number : null;
+  const myRun = _autoRunForEpisode(sid, num);
+  const btn = document.getElementById('auto-mode-btn');
+  if (btn) {
+    btn.innerHTML = myRun
+      ? '⏸ Стоп — остановить генерацию серии'
+      : '🎬 Сгенерировать всю серию в Seedance';
+    btn.className = myRun ? 'btn-danger' : 'btn-accent';
+  }
+  const el = document.getElementById('auto-status');
+  if (el) {
+    if (!myRun) {
+      el.textContent = (!AUTO.active && (AUTO.completedCount || AUTO.cursor) > 0 && AUTO.total > 0)
+        ? `Завершено: ${AUTO.completedCount || AUTO.cursor}/${AUTO.total}`
+        : '';
+    } else {
+      const done = myRun.completedCount || 0;
+      const mode = myRun.parallel
+        ? 'паралл.'
+        : ((myRun.activeChains || 0) > 1 ? `сцены × ${myRun.activeChains}` : 'последов.');
+      el.textContent = `Auto-mode (${mode}) · ${done}/${myRun.total || 0} · ${myRun.lastStatus || '...'}`;
+    }
+  }
+}
+
 // ── Persistence — survive page refresh ─────────────────────────────────────
 // The JS loop dies on refresh (any open Seedance jobs still finish on the
 // backend), so we serialize active-run state to localStorage. On next page
@@ -10304,31 +10765,12 @@ function _autoCollectSegments(opts = {}) {
 }
 
 function _autoUpdateStatusUI() {
-  const el = document.getElementById('auto-status');
-  const btn = document.getElementById('auto-mode-btn');
-  if (btn) {
-    btn.innerHTML = AUTO.active ? '⏸ Стоп Auto-mode' : '▶ Auto-mode';
-    btn.className = AUTO.active ? 'btn-danger' : 'btn-accent';
-  }
-  // Floating widget — visible everywhere on the site while AUTO runs, shows
-  // progress + percent + current status + stop button. Survives navigation
-  // (the AUTO loop continues on its captured epSid/epNumber regardless of
-  // which page is currently rendered).
+  // Floating widget — visible everywhere on the site while any run is active,
+  // shows progress + percent + current status + stop button. Survives
+  // navigation (each run continues on its captured epSid/epNumber regardless of
+  // which page is currently rendered). It also refreshes the per-episode
+  // toolbar button + inline status via _autoRefreshToolbarBtn().
   _autoUpdateFloatingWidget();
-  if (!el) return;
-  if (!AUTO.active) {
-    el.textContent = (AUTO.completedCount || AUTO.cursor) > 0 && AUTO.total > 0
-      ? `Завершено: ${AUTO.completedCount || AUTO.cursor}/${AUTO.total}`
-      : '';
-    return;
-  }
-  const done = AUTO.completedCount || 0;
-  const status = AUTO.lastStatus || '...';
-  let mode;
-  if (AUTO.parallel) mode = 'паралл.';
-  else if ((AUTO.activeChains || 0) > 1) mode = `сцены × ${AUTO.activeChains}`;
-  else mode = 'последов.';
-  el.textContent = `Auto-mode (${mode}) · ${done}/${AUTO.total} · ${status}`;
 }
 
 // ── Floating Auto-mode progress widget ─────────────────────────────────────
@@ -10345,6 +10787,9 @@ function _autoEnsureFloatingWidget() {
   return w;
 }
 function _autoUpdateFloatingWidget() {
+  // Keep the in-episode toolbar button + status in sync with the current
+  // episode's run (per-episode, not the global singleton).
+  try { _autoRefreshToolbarBtn(); } catch {}
   const rangeActive = (typeof RANGE !== 'undefined') && RANGE.active;
   const runs = _autoAllRuns();
   const active = runs.length > 0 || rangeActive;
@@ -10381,6 +10826,10 @@ function _autoUpdateFloatingWidget() {
     const resumeBtn = r.suspended
       ? `<button class="auto-float-resume" data-sid="${esc(r._epSid || '')}" data-ep="${esc(String(r._epNumber || ''))}" title="Возобновить — пропустит уже готовые чанки">▶ Продолжить</button>`
       : '';
+    // Per-run stop — kills just this episode, leaving other parallel runs alive.
+    const stopBtn = r.suspended
+      ? ''
+      : `<button class="auto-float-stop-row" data-sid="${esc(r._epSid || '')}" data-ep="${esc(String(r._epNumber || ''))}" title="Остановить только этот эпизод" style="margin-left:6px;background:none;border:0;color:inherit;cursor:pointer;opacity:.7;font-size:0.85rem">⏹</button>`;
     const spinHtml = r.suspended ? '⏸' : '<span class="auto-float-spin"></span>';
     return `
       <div class="auto-float-row${r.suspended ? ' auto-float-row-suspended' : ''}" data-sid="${esc(r._epSid || '')}" data-ep="${esc(String(r._epNumber || ''))}">
@@ -10388,7 +10837,7 @@ function _autoUpdateFloatingWidget() {
           ${spinHtml}
           <span class="auto-float-row-label">${esc(ep)}</span>
           <span class="auto-float-row-count">${total ? `${done}/${total} · ${pct}%` : '…'}</span>
-          ${resumeBtn}
+          ${resumeBtn}${stopBtn}
         </div>
         <div class="auto-float-bar"><div class="auto-float-bar-fill" style="width:${pct}%"></div></div>
         <div class="auto-float-status">${esc(mode)} · ${esc(r.lastStatus || '...')}</div>
@@ -10407,7 +10856,20 @@ function _autoUpdateFloatingWidget() {
   w.querySelector('.auto-float-stop')?.addEventListener('click', (ev) => {
     ev.stopPropagation();
     try { if (typeof stopRangeGen === 'function' && (typeof RANGE !== 'undefined') && RANGE.active) stopRangeGen(); } catch {}
-    try { if (typeof stopAutoMode === 'function') stopAutoMode(); } catch {}
+    // Stop EVERY run (primary AUTO + all standalone parallel runs), not just the
+    // singleton — otherwise the ⏸ in the header would leave parallel runs going.
+    try { _stopAllAutoRuns(); } catch {}
+    showToast('⏸ Останавливаю все авторежимы после текущего шага…', 3000);
+  });
+  // Per-row stop — cancels just that episode's run, leaving siblings running.
+  // Bound before the row-level navigation handler so the click isn't swallowed.
+  w.querySelectorAll('.auto-float-stop-row').forEach(btn => {
+    btn.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      const sid = btn.dataset.sid;
+      const ep  = parseInt(btn.dataset.ep, 10);
+      if (sid && !Number.isNaN(ep)) _stopAutoRunForEpisode(sid, ep);
+    });
   });
   // Resume buttons on suspended rows — must run BEFORE the row-level
   // navigation handler binds, otherwise the row click intercepts the button.
@@ -10507,8 +10969,12 @@ function appConfirm(opts) {
 }
 
 function _autoModeToggle() {
-  if (AUTO.active) stopAutoMode();
-  else startAutoMode();
+  // Per-episode toggle: if THIS episode has a live run, stop just it; otherwise
+  // start a run (primary if the singleton is free, else a parallel standalone).
+  const sid = (typeof S !== 'undefined' && S) ? S.seriesId : null;
+  const num = (typeof S !== 'undefined' && S && S.episode) ? S.episode.number : null;
+  if (_autoRunForEpisode(sid, num)) { _stopAutoRunForEpisode(sid, num); return; }
+  startAutoMode();
 }
 
 function stopAutoMode() {
@@ -10534,15 +11000,33 @@ function clog(level, event, fields = {}) {
 
 async function startAutoMode() {
   clog('INFO', 'auto.entry', { sid: S.seriesId || null, ep: S.episode?.number ?? null });
-  if (AUTO.active) {
-    clog('WARN', 'auto.bail', { reason: 'already_active' });
-    showToast('Auto-mode уже активен');
-    return;
-  }
   if (!S.episode) {
     clog('WARN', 'auto.bail', { reason: 'no_episode' });
     showToast('⚠ Сначала открой эпизод');
     return;
+  }
+  const _sid = S.seriesId, _num = S.episode.number;
+  // Already running on THIS episode → ignore (the button shows Stop in that
+  // case; stopping is handled by _autoModeToggle, not here).
+  if (_autoRunForEpisode(_sid, _num)) {
+    clog('WARN', 'auto.bail', { reason: 'episode_already_running', ep: _num });
+    showToast(`Auto-mode уже идёт на эпизоде ${_num}`);
+    return;
+  }
+  // Global concurrency ceiling — at most MAX_CONCURRENT_AUTO live runs across
+  // the series at once (matches range-gen; the backend handles 3 concurrent
+  // per-episode pipelines safely).
+  if (_autoActiveRunCount() >= MAX_CONCURRENT_AUTO) {
+    clog('WARN', 'auto.bail', { reason: 'concurrency_cap', cap: MAX_CONCURRENT_AUTO });
+    showToast(`⚠ Уже идёт ${MAX_CONCURRENT_AUTO} авторежима одновременно — дождись или останови один (⏹ в виджете)`, 6000);
+    return;
+  }
+  // If the PRIMARY slot is busy on another episode, spin THIS episode up as an
+  // additional parallel run via the self-contained standalone engine. The rich
+  // primary path below (turbo / skip-filter / confirm) is reserved for the
+  // first/only run; parallel runs are sequential + scene-parallel.
+  if (AUTO.active) {
+    return _startParallelAutoMode(_sid, _num);
   }
   // Pre-flight: warn if any active char/loc lacks ref before kicking off N
   // chunks of generation. User often regrets discovering missing assets only
@@ -10587,7 +11071,7 @@ async function startAutoMode() {
       try {
         const epScript = (document.getElementById('ep-script')?.value || '').trim();
         if (epScript) {
-          const scenes = _parseScriptScenes(epScript, {});
+          const scenes = _parseScriptScenes(epScript, _segmentOverrides());
           const planMap = new Map();
           scenes.forEach((sc, sIdx) => {
             for (let g = 0; g < sc.segCount; g++) {
@@ -11324,6 +11808,83 @@ async function startAutoMode() {
   }
 }
 
+// ── Manual parallel launcher ───────────────────────────────────────────────
+// Spins the currently-open episode up as an ADDITIONAL auto-mode run while
+// another episode's run is already in flight. Runs the same pre-flight as the
+// primary path (missing-asset check + 15s-duration enforcement + confirm),
+// gathers params from the Seedance panel, then delegates to the proven
+// standalone engine. Always sequential / scene-parallel — turbo submits
+// everything at once and finishes fast, so it never needs a long-lived slot.
+async function _startParallelAutoMode(sid, num) {
+  // Pre-flight: don't burn compute on chunks with placeholder/random faces.
+  if (!await _confirmMissingAssetsBeforeGen('Auto-mode (видео-генерацию)')) {
+    clog('WARN', 'auto.parallel_bail', { reason: 'missing_assets_cancelled', ep: num });
+    return;
+  }
+  // Duration must be 15s — segmentation is calibrated around 15s chunks.
+  const durEl = document.getElementById('sd-duration');
+  const curDur = parseInt(durEl?.value, 10);
+  if (curDur !== 15) {
+    const ok = await appConfirm({
+      title: '⚠ Не та длительность Seedance',
+      message:
+        `Длительность Seedance стоит ${curDur || '?'}с, но Auto-mode калиброван под 15с.\n\n` +
+        `Поставить 15с автоматически и продолжить?`,
+      okText: 'Поставить 15с и запустить', cancelText: 'Отмена', okStyle: 'accent',
+    });
+    if (!ok) { clog('WARN', 'auto.parallel_bail', { reason: 'duration_cancelled', ep: num }); return; }
+    if (durEl) { durEl.value = '15'; durEl.dispatchEvent(new Event('change', { bubbles: true })); }
+  }
+  // Params from the Seedance panel — same controls the primary path reads.
+  const opts = {
+    useLastframe: true,         // sequential continuity always on
+    useCutframes: true,
+    useStyle: !!document.getElementById('sd-use-style')?.checked,
+    styleVal: (document.getElementById('sd-style')?.value || '').trim(),
+    baseOnly: !!document.getElementById('sd-base-only')?.checked,
+    closeUpOnly: !!document.getElementById('sd-close-up-only')?.checked,
+    duration: parseInt(document.getElementById('sd-duration')?.value, 10) || 15,
+    resolution: document.getElementById('sd-resolution')?.value || '720p',
+    moderation_bypass: document.getElementById('sd-mod-bypass')?.value || 'off',
+    model_tier: document.getElementById('sd-model-tier')?.value || 'reference-fast',
+    errorMode: localStorage.getItem('auto_error_mode') || 'heal',
+    enableMusic: S.series?.settings?.enable_music !== false,
+    maxParallelScenes: 2,
+    _manualParallel: true,
+  };
+  const liveCount = _autoActiveRunCount();
+  if (!await appConfirm({
+    title: '▶ Запустить ещё один Auto-mode параллельно?',
+    message:
+      `Эпизод ${num} запустится ПАРАЛЛЕЛЬНО с уже идущим(и) авторежимом(ами) (сейчас активно: ${liveCount}).\n` +
+      `Движок: последовательный (сцены внутри эпизода — параллельно).\n` +
+      `Уже готовые чанки и помеченные «skip» сегменты пропустятся.\n\n` +
+      `Максимум одновременно: ${MAX_CONCURRENT_AUTO} эпизода. Прогресс — в виджете справа внизу (⏹ останавливает только свой эпизод).`,
+    okText: '▶ Запустить', cancelText: 'Отмена', okStyle: 'accent',
+  })) {
+    clog('WARN', 'auto.parallel_bail', { reason: 'confirm_cancelled', ep: num });
+    return;
+  }
+
+  showToast(`▶ Auto-mode эп.${num} запущен параллельно`, 4000);
+  clog('INFO', 'auto.parallel_manual_start', { sid, ep: num, live: liveCount });
+  let res;
+  try {
+    res = await _runEpisodeAutoStandalone(sid, num, opts);
+  } catch (e) {
+    Sounds.playError();
+    showToast(`✗ Auto-mode эп.${num} упал: ${e.message || e}`, 8000);
+    return;
+  }
+  if (res && res.ok) {
+    Sounds.speak(`Episode ${num} generation finished.`);
+    showToast(`✓ Auto-mode эп.${num} завершён · ${res.completed}/${res.total}`, 6000);
+  } else if (res) {
+    Sounds.playError();
+    showToast(`⏸ Auto-mode эп.${num}: ${res.completed}/${res.total}${res.errors ? `, ошибок ${res.errors}` : ''}`, 7000);
+  }
+}
+
 // ── Standalone parallel auto-run for range-gen (concurrency > 1) ──────────
 // Self-contained per-episode auto-mode runner. Doesn't touch global AUTO so
 // multiple episodes can run concurrently without state collisions. Mirrors
@@ -11373,7 +11934,11 @@ async function _runEpisodeAutoStandalone(sid, num, opts = {}) {
     //    _autoCollectSegments). Reuses _parseScriptScenes which is pure.
     R.lastStatus = '⚙ строю сегменты...';
     _autoUpdateFloatingWidget();
-    const scenes = _parseScriptScenes(scriptText, {});  // no overrides in parallel mode
+    // Honor the episode's saved manual segment splits/merges if the fetched
+    // episode carries them; otherwise no overrides. MUST be an array — passing
+    // `{}` here used to crash the run with «(overrides || []) is not iterable».
+    const _ovr = Array.isArray(ep?.segment_overrides) ? ep.segment_overrides : [];
+    const scenes = _parseScriptScenes(scriptText, _ovr);
     const allSegs = [];
     scenes.forEach((sc, sIdx) => {
       for (let g = 0; g < sc.segCount; g++) {
@@ -11397,14 +11962,43 @@ async function _runEpisodeAutoStandalone(sid, num, opts = {}) {
       clog('WARN', 'parallel.no_segments', { sid: epSid, ep: epNumber, script_len: scriptText.length, scene_count: scenes.length });
       return { ok: false, completed: 0, total: 0, errors: 1 };
     }
-    R.segments = allSegs;
-    R.total = allSegs.length;
-    clog('INFO', 'parallel.built', { sid: epSid, ep: epNumber, total: allSegs.length, scenes: scenes.length });
+    // Resume-safe + skip-aware filter. Drop segments whose chunk is already
+    // completed on the backend (matched by script_order) so a re-launched run
+    // (manual parallel on a partial episode, or range-gen after a refresh)
+    // doesn't redo finished work, and honor the per-segment AUTO-skip flags
+    // persisted on the episode. For a brand-new episode both sets are empty, so
+    // this is a no-op — range-gen behaviour is unchanged.
+    const _existingChunks = (ep && ep.seedance_chunks) || [];
+    const _completedOrders = new Set(
+      _existingChunks
+        .filter(c => c && c.status === 'completed' && typeof c.script_order === 'number')
+        .map(c => c.script_order)
+    );
+    const _skipKeys = new Set((ep && ep.segment_auto_skips) || []);
+    const segs = allSegs.filter(s =>
+      !_completedOrders.has(s.scriptOrder) &&
+      !_skipKeys.has(`s${s.sceneIdx}g${s.segIdx}`)
+    );
+    if (!segs.length) {
+      clog('INFO', 'parallel.nothing_to_do', {
+        sid: epSid, ep: epNumber, total_raw: allSegs.length,
+        done: _completedOrders.size, skipped: _skipKeys.size,
+      });
+      // Nothing left to generate counts as success, not an error — the episode
+      // is already complete (or every remaining segment is skipped).
+      return { ok: true, completed: 0, total: 0, errors: 0 };
+    }
+    R.segments = segs;
+    R.total = segs.length;
+    clog('INFO', 'parallel.built', {
+      sid: epSid, ep: epNumber, total: segs.length, raw: allSegs.length,
+      done: _completedOrders.size, skipped: _skipKeys.size, scenes: scenes.length,
+    });
 
     // Group by scene for scene-parallel execution within the episode.
     const sceneGroups = (() => {
       const m = new Map();
-      for (const s of allSegs) {
+      for (const s of segs) {
         if (!m.has(s.sceneIdx)) m.set(s.sceneIdx, []);
         m.get(s.sceneIdx).push(s);
       }
@@ -11446,7 +12040,7 @@ async function _runEpisodeAutoStandalone(sid, num, opts = {}) {
       closeUpOnly: !!opts.closeUpOnly,
       duration: opts.duration || 15,
       resolution: opts.resolution || '720p',
-      moderation_bypass: opts.moderation_bypass || 'collage_grid',
+      moderation_bypass: opts.moderation_bypass || 'off',
       model_tier: opts.model_tier || 'reference-fast',
     };
 
@@ -11474,6 +12068,12 @@ async function _runEpisodeAutoStandalone(sid, num, opts = {}) {
         try {
           const res = await api.post(`/api/series/${epSid}/episodes/${epNumber}/seedance/poll`, {});
           polled = res.chunks || [];
+          // If the user is currently viewing THIS episode, animate the chunk
+          // grid live (parallel runs are watched manually, not just headless).
+          if (S.seriesId === epSid && S.episode?.number === epNumber) {
+            try { _sdNotifyTransitions(polled); } catch {}
+            try { sdRenderList(polled); } catch {}
+          }
         } catch (e) { polled = []; }
         const chunk = polled.find(c => c.idx === curIdx);
         if (!chunk) {
@@ -11830,19 +12430,22 @@ async function startRangeGen() {
         try {
           // Fetch episode script (may already be in memory if same episode).
           let epScript = '';
+          let epOverrides = [];   // MUST stay an array — _parseScriptScenes throws on {}
           if (S.episode?.number === epNum && S.seriesId === RANGE.seriesId) {
             epScript = document.getElementById('ep-script')?.value?.trim() || '';
+            epOverrides = _segmentOverrides();
           }
           if (!epScript) {
             const epJson = await api.get(
               `/api/series/${RANGE.seriesId}/episodes/${epNum}`
             );
             epScript = (epJson?.script || '').trim();
+            if (Array.isArray(epJson?.segment_overrides)) epOverrides = epJson.segment_overrides;
           }
           if (!epScript) return;
 
           // Parse script into scene groups (same helper as standalone runner).
-          const scenes = _parseScriptScenes(epScript, {});
+          const scenes = _parseScriptScenes(epScript, epOverrides);
           const planMap = new Map();
           scenes.forEach((sc, sIdx) => {
             for (let g = 0; g < sc.segCount; g++) {
@@ -16408,10 +17011,13 @@ function sdLoadPrefs() {
     const p = JSON.parse(localStorage.getItem('sd_prefs') || '{}');
     if (p.duration) document.getElementById('sd-duration').value = p.duration;
     if (p.resolution) document.getElementById('sd-resolution').value = p.resolution;
-    // moderation_bypass: per-series override > cartoon-style auto-default > global
+    // moderation_bypass default: Seedance no longer enforces grid-mode
+    // moderation, so every NEW series starts with bypass OFF. Only an explicit
+    // per-series override (user manually picked grid/collage_grid/cartoon for a
+    // risky show) survives — it does NOT carry over to other shows, and there is
+    // no cartoon-style or global last-used auto-default anymore.
     const seriesMod = S.seriesId ? localStorage.getItem(_sdModKey(S.seriesId)) : null;
-    const cartoonAuto = (!seriesMod && _seriesIsCartoonish(S.series)) ? 'cartoon' : null;
-    const finalMod = seriesMod || cartoonAuto || p.moderation_bypass;
+    const finalMod = seriesMod || 'off';
     if (finalMod) document.getElementById('sd-mod-bypass').value = finalMod;
     const cb = document.getElementById('sd-use-lastframe');
     if (cb && typeof p.use_prev_lastframe === 'boolean') cb.checked = p.use_prev_lastframe;
@@ -17627,7 +18233,7 @@ async function sdRetry(idx, btn) {
           ? _estimateChunkDurationSec(c.chunk_text, { fallback: c.duration || 15 })
           : (c.duration || 15),
         resolution: c.resolution || '720p',
-        moderation_bypass: c.moderation_bypass || 'collage_grid',
+        moderation_bypass: c.moderation_bypass || 'off',
         // Carry the source chunk's canonical script_order. Without this the
         // retry creates a no-position orphan, and the backend's auto-assemble
         // dedup keeps the OLD chunk for that script_order slot AND appends
