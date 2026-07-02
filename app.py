@@ -57,88 +57,23 @@ except ImportError:
     _AUTHLIB_AVAILABLE = False
 
 
-_TRANSLIT = {
-    'а':'a','б':'b','в':'v','г':'g','д':'d','е':'e','ё':'e','ж':'zh',
-    'з':'z','и':'i','й':'y','к':'k','л':'l','м':'m','н':'n','о':'o',
-    'п':'p','р':'r','с':'s','т':'t','у':'u','ф':'f','х':'h','ц':'ts',
-    'ч':'ch','ш':'sh','щ':'sch','ъ':'','ы':'y','ь':'','э':'e','ю':'yu','я':'ya',
-}
-
-def slugify(title):
-    """Convert series/character title to a safe folder name."""
-    s = ''.join(_TRANSLIT.get(c.lower(), c) if c.lower() in _TRANSLIT else c for c in title)
-    s = re.sub(r'[^\w\s-]', '', s)
-    s = re.sub(r'[\s_-]+', '_', s).strip('_')
-    return s[:40] or 'series'
-
-def asset_name(*parts):
-    """Create UPPER_SNAKE_CASE asset filename stem from name parts.
-    e.g. asset_name('Claire', 'Work Blazer') → 'CLAIRE_WORK_BLAZER'
-         asset_name("Sophie's Apartment") → 'SOPHIES_APARTMENT'
-    """
-    combined = '_'.join(str(p) for p in parts)
-    combined = re.sub(r"['\"]", '', combined)       # strip apostrophes/quotes
-    combined = re.sub(r'[^\w]+', '_', combined)     # non-word chars → underscore
-    return combined.upper().strip('_')
-
-
-# ── Scene heading detection (mirrors static/app.js _matchSceneHeading) ────────
-# Used by Seedance compose to skip scene headings as text anchors when locating
-# chunks in the script. Recognises BOTH formal (INT./EXT./ИНТ./...) AND inferred
-# headings (Локация:, СЦЕНА N, standalone ALL-CAPS slugs, [bracketed slugs])
-# so continuity logic survives in scripts that don't use INT./EXT.
-# `[\s*_#>]*` allows markdown decorators (**, __, #, >) before the cue.
-# Without it `**INT. RANCH HOUSE — MORNING**` silently fails detection.
-_SCENE_HEADING_FORMAL_RE = re.compile(
-    r'^[\s*_#>]*(INT\.|EXT\.|INT\.?\s*/\s*EXT\.?|I/E\.|ИНТ\.|ИНТА\.|ЭКСТ\.|ЭКС\.|НАТ\.|НАТУРА\.|ВНУТР\.|ИНТЕРЬЕР|ВНЕ\.|СНАРУЖИ)\s+',
-    re.IGNORECASE,
+from sw.utils import (
+    _TRANSLIT,
+    slugify,
+    asset_name,
 )
-_SCENE_HEADING_INFER_RE = re.compile(
-    # Time-coded beat ("0:00—0:05 — Hook" / "1:30 — On the way") added 2026-05-19
-    # — short-drama scripts often mark scene breaks by timestamp instead of
-    # INT./EXT. slug. Each beat tends to be a new location.
-    r'^[\s*_#>]*(Локация\s*[:：]|Location\s*[:：]|СЦЕНА\s*\d|Сцена\s*\d|SCENE\s*\d|\d{1,2}:\d{2}\s*[—–\-])',
-    re.IGNORECASE,
+
+from sw.scriptparse import (
+    _SCENE_HEADING_FORMAL_RE,
+    _SCENE_HEADING_INFER_RE,
+    _SLUG_BLOCKLIST_RE,
+    _TRANSITION_PREFIX_RE,
+    _LOWERCASE_LETTER_RE,
+    _UPPERCASE_LETTER_RE,
+    _is_all_caps_slug,
+    _is_bracket_slug,
+    is_scene_heading,
 )
-_SLUG_BLOCKLIST_RE = re.compile(
-    r'^(REVERSAL|END|FIN|КОНЕЦ|TBD|TBC|БИТ|BIT|HOOK|TWIST|CLIFFHANGER|КЛИФФХЭНГЕР|РАЗВОРОТ|ПАУЗА|ТИШИНА|FLASHBACK|FLASH BACK|MONTAGE|МОНТАЖ|VOICE OVER|V\.O\.|O\.S\.)$',
-    re.IGNORECASE,
-)
-_TRANSITION_PREFIX_RE = re.compile(r'^(FADE|CUT|DISSOLVE|SMASH|MATCH)\b', re.IGNORECASE)
-_LOWERCASE_LETTER_RE = re.compile(r'[a-zа-яё]')
-_UPPERCASE_LETTER_RE = re.compile(r'[A-ZА-ЯЁ]')
-
-def _is_all_caps_slug(t: str) -> bool:
-    """ALL-CAPS standalone slug like 'ДОМ АННЫ — НОЧЬ' or 'OFFICE — DAY'."""
-    if not t or len(t) < 5 or len(t) > 80: return False
-    if any(ch in t for ch in ':：[]'):     return False
-    if _LOWERCASE_LETTER_RE.search(t):      return False
-    if not _UPPERCASE_LETTER_RE.search(t):  return False
-    if _TRANSITION_PREFIX_RE.match(t):      return False
-    if _SLUG_BLOCKLIST_RE.match(re.sub(r'[\.\—\-\s]+$', '', t)): return False
-    return True
-
-def _is_bracket_slug(t: str) -> bool:
-    """Bracketed slug like '[КАФЕ — НОЧЬ]'. Inner must be uppercase only."""
-    m = re.match(r'^\[\s*([^\]]{3,80})\s*\]\s*$', t or '')
-    if not m: return False
-    inner = m.group(1).strip()
-    if _LOWERCASE_LETTER_RE.search(inner): return False
-    if _SLUG_BLOCKLIST_RE.match(inner):    return False
-    if _TRANSITION_PREFIX_RE.match(inner): return False
-    return True
-
-def is_scene_heading(line: str) -> bool:
-    """True if the line opens a new scene — formal (INT./EXT./ИНТ./...) OR inferred
-    (Локация:, СЦЕНА N, standalone ALL-CAPS slug, [bracketed slug])."""
-    if not line: return False
-    t = line.strip()
-    if not t: return False
-    if _SCENE_HEADING_FORMAL_RE.match(t): return True
-    if _SCENE_HEADING_INFER_RE.match(t):  return True
-    if _is_all_caps_slug(t):              return True
-    if _is_bracket_slug(t):               return True
-    return False
 
 app = Flask(__name__, static_folder='static', template_folder='templates')
 
@@ -165,123 +100,32 @@ app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB
 from werkzeug.middleware.proxy_fix import ProxyFix
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 
-BASE = Path(__file__).parent
-# DATA_ROOT holds per-user subfolders: <DATA_ROOT>/<email>/projects/<sid>/...
-# Override via env (DATA_ROOT=/var/lib/series-writer on the server).
-DATA_ROOT = Path(os.environ.get('DATA_ROOT') or (BASE / 'data')).resolve()
-DATA_ROOT.mkdir(parents=True, exist_ok=True)
-# Legacy path — used to one-time-migrate existing single-user data
-LEGACY_PROJECTS = BASE / 'projects'
-CONFIG_FILE = BASE / 'config.json'
-RETELLER_API   = 'https://reteller.ai/api/v1'
-AVAI_API       = 'https://avai-gen.com/api/public/generate'
-
-def _read_config_field(field):
-    """Read a key from config.json (legacy single-user dev fallback)."""
-    try:
-        if CONFIG_FILE.exists():
-            cfg = json.loads(CONFIG_FILE.read_text())
-            return (cfg.get(field) or '').strip()
-    except Exception:
-        pass
-    return ''
-
-def _load_secret(env_name, config_field=None):
-    """Resolve a secret in this order: env var → config.json field → empty.
-    Env wins so production deploys never accidentally fall back to a checked-in
-    legacy config (config.json is gitignored, but exists locally)."""
-    val = (os.environ.get(env_name) or '').strip()
-    if val:
-        return val
-    if config_field:
-        return _read_config_field(config_field)
-    return ''
-
-# Email of the user whose AVAI/Reteller keys default to the global env (the
-# operator who set up the system). Other users must enter their own keys.
-PRIMARY_USER_EMAIL = (os.environ.get('PRIMARY_USER_EMAIL') or 'v.privalov@gamegears.online').lower()
-
-def _user_keys_path(email):
-    """Per-user keys file: <DATA_ROOT>/<email-slug>/keys.json"""
-    safe = re.sub(r'[^a-z0-9]+', '_', (email or '').lower()).strip('_') or 'anon'
-    return DATA_ROOT / safe / 'keys.json'
-
-def _load_user_keys(email):
-    """Returns dict {avai_key, reteller_key} for this user (empty strings if not set)."""
-    p = _user_keys_path(email)
-    if not p.exists():
-        return {'avai_key': '', 'reteller_key': ''}
-    try:
-        d = json.loads(p.read_text())
-        return {
-            'avai_key': (d.get('avai_key') or '').strip(),
-            'reteller_key': (d.get('reteller_key') or '').strip(),
-        }
-    except Exception:
-        return {'avai_key': '', 'reteller_key': ''}
-
-def _save_user_keys(email, keys):
-    """Persist per-user keys. Caller passes a dict — only known fields are kept."""
-    p = _user_keys_path(email)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    safe = {
-        'avai_key': (keys.get('avai_key') or '').strip(),
-        'reteller_key': (keys.get('reteller_key') or '').strip(),
-    }
-    p.write_text(json.dumps(safe, indent=2))
-
+from sw.config import (
+    BASE,
+    DATA_ROOT,
+    LEGACY_PROJECTS,
+    CONFIG_FILE,
+    RETELLER_API,
+    AVAI_API,
+    _read_config_field,
+    _load_secret,
+    PRIMARY_USER_EMAIL,
+    _user_keys_path,
+    _load_user_keys,
+    _save_user_keys,
+)
 
 # ── Per-user app settings (auto-revise instruction, future toggles) ──────────
 # Stored separately from keys.json so concerns don't mix. Default-text mirrors
 # the colleague's `DEFAULT_AUTO_REVISE_INSTRUCTION` (src/shared/lib/auto-revise.ts)
 # but extended per the operator's preferred wording (see /Volumes/T7 S 2TB
 # screenshot — Settings → «Автоматическая правка» tab).
-DEFAULT_AUTO_REVISE_INSTRUCTION = (
-    'следи чтоб персонажи в чанках не перемещались незаметно в пространстве и не '
-    'появлялись из неотткуда и чтоб на видео было понятно кто что кому говорит , где '
-    'находится, что делает, куда передвигается, чтоб они внезапно не телепортировались '
-    'из ниоткуда или не меняли за кадром положение или состояние между чанками (между '
-    'концом одного чанка и началом другого.) Чанки должны монтажно между собой '
-    'склеиваться. и сохраняться общая стилистика.  Должно быть понятно что происходит '
-    'в серии с сохранением логики и диалогов. Внимательно следи за внешним видом/'
-    'состоянием персонажей и описывай состояние внешного вида в каждом чанке '
-    '(например наушник или кепка или что в руках держит). Следи за длинной реплик '
-    'особенно в конце чанка. Если есть риск что реплика не успеет произнестись по '
-    'факту - укороти реплики сохранив их смысл и эмоции.'
+from sw.config import (
+    DEFAULT_AUTO_REVISE_INSTRUCTION,
+    _user_settings_path,
+    _load_user_settings,
+    _save_user_settings,
 )
-
-def _user_settings_path(email):
-    safe = re.sub(r'[^a-z0-9]+', '_', (email or '').lower()).strip('_') or 'anon'
-    return DATA_ROOT / safe / 'settings.json'
-
-def _load_user_settings(email):
-    """Returns dict with auto-revise + future per-user UI prefs."""
-    p = _user_settings_path(email)
-    if not p.exists():
-        return {
-            'auto_revise_enabled': True,
-            'auto_revise_instruction': DEFAULT_AUTO_REVISE_INSTRUCTION,
-        }
-    try:
-        d = json.loads(p.read_text())
-        return {
-            'auto_revise_enabled': bool(d.get('auto_revise_enabled', True)),
-            'auto_revise_instruction': (d.get('auto_revise_instruction') or DEFAULT_AUTO_REVISE_INSTRUCTION).strip(),
-        }
-    except Exception:
-        return {
-            'auto_revise_enabled': True,
-            'auto_revise_instruction': DEFAULT_AUTO_REVISE_INSTRUCTION,
-        }
-
-def _save_user_settings(email, settings):
-    p = _user_settings_path(email)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    safe = {
-        'auto_revise_enabled': bool(settings.get('auto_revise_enabled', True)),
-        'auto_revise_instruction': (settings.get('auto_revise_instruction') or DEFAULT_AUTO_REVISE_INSTRUCTION).strip(),
-    }
-    p.write_text(json.dumps(safe, indent=2, ensure_ascii=False))
 
 # Thread-local override for background workers spawned outside Flask request
 # context. When a request handler spawns a daemon thread, Flask's `session` is
@@ -386,34 +230,14 @@ def _spawn_with_keys(target, *args, **kwargs):
     t.start()
     return t
 
-# All secrets are loaded once at startup. Env vars are the canonical source for
-# production; config.json is a dev-only convenience fallback.
-ANTHROPIC_KEY  = _load_secret('ANTHROPIC_API_KEY',  'anthropic_key')
-AVAI_KEY       = _load_secret('AVAI_API_KEY',       'avai_key')
-RETELLER_KEY   = _load_secret('RETELLER_API_KEY',   'reteller_key')
-ELEVENLABS_KEY = _load_secret('ELEVENLABS_API_KEY', 'elevenlabs_key')
-# OPENAI key used ONLY by the chunk-QC pipeline (Whisper language detection).
-# Optional — if missing, language QC stage degrades to a no-op (pass-through).
-OPENAI_KEY     = _load_secret('OPENAI_API_KEY',     'openai_key')
-
-# ── EXPERIMENTAL feature flags ──────────────────────────────────────────────
-# STRICT_CHAR_FILTER: drop ALL character refs from compose if their name is
-# not in chunk_text. Catches composer over-attaching characters from episode
-# roster (e.g. «Sophie sits in chair» when chunk only has Emma+Adrian dialogue).
-# Trial flag — easy rollback: flip to '0' or remove env var.
-# Risk: false-positive drop of chars who appear physically but aren't named
-# (e.g. «her hand visible at edge of frame» — hand's owner not named).
-# Dropped chars are logged in compose_warnings so the regression is visible.
-STRICT_CHAR_FILTER = os.environ.get('STRICT_CHAR_FILTER', '1') == '1'
-
-# Warn loudly at startup if anything is missing — easier than debugging 401s later.
-for _name, _val in (('ANTHROPIC_API_KEY',  ANTHROPIC_KEY),
-                    ('AVAI_API_KEY',       AVAI_KEY),
-                    ('RETELLER_API_KEY',   RETELLER_KEY),
-                    ('ELEVENLABS_API_KEY', ELEVENLABS_KEY),
-                    ('OPENAI_API_KEY',     OPENAI_KEY)):
-    if not _val:
-        print(f'[config] WARNING {_name} is not set — related features will fail')
+from sw.config import (
+    ANTHROPIC_KEY,
+    AVAI_KEY,
+    RETELLER_KEY,
+    ELEVENLABS_KEY,
+    OPENAI_KEY,
+    STRICT_CHAR_FILTER,
+)
 
 # ── Render queue ─────────────────────────────────────────────────────────────
 # Cap concurrent ffmpeg renders so N users don't all pin the CPU at once.
