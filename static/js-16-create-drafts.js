@@ -165,6 +165,57 @@ function setAppendMode(mode) {
     }
     // Surface landmark-attached generation if finale / nearest-checkpoint is set ahead.
     try { refreshAppendLandmarkBlock(); } catch (e) { /* ignore */ }
+    // Surface the source-drama continuation panel (re-analyze next episodes) if linked.
+    try { refreshSourceDramaPanel(); } catch (e) { /* ignore */ }
+  }
+}
+
+// Show the source-drama panel when the series is adapted from a real drama, so the
+// user can re-analyze the drama's next episodes and continue the series from them.
+function refreshSourceDramaPanel() {
+  const panel = document.getElementById('source-drama-panel');
+  if (!panel) return;
+  const s = S.series || {};
+  const src = s.source_drama || null;
+  if (!src || !(src.id || src.title)) { panel.style.display = 'none'; return; }
+  panel.style.display = '';
+  const titleEl = document.getElementById('source-drama-title');
+  const attrEl  = document.getElementById('source-drama-attr');
+  const anEl    = document.getElementById('source-drama-analyzed');
+  if (titleEl) titleEl.textContent = src.title || src.id;
+  const attrLabels = { exact: '', guessed: ' (источник определён приблизительно)', manual: ' (указан вручную)', unknown: ' (источник неизвестен)' };
+  if (attrEl) attrEl.textContent = attrLabels[src.attribution] || '';
+  const through = src.analyzed_through || (s.source_episode_outline || []).filter(x => (x || '').trim()).length;
+  if (anEl) anEl.textContent = through ? `Разобрано серий драмы: ${through}. Следующий доанализ начнётся с серии ${through + 1}.` : '';
+}
+
+// Re-analyze the source drama's next episode range and append the beats to the
+// series outline, then prefill the generate count so the user can write those episodes.
+async function analyzeMoreEpisodes(btn) {
+  const status = document.getElementById('analyze-more-status');
+  const count = Math.max(1, Math.min(5, parseInt(document.getElementById('analyze-more-count')?.value, 10) || 5));
+  const orig = btn ? btn.innerHTML : '';
+  if (btn) { btn.disabled = true; btn.innerHTML = '🔍 Анализируем драму…'; }
+  if (status) { status.style.color = 'var(--muted)'; status.textContent = 'Идёт веб-анализ следующих серий драмы (~1 мин)…'; }
+  try {
+    const r = await api.post(`/api/series/${S.seriesId}/analyze-more-episodes`, { count });
+    // Refresh the cached series so the panel + generation see the extended outline.
+    S.series = await api.get(`/api/series/${S.seriesId}`);
+    refreshSourceDramaPanel();
+    const [from, to] = r.range || [];
+    const beats = (r.beats || []).map((b, i) => `<li>Серия ${from + i}: ${esc(b)}</li>`).join('');
+    if (status) {
+      status.style.color = 'var(--success)';
+      status.innerHTML = `✓ Разобраны серии ${from}–${to}. Теперь сгенерируй их — жми «Сгенерировать сценарий».` +
+        (beats ? `<ol style="margin:6px 0 0 16px;padding:0;color:var(--muted)">${beats}</ol>` : '');
+    }
+    // Prefill the generate count with the newly analyzed range.
+    const cnt = document.getElementById('append-gen-count');
+    if (cnt && r.beats) cnt.value = String(r.beats.length);
+  } catch (e) {
+    if (status) { status.style.color = 'var(--danger)'; status.textContent = 'Ошибка: ' + (e.message || e); }
+  } finally {
+    if (btn) { btn.disabled = false; btn.innerHTML = orig; }
   }
 }
 

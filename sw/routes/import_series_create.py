@@ -126,6 +126,41 @@ def reextract_series(sid):
     return jsonify({'queued': len(targets), 'started': True}), 202
 
 
+# Max stored per-episode outline beats. Was a hard [:5] at create time; raised so
+# the outline can grow when the source drama is re-analyzed for later episode ranges
+# (6-10, 11-15…) via /api/series/<sid>/analyze-more-episodes.
+_OUTLINE_MAX = 40
+
+# Allowed attribution values for how confidently a series is tied to its source drama.
+_SOURCE_ATTRIBUTION = ('exact', 'guessed', 'manual', 'unknown')
+
+
+def _resolve_source_drama(raw, outline):
+    """Normalize the source-drama link carried in from the 'make series from top
+    drama' flow. Returns None when nothing usable was sent (no id and no title) so
+    manually-created series stay unlinked. `analyzed_through` records how many of the
+    drama's episodes are already laid out in source_episode_outline (used to compute
+    the next range when re-analyzing episodes 6-10, etc.)."""
+    if not isinstance(raw, dict):
+        return None
+    did = str(raw.get('id') or '').strip()
+    title = str(raw.get('title') or '').strip()
+    if not did and not title:
+        return None
+    attribution = str(raw.get('attribution') or 'exact').strip().lower()
+    if attribution not in _SOURCE_ATTRIBUTION:
+        attribution = 'exact'
+    n_outline = len([x for x in (outline or []) if str(x).strip()])
+    return {
+        'id': did,
+        'title': title,
+        'genre': str(raw.get('genre') or '').strip(),
+        'premise': str(raw.get('premise') or '').strip(),
+        'attribution': attribution,
+        'analyzed_through': n_outline,
+    }
+
+
 @app.route('/api/series', methods=['POST'])
 def create_series():
     data = request.json
@@ -154,7 +189,16 @@ def create_series():
         # Per-episode outline carried in from a deep-analyzed top drama: the
         # first episodes are written to these beats, with THIS series' own cast
         # (the source names in the beats are placeholders). See _source_outline_episode_block.
-        'source_episode_outline': [str(x).strip() for x in (data.get('source_episode_outline') or []) if str(x).strip()][:5],
+        'source_episode_outline': [str(x).strip() for x in (data.get('source_episode_outline') or []) if str(x).strip()][:_OUTLINE_MAX],
+        # Which real short drama this series is adapted from — id/title/premise +
+        # attribution confidence + analyzed_through (how many of the drama's episodes
+        # are already laid out in source_episode_outline). Enables continuing the
+        # series by re-analyzing the drama's later episodes. None for original series.
+        'source_drama': _resolve_source_drama(data.get('source_drama'), data.get('source_episode_outline')),
+        # Asian-recast flag from the "make series from top drama" flow: keep the
+        # source plot 1-to-1 but every character is Asian and the world is East-Asian.
+        # Reinforced in episode generation via _source_outline_episode_block.
+        'asian_recast': bool(data.get('asian_recast', False)),
         # Creative-writing model selector (ideas + episode scripts). Set at
         # creation time, can be overridden per-call from UI. Whitelist enforced
         # in _resolve_writer_model. Unknown / missing → default Claude.

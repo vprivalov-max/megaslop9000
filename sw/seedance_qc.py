@@ -447,25 +447,6 @@ def _qc_can_pass(chunk):
     return qc.get('status') in ('pass', 'retry_exhausted')
 
 
-
-    """Locations created before Seedance was added store only ref_images. Lazy-upload
-    the first ref to AVAI to get a public URL, persist it on the loc."""
-    if loc.get('avai_url'):
-        return loc['avai_url']
-    refs = loc.get('ref_images') or []
-    if not refs:
-        return None
-    local = series_path(sid) / refs[0]
-    if not local.exists():
-        return None
-    try:
-        url = _avai_upload_local_image(local)
-        loc['avai_url'] = url
-        return url
-    except Exception as e:
-        print(f'[seedance] loc upload failed for {loc.get("name")}: {e}')
-        return None
-
 def _ensure_loc_avai_url(sid, loc):
     """Lazy-upload the location's first local ref_image to AVAI when
     avai_url is missing. Persists the URL on the loc dict in-memory

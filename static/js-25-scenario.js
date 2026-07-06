@@ -273,6 +273,14 @@ async function findTopDramas() {
   }
 }
 
+// Reads the "Азиатская адаптация" toggle (either the board checkbox or the
+// picker checkbox). When on: the source plot is kept 1-to-1 but every character
+// is Asian and the world is re-set to an East-Asian setting.
+function _dramaAsianRecast() {
+  return !!(document.getElementById('drama-asian-recast')?.checked
+         || document.getElementById('drama-asian-recast-picker')?.checked);
+}
+
 async function makeSimilarFromDrama(index) {
   const wrap = document.getElementById('top-dramas-list');
   const d = wrap._dramas?.[index];
@@ -282,17 +290,19 @@ async function makeSimilarFromDrama(index) {
   wrap.classList.add('hidden');
   list.classList.add('hidden');
   list.innerHTML = '';
+  const asian = _dramaAsianRecast();
   // 1-TO-1: take the chosen hit's premise verbatim, retitle it, fill the form.
-  status.innerHTML = '<span class="spinner"></span> Готовим идею «' + esc(d.title) + '» 1-в-1...';
+  status.innerHTML = '<span class="spinner"></span> Готовим идею «' + esc(d.title) + '»' + (asian ? ' (азиатская адаптация)' : ' 1-в-1') + '...';
   status.style.color = 'var(--muted)';
   try {
     const genres = getSelectedGenres();
     const model = _selectedWriterModel('writer-model-create');
-    const ideas = await api.post('/api/ideas-from-drama', { drama: d, genres, model, ...getEraSetting() });
+    const ideas = await api.post('/api/ideas-from-drama', { drama: d, genres, model, asian_recast: asian, ...getEraSetting() });
     const idea = Array.isArray(ideas) ? ideas[0] : ideas;
     if (!idea) throw new Error('пустой ответ');
     fillSeriesForm(idea);
-    status.textContent = '✓ Идея «' + d.title + '» загружена 1-в-1 — проверь поля и жми «Создать сериал»';
+    window._pendingAsianRecast = asian;
+    status.textContent = '✓ Идея «' + d.title + '» загружена' + (asian ? ' (азиатская адаптация)' : ' 1-в-1') + ' — проверь поля и жми «Создать сериал»';
     status.style.color = 'var(--success)';
   } catch (e) {
     status.textContent = 'Ошибка: ' + e.message;
@@ -395,21 +405,27 @@ async function makeSeriesFromTopDrama(index) {
   const premise = a ? (a.detailed_synopsis || d.premise || '') : (d.premise || '');
   const premise_ru = a ? (a.detailed_synopsis_ru || d.premise_ru || '') : (d.premise_ru || '');
   const status = document.getElementById('top-dramas-status');
-  if (status) { status.textContent = 'Готовим сериал на основе «' + d.title + '»...'; status.style.color = 'var(--muted)'; }
+  const asian = _dramaAsianRecast();
+  if (status) { status.textContent = 'Готовим сериал на основе «' + d.title + '»' + (asian ? ' (азиатская адаптация)' : '') + '...'; status.style.color = 'var(--muted)'; }
   try {
-    const ideas = await api.post('/api/ideas-from-drama', { drama: { title: d.title, genre: d.genre, premise, premise_ru } });
+    const ideas = await api.post('/api/ideas-from-drama', { drama: { title: d.title, genre: d.genre, premise, premise_ru }, asian_recast: asian });
     const idea = Array.isArray(ideas) ? ideas[0] : ideas;
     if (!idea) throw new Error('пустой ответ');
     openCreateSeries();
     fillSeriesForm(idea);
     const outline = (a && Array.isArray(a.first_5_episodes) && a.first_5_episodes.length) ? a.first_5_episodes : null;
     window._pendingSeriesOutline = outline;
+    window._pendingAsianRecast = asian;
+    // Remember which drama this series is adapted from, so the created series can
+    // later be continued by re-analyzing the drama's next episodes (6-10, …).
+    window._pendingSourceDrama = { id: d.id, title: d.title, genre: d.genre, premise: (premise_ru || premise || ''), attribution: 'exact' };
     if (status) status.textContent = '';
     const gs = document.getElementById('series-gen-status');
     if (gs) {
+      const asianNote = asian ? ' Все персонажи — азиаты, азиатская тематика (сюжет сохранён).' : '';
       gs.textContent = outline
-        ? '✓ Идея «' + d.title + '» загружена. Первые ' + outline.length + ' серий напишутся по разбору (с новыми именами) — жми «Создать сериал»'
-        : '✓ Идея «' + d.title + '» загружена — проверь поля и жми «Создать сериал»';
+        ? '✓ Идея «' + d.title + '» загружена.' + asianNote + ' Первые ' + outline.length + ' серий напишутся по разбору (с новыми именами) — жми «Создать сериал»'
+        : '✓ Идея «' + d.title + '» загружена' + (asian ? ' (азиатская адаптация).' : '') + ' — проверь поля и жми «Создать сериал»';
       gs.style.color = 'var(--success)';
     }
   } catch (e) {
@@ -503,9 +519,13 @@ async function createSeries() {
       writer_model: _selectedWriterModel('writer-model-create'),
       target_duration_sec,
       source_episode_outline: window._pendingSeriesOutline || null,
+      asian_recast: !!window._pendingAsianRecast,
+      source_drama: window._pendingSourceDrama || null,
     });
     const _autoOutlineN = (window._pendingSeriesOutline || []).length;
     window._pendingSeriesOutline = null;
+    window._pendingAsianRecast = false;
+    window._pendingSourceDrama = null;
     closeModal('modal-create-series');
     _createSeriesDraftClear();
     if (data?._scaffold?.prproj_warning) {

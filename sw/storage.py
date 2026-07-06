@@ -177,6 +177,8 @@ def load_series(sid):
     data.setdefault('items', [])                         # story-relevant props (handbag, gun, locket...)
     data.setdefault('devices_index', {})                 # plot-device anti-repetition registry
     data.setdefault('cadence_policy', {'default_min_gap': 4, 'hard_limit': 3})
+    data.setdefault('source_drama', None)                # {id,title,genre,premise,attribution,analyzed_through} | None
+    data.setdefault('source_episode_outline', [])        # per-episode source beats (index i → episode i+1)
     # Cover art (short-drama style poster) — shown as background on the
     # project card in the main menu. Generated via /api/series/<sid>/cover/generate.
     data.setdefault('cover_image', '')          # rel path inside series dir, e.g. 'assets/cover.jpg'
@@ -284,6 +286,42 @@ def _expand_outfit_label_to_desc(label: str, char_appearance: str = '', char_gen
         return label
 
 
+# Russian-Cyrillic → Latin transliteration used ONLY to bridge Cyrillic script
+# cues (`ДА ХИ`, `СО ДЖИН`) to a Latin/romanized roster (`Lee Da Hee`,
+# `Kim Seo-jin`). `дж` is folded to `j` first so romanized Korean/CJK names land
+# on their English spelling (`ДЖИН`→`jin`, not `dzhin`).
+_CYR_DIGRAPHS = (('дж', 'j'),)
+_CYR2LAT = {
+    'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ё': 'yo',
+    'ж': 'zh', 'з': 'z', 'и': 'i', 'й': 'y', 'к': 'k', 'л': 'l', 'м': 'm',
+    'н': 'n', 'о': 'o', 'п': 'p', 'р': 'r', 'с': 's', 'т': 't', 'у': 'u',
+    'ф': 'f', 'х': 'h', 'ц': 'ts', 'ч': 'ch', 'ш': 'sh', 'щ': 'sch',
+    'ъ': '', 'ы': 'y', 'ь': '', 'э': 'e', 'ю': 'yu', 'я': 'ya',
+}
+
+
+def _translit_cyrillic_to_latin(s: str) -> str:
+    s = (s or '').lower()
+    for a, b in _CYR_DIGRAPHS:
+        s = s.replace(a, b)
+    return ''.join(_CYR2LAT.get(ch, ch) for ch in s)
+
+
+def _phonetic_fold(token: str) -> str:
+    """Collapse romanized-Korean long vowels + doubled letters to a single form
+    so a transliterated cue (`hi`, `so`, `hyon`) lines up with the roster's
+    romanization (`hee`, `seo`, `hyeon`). `ee→i`, `eo→o`, `oo→u`, then any
+    remaining doubled letter is de-duplicated (`lee→li`)."""
+    t = (token or '').lower()
+    t = t.replace('eo', 'o').replace('ee', 'i').replace('oo', 'u')
+    out = []
+    for ch in t:
+        if out and out[-1] == ch:
+            continue
+        out.append(ch)
+    return ''.join(out)
+
+
 def _resolve_char_by_script_name(script_name: str, chars: list) -> dict | None:
     """Match a character-name token taken from a script line (typically ALL-CAPS
     first name like `ADRIAN`, `MRS. VALE`) against the series character roster
@@ -296,6 +334,12 @@ def _resolve_char_by_script_name(script_name: str, chars: list) -> dict | None:
          pattern — scripts always use the first name in dialogue cues.
       3. Script name matches ANY whitespace-token in a character name
          (`VALE` ↔ `Mrs. Vale`) — last-name fallback.
+      4. Cyrillic cue vs Latin/romanized roster — the writer emits blocking cues
+         in Cyrillic (`ДА ХИ`) while the roster stores romanized names
+         (`Lee Da Hee`). Transliterate the cue, then require EVERY cue token to
+         fuzzy-match some name token; return the unambiguous best. Only fires
+         when tiers 1-3 found nothing AND the cue actually contains Cyrillic, so
+         pure-Latin projects are untouched.
 
     Returns the matching character dict, or None. If multiple chars match
     at the same tier the first one wins (stable order).
@@ -321,6 +365,28 @@ def _resolve_char_by_script_name(script_name: str, chars: list) -> dict | None:
         nm_parts = [p.rstrip('.,;:') for p in (c.get('name') or '').strip().lower().split()]
         if sn_first in nm_parts:
             return c
+    # Tier 4 — Cyrillic cue → romanized Latin roster (fuzzy, unambiguous only)
+    if re.search(r'[а-яё]', sn):
+        from difflib import SequenceMatcher
+        cue_tokens = [_phonetic_fold(t) for t in re.split(r'[\s\-]+', _translit_cyrillic_to_latin(sn)) if t]
+        if cue_tokens:
+            scored = []
+            for c in chars:
+                name_tokens = [_phonetic_fold(t) for t in re.split(r'[\s\-.,;:]+', (c.get('name') or '').lower()) if t]
+                if not name_tokens:
+                    continue
+                # every cue token must find a strong match in the name tokens;
+                # the character's score is the weakest of those best-matches.
+                per_token = [
+                    max((SequenceMatcher(None, ct, nt).ratio() for nt in name_tokens), default=0.0)
+                    for ct in cue_tokens
+                ]
+                scored.append((min(per_token), c))
+            scored.sort(key=lambda x: x[0], reverse=True)
+            if scored and scored[0][0] >= 0.72:
+                # require an unambiguous winner (avoids Student 1 vs Student 2 ties)
+                if len(scored) == 1 or scored[0][0] - scored[1][0] >= 0.08:
+                    return scored[0][1]
     return None
 
 

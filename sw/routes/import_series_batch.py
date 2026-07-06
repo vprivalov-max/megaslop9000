@@ -61,6 +61,49 @@ from sw.utils import slugify
 from sw.vision import _backfill_uploaded_char_appearances
 from sw.routes.import_series_worker import _import_worker, _split_script_into_episodes
 
+@app.route('/api/series/<sid>/analyze-more-episodes', methods=['POST'])
+def analyze_more_episodes(sid):
+    """Re-analyze the source drama's NEXT episode range and append the beats to the
+    series' source_episode_outline, so the series can be continued past its original
+    5-episode outline. Generation itself is unchanged: once the outline covers episodes
+    6-10, generate_script_batch + _source_outline_episode_block pick them up automatically.
+
+    Body: {count?: int (1-5, default 5)}
+    """
+    s = load_series(sid)
+    if not s:
+        return jsonify({'error': 'series not found'}), 404
+    src = s.get('source_drama') or {}
+    if not (src.get('id') or src.get('title')):
+        return jsonify({'error': 'no source drama linked'}), 400
+    body = request.json or {}
+    count = max(1, min(5, int(body.get('count') or 5)))
+    outline = [str(x) for x in (s.get('source_episode_outline') or [])]
+    analyzed_through = int(src.get('analyzed_through') or len([x for x in outline if x.strip()]))
+    ep_from = analyzed_through + 1
+    ep_to = ep_from + count - 1
+    # Context = the beats already laid out, so the continuation stays coherent.
+    context = '\n'.join(f'Эп.{i+1}: {b}' for i, b in enumerate(outline) if b.strip())
+    from sw.routes.ideas_dramas import _analyze_drama_range
+    try:
+        beats = _analyze_drama_range(src, ep_from, ep_to, context=context)
+    except Exception as e:
+        _log_event('WARN', 'analyze_more_episodes_fail', err=str(e)[:200])
+        return jsonify({'error': str(e)}), 500
+    if not beats:
+        return jsonify({'error': 'analysis returned no episodes'}), 502
+    # Pad so index i → episode i+1 stays aligned, then append the new beats.
+    while len(outline) < ep_from - 1:
+        outline.append('')
+    outline.extend(beats)
+    ep_to = ep_from + len(beats) - 1
+    s['source_episode_outline'] = outline
+    src['analyzed_through'] = ep_to
+    s['source_drama'] = src
+    save_series(sid, s)
+    return jsonify({'range': [ep_from, ep_to], 'beats': beats, 'analyzed_through': ep_to})
+
+
 @app.route('/api/series/<sid>/generate-script-batch', methods=['POST'])
 def generate_script_batch(sid):
     """Generate N new episodes for an existing series. Returns the generated
@@ -474,9 +517,14 @@ def generate_script_batch(sid):
         + f"Если больше {eff_spoken_ceiling} — сократи или перенеси в следующую серию. РОВНО ~{eff_duration}с на каждую серию.\n"
         + "Каждая серия начинается с СТРОГО строки 'Episode N: <title>' — без других маркеров. "
         + "Никакой markdown, никаких '===', никаких '#'. Только plain text. "
-        + ("Язык по контексту: если синопсис/направление на русском — пишем по-русски; "
-           "если на английском — по-английски.\n\n" if from_scratch else
-           "Язык — тот же что в предыдущих сериях (русский/английский/смесь — сохраняй стиль).\n\n")
+        + ("ЯЗЫК — СТРОГО ПО СТАНДАРТУ (не зависит от языка библии/синопсиса/предыдущих серий):\n"
+           "  • ДИАЛОГ (все реплики персонажей и VO) — ТОЛЬКО английский. Каждая произносимая строка на English.\n"
+           "  • ACTION-строки, ремарки, описания позиций в [BLOCKING]/[BLOCKING_END] — русский.\n"
+           "  • Заголовки сцен: часть-локация на English (см. правило про ИНТА. ENGLISH LOCATION выше).\n"
+           "  • Названия серий (Episode N: ...) и 'Кратко:' — русский.\n"
+           "  • Имена персонажей в репликах (NAME:) — ALL CAPS, точно как заданы, НЕ переводить.\n"
+           "⚠ Даже если библия/синопсис на русском — реплики ВСЁ РАВНО пиши по-английски: "
+           "downstream видео-генерация (Seedance) требует английский диалог, это нередактируемое требование стандарта.\n\n")
         + "ВАЖНО: возвращай ТОЛЬКО сценарий, без преамбулы 'Вот сценарий:' и без post-комментариев."
     )
     # Build narrative history + device history blocks for batch gen

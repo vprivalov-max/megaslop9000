@@ -542,6 +542,7 @@ async function confirmDeleteSeries(sid, title) {
 
 function openCreateSeries() {
   window._pendingSeriesOutline = null;
+  window._pendingAsianRecast = false;
   clearFields(['series-idea-input','new-series-title','new-series-genre','new-series-tone','new-series-audience','new-series-world','new-series-synopsis']);
   document.getElementById('series-ideas-list').classList.add('hidden');
   document.getElementById('series-ideas-list').innerHTML = '';

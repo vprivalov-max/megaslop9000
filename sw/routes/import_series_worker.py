@@ -60,6 +60,71 @@ from sw.textrules_sanitizer import _sanitize_appearance_for_moderation
 from sw.utils import slugify
 from sw.vision import _backfill_uploaded_char_appearances
 
+# ── Robust rewritten-script extraction ───────────────────────────────────────
+# The logic-heal endpoints ask Claude to return the FULL rewritten script. Doing
+# that as a JSON string value (`{"script": "...huge text..."}`) is fragile: on a
+# multi-KB script full of dialogue the model routinely breaks JSON escaping (a
+# raw quote or literal newline inside the string) and json.loads dies with
+# «Expecting ',' delimiter». Instead we have the model emit the script as PLAIN
+# TEXT between sentinels (no escaping needed) followed by a tiny changes JSON.
+_HEAL_SCRIPT_BEGIN = '<<<SCRIPT>>>'
+_HEAL_SCRIPT_END = '<<<END_SCRIPT>>>'
+
+# Prompt fragment describing the sentinel output format. Shared by both heal
+# endpoints so the parser and the instructions stay in lockstep.
+_HEAL_OUTPUT_FORMAT = (
+    "OUTPUT FORMAT — follow EXACTLY, emit nothing before or after:\n"
+    f"{_HEAL_SCRIPT_BEGIN}\n"
+    "<the full rewritten script here as PLAIN TEXT — real line breaks, real quotes, "
+    "NOT JSON-escaped, no surrounding quotes>\n"
+    f"{_HEAL_SCRIPT_END}\n"
+    '{"changes": [{"issue_index": <int>, "summary": "<1 sentence what you changed>"}]}\n'
+    "The block between the sentinels is copied verbatim as the script, so never "
+    "escape it and never wrap it in quotes or code fences. The changes line is "
+    "compact JSON on its own after the closing sentinel."
+)
+
+
+def _parse_healed_script(raw: str):
+    """Parse a logic-heal response into (script, changes).
+
+    Primary format: script between _HEAL_SCRIPT_BEGIN/_END sentinels + a small
+    trailing changes JSON. Robust to unescaped quotes/newlines in the script.
+    Falls back to the legacy strict-JSON {"script","changes"} shape so older
+    prompt variants / model drift still work. Returns (None, []) if neither
+    yields a non-empty script."""
+    text = raw or ''
+    if _HEAL_SCRIPT_BEGIN in text and _HEAL_SCRIPT_END in text:
+        start = text.index(_HEAL_SCRIPT_BEGIN) + len(_HEAL_SCRIPT_BEGIN)
+        end = text.index(_HEAL_SCRIPT_END, start)
+        script = text[start:end].strip('\n')
+        changes = []
+        tail = text[end + len(_HEAL_SCRIPT_END):]
+        m = re.search(r'[\[{].*[\]}]', tail, re.DOTALL)
+        if m:
+            try:
+                parsed = loads_lenient(m.group(0))
+                if isinstance(parsed, dict):
+                    changes = parsed.get('changes') or []
+                elif isinstance(parsed, list):
+                    changes = parsed
+            except Exception:
+                changes = []
+        if isinstance(script, str) and script.strip():
+            return script, (changes if isinstance(changes, list) else [])
+    # Legacy fallback: strict JSON with the script embedded as a string value.
+    try:
+        parsed = loads_lenient(strip_json(text))
+    except Exception:
+        return None, []
+    if isinstance(parsed, dict):
+        s = parsed.get('script')
+        c = parsed.get('changes') or []
+        if isinstance(s, str) and s.strip():
+            return s, (c if isinstance(c, list) else [])
+    return None, []
+
+
 # ── Import series from existing script ───────────────────────────────────────
 # Lets the user paste / upload a 70-episode script and get a fully populated
 # series in one shot: episodes split + chars/locs/items extracted per-episode.
@@ -561,22 +626,18 @@ def episodes_logic_apply_multi(sid):
         "Preserve EVERY '--- Episode N: Title ---' header line exactly. "
         "Preserve every other character and dialogue line verbatim. Only change what's "
         "strictly needed to address each listed issue. Keep the same language as the "
-        "original script. Output STRICT JSON, no prose, no markdown:\n"
-        '{"script": "full rewritten multi-episode text with \\n line breaks", '
-        '"changes": [{"issue_index": int, "summary": "1 sentence what you changed"}]}\n'
-        "issue_index is the 1-based number from the input list."
+        "original script.\n" + _HEAL_OUTPUT_FORMAT
     )
     user_msg = (
         f"=== MULTI-EPISODE SCRIPT TO PATCH ===\n{joined[:90000]}\n\n"
         f"=== ISSUES TO FIX ===\n{fixes_block}\n\n"
-        "Return the corrected full multi-episode text + per-issue change summary. JSON only."
+        "Return the corrected full multi-episode text (keeping every episode header) "
+        "+ per-issue change summary, in the required output format."
     )
     try:
         raw = claude_ask(user_msg, system=system, max_tokens=20000)
-        parsed = loads_lenient(raw)
-        new_script = parsed.get('script') if isinstance(parsed, dict) else None
-        changes = parsed.get('changes') if isinstance(parsed, dict) else []
-        if not isinstance(new_script, str) or not new_script.strip():
+        new_script, changes = _parse_healed_script(raw)
+        if not new_script:
             return jsonify({'error': 'LLM returned no script', 'raw': raw[:400]}), 500
     except Exception as e:
         _log_event('WARN', 'logic_apply_multi_llm_fail', err=str(e)[:200])
@@ -733,25 +794,19 @@ def import_from_script_apply_fixes():
         "other character and dialogue line verbatim. Only change what's strictly "
         "needed to address each listed issue (rewrite, add 1-2 lines for setup, "
         "remove a contradictory line — whichever is most surgical). "
-        "Keep the same language as the original script (Russian if Russian, English if English). "
-        "Output STRICT JSON, no prose, no markdown:\n"
-        '{\n'
-        '  "script":  "the full rewritten script as one string with \\n line breaks",\n'
-        '  "changes": [{"issue_index": int, "summary": "1 sentence what you changed"}]\n'
-        '}\n'
-        "issue_index is the 1-based number from the input list."
+        "Keep the same language as the original script (Russian if Russian, English if English).\n"
+        + _HEAL_OUTPUT_FORMAT
     )
     user_msg = (
         f"=== SCRIPT TO PATCH ===\n{script[:60000]}\n\n"
         f"=== ISSUES TO FIX ===\n{fixes_block}\n\n"
-        "Return the corrected full script + a short list of what you changed. JSON only."
+        "Return the corrected full script + a short list of what you changed, "
+        "in the required output format."
     )
     try:
         raw = claude_ask(user_msg, system=system, max_tokens=16000)
-        parsed = loads_lenient(raw)
-        new_script = parsed.get('script') if isinstance(parsed, dict) else None
-        changes = parsed.get('changes') if isinstance(parsed, dict) else []
-        if not isinstance(new_script, str) or not new_script.strip():
+        new_script, changes = _parse_healed_script(raw)
+        if not new_script:
             return jsonify({'error': 'LLM returned no script', 'raw': raw[:400]}), 500
         return jsonify({
             'script':  new_script,

@@ -61,6 +61,10 @@
       <span id="top-dramas-meta" style="font-size:0.72rem;color:var(--muted);font-weight:400"></span>
       <button onclick="event.preventDefault();refreshTopDramas()" id="btn-refresh-top-dramas" style="margin-left:auto;padding:6px 12px;border:none;border-radius:8px;background:linear-gradient(135deg,#ff6b35,#f7931e);color:#fff;font-weight:600;cursor:pointer;font-size:0.82rem">🔄 Обновить список</button>
     </summary>
+    <label style="display:flex;align-items:center;gap:8px;font-size:0.85rem;color:var(--muted);margin:8px 0;cursor:pointer;user-select:none">
+      <input type="checkbox" id="drama-asian-recast" style="width:16px;height:16px;cursor:pointer">
+      🌏 Азиатская адаптация — все персонажи азиаты, сюжет сохраняется
+    </label>
     <div id="top-dramas-status" style="font-size:0.82rem;color:var(--muted);margin:8px 0"></div>
     <div id="top-dramas-board" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px;margin-top:10px"></div>
   </details>
@@ -1152,6 +1156,10 @@
         <div class="idea-gen-actions" style="margin-top:8px">
           <button class="btn-idea-random" id="btn-find-top-dramas" onclick="findTopDramas()" style="background:linear-gradient(135deg,#ff6b35,#f7931e);color:#fff">🔥 Найти топовые шортдраммы</button>
         </div>
+        <label style="display:flex;align-items:center;gap:8px;font-size:0.82rem;color:var(--muted);margin:8px 0;cursor:pointer;user-select:none">
+          <input type="checkbox" id="drama-asian-recast-picker" style="width:16px;height:16px;cursor:pointer">
+          🌏 Азиатская адаптация — все персонажи азиаты, сюжет сохраняется
+        </label>
         <details style="margin:8px 0;background:rgba(132,94,247,0.04);border:1px solid rgba(132,94,247,0.15);border-radius:8px;padding:6px 12px">
           <summary style="cursor:pointer;font-size:0.82rem;color:var(--muted);user-select:none">🚫 Не предлагать (тропы / роли которые надоели)</summary>
           <textarea id="series-ideas-avoid" rows="2"
@@ -1604,6 +1612,24 @@
             </button>
           </div>
           <div id="append-landmark-status" style="font-size:0.82rem;color:var(--muted);margin-top:10px"></div>
+        </div>
+
+        <!-- Source-drama continuation: shown only for series adapted from a real drama.
+             Re-analyzes the drama's next episode range and appends beats to the outline. -->
+        <div id="source-drama-panel" style="display:none;margin-bottom:14px;padding:10px 12px;background:rgba(132,94,247,0.06);border:1px solid rgba(132,94,247,0.18);border-radius:8px">
+          <div style="font-size:0.85rem;line-height:1.5">
+            🎬 Сериал сделан по драме <b id="source-drama-title">—</b><span id="source-drama-attr" style="color:var(--muted)"></span>.
+            <span id="source-drama-analyzed" style="color:var(--muted)"></span>
+          </div>
+          <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:8px">
+            <button class="btn-ghost" id="analyze-more-btn" onclick="analyzeMoreEpisodes(this)" style="font-size:0.83rem">
+              📥 Доанализировать след. серии из драмы-источника
+            </button>
+            <label style="font-size:0.8rem;color:var(--muted)">серий:
+              <input type="number" id="analyze-more-count" min="1" max="5" value="5" style="width:56px">
+            </label>
+          </div>
+          <div id="analyze-more-status" style="font-size:0.8rem;color:var(--muted);margin-top:6px"></div>
         </div>
 
         <div class="field-group">

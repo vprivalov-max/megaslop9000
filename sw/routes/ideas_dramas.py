@@ -229,10 +229,38 @@ _TOP_DRAMAS_SCHEMA = """{
 }"""
 
 
-def _research_top_dramas(genres=None, idea_hint='', era_hint='', n=10):
+def _norm_drama_title(title):
+    """Normalized key for de-duping / exclusion (case + punctuation insensitive)."""
+    import re as _re
+    return _re.sub(r'[^a-z0-9]+', '', (title or '').lower())
+
+
+def _exclude_titles_block(exclude_titles):
+    """Prompt block that tells the researcher to AVOID titles already surfaced,
+    so repeated scans push past the same evergreen hits and find fresh ones."""
+    titles = [t for t in (exclude_titles or []) if str(t).strip()]
+    if not titles:
+        return ''
+    # Cap the injected list so the prompt stays lean; the newest exclusions
+    # (end of the list) matter most, so keep the tail.
+    shown = titles[-120:]
+    lines = '\n'.join(f'- {t}' for t in shown)
+    return (
+        "\n\nALREADY-FOUND — DO NOT RETURN ANY OF THESE (hard exclusion): earlier scans already surfaced the "
+        "shows below. The user has seen them. Return only DIFFERENT, fresh titles that are NOT in this list "
+        "(and not mere renamings/sequels of them). Dig deeper into the charts, other genres, newer releases and "
+        "rising titles to find genuinely NEW shows:\n"
+        f"{lines}\n"
+    )
+
+
+def _research_top_dramas(genres=None, idea_hint='', era_hint='', n=10, exclude_titles=None):
     """Live-web research of the ACTUAL top-performing short dramas, returned as a
     structured list (powers the 'Find top short dramas' button). Genre / hint /
-    era filter the search when given; otherwise the overall best across genres."""
+    era filter the search when given; otherwise the overall best across genres.
+    `exclude_titles` are shows already surfaced in prior scans — the researcher is
+    told to skip them and find NEW ones, so the board keeps growing instead of
+    repeating the same evergreen hits."""
     bits = []
     if genres:
         bits.append('genres: ' + ', '.join(genres))
@@ -241,6 +269,7 @@ def _research_top_dramas(genres=None, idea_hint='', era_hint='', n=10):
     if era_hint:
         bits.append(era_hint)
     brief = '; '.join(bits) if bits else 'the overall most popular, highest-rated and most-viewed vertical short dramas right now, across all genres'
+    exclude_block = _exclude_titles_block(exclude_titles)
     # Step 1 — live web research returns a PROSE list of real shows (the search
     # tool wraps output in commentary, so we do NOT ask it for JSON here).
     research_prompt = (
@@ -250,6 +279,7 @@ def _research_top_dramas(genres=None, idea_hint='', era_hint='', n=10):
         "GoodShort, ShortMax, NetShort and viral verticals on YouTube / TikTok. List 8-12 of the strongest "
         "REAL shows; for each give: title, one-line premise, genre/tone, why it hooks viewers, and any "
         "popularity signal (views / rating / chart position) you can find. Be concrete with real titles."
+        + exclude_block
     )
     digest = ''
     try:
@@ -270,18 +300,23 @@ def _research_top_dramas(genres=None, idea_hint='', era_hint='', n=10):
         f"{digest}\n\n"
         f"Convert it into STRICT valid JSON, {n}-12 entries, matching this schema. Output ONLY the JSON "
         f"(no prose, no code fences) and do NOT use the double-quote character inside any value:\n{_TOP_DRAMAS_SCHEMA}"
+        + exclude_block
     )
     raw = claude_ask_quality(fmt_prompt, system='You output ONLY strict valid JSON — no prose, no code fences, no commentary.') or ''
     data = loads_lenient(strip_json(raw))
     dramas = data.get('dramas', data) if isinstance(data, dict) else data
     if not isinstance(dramas, list):
         raise ValueError('top-dramas: no list parsed')
+    # Belt-and-suspenders: drop anything already seen even if the model slipped it back in.
+    _excluded = {_norm_drama_title(t) for t in (exclude_titles or []) if str(t).strip()}
     out = []
     for d in dramas:
         if not isinstance(d, dict):
             continue
         title = (d.get('title') or '').strip()
         if not title:
+            continue
+        if _norm_drama_title(title) in _excluded:
             continue
         out.append({
             'title': title,
@@ -307,9 +342,21 @@ def research_top_dramas():
         data_in.get('world_setting'), data_in.get('world_custom'),
     )
     era_hint = 'a non-modern era/world is set — surface period/world-appropriate hits' if era_dir else ''
+    store = _load_top_dramas()
+    exclude = _seen_titles_from_store(store)
     try:
-        dramas = _research_top_dramas(genres=genres, idea_hint=idea_hint, era_hint=era_hint)
-        print(f'[top-dramas] returned {len(dramas)} dramas', flush=True)
+        dramas = _research_top_dramas(genres=genres, idea_hint=idea_hint, era_hint=era_hint, exclude_titles=exclude)
+        print(f'[top-dramas] returned {len(dramas)} dramas (excluded {len(exclude)} seen)', flush=True)
+        # Remember what we just showed so the next research call rotates onward.
+        seen = list(store.get('seen_titles') or [])
+        seen_keys = {_norm_drama_title(x) for x in seen}
+        for d in dramas:
+            t = d.get('title')
+            if t and _norm_drama_title(t) not in seen_keys:
+                seen.append(t)
+                seen_keys.add(_norm_drama_title(t))
+        store['seen_titles'] = seen[-_SEEN_TITLES_MAX:]
+        _save_top_dramas(store)
         return jsonify({'dramas': dramas})
     except Exception as e:
         _log_event('WARN', 'top_dramas_fail', err=str(e)[:200])
@@ -324,10 +371,21 @@ ABSOLUTE RULE: do NOT reinterpret, do NOT invent a new profession, company, sett
 The ONLY new things you create: an original short English title (do NOT reuse the hit's own title) and the genre / tone / target_audience / world_description fields. Voice natural and short, PG-13 register, never vulgar sexual verbs in any language. synopsis in English and synopsis_ru in natural Russian, BOTH stating the premise 1-to-1. Return ONLY valid JSON for the given schema."""
 
 
-def _ideas_from_drama(drama, genres=None, era_hint='', writer_model=''):
+_IDEAS_ASIAN_SYSTEM = """You convert a proven short-drama HIT into a ready-to-use series concept, KEEPING THE MAIN STORY 1-TO-1 while RE-SETTING it into an East-Asian world with an all-Asian cast.
+
+WHAT STAYS IDENTICAL (the plot spine — do NOT change): the setup, the roles and their relationships, who hides what, who discovers what, the central conflict, the reveal, and the escalation. The story that happens is the SAME story as the hit — same beats, same twist. If the hit is «a wife discovers her humble husband is secretly a billionaire», the recast is still exactly that — a wife discovers her ordinary husband is secretly a billionaire — never a new profession, never a new twist.
+
+WHAT YOU RE-SKIN (the cultural surface only): relocate the story into ONE coherent East-Asian setting (e.g. China, South Korea, or Japan — pick the single one that best fits the genre and commit to it fully). EVERY character is ethnically Asian, with natural Asian names appropriate to the chosen country. The world, locations, customs, honorifics, family/social dynamics, food, festivals and texture are authentically Asian. Weave in culturally Asian themes that fit the same plot (filial duty, face/honor, family hierarchy, arranged-marriage pressure, chaebol/dynasty power, etc.) WITHOUT altering the plot spine.
+
+The ONLY new things you create: an original short English title (do NOT reuse the hit's own title), plus genre / tone / target_audience / world_description. The `world_description` MUST open by stating explicitly that the series is set in [the chosen Asian country] and that ALL characters are Asian, so downstream generation casts them correctly. Voice natural and short, PG-13 register, never vulgar sexual verbs in any language. synopsis in English and synopsis_ru in natural Russian, BOTH telling the SAME story as the hit, now in the Asian setting with Asian character names. Return ONLY valid JSON for the given schema."""
+
+
+def _ideas_from_drama(drama, genres=None, era_hint='', writer_model='', asian_recast=False):
     """Turn ONE chosen hit into a ready-to-use series concept that keeps its premise
     1-TO-1 (powers the per-card 'Сделать подобный сериал' button). No reinterpretation,
-    no invented specifics — the output IS the chosen drama's idea, just retitled."""
+    no invented specifics — the output IS the chosen drama's idea, just retitled.
+    When `asian_recast` is set: the PLOT stays 1-to-1 but the story is re-set in an
+    East-Asian world with an all-Asian cast (характеры-азиаты, азиатская тематика)."""
     title   = (drama.get('title') or '').strip()
     premise = (drama.get('premise_ru') or drama.get('premise') or '').strip()
     genre   = (drama.get('genre') or '').strip()
@@ -337,25 +395,44 @@ def _ideas_from_drama(drama, genres=None, era_hint='', writer_model=''):
     if era_hint:
         controls.append(era_hint)
     controls_s = ('\n'.join(controls) + '\n\n') if controls else ''
-    prompt = (
-        "The proven HIT to turn into a series, KEEPING ITS PREMISE 1-TO-1:\n"
-        f"TITLE: {title}\nGENRE: {genre}\nPREMISE: {premise}\n\n"
-        + controls_s
-        + "Produce exactly 1 series concept whose premise is the SAME as this hit — identical setup, roles and "
-          "reveal. Do NOT reinterpret it, do NOT invent a profession / company / setting / twist that is not in "
-          "the premise above, do NOT change who hides what or who discovers what. Keep it as clean and general as "
-          "the premise itself. Create only an original short title plus genre / tone / target_audience / "
-          "world_description.\n\n"
-        + "synopsis + synopsis_ru = 1-2 short sentences stating that EXACT premise (the same story as the hit). "
-          "Set the \"style\" field to \"logline\".\n\n"
-        + "JSON SAFETY: strict valid JSON; no double-quote character inside any value; no line breaks inside values.\n\n"
-        + f"Return JSON matching this schema (a single idea inside the ideas array):\n{_IDEAS_SCHEMA_V2}"
-    )
-    ideas = loads_lenient(strip_json(llm_ask(writer_model, prompt, system=_IDEAS_SIMILAR_SYSTEM)))
+    if asian_recast:
+        prompt = (
+            "The proven HIT to turn into a series, KEEPING ITS PLOT 1-TO-1 but RE-SET in an East-Asian world:\n"
+            f"TITLE: {title}\nGENRE: {genre}\nPREMISE: {premise}\n\n"
+            + controls_s
+            + "Produce exactly 1 series concept that tells the SAME story as this hit — identical setup, roles, "
+              "conflict, who-hides-what, reveal and escalation — but relocated into ONE coherent East-Asian setting "
+              "(China / South Korea / Japan — pick one and commit). EVERY character is ethnically Asian with natural "
+              "Asian names. Keep the plot spine untouched; only the cultural surface (setting, names, customs, "
+              "themes) becomes Asian. Do NOT invent a new profession / twist / reveal that is not in the premise.\n\n"
+            + "The world_description MUST open by stating the series is set in [chosen Asian country] and that ALL "
+              "characters are Asian. synopsis + synopsis_ru = 1-2 short sentences telling that EXACT same story in "
+              "the Asian setting, with Asian names. Set the \"style\" field to \"logline\".\n\n"
+            + "JSON SAFETY: strict valid JSON; no double-quote character inside any value; no line breaks inside values.\n\n"
+            + f"Return JSON matching this schema (a single idea inside the ideas array):\n{_IDEAS_SCHEMA_V2}"
+        )
+        system = _IDEAS_ASIAN_SYSTEM
+    else:
+        prompt = (
+            "The proven HIT to turn into a series, KEEPING ITS PREMISE 1-TO-1:\n"
+            f"TITLE: {title}\nGENRE: {genre}\nPREMISE: {premise}\n\n"
+            + controls_s
+            + "Produce exactly 1 series concept whose premise is the SAME as this hit — identical setup, roles and "
+              "reveal. Do NOT reinterpret it, do NOT invent a profession / company / setting / twist that is not in "
+              "the premise above, do NOT change who hides what or who discovers what. Keep it as clean and general as "
+              "the premise itself. Create only an original short title plus genre / tone / target_audience / "
+              "world_description.\n\n"
+            + "synopsis + synopsis_ru = 1-2 short sentences stating that EXACT premise (the same story as the hit). "
+              "Set the \"style\" field to \"logline\".\n\n"
+            + "JSON SAFETY: strict valid JSON; no double-quote character inside any value; no line breaks inside values.\n\n"
+            + f"Return JSON matching this schema (a single idea inside the ideas array):\n{_IDEAS_SCHEMA_V2}"
+        )
+        system = _IDEAS_SIMILAR_SYSTEM
+    ideas = loads_lenient(strip_json(llm_ask(writer_model, prompt, system=system)))
     ideas = ideas.get('ideas', ideas) if isinstance(ideas, dict) else ideas
     if not isinstance(ideas, list) or not ideas:
         raise ValueError('ideas-from-drama: no list parsed')
-    print(f'[ideas-from-drama] 1-to-1 concept from {title!r}', flush=True)
+    print(f'[ideas-from-drama] {"asian-recast" if asian_recast else "1-to-1"} concept from {title!r}', flush=True)
     return ideas
 
 
@@ -375,8 +452,9 @@ def ideas_from_drama():
         data_in.get('world_setting'), data_in.get('world_custom'),
     )
     era_hint = 'a non-modern era/world is set — keep every idea in that period/world' if era_dir else ''
+    asian_recast = bool(data_in.get('asian_recast'))
     try:
-        ideas = _ideas_from_drama(drama, genres=genres, era_hint=era_hint, writer_model=writer_model)
+        ideas = _ideas_from_drama(drama, genres=genres, era_hint=era_hint, writer_model=writer_model, asian_recast=asian_recast)
         return jsonify(ideas)
     except Exception as e:
         _log_event('WARN', 'ideas_from_drama_fail', err=str(e)[:200])
@@ -399,16 +477,23 @@ def _top_dramas_path():
     return DATA_ROOT / 'top_dramas.json'
 
 
+# Cap on the persisted display board. Older entries stay in `seen_titles` (so the
+# researcher keeps excluding them) even after they scroll off the visible board.
+_TOP_DRAMAS_DISPLAY_MAX = 80
+_SEEN_TITLES_MAX = 400
+
+
 def _load_top_dramas():
     try:
         p = _top_dramas_path()
         if p.exists():
             d = json.loads(p.read_text(encoding='utf-8'))
             if isinstance(d, dict):
+                d.setdefault('seen_titles', [])
                 return d
     except Exception as e:
         print(f'[top-dramas] load failed ({e.__class__.__name__})', flush=True)
-    return {'scanned_at': '', 'genres': [], 'dramas': []}
+    return {'scanned_at': '', 'genres': [], 'dramas': [], 'seen_titles': []}
 
 
 def _save_top_dramas(store):
@@ -416,6 +501,48 @@ def _save_top_dramas(store):
         _top_dramas_path().write_text(json.dumps(store, ensure_ascii=False, indent=1), encoding='utf-8')
     except Exception as e:
         print(f'[top-dramas] save failed ({e.__class__.__name__})', flush=True)
+
+
+def _seen_titles_from_store(store):
+    """Every title ever surfaced — union of the accumulated `seen_titles` and the
+    titles currently on the board — used to exclude repeats on the next scan."""
+    seen = list(store.get('seen_titles') or [])
+    seen += [d.get('title') for d in (store.get('dramas') or []) if isinstance(d, dict) and d.get('title')]
+    # De-dupe preserving order (keep first occurrence).
+    out, keys = [], set()
+    for t in seen:
+        k = _norm_drama_title(t)
+        if not k or k in keys:
+            continue
+        keys.add(k)
+        out.append(t)
+    return out
+
+
+def _merge_dramas(existing, fresh):
+    """Merge freshly-found dramas with the existing board: NEW ones go on top,
+    the previously-found ones are kept and pushed down (never dropped, up to the
+    display cap). De-dupe by normalized title; preserve any stored `analysis` on
+    dramas that reappear. Returns the merged display list."""
+    existing = [d for d in (existing or []) if isinstance(d, dict) and d.get('title')]
+    fresh = [d for d in (fresh or []) if isinstance(d, dict) and d.get('title')]
+    existing_by_key = {_norm_drama_title(d.get('title')): d for d in existing}
+    merged, keys = [], set()
+    # New finds first (skip any that are actually already on the board).
+    for d in fresh:
+        k = _norm_drama_title(d.get('title'))
+        if not k or k in keys or k in existing_by_key:
+            continue
+        keys.add(k)
+        merged.append(d)
+    # Then the previously-found ones, in their existing order (pushed down).
+    for d in existing:
+        k = _norm_drama_title(d.get('title'))
+        if k in keys:
+            continue
+        keys.add(k)
+        merged.append(d)
+    return merged[:_TOP_DRAMAS_DISPLAY_MAX]
 
 
 def _drama_slug(title, i):
@@ -481,6 +608,62 @@ def _analyze_drama(drama):
     }
 
 
+_DRAMA_RANGE_SCHEMA = """{
+  "episodes": ["Серия N: что происходит + клиффхэнгер", "Серия N+1: ...", "..."]
+}"""
+
+
+def _analyze_drama_range(drama, ep_from, ep_to, context=''):
+    """Web-research how episodes [ep_from, ep_to] of ONE real show unfold and return
+    a list of per-episode beats (same shape as _analyze_drama's first_5_episodes, but
+    for an arbitrary range). Powers continuing a series past its original outline.
+
+    `context` = what is already known / what the earlier episodes covered, so the new
+    beats continue coherently instead of restarting the story."""
+    title   = (drama.get('title') or '').strip()
+    premise = (drama.get('premise_ru') or drama.get('premise') or '').strip()
+    genre   = (drama.get('genre') or '').strip()
+    n = ep_to - ep_from + 1
+    ctx_block = f'\n\nWhat the earlier episodes already covered (continue from here, do NOT restart):\n{context}' if context else ''
+    research_prompt = (
+        f'Study the vertical short drama "{title}" ({genre}) as thoroughly as possible.\n'
+        f'Known premise: {premise}{ctx_block}\n\n'
+        f'Search the live web for how episodes {ep_from} through {ep_to} of THIS specific show unfold: '
+        'what happens in each of those episodes, how the conflict escalates, the twists and the cliffhanger '
+        'that closes each one. Be concrete and detailed, episode by episode.'
+    )
+    digest = ''
+    try:
+        digest = claude_web_research(research_prompt, system=_IDEAS_RESEARCH_SYSTEM, max_uses=6)
+        if digest and len(digest.strip()) > 40:
+            print(f'[analyze-drama-range] web ok for {title!r} eps {ep_from}-{ep_to}', flush=True)
+        else:
+            digest = ''
+    except Exception as e:
+        print(f'[analyze-drama-range] web failed ({e.__class__.__name__})', flush=True)
+        digest = ''
+    if not digest:
+        digest = claude_ask_quality(research_prompt, system=_IDEAS_RESEARCH_SYSTEM) or ''
+        print(f'[analyze-drama-range] fallback for {title!r} eps {ep_from}-{ep_to}', flush=True)
+    fmt_prompt = (
+        f'Here is research about episodes {ep_from}-{ep_to} of the short drama "{title}":\n\n{digest}\n\n'
+        f'Produce the per-episode breakdown as STRICT JSON. episodes = exactly {n} entries, one per episode '
+        f'for episodes {ep_from} through {ep_to} in order, each a concrete beat ending on a cliffhanger. '
+        'Output ONLY the JSON, no prose, and do NOT use the double-quote character inside any value:\n'
+        f'{_DRAMA_RANGE_SCHEMA}'
+    )
+    raw = claude_ask_quality(fmt_prompt, system='You output ONLY strict valid JSON — no prose, no code fences, no commentary.') or ''
+    data = loads_lenient(strip_json(raw))
+    if isinstance(data, list) and data:
+        data = data[0]
+    if not isinstance(data, dict):
+        raise ValueError('analyze-drama-range: no object parsed')
+    eps = data.get('episodes') or []
+    if not isinstance(eps, list):
+        eps = []
+    return [str(e).strip() for e in eps if str(e).strip()]
+
+
 @app.route('/api/top-dramas', methods=['GET'])
 def top_dramas_get():
     """Return the persisted top-dramas board (survives page reload)."""
@@ -499,20 +682,36 @@ def top_dramas_scan():
         data_in.get('world_setting'), data_in.get('world_custom'),
     )
     era_hint = 'a non-modern era/world is set — surface period/world-appropriate hits' if era_dir else ''
+    prev = _load_top_dramas()
+    exclude = _seen_titles_from_store(prev)
     try:
-        dramas = _research_top_dramas(genres=genres, idea_hint=(data_in.get('idea') or '').strip(), era_hint=era_hint)
+        dramas = _research_top_dramas(
+            genres=genres, idea_hint=(data_in.get('idea') or '').strip(),
+            era_hint=era_hint, exclude_titles=exclude,
+        )
     except Exception as e:
         _log_event('WARN', 'top_dramas_scan_fail', err=str(e)[:200])
         return jsonify({'error': str(e)}), 500
-    for i, d in enumerate(dramas):
-        d['id'] = _drama_slug(d.get('title'), i)
+    # Merge: new finds on top, previously-found kept and pushed down (not removed).
+    merged = _merge_dramas(prev.get('dramas'), dramas)
+    for i, d in enumerate(merged):
+        if not d.get('id'):
+            d['id'] = _drama_slug(d.get('title'), i)
+    # Accumulate the full seen-history so future scans keep excluding these titles
+    # even once they scroll off the visible board.
+    seen = _seen_titles_from_store(prev)
+    for d in dramas:
+        t = d.get('title')
+        if t and _norm_drama_title(t) not in {_norm_drama_title(x) for x in seen}:
+            seen.append(t)
     store = {
         'scanned_at': datetime.datetime.utcnow().isoformat() + 'Z',
         'genres': genres,
-        'dramas': dramas,
+        'dramas': merged,
+        'seen_titles': seen[-_SEEN_TITLES_MAX:],
     }
     _save_top_dramas(store)
-    print(f'[top-dramas] scanned + saved {len(dramas)}', flush=True)
+    print(f'[top-dramas] scan: {len(dramas)} new, {len(merged)} on board, {len(store["seen_titles"])} seen', flush=True)
     return jsonify(store)
 
 
