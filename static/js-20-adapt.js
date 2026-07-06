@@ -209,9 +209,9 @@ async function importAdaptToStandard(btn) {
   if (!script) { if (out) out.innerHTML = '<div style="color:var(--warning);font-size:0.85rem">Сценарий пустой</div>'; return; }
   const oldHtml = btn ? btn.innerHTML : '';
   if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Адаптирую…'; }
-  if (out) out.innerHTML = '<div style="font-size:0.85rem;color:var(--muted)"><span class="spinner"></span> Claude добавляет позиции, адаптирует диалоги и сканирует модерацию… ~30-60 сек</div>';
+  if (out) out.innerHTML = '<div style="font-size:0.85rem;color:var(--muted)"><span class="spinner"></span> Claude добавляет позиции, адаптирует диалоги и сканирует модерацию… ~1-4 мин (большой сценарий — дольше)</div>';
   try {
-    const r = await api.post('/api/adapt-script-to-standard', { script }, { timeoutMs: 180000 });
+    const r = await api.post('/api/adapt-script-to-standard', { script }, { timeoutMs: 600000 });
     if (r.error) throw new Error(r.error);
     ta.dataset.preAdaptSnapshot = script;
     ta.value = r.script;
@@ -246,9 +246,9 @@ async function appendAdaptToStandard(btn) {
   if (!script) { if (out) out.innerHTML = '<div style="color:var(--warning);font-size:0.85rem">Сценарий пустой</div>'; return; }
   const oldHtml = btn ? btn.innerHTML : '';
   if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Адаптирую…'; }
-  if (out) out.innerHTML = '<div style="font-size:0.85rem;color:var(--muted)"><span class="spinner"></span> Claude добавляет позиции, адаптирует диалоги и сканирует модерацию… ~30-60 сек</div>';
+  if (out) out.innerHTML = '<div style="font-size:0.85rem;color:var(--muted)"><span class="spinner"></span> Claude добавляет позиции, адаптирует диалоги и сканирует модерацию… ~1-4 мин (большой сценарий — дольше)</div>';
   try {
-    const r = await api.post('/api/adapt-script-to-standard', { script }, { timeoutMs: 180000 });
+    const r = await api.post('/api/adapt-script-to-standard', { script }, { timeoutMs: 600000 });
     if (r.error) throw new Error(r.error);
     ta.dataset.preAdaptSnapshot = script;
     ta.value = r.script;
@@ -281,9 +281,9 @@ async function epAdaptToStandard(btn) {
   if (!script) { if (out) out.innerHTML = '<div style="color:var(--warning);font-size:0.85rem">Сценарий пустой</div>'; return; }
   const oldHtml = btn ? btn.innerHTML : '';
   if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>…'; }
-  if (out) out.innerHTML = '<div style="font-size:0.85rem;color:var(--muted)"><span class="spinner"></span> Адаптирую под стандарт и сканирую модерацию… ~30-60 сек</div>';
+  if (out) out.innerHTML = '<div style="font-size:0.85rem;color:var(--muted)"><span class="spinner"></span> Адаптирую под стандарт и сканирую модерацию… ~1-4 мин (большой сценарий — дольше)</div>';
   try {
-    const r = await api.post('/api/adapt-script-to-standard', { script }, { timeoutMs: 180000 });
+    const r = await api.post('/api/adapt-script-to-standard', { script }, { timeoutMs: 600000 });
     if (r.error) throw new Error(r.error);
     ta.dataset.preAdaptSnapshot = script;
     ta.value = r.script;

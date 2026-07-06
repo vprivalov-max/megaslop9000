@@ -124,7 +124,7 @@ async function _runAppendPipeline(overlay) {
   // 1) ADAPT TO STANDARD
   if (autoPipeEnabled('adapt')) {
     overlay.set('adapt', 'run');
-    const r = await api.post('/api/adapt-script-to-standard', { script: getScript() }, { timeoutMs: 180000 });
+    const r = await api.post('/api/adapt-script-to-standard', { script: getScript() }, { timeoutMs: 600000 });
     if (r.error) throw new Error('Подгонка под стандарт: ' + r.error);
     if (r.script) { ta.dataset.preAdaptSnapshot = ta.value; ta.value = r.script; appendUpdateStats(); }
     overlay.set('adapt', 'done');
