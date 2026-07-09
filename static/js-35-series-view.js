@@ -271,7 +271,7 @@ async function checkLogicOnSelected() {
     const r = await api.post(
       `/api/series/${S.seriesId}/episodes/logic-check-multi`,
       { episode_numbers: validNums },
-      { timeoutMs: 240_000 }
+      { timeoutMs: 600_000 }
     );
     if (r.error) throw new Error(r.error);
     const issues = r.issues || [];

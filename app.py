@@ -516,6 +516,7 @@ from sw.routes.seedance_batch import (
 from sw.routes.seedance_compose import seedance_compose
 
 import sw.routes.timeline  # registers timeline routes
+import sw.routes.greenlight  # registers GREEN LIGHT playbook routes
 from sw.routes.seedance_run import (
     seedance_start,
     seedance_poll,

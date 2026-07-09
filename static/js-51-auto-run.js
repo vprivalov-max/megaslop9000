@@ -410,6 +410,7 @@ async function startAutoMode() {
         chunk_text: seg.text,
         duration: seg.durationSec || sharedOpts.duration, resolution: sharedOpts.resolution,
         moderation_bypass: sharedOpts.moderation_bypass,
+        mod_full_battery: true,   // auto-mode: on moderation block run the FULL bypass battery + wait
         model: sharedOpts.model_tier,
         script_order: (scriptOrder != null ? scriptOrder : (typeof seg.scriptOrder === 'number' ? seg.scriptOrder : null)),
         sceneIdx: seg.sceneIdx,
@@ -504,6 +505,7 @@ async function startAutoMode() {
             chunk_text: segText,
             duration: segDuration || sharedOpts.duration, resolution: sharedOpts.resolution,
             moderation_bypass: sharedOpts.moderation_bypass,
+            mod_full_battery: true,   // auto-mode: full bypass battery + wait
             model: sharedOpts.model_tier,
             refs: (composeRes.refs || []).map(r => ({
               kind: r.kind, id: r.id, outfit: r.outfit || null, url: r.url || null,
@@ -517,33 +519,13 @@ async function startAutoMode() {
         continue;
       }
       if (chunk.status === 'failed') {
-        if (AUTO.errorMode === 'heal' && healAttempts < sharedOpts.MAX_HEAL_RETRIES) {
-          healAttempts++;
-          AUTO.lastStatus = `🩹 лечу промпт #${curIdx}...`;
-          _autoUpdateStatusUI();
-          const healRes = await api.post(
-            `/api/series/${epSid}/episodes/${epNumber}/seedance/${curIdx}/heal-prompt`,
-            {}
-          );
-          const restart = await api.post(
-            `/api/series/${epSid}/episodes/${epNumber}/seedance/start`,
-            {
-              prompt: healRes.prompt || composeRes.prompt,
-              chunk_text: healRes.chunk_text || segText,
-              duration: segDuration || sharedOpts.duration, resolution: sharedOpts.resolution,
-              moderation_bypass: sharedOpts.moderation_bypass,
-              model: sharedOpts.model_tier,
-              refs: (composeRes.refs || []).map(r => ({
-                kind: r.kind, id: r.id, outfit: r.outfit || null, url: r.url || null,
-                source: r.source, prev_idx: r.prev_idx, name: r.name,
-                cut_index: r.cut_index, cut_time: r.cut_time,
-              })),
-            }
-          );
-          if (restart?.chunk?.idx != null) curIdx = restart.chunk.idx;
-          await sdRefreshList();
-          continue;
-        }
+        // Moderation recovery is now owned by the SERVER poll ladder (classify
+        // the block → cheapest LEGITIMATE fix → resubmit on the SAME chunk, no
+        // evasion, no dialogue/appearance mangling). While it works the chunk
+        // sits in 'moderation_blocked' (handled by the keep-polling fall-through
+        // below), and it only reaches 'failed' once the ladder is exhausted — so
+        // we must NOT re-heal here (that re-ran the old mangling path and spawned
+        // duplicate chunks). Just stop and surface the server's message.
         return { ok: false, chunk, error: chunk.error || 'failed' };
       }
       // processing / submitting / pending → keep polling
@@ -711,6 +693,7 @@ async function startAutoMode() {
                 prompt: prebuilt.prompt,
                 chunk_text: seg.text,
                 duration: segDur, resolution, moderation_bypass,
+                mod_full_battery: true,   // auto-mode (turbo): full bypass battery + wait
                 script_order: seg.scriptOrder,
                 sceneIdx: seg.sceneIdx,
                 segIdx: seg.segIdx,

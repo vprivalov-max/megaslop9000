@@ -70,20 +70,16 @@
   </details>
   <div class="projects-filterbar" id="projects-filterbar">
     <div class="filter-group">
-      <span class="filter-label">Цвет:</span>
-      <button class="color-filter-btn active" data-color="" onclick="setColorFilter('')" title="Все">∗</button>
-      <button class="color-filter-btn swatch-red"    data-color="red"    onclick="setColorFilter('red')"    title="Красный"></button>
-      <button class="color-filter-btn swatch-orange" data-color="orange" onclick="setColorFilter('orange')" title="Оранжевый"></button>
-      <button class="color-filter-btn swatch-yellow" data-color="yellow" onclick="setColorFilter('yellow')" title="Жёлтый"></button>
-      <button class="color-filter-btn swatch-green"  data-color="green"  onclick="setColorFilter('green')"  title="Зелёный"></button>
-      <button class="color-filter-btn swatch-teal"   data-color="teal"   onclick="setColorFilter('teal')"   title="Бирюза"></button>
-      <button class="color-filter-btn swatch-blue"   data-color="blue"   onclick="setColorFilter('blue')"   title="Синий"></button>
-      <button class="color-filter-btn swatch-purple" data-color="purple" onclick="setColorFilter('purple')" title="Фиолетовый"></button>
-      <button class="color-filter-btn swatch-pink"   data-color="pink"   onclick="setColorFilter('pink')"   title="Розовый"></button>
-      <button class="color-filter-btn swatch-gray"   data-color="gray"   onclick="setColorFilter('gray')"   title="Серый"></button>
+      <span class="filter-label">Метка:</span>
+      <button class="greenlight-filter-btn active" data-color="" onclick="setColorFilter('')" title="Показать все">Все</button>
+      <button class="greenlight-filter-btn is-green" data-color="green" onclick="setColorFilter('green')" title="Только GREEN LIGHT">💚 GREEN LIGHT</button>
     </div>
     <div class="filter-group">
       <button class="star-filter-btn" id="star-filter-btn" onclick="toggleStarFilter()" title="Только избранные">☆ Только избранные</button>
+    </div>
+    <div class="filter-group">
+      <button class="greenlight-playbook-btn" id="greenlight-playbook-btn" onclick="rebuildGreenLightPlaybook(this)" title="Пересобрать playbook: дистиллировать приёмы из GREEN LIGHT-серий и анализов топ-драм и подмешать в написатель">📗 Обучить написателя</button>
+      <span class="greenlight-playbook-status" id="greenlight-playbook-status"></span>
     </div>
     <div class="filter-group">
       <span class="filter-label">Сортировка:</span>

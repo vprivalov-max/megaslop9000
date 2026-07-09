@@ -1781,7 +1781,7 @@ def seedance_compose(sid, num):
                 if analysis_text:
                     # ── Script-pose override (Vision misread guard) ────────────
                     # Real production bug: «The Fox CEO's Trap» ep 1 — chunk 0's
-                    # script said «Fox Woman lies halfway under the car». Pixar
+                    # script said «a character in a hard pose». Pixar
                     # render botched the pose and drew her standing. Vision then
                     # honestly transcribed the broken render as «поза=стоит»
                     # for the POSTURE LOCK fed to chunk 1. Chunk 1 inherited
@@ -1810,19 +1810,18 @@ def seedance_compose(sid, num):
                 "ВАЖНО: базовые портреты персонажей (@Image1, @Image2...) показывают КАНОНИЧЕСКИЙ ВИД персонажа "
                 "ДО событий сцены. ТЕКУЩЕЕ СОСТОЯНИЕ — то что описано выше из continuity-кадров. "
                 "В SUBJECT/ACTION текущего промпта ОБЯЗАТЕЛЬНО отрази это состояние явными словами "
-                "(например: 'Maya, на губе кровь из разбитой губы, мокрые волосы, разорванная блузка, дрожит'). "
+                "(явно перечисли видимые изменения состояния персонажа из анализа выше). "
                 "НЕ описывай персонажей как «свежих» / в базовом виде — они продолжаются из прошлого кадра.\n\n"
                 "POSTURE/STATE LOCK ИЗ ЭТОГО АНАЛИЗА:\n"
                 "Состояние выше — это твой ENDING STATE предыдущего чанка. По умолчанию переноси его в начало "
                 "текущего чанка (поза стоя/сидя, где стоит, что в руках, физический контакт).\n"
                 "ВАЖНОЕ ИСКЛЮЧЕНИЕ — СЦЕНАРИЙ ВЫШЕ POSTURE LOCK'а: если CHUNK TEXT этого чанка ИЛИ предыдущего "
-                "явно описывает позу/положение которое ПРОТИВОРЕЧИТ анализу (например chunk_text: «Fox Woman lies "
-                "halfway under the car», а Vision-анализ говорит «Fox Woman стоит») — ВЕРЬ СЦЕНАРИЮ, не анализу. "
+                "явно описывает позу/положение которое ПРОТИВОРЕЧИТ анализу (например: сценарий описывает "
+                "нестандартную позу, а Vision-анализ — обычную стоячую) — ВЕРЬ СЦЕНАРИЮ, не анализу. "
                 "Vision-анализ может ошибаться когда предыдущий рендер не справился со сложной позой "
-                "(persona под машиной, на коленях, в нестандартной позе) и нарисовал её в дефолтной стоячей позе. "
+                "(на коленях, лёжа или в иной нестандартной позе) и нарисовал её в дефолтной стоячей позе. "
                 "Сценарий — ground truth, анализ — лучшая догадка по картинке. При конфликте: "
-                "  • В SUBJECT/ACTION пиши позу ИЗ СЦЕНАРИЯ («Fox Woman продолжает лежать наполовину под машиной, "
-                "    голова и плечи торчат наружу»).\n"
+                "  • В SUBJECT/ACTION пиши позу ИЗ СЦЕНАРИЯ — ровно так, как она описана в сценарии.\n"
                 "  • НЕ повторяй неправильную позу из анализа в первой строке ACTION.\n"
                 "Если в CHUNK явный глагол смены позы (садится, встаёт, выходит) — это нормальный переход, "
                 "выполняй сценарий.\n"
@@ -2036,8 +2035,8 @@ def seedance_compose(sid, num):
     # context, this echo reinforces «don't change pose» right before generation.
     if pose_lock_fallback in ('vision', 'ending_state', 'chunk_text_regex'):
         data['prompt'] = (data.get('prompt') or '').rstrip() + (
-            "\n\nКРИТИЧНО: позы из CHUNK TEXT (сценарий выше) — ground truth. Если сценарий говорит "
-            "«Fox Woman lies under the car», а POSTURE LOCK анализ говорит «стоит» — рендери "
+            "\n\nКРИТИЧНО: позы из CHUNK TEXT (сценарий выше) — ground truth. Если сценарий и POSTURE LOCK "
+            "анализ расходятся по позе — рендери "
             "позу ИЗ СЦЕНАРИЯ. Анализ полезен только когда сценарий не уточняет позу. "
             "Не меняй позы из головы — следуй сценарию + POSTURE LOCK как fallback. "
             "Continuity > свобода интерпретации."
@@ -2190,7 +2189,7 @@ def seedance_compose(sid, num):
     # 4) Named character VISIBLE in chunk_text but NOT in refs[]: AUTO-ADD.
     #    Composer-LLM repeatedly forgets to include characters doing visible
     #    actions even with explicit sysprompt rules (real prod: «Vice Beasts»
-    #    ep 1 chunks 6, 8, 9 — Leo dropped despite «Leo disappears in another
+    #    ep 1 chunks 6, 8, 9 — Leo dropped despite «a character exits in another
     #    direction»). Switched from warn-only to auto-fix on 2026-05-20.
     #
     #    Heuristic: character is VISIBLE if their name appears in chunk_text
@@ -2277,9 +2276,8 @@ def seedance_compose(sid, num):
                 data['prompt'] = (data.get('prompt') or '').rstrip() + (
                     f"\n\nДОБАВЛЕННЫЕ СЕРВЕРОМ ПЕРСОНАЖИ: {names_str} — composer "
                     f"пропустил их, но они УПОМЯНУТЫ в chunk_text сценарии вне диалога "
-                    f"(совершают visible action). Включи их в визуал согласно сценарию. "
-                    f"Если в действии написано «{actually_added[0]['name']} disappears in another direction» — "
-                    f"покажи это движение, не игнорируй персонажа."
+                    f"(совершают visible action). Включи их в визуал согласно сценарию — "
+                    f"покажи их движение согласно действию, не игнорируй персонажа."
                 )
                 compose_warnings.append({
                     'kind': 'named_char_auto_added_to_refs',

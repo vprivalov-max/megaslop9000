@@ -345,6 +345,93 @@ def _seedance_moderation_precheck(prompt_text):
         }
 
 
+# ── Moderation-block classification (legitimate-recovery ladder) ────────────
+# AVAI is undocumented publicly, so the exact block-response shape is unknown.
+# We classify BEST-EFFORT from a stringified blob of (error + raw + placeholder
+# url) so it works regardless of AVAI's field names, and we LOG the raw payload
+# verbatim on every block (see seedance_poll) to learn ground truth over time.
+# Per product decision we do NOT use evasion (grid/collage/cartoon) — the class
+# only steers which *legitimate* content fix the ladder applies.
+_MOD_HARD_RE  = re.compile(
+    r'minor|child|underage|csam'
+    r'|nud(?:e|ity)|porn|nsfw|sexual|explicit'
+    r'|celebrit|public[\s_-]?figure|deepfake',
+    re.IGNORECASE)
+_MOD_FACE_RE  = re.compile(
+    r'\bface|portrait|likeness|resembl|identit|real[\s_-]?person'
+    r'|input[\s_-]?image|reference[\s_-]?image',
+    re.IGNORECASE)
+_MOD_AUDIO_RE = re.compile(
+    r'audio|voice|speech|\bsong|music|lyric|soundtrack',
+    re.IGNORECASE)
+
+
+def _classify_moderation_block(raw, error='', video_url=''):
+    """Best-effort class of a Seedance/AVAI moderation block:
+      'hard'    — real person / NSFW / minors: no legitimate workaround → stop.
+      'face'    — reference-image face/likeness block: fix is swapping the
+                  reference photo, NOT editing the prompt → stop + surface.
+      'audio'   — audio/dialogue/song path block: fix is a minimal offending-
+                  line edit (voice is kept — it is the final deliverable).
+      'content' — generic prompt/output content block: fix is retry / action
+                  re-description.
+    Defaults to 'content' when nothing recognizable is present."""
+    try:
+        raw_str = json.dumps(raw, ensure_ascii=False)[:4000] if raw else ''
+    except Exception:
+        raw_str = str(raw)[:4000]
+    blob = ' '.join([str(error or ''), raw_str, str(video_url or '')])
+    if _MOD_HARD_RE.search(blob):
+        return 'hard'
+    if _MOD_FACE_RE.search(blob):
+        return 'face'
+    if _MOD_AUDIO_RE.search(blob):
+        return 'audio'
+    return 'content'
+
+
+# ── Render-prompt meta-instruction scrubber (submit-time safety net) ─────────
+# Legacy chunk prompts (composed BEFORE the compose-side cleanup) have Russian
+# meta-instructions / internal notes / the hardcoded pose example baked into
+# chunk['prompt']. Every re-submit path (heal / pass-moderation / retry / reuse)
+# sends that STORED prompt, so the junk still reaches AVAI. This strips the known
+# meta blocks at the LAST mile — every submit passes through _avai_seedance_start
+# — while KEEPING the real content (ТЕКУЩЕЕ СОСТОЯНИЕ state, ПОЗИЦИИ/ending_state,
+# clothing desc, camera framing, VOICE). Idempotent: a no-op on already-clean
+# (freshly composed) prompts.
+# The prompt STRUCTURE (positions, POSTURE LOCK, continuity, framing) is the
+# user's intentional design and must be KEPT. Only the hardcoded EXAMPLE phrases
+# baked into old stored prompts (the moderation-trigger "Fox Woman … under the
+# car", the "Maya … blood" example, the "{name} disappears" example) are
+# neutralized here — the last-mile net for legacy chunks re-submitted via heal /
+# pass-moderation / retry / reuse. New prompts (composer already cleaned) hit
+# these as no-ops. We do NOT strip any instruction block.
+_EXAMPLE_SUBS = [
+    (re.compile(r'Fox Woman lies halfway under the car', re.IGNORECASE), 'персонаж в нестандартной позе'),
+    (re.compile(r'Fox Woman lies under the car', re.IGNORECASE), 'персонаж в нестандартной позе'),
+    (re.compile(r'Fox Woman продолжает лежать наполовину под машиной,?\s*(?:голова и плечи торчат наружу)?'),
+     'персонаж в позе из сценария'),
+    (re.compile(r'Fox Woman стоит'), 'персонаж стоит'),
+    (re.compile(r'\bFox Woman\b'), 'персонаж'),
+    (re.compile(r"'Maya, на губе кровь из разбитой губы, мокрые волосы, разорванная блузка, дрожит'"),
+     'видимое состояние персонажа из анализа'),
+    (re.compile(r'persona под машиной, на коленях', re.IGNORECASE), 'на коленях, лёжа'),
+    (re.compile(r'«([^»]{1,40}) disappears in another direction»'), r'«\1 уходит в сторону»'),
+]
+
+
+def _strip_meta_instructions(prompt):
+    """Neutralize ONLY the hardcoded example phrases baked into legacy prompts
+    (Fox Woman / Maya-blood / disappears). Keeps the whole prompt STRUCTURE
+    (positions, POSTURE LOCK, framing, VOICE) intact. Idempotent."""
+    if not prompt:
+        return prompt
+    out = prompt
+    for rx, repl in _EXAMPLE_SUBS:
+        out = rx.sub(repl, out)
+    return out
+
+
 def _avai_kill_switch_status():
     """Returns dict {active, since, reason, file_path} for UI display.
     Always safe to call — handles missing file / parse errors gracefully."""
@@ -477,6 +564,19 @@ def _avai_seedance_start(prompt, ref_urls, duration, resolution, moderation_bypa
         except Exception:
             pass
         prompt = _clean_prompt
+    # Strip legacy meta-instruction junk baked into old stored prompts (the
+    # last-mile net — EVERY submit passes through here, incl. heal / pass-
+    # moderation / retry / reuse of chunks composed before the compose-side
+    # cleanup). Keeps content (state / positions / framing / clothing / VOICE),
+    # drops the noise + the hardcoded pose example. No-op on clean prompts.
+    _stripped = _strip_meta_instructions(prompt)
+    if _stripped != prompt:
+        try:
+            _log_event('INFO', 'avai_prompt_meta_stripped',
+                       removed_chars=len(prompt) - len(_stripped))
+        except Exception:
+            pass
+        prompt = _stripped
     # Hard rate-limit / circuit-breaker — fires BEFORE any AVAI network call
     # so cost is bounded regardless of caller bugs. Raises AVAICircuitBreakerError
     # if limits exceeded; caller must catch + show user-friendly error.

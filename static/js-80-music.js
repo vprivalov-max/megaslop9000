@@ -533,8 +533,8 @@ function _sdCardHTML(c, labelInfo) {
       ${canRetry ? `<button class="btn-ghost btn-sm" onclick="event.stopPropagation();sdRetry(${c.idx}, this)" title="Retry: тот же промпт+refs, новый чанк">🔁 Retry</button>` : '<span></span>'}
       <button class="btn-ghost btn-sm" onclick="event.stopPropagation();sdShowInScript(${c.idx})" title="Прокрутить вверх к сценарию и подсветить сегмент, к которому относится этот чанк">📜 В сценарии</button>
       <button class="btn-ghost btn-sm" onclick="event.stopPropagation();sdReuse(${c.idx})" title="Подставить параметры в форму выше">↻ Reuse</button>
-      ${c.status === 'failed' ? `<button class="btn-ghost btn-sm full-row" onclick="event.stopPropagation();sdHealAndReuse(${c.idx}, this)" title="Переписать промпт чтобы прошёл модерацию + Reuse">🩹 Лечить промпт</button>` : ''}
-      ${(c.status === 'failed' && (c.heal_count || 0) >= 1) ? `<button class="btn-ghost btn-sm full-row" style="color:var(--accent)" onclick="event.stopPropagation();sdRewriteChunk(${c.idx}, this)" title="Лечение не помогло — переписать сцену с нуля с учётом всей серии">✍️ Переписать сцену</button>` : ''}
+      ${c.status === 'failed' ? `<button class="btn-accent btn-sm full-row" onclick="event.stopPropagation();sdPassModeration(${c.idx}, this)" title="Автоматически прогонит весь легитимный арсенал (переописать действие → усиленно + смена ракурса → без части референсов → глубокий рерайт сцены), пересабмитит и подождёт, пока чанк пройдёт модерацию. Без сеток/обходов, голос сохраняется. Ничего жать больше не нужно.">🛡 Попробовать обойти модерацию</button>` : ''}
+      ${(c.status === 'failed' && (c.submit_count || 0) >= 8) ? `<button class="btn-ghost btn-sm full-row" onclick="event.stopPropagation();sdResetSubmitLimit(${c.idx}, this)" title="Обнулить счётчик сабмитов на этом чанке — снова разрешит до 8 генераций">🔓 Сбросить лимит (${c.submit_count}/8)</button>` : ''}
       <button class="btn-ghost btn-sm full-row" onclick="event.stopPropagation();sdDelete(${c.idx})">🗑 Удалить</button>
     </div>
   `;
@@ -663,8 +663,8 @@ function sdOpenChunkModal(idx) {
         ${videoUrl ? `<button class="btn-ghost btn-sm" onclick="sdAddToTimeline(${c.idx}, this)">➕ На таймлайн</button>` : ''}
         ${canRetry ? `<button class="btn-ghost btn-sm" onclick="sdRetry(${c.idx}, this)">🔁 Retry</button>` : ''}
         <button class="btn-ghost btn-sm" onclick="sdReuse(${c.idx});_sdCloseChunkModal()">↻ Reuse</button>
-        ${c.status === 'failed' ? `<button class="btn-ghost btn-sm" onclick="sdHealAndReuse(${c.idx}, this)">🩹 Лечить</button>` : ''}
-        ${(c.status === 'failed' && (c.heal_count || 0) >= 1) ? `<button class="btn-ghost btn-sm" style="color:var(--accent)" onclick="sdRewriteChunk(${c.idx}, this)" title="Переписать сцену с нуля с учётом всей серии">✍️ Переписать сцену</button>` : ''}
+        ${c.status === 'failed' ? `<button class="btn-accent btn-sm" onclick="sdPassModeration(${c.idx}, this)" title="Авто: прогнать весь легитимный арсенал (переописание → усиленно → без части референсов → глубокий рерайт), пока чанк не пройдёт модерацию. Без обходов, голос сохраняется.">🛡 Попробовать обойти модерацию</button>` : ''}
+        ${(c.status === 'failed' && (c.submit_count || 0) >= 8) ? `<button class="btn-ghost btn-sm" onclick="sdResetSubmitLimit(${c.idx}, this)" title="Обнулить счётчик сабмитов — снова разрешит до 8 генераций">🔓 Сбросить лимит (${c.submit_count}/8)</button>` : ''}
         <button class="btn-ghost btn-sm" onclick="if(confirm('Удалить эту генерацию?')){sdDelete(${c.idx});_sdCloseChunkModal()}" style="color:var(--danger)">🗑 Удалить</button>
       </div>
       <div style="font-size:0.78rem;color:var(--muted);margin-top:4px">Промпт, отправленный в Seedance:</div>

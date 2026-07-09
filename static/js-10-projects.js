@@ -17,6 +17,7 @@ async function loadProjects() {
   applyProjectFilters();
   loadBalance();
   loadTopDramas();
+  refreshGreenLightPlaybookStatus();
 }
 
 function _projectCreatedTs(s) {
@@ -83,7 +84,9 @@ function setSortMode(mode) {
   applyProjectFilters();
 }
 
-const COLOR_PALETTE = ['', 'red','orange','yellow','green','teal','blue','purple','pink','gray'];
+// GREEN LIGHT model: a series is either flagged 'green' (GREEN LIGHT — proven
+// strong statistics, fed into the writer's playbook) or has no mark. The legacy
+// multi-color palette was retired.
 
 function renderProjects(list) {
   const grid = document.getElementById('projects-grid');
@@ -102,7 +105,8 @@ function renderProjects(list) {
   }
   empty.classList.add('hidden');
   grid.innerHTML = list.map(s => {
-    const colorCls = s.color ? ` color-${s.color}` : '';
+    const isGreenLight = (s.color || '') === 'green';
+    const colorCls = isGreenLight ? ' color-green' : '';
     const starGlyph = s.starred ? '★' : '☆';
     const hasCover = !!s.cover_image;
     const coverUrl = hasCover
@@ -117,14 +121,15 @@ function renderProjects(list) {
       ? `<button class="project-cover-cta has" type="button" onmousedown="event.stopPropagation()" onclick="event.stopPropagation();event.preventDefault();openCoverViewer('${s.id}')" title="Открыть обложку, перегенерить или скачать">🖼 Обложка</button>`
       : `<button class="project-cover-cta" type="button" onmousedown="event.stopPropagation()" onclick="event.stopPropagation();event.preventDefault();generateCoverFromCard('${s.id}', this)" title="Создать обложку через AVAI (3:4 JPEG, использует синопсис + главных героев)">🎬 Сгенерить обложку</button>`;
     return `
-    <div class="project-card${s.pinned ? ' pinned' : ''}${colorCls}${coverCls}"${coverStyle} draggable="true" data-sid="${s.id}" data-title="${esc(s.title)}" onclick="if(event.target.closest('.project-delete-btn')||event.target.closest('.project-pin-btn')||event.target.closest('.project-star-btn')||event.target.closest('.project-color-btn')||event.target.closest('.project-cover-btn')||event.target.closest('.project-cover-cta')||event.target.closest('.project-color-popover'))return;navigate('series',{seriesId:'${s.id}'})">
+    <div class="project-card${s.pinned ? ' pinned' : ''}${colorCls}${coverCls}"${coverStyle} draggable="true" data-sid="${s.id}" data-title="${esc(s.title)}" onclick="if(event.target.closest('.project-delete-btn')||event.target.closest('.project-pin-btn')||event.target.closest('.project-star-btn')||event.target.closest('.project-greenlight-btn')||event.target.closest('.project-cover-btn')||event.target.closest('.project-cover-cta'))return;navigate('series',{seriesId:'${s.id}'})">
       <button class="project-pin-btn${s.pinned ? ' active' : ''}" type="button" onmousedown="event.stopPropagation()" ontouchstart="event.stopPropagation()" onclick="event.stopPropagation();event.preventDefault();togglePin('${s.id}')" title="${s.pinned ? 'Открепить' : 'Закрепить вверху'}">${s.pinned ? '📌' : '📍'}</button>
       <div class="project-card-tools">
         <button class="project-star-btn${s.starred ? ' active' : ''}" type="button" onmousedown="event.stopPropagation()" onclick="event.stopPropagation();event.preventDefault();toggleStar('${s.id}')" title="${s.starred ? 'Убрать из избранного' : 'В избранное'}">${starGlyph}</button>
-        <button class="project-color-btn" type="button" onmousedown="event.stopPropagation()" onclick="event.stopPropagation();event.preventDefault();openColorPicker(event,'${s.id}')" title="Цвет ячейки">🎨</button>
+        <button class="project-greenlight-btn${isGreenLight ? ' active' : ''}" type="button" onmousedown="event.stopPropagation()" onclick="event.stopPropagation();event.preventDefault();toggleGreenLight('${s.id}')" title="${isGreenLight ? 'Снять GREEN LIGHT' : 'Пометить GREEN LIGHT — сильная статистика, идёт в обучение написателя'}">💚</button>
         <button class="project-delete-btn" type="button" onmousedown="event.stopPropagation()" ontouchstart="event.stopPropagation()" onclick="event.stopPropagation();event.preventDefault();confirmDeleteSeries('${s.id}','${esc(s.title)}')" title="Удалить">✕</button>
       </div>
       <div class="project-card-content">
+        ${isGreenLight ? '<div class="greenlight-badge" title="GREEN LIGHT — подтверждённая сильная статистика; сценарии этой серии обучают написателя">GREEN LIGHT</div>' : ''}
         <h3>${esc(s.title)}</h3>
         <div class="meta">
           <span>${esc(s.genre || '—')}</span>
@@ -161,46 +166,11 @@ async function toggleStar(sid) {
   }
 }
 
-let _colorPopoverOpen = null;
-function openColorPicker(e, sid) {
-  // Close any prior popover
-  document.querySelectorAll('.project-color-popover').forEach(p => p.remove());
-  if (_colorPopoverOpen === sid) { _colorPopoverOpen = null; return; }
-  _colorPopoverOpen = sid;
-
-  const btn = e.currentTarget;
-  const card = btn.closest('.project-card');
-  const current = (_allProjects.find(x => x.id === sid)?.color) || '';
-  const pop = document.createElement('div');
-  pop.className = 'project-color-popover';
-  pop.innerHTML = COLOR_PALETTE.map(c => {
-    const isActive = c === current;
-    const cls = c ? `swatch-${c}` : 'swatch-clear';
-    return `<button class="color-swatch ${cls}${isActive ? ' active' : ''}" data-color="${c}" title="${c || 'Без цвета'}">${c ? '' : '∅'}</button>`;
-  }).join('');
-  card.appendChild(pop);
-
-  pop.querySelectorAll('.color-swatch').forEach(sw => {
-    sw.addEventListener('click', async (ev) => {
-      ev.stopPropagation();
-      const color = sw.dataset.color || '';
-      pop.remove();
-      _colorPopoverOpen = null;
-      await setProjectColor(sid, color);
-    });
-  });
-
-  // Click-outside closes the popover
-  setTimeout(() => {
-    const closer = (ev) => {
-      if (!pop.contains(ev.target)) {
-        pop.remove();
-        _colorPopoverOpen = null;
-        document.removeEventListener('click', closer, true);
-      }
-    };
-    document.addEventListener('click', closer, true);
-  }, 0);
+// GREEN LIGHT is a binary flag — toggle it directly, no color picker.
+async function toggleGreenLight(sid) {
+  const s = _allProjects.find(x => x.id === sid);
+  const next = (s && (s.color || '') === 'green') ? '' : 'green';
+  await setProjectColor(sid, next);
 }
 
 async function setProjectColor(sid, color) {
@@ -214,6 +184,46 @@ async function setProjectColor(sid, color) {
     if (s) s.color = prev;
     applyProjectFilters();
     alert('Не удалось задать цвет: ' + e.message);
+  }
+}
+
+// ── GREEN LIGHT playbook (the writer's "training" signal) ───────────────────
+function _formatPlaybookStatus(pb) {
+  if (!pb || !pb.exists) return 'playbook не собран — нажми «Обучить написателя»';
+  const src = pb.sources || {};
+  const nGreen = (src.green_series || []).length;
+  const nDramas = src.dramas_analyzed || 0;
+  let when = '';
+  try { when = pb.built_at ? new Date(pb.built_at).toLocaleString('ru-RU') : ''; } catch {}
+  return `playbook: ${nGreen} GREEN LIGHT-серий + ${nDramas} драм${when ? ' · ' + when : ''}`;
+}
+
+async function refreshGreenLightPlaybookStatus() {
+  const el = document.getElementById('greenlight-playbook-status');
+  if (!el) return;
+  try {
+    const pb = await api.get('/api/greenlight/playbook');
+    el.textContent = _formatPlaybookStatus(pb);
+  } catch {
+    el.textContent = '';
+  }
+}
+
+async function rebuildGreenLightPlaybook(btn) {
+  const statusEl = document.getElementById('greenlight-playbook-status');
+  const original = btn ? btn.innerHTML : '';
+  if (btn) { btn.disabled = true; btn.innerHTML = '📗 Обучаю…'; }
+  if (statusEl) statusEl.textContent = 'дистиллирую приёмы из GREEN LIGHT-серий и анализов топ-драм…';
+  try {
+    const r = await api.post('/api/greenlight/playbook/rebuild', {}, { timeoutMs: 300_000 });
+    if (r.error) throw new Error(r.error);
+    if (statusEl) statusEl.textContent = _formatPlaybookStatus({ exists: true, built_at: r.built_at, sources: r.sources });
+    showToast('✓ Написатель обучен на GREEN LIGHT-приёмах', 4000);
+  } catch (e) {
+    if (statusEl) statusEl.textContent = 'ошибка: ' + (e.message || e);
+    showToast('Не удалось пересобрать playbook: ' + (e.message || e), 7000);
+  } finally {
+    if (btn) { btn.disabled = false; btn.innerHTML = original; }
   }
 }
 

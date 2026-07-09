@@ -37,6 +37,7 @@ from sw.story_prompts import (_build_cast_block, _format_mode_block,
                               _format_mode_of, _outfit_ids)
 from sw.story_writer import _build_batch_script_system, _build_script_system
 from sw.routes.scripts_landmark import _series_beats_episode_block, trigger_autogen_if_enabled
+from sw.greenlight import get_playbook_block
 
 @app.route('/api/series/<sid>/episodes/<int:num>/generate-script', methods=['POST'])
 def generate_episode_script(sid, num):
@@ -311,6 +312,7 @@ def generate_episode_script(sid, num):
         + bridge_block            # ← concrete per-episode plan from current state to finale
         + crowd_block             # ← HARD limit on characters per scene, lifted up front
         + format_block
+        + get_playbook_block()    # ← GREEN LIGHT playbook: proven craft from top dramas + green series
         + (cast_block + '\n\n' if cast_block else '')
         + brief_block
         + devices_block

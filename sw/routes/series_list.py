@@ -22,6 +22,11 @@ def list_series():
         sf = d / 'series.json'
         if sf.exists():
             s = json.loads(sf.read_text())
+            # GREEN LIGHT model: only 'green' survives. Legacy swatch colors
+            # (red/orange/…) render as no-color. Normalized on read so old data
+            # displays correctly without a bulk disk migration.
+            if (s.get('color') or '') != 'green':
+                s['color'] = ''
             is_archived = bool(s.get('archived'))
             if want_archived and not is_archived:
                 continue
@@ -195,8 +200,10 @@ def update_series_meta(sid):
     body = request.json or {}
     if 'color' in body:
         c = (body.get('color') or '').strip()
-        # Whitelist: empty (clear) or one of the swatch slugs
-        allowed = {'', 'red', 'orange', 'yellow', 'green', 'teal', 'blue', 'purple', 'pink', 'gray'}
+        # GREEN LIGHT model: a series is either flagged 'green' (GREEN LIGHT —
+        # confirmed strong statistics, fed into the writer's playbook) or has no
+        # color. The legacy 10-swatch palette was retired.
+        allowed = {'', 'green'}
         if c not in allowed:
             return jsonify({'error': f'invalid color: {c}'}), 400
         s['color'] = c

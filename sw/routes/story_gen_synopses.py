@@ -23,6 +23,7 @@ from sw.storage import (TOTAL_SUB_EPS, _extract_end_position,
                         load_episode, load_series, save_episode, save_series)
 from sw.story_prompts import (_build_cast_block, _canonical_cast_block,
                               _format_mode_block, _format_mode_of, _outfit_ids)
+from sw.greenlight import get_playbook_block
 from sw.story_logic import (MILESTONE_EPS, _WRITER_SYSTEM, audit_logic_holes,
                             audit_script, build_logic_brief, doctor_script,
                             extract_canon_updates, rollback_canon_for_episode)
@@ -404,6 +405,11 @@ def generate_next_episode_synopsis(sid):
     # and s['finale'] (the planned ending). Without injecting these, the
     # synopsis generator drifts and ignores the finale entirely.
     trajectory_block = build_trajectory_block(s, next_num)
+    # GREEN LIGHT playbook — proven craft from top dramas + green-marked series.
+    # Prepended once here so it rides into every prompt branch via {trajectory_block}.
+    _pb_block = get_playbook_block()
+    if _pb_block:
+        trajectory_block = _pb_block + trajectory_block
     # Keep the ordered beat skeleton (ноды) steering every synopsis — prepend
     # so it sits above the per-episode trajectory. Included in all prompt
     # branches below via {trajectory_block}.
@@ -595,7 +601,7 @@ def generate_episode_synopses(sid):
     ms = s.get('milestone_synopses', {})
     batch = is_batch_mode(s)
     bs = batch_size(s) if batch else 1
-    cast_pin = _canonical_cast_block(s) + _revision_instructions_block(s)
+    cast_pin = get_playbook_block() + _canonical_cast_block(s) + _revision_instructions_block(s)
     if batch:
         # In batch mode, fill all chunks BETWEEN the anchor chunks (e.g. chunks 1..chunk_of(10)).
         # Each chunk synopsis must outline `bs` sub-cliffhangers + the chunk's main reversal.

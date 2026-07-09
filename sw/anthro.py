@@ -831,7 +831,7 @@ def _override_vision_with_script_poses(analysis_text, prev_chunk_text, prev_char
     # because vanilla Pixar/Banana gen has weak priors for «person halfway
     # under car, torso visible from beneath the bumper» and defaults to
     # «person lying next to car» 75% of the time. User-reported: 4 retakes
-    # of «Fox Woman lies halfway under the car», only 1 placed her under,
+    # of «a character in a hard pose», only 1 placed her under,
     # and even that one put her behind the car instead of sticking out
     # from the side. Adding photography-style framing vocabulary to the
     # composer's instructions improves the hit rate.

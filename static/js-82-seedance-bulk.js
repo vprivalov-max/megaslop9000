@@ -197,67 +197,48 @@ async function sdAddToTimeline(idx, btn) {
   }
 }
 
-async function sdHealAndReuse(idx, btn) {
+// One-click «Попробовать обойти модерацию» for a failed chunk. Fires the
+// server-side driver that runs the FULL legitimate arsenal AUTOMATICALLY
+// (re-describe action → aggressive re-describe + reframe → deep series-aware
+// scene rewrite), resubmitting and waiting until the chunk passes — with NO
+// evasion (никаких сеток/cartoon) and the voice kept. No manual composer step:
+// progress + result show right on the chunk card via the normal poll loop.
+async function sdPassModeration(idx, btn) {
   const oldHtml = btn ? btn.innerHTML : '';
-  if (btn) { btn.disabled = true; btn.innerHTML = '⏳ лечу...'; }
+  if (btn) { btn.disabled = true; btn.innerHTML = '⏳ обхожу…'; }
   try {
-    // 1) Reuse first — fills prompt, chunk_text, refs, params from the failed chunk
-    await sdReuse(idx);
-    // 2) Ask backend to rewrite prompt+chunk to pass moderation
-    const res = await api.post(
-      `/api/series/${S.seriesId}/episodes/${S.episode.number}/seedance/${idx}/heal-prompt`,
+    await api.post(
+      `/api/series/${S.seriesId}/episodes/${S.episode.number}/seedance/${idx}/pass-moderation`,
       {}
     );
-    // 3) Apply healed text into composer
-    if (res.prompt) document.getElementById('sd-prompt').value = res.prompt;
-    if (res.chunk_text) document.getElementById('sd-chunk-text').value = res.chunk_text;
-    // 4) Show changes summary in a modal so user understands what shifted
-    const changes = res.changes || [];
-    const lines = changes.length
-      ? changes.map(s => `  • ${s}`).join('\n')
-      : '  (модель не выделила конкретных правок — проверь сам)';
-    const reason = res.reasoning ? `\n\nОбоснование: ${res.reasoning}` : '';
-    alert(
-      `🩹 Промпт пролечен. Что изменено:\n\n${lines}${reason}\n\n` +
-      'Промпт и chunk_text обновлены в композере. Нажми ▶ Сгенерировать чтобы попробовать.'
-    );
-    showToast('🩹 Готово · промпт пролечен', 4000);
+    showToast('🛡 Провожу через модерацию — переписываю и пересабмичу, статус обновится сам…', 6000);
+    if (typeof sdRefreshList === 'function') await sdRefreshList();
+    // Start the shared singleton 8s poll loop so the passed video + live status
+    // appear WITHOUT a manual page refresh. This loop only READS /poll (which
+    // downloads finished videos + re-renders) and auto-stops when the chunk is
+    // completed/failed. It CANNOT trigger a generation: the chunk carries
+    // mod_driver_active=True, so the server's /poll skips all escalation — only
+    // the single bounded driver thread submits (capped by the per-chunk limit +
+    // 6-rung ladder + circuit breaker). No new loop, no $600 replay.
+    if (typeof sdEnsurePoll === 'function') sdEnsurePoll();
   } catch (e) {
-    showToast('✗ heal: ' + (e.message || e), 6000);
-  } finally {
-    if (btn) { btn.disabled = false; btn.innerHTML = oldHtml || '🩹 Лечить'; }
+    showToast('✗ ' + (e.message || e), 6000);
+    if (btn) { btn.disabled = false; btn.innerHTML = oldHtml || '🛡 Попробовать обойти модерацию'; }
   }
 }
 
-async function sdRewriteChunk(idx, btn) {
+// Reset the per-chunk lifetime submit counter so «Попробовать обойти модерацию»
+// can run again — the server re-applies the same cap (8) from zero.
+async function sdResetSubmitLimit(idx, btn) {
   const oldHtml = btn ? btn.innerHTML : '';
-  if (btn) { btn.disabled = true; btn.innerHTML = '⏳ переписываю...'; }
+  if (btn) { btn.disabled = true; btn.innerHTML = '⏳…'; }
   try {
-    const res = await api.post(
-      `/api/series/${S.seriesId}/episodes/${S.episode.number}/seedance/${idx}/rewrite-chunk`,
-      {}
-    );
-    // Apply rewritten chunk_text into composer
-    if (res.chunk_text) document.getElementById('sd-chunk-text').value = res.chunk_text;
-    // Show what changed
-    const changes = res.changes || [];
-    const lines = changes.length
-      ? changes.map(s => `  • ${s}`).join('\n')
-      : '  (модель не выделила конкретных правок — проверь сам)';
-    const reason = res.reasoning ? `\n\nОбоснование: ${res.reasoning}` : '';
-    alert(
-      `✍️ Сцена переписана. Что изменено:\n\n${lines}${reason}\n\n` +
-      'Текст обновлён в composer. Нажми ▶ Сгенерировать — автоматически построит новый видео-промпт.'
-    );
-    showToast('✍️ Сцена переписана', 4000);
-    // Reuse copies refs/params; then restore the rewritten chunk_text
-    await sdReuse(idx);
-    if (res.chunk_text) document.getElementById('sd-chunk-text').value = res.chunk_text;
-    document.getElementById('seedance-panel')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    await api.post(`/api/series/${S.seriesId}/episodes/${S.episode.number}/seedance/${idx}/reset-submit-limit`, {});
+    showToast('🔓 Лимит сброшен — снова доступно до 8 генераций на этот чанк', 5000);
+    if (typeof sdRefreshList === 'function') await sdRefreshList();
   } catch (e) {
-    showToast('✗ rewrite: ' + (e.message || e), 6000);
-  } finally {
-    if (btn) { btn.disabled = false; btn.innerHTML = oldHtml || '✍️ Переписать'; }
+    showToast('✗ ' + (e.message || e), 6000);
+    if (btn) { btn.disabled = false; btn.innerHTML = oldHtml || '🔓 Сбросить лимит'; }
   }
 }
 
@@ -275,7 +256,7 @@ async function sdReuse(idx) {
     ? _estimateChunkDurationSec(c.chunk_text, { fallback: c.duration || 15 })
     : (c.duration || 15);
   document.getElementById('sd-resolution').value = c.resolution || '720p';
-  document.getElementById('sd-mod-bypass').value = c.moderation_bypass || 'collage_grid';
+  document.getElementById('sd-mod-bypass').value = c.moderation_bypass || 'off';
   // Rebuild refs from stored descriptors. Must cover every kind that compose/
   // start can emit (char, loc, item, lastframe, cutframe) — otherwise reuse
   // for the heal-prompt flow drops the photo and the user sees "no photo" with
@@ -606,7 +587,7 @@ async function _qcAutoRetryStorm(chunks) {
           chunk_text: c.chunk_text,
           duration: c.duration || c.durationSec || 15,
           resolution: c.resolution || '480p',
-          moderation_bypass: c.moderation_bypass || 'collage_grid',
+          moderation_bypass: c.moderation_bypass || 'off',
           model: c.model || 'reference-fast',
           // Propagate canonical script position so retries get the «v2/v3»
           // label rather than orphan «доп.N». Same fix as sdRetry (manual

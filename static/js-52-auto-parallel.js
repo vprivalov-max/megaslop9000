@@ -302,6 +302,7 @@ async function _runEpisodeAutoStandalone(sid, num, opts = {}) {
               duration: segDuration || shared.duration,
               resolution: shared.resolution,
               moderation_bypass: shared.moderation_bypass,
+              mod_full_battery: true,   // auto-mode: full bypass battery + wait
               model: shared.model_tier,
               refs: (composeRes.refs || []).map(r => ({
                 kind: r.kind, id: r.id, outfit: r.outfit || null, url: r.url || null,
@@ -316,31 +317,10 @@ async function _runEpisodeAutoStandalone(sid, num, opts = {}) {
           }
         }
         if (chunk.status === 'failed') {
-          if (R.errorMode === 'heal' && healAttempts < MAX_HEAL_RETRIES) {
-            healAttempts++;
-            R.lastStatus = `🩹 лечу #${curIdx}...`;
-            _autoUpdateFloatingWidget();
-            try {
-              const healRes = await api.post(`/api/series/${epSid}/episodes/${epNumber}/seedance/${curIdx}/heal-prompt`, {});
-              const restart = await api.post(`/api/series/${epSid}/episodes/${epNumber}/seedance/start`, {
-                prompt: healRes.prompt || composeRes.prompt,
-                chunk_text: healRes.chunk_text || segText,
-                duration: segDuration || shared.duration,
-                resolution: shared.resolution,
-                moderation_bypass: shared.moderation_bypass,
-                model: shared.model_tier,
-                refs: (composeRes.refs || []).map(r => ({
-                  kind: r.kind, id: r.id, outfit: r.outfit || null, url: r.url || null,
-                  source: r.source, prev_idx: r.prev_idx, name: r.name,
-                  cut_index: r.cut_index, cut_time: r.cut_time,
-                })),
-              });
-              if (restart?.chunk?.idx != null) curIdx = restart.chunk.idx;
-              continue;
-            } catch (e) {
-              return { ok: false, error: e?.message || 'heal-failed' };
-            }
-          }
+          // Moderation recovery is owned by the SERVER poll ladder now (see
+          // js-51 note). Transient recovery shows as 'moderation_blocked' and
+          // keeps polling; 'failed' means the ladder is exhausted — do NOT
+          // re-heal here (old mangling path + duplicate chunks). Just stop.
           return { ok: false, chunk, error: chunk.error || 'failed' };
         }
       }
@@ -386,6 +366,7 @@ async function _runEpisodeAutoStandalone(sid, num, opts = {}) {
             duration: seg.durationSec || shared.duration,
             resolution: shared.resolution,
             moderation_bypass: shared.moderation_bypass,
+            mod_full_battery: true,   // auto-mode: full bypass battery + wait
             model: shared.model_tier,
             script_order: seg.scriptOrder,
             refs: (composeRes.refs || []).map(r => ({

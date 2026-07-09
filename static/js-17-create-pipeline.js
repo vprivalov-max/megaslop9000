@@ -132,7 +132,7 @@ async function _runAppendPipeline(overlay) {
   // 2) LOGIC CHECK + 3) HEAL ALL FOUND ISSUES
   if (autoPipeEnabled('logic')) {
     overlay.set('logic', 'run');
-    const lc = await api.post('/api/series/import-from-script/logic-check', { script: getScript() }, { timeoutMs: 120000 });
+    const lc = await api.post('/api/series/import-from-script/logic-check', { script: getScript() }, { timeoutMs: 600000 });
     if (lc.error) throw new Error('Проверка логики: ' + lc.error);
     const issues = lc.issues || [];
     if (!issues.length) {
@@ -141,7 +141,7 @@ async function _runAppendPipeline(overlay) {
     } else {
       overlay.set('logic', 'done', `${issues.length} замеч.`);
       overlay.set('heal', 'run');
-      const fx = await api.post('/api/series/import-from-script/apply-fixes', { script: getScript(), issues }, { timeoutMs: 180000 });
+      const fx = await api.post('/api/series/import-from-script/apply-fixes', { script: getScript(), issues }, { timeoutMs: 600000 });
       if (fx.error) throw new Error('Лечение проблем: ' + fx.error);
       if (fx.script) { ta.dataset.preFixSnapshot = ta.value; ta.value = fx.script; appendUpdateStats(); }
       overlay.set('heal', 'done', `${fx.applied_count ?? issues.length} правок`);
@@ -315,7 +315,7 @@ async function appendLogicCheck() {
   out.innerHTML = '<div style="font-size:0.85rem;color:var(--muted)"><span class="spinner"></span> Claude читает все серии и ищет противоречия… ~15-40 сек</div>';
   _appendLogicIssues = [];
   try {
-    const r = await api.post('/api/series/import-from-script/logic-check', { script }, { timeoutMs: 120000 });
+    const r = await api.post('/api/series/import-from-script/logic-check', { script }, { timeoutMs: 600000 });
     if (r.error) throw new Error(r.error);
     const issues = r.issues || [];
     _appendLogicIssues = issues;
@@ -407,7 +407,7 @@ async function appendLogicApply(btn) {
   try {
     const r = await api.post('/api/series/import-from-script/apply-fixes',
       { script, issues: selected },
-      { timeoutMs: 180000 });
+      { timeoutMs: 600000 });
     if (r.error) throw new Error(r.error);
     if (!r.script) throw new Error('пустой ответ');
     // Save undo snapshot (Cmd+Z would only undo characters typed by user; this
@@ -470,7 +470,7 @@ async function importLogicCheck(btn) {
   if (out) out.innerHTML = '<div style="font-size:0.85rem;color:var(--muted)"><span class="spinner"></span> Claude читает все серии и ищет противоречия… ~15-40 сек</div>';
   _importLogicIssues = [];
   try {
-    const r = await api.post('/api/series/import-from-script/logic-check', { script }, { timeoutMs: 120000 });
+    const r = await api.post('/api/series/import-from-script/logic-check', { script }, { timeoutMs: 600000 });
     if (r.error) throw new Error(r.error);
     const issues = r.issues || [];
     _importLogicIssues = issues;
@@ -556,7 +556,7 @@ async function importLogicApply(btn) {
   );
   try {
     const r = await api.post('/api/series/import-from-script/apply-fixes',
-      { script, issues: selected }, { timeoutMs: 180000 });
+      { script, issues: selected }, { timeoutMs: 600000 });
     if (r.error) throw new Error(r.error);
     if (!r.script) throw new Error('пустой ответ');
     ta.dataset.preFixSnapshot = script;

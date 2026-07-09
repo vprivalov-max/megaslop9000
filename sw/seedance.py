@@ -19,6 +19,7 @@ from sw.seedance_avai import (
     _avai_seedance_start,
     _avai_seedance_status,
     _avai_upload_local_image,
+    _classify_moderation_block,
     _detect_cuts,
     _extract_keyframes_at_cuts,
     _extract_last_frame,
